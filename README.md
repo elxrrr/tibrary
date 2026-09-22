@@ -4,7 +4,7 @@
 
 🚨 Primarily built by **Gemini 3.8** and **GPT-6 Astra**, only small fixes and amendments have been done by me
 
-![Overview of Tibrary](./support/imgs/overview.png)
+![Overview of Tibrary](./desktop/src-tauri/icons/128x128.png)
 
 ## What It Does
 
