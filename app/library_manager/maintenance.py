@@ -127,16 +127,12 @@ def plan_library(root, repair=True, dates=True, organise=False, cancel=lambda:Fa
     root=Path(root).expanduser().resolve(strict=True)
     if not root.is_dir():raise ValueError('Choose a library folder')
     snapshot=[]
-    def walk_error(error):raise error
-    for directory,dirs,files in os.walk(root,followlinks=False,onerror=walk_error):
+    from .file_services import inventory
+    entries, complete = inventory(root, {'.flac'}, cancel, progress)
+    for name, _, _ in entries:
         if cancel():break
-        dirs[:]=[d for d in dirs if not Path(directory,d).is_symlink()]
-        for name in files:
-            if cancel():break
-            path=Path(directory,name)
-            if path.suffix.lower()!='.flac' or path.is_symlink():continue
-            snapshot.append(inspect_file(path,root,layout))
-            if len(snapshot)%100==0:progress(f'Inspected {len(snapshot):,} FLAC files')
+        snapshot.append(inspect_file(Path(name),root,layout))
+        if len(snapshot)%100==0:progress(f'Inspected {len(snapshot):,} FLAC files')
     progress(f'{"Partial inspection" if cancel() else "Inspection complete"} · {len(snapshot):,} FLAC files · no files changed')
     return replan(snapshot,repair,dates,organise,discs)
 
@@ -581,14 +577,9 @@ def apply_one(row, store, cancel=lambda:False):
         target.parent.mkdir(parents=True,exist_ok=True)
         guarded_path(target,root)
         fd,temporary=tempfile.mkstemp(prefix='.library-tags-',suffix='.flac',dir=target.parent);os.close(fd)
-        with open(source,'rb') as original,open(temporary,'wb') as output:
-            while True:
-                check_cancelled(cancel)
-                block=original.read(1024*1024)
-                if not block:break
-                output.write(block)
+        from .file_services import copy_flac_verified
+        digest=copy_flac_verified(source,temporary,lambda:check_cancelled(cancel))
         shutil.copystat(source,temporary)
-        digest=audio_digest(source,cancel)
         audio=FLAC(temporary)
         original_tags={k:list(v) for k,v in audio.tags.items()}
         pictures=[p.write() for p in audio.pictures]

@@ -271,6 +271,40 @@ class DesktopServiceTests(unittest.TestCase):
         self.assertIsNot(original, self.service.api())
         self.assertAlmostEqual(self.service.pacer.interval, 1.1)
 
+    def test_force_refresh_walks_once_and_tables_reuse_snapshot(self):
+        from library_manager.core import scan as real_scan
+
+        with patch("library_manager.freshness.scan", wraps=real_scan) as walk:
+            self.service.inspect(str(self.root), force=True)
+            self.assertEqual(walk.call_count, 1)
+            self.assertTrue(walk.call_args.kwargs["force"])
+            for route in ("correct", "metadata", "artwork", "links"):
+                self.service.table(dict(root=str(self.root), route=route, limit=5))
+            self.assertEqual(walk.call_count, 1)
+
+    def test_background_preview_survives_navigation_and_blocks_conflicting_jobs(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        original = self.service.run_job
+        def held(kind, args):
+            entered.set()
+            release.wait(3)
+            return original(kind, args)
+        with patch.object(self.service, 'run_job', side_effect=held):
+            self.service.start('preview', dict(root=str(self.root), action='numbers'))
+            try:
+                self.assertTrue(entered.wait(2))
+                self.service.table(dict(root=str(self.root), route='metadata', limit=5))
+                self.assertTrue(self.service.active())
+                with self.assertRaises(ValueError):
+                    self.service.start('scan', dict(root=str(self.root)))
+            finally:
+                release.set()
+                self.service.worker.join(5)
+        self.assertEqual(self.service.job['status'], 'complete')
+        restored=self.service.table(dict(root=str(self.root),route='correct',action='numbers'))
+        self.assertEqual(restored['preview_id'],self.service.job['result']['preview_id'])
+
 
 if __name__ == "__main__":
     unittest.main()

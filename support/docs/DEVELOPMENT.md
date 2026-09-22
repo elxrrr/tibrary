@@ -110,3 +110,38 @@ Run the native contract tests with `test_native_tags` through the isolated runne
 `support/tools/benchmark_tags.py <library> --limit 100` compares readers without
 changing source files; write measurements use temporary copies only. Benchmark
 results do not imply faster network/API requests or already-cached scans.
+
+
+### Shared scan and catalogue policy
+
+The desktop service owns background operations independently of navigation. Startup
+and **Refresh local files** discover filesystem changes; dependent pages use the
+same persisted inspection, including empty libraries. A forced refresh walks once
+and rereads tags. Normal refreshes reuse files with unchanged fingerprints. Applying
+changes updates affected snapshots and the database; consolidation/repair refresh
+once after completion. Changes made in another editor require a local refresh.
+
+Every catalogue workflow uses `CachedTidal`: searches, recording editions and artist
+summaries are shared across jobs and restarts, scoped to market (24 hours; empty
+searches one hour). Explicit release-list refresh bypasses summary caching, while
+unchanged track lists remain reusable. Release details use the configured cache
+age (30 days by default); extended tags and availability use one day. Incomplete,
+failed or cancelled fetches do not replace successful observations. The additional
+metadata provider retains its existing market-scoped BPM/key cache.
+
+Activity identifies the operation, library, cache reuse and reasons for online
+fetches. Rapid routine cache/progress messages are throttled to keep the interface
+responsive. The service runs one job at a time; route changes never start scans.
+
+### Native filesystem boundary
+
+`native/tibrary-tags/src/filesystem.rs` implements read-only inventory traversal
+and staged FLAC copying with audio-frame hashing. `file_services.py` is the shared
+Python boundary and retains filesystem audit events. Native operations release
+Python's interpreter lock; cancellation callbacks run at bounded file/chunk
+boundaries. Native copying never publishes, moves or deletes a library file.
+The existing reviewed workflow owns publication and database reconciliation.
+
+The native package is pinned by `app/pyproject.toml`. Rebuild its wheel before
+running source changes that introduce native functions. The desktop builder
+selects the exact native version declared in `native/tibrary-tags/pyproject.toml`.

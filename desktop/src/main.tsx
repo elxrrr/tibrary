@@ -64,16 +64,6 @@ const groups = [
     ],
   },
   {
-    id: "fix",
-    name: "Fix library",
-    icon: Sparkles,
-    items: [
-      ["metadata", "Add missing tags", Tags],
-      ["artwork", "Fix artwork", Image],
-      ["online", "Online replacements", RefreshCw],
-    ],
-  },
-  {
     id: "complete",
     name: "Complete library",
     icon: ArrowDownToLine,
@@ -81,6 +71,16 @@ const groups = [
       ["missing", "Missing releases", Search],
       ["queue", "Download queue", ArrowDownToLine],
       ["downloaded", "Downloaded releases", Check],
+    ],
+  },
+  {
+    id: "fix",
+    name: "Update library",
+    icon: Sparkles,
+    items: [
+      ["metadata", "Add missing tags", Tags],
+      ["artwork", "Fix artwork", Image],
+      ["online", "Online replacements", RefreshCw],
     ],
   },
   {
@@ -220,6 +220,16 @@ function App() {
     [recommendation, setRecommendation] = useState("All recommendations"),
     [copyright, setCopyright] = useState("All copyrights"),
     [releaseType, setReleaseType] = useState("All types");
+  const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
+  useEffect(() => {
+    if (route !== "overview" || !state) return;
+    let alive = true;
+    call("table", {route: "missing", timeline: "All missing releases", status: "Missing release",
+      sort: "date", direction: "desc", limit: 20, recommendation: "All recommendations"})
+      .then((result) => { if (alive) setLatestMissing(result.rows); })
+      .catch((e) => { if (alive) notifyError(e); });
+    return () => { alive = false; };
+  }, [route, state?.revision]);
   const [detail, setDetail] = useState<any>(null),
     [review, setReview] = useState<any>(null),
     [menu, setMenu] = useState<{ row: Row; x: number; y: number } | null>(null),
@@ -302,6 +312,11 @@ function App() {
   useEffect(() => {
     let alive = true;
     const n = ++sequence.current;
+    if (!state || (root && !state.roots.some((r) => r.root === root))) return;
+    if (["overview", "prepare", "catalogue", "complete", "fix", "settings"].includes(route)) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     const timer = setTimeout(
       () =>
@@ -403,7 +418,7 @@ function App() {
         call("preview", { id: j.result.preview_id })
           .then(setDeep)
           .catch(notifyError);
-      else setFilter("affected");
+      else if (root === j.result.root && route === target) setFilter("affected");
     }
     if (["apply", "deep_apply", "consolidate"].includes(j.kind)) {
       setPreview(undefined);
@@ -607,8 +622,8 @@ function App() {
             <>
               {card(
                 "Local tracks",
-                s.track_count?.toLocaleString(),
-                "Indexed music files",
+                `${(s.linked_tracks || 0).toLocaleString()} / ${(s.track_count || 0).toLocaleString()}`,
+                "Linked tracks / indexed locally",
                 "files",
               )}
               {card(
@@ -723,19 +738,19 @@ function App() {
         {route === "overview" && (
           <section className="card">
             <div className="section-heading">
-              <h2>Latest downloads</h2>
-              <button onClick={() => setRoute("downloaded")}>
-                View downloaded releases
+              <h2>Latest missing releases</h2>
+              <button onClick={() => { setTimeline("All missing releases"); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
+                View missing releases
               </button>
             </div>
-            {state?.recent_downloads?.length ? (
-              state.recent_downloads.map((r) => (
+            {latestMissing?.length ? (
+              latestMissing.map((r) => (
                 <div className="library-row" key={r.id}>
                   <Music2 size={18} />
                   <strong>
                     {r.artist} — {r.release}
                   </strong>
-                  <span>{r.tracks} tracks</span>
+                  <span>{r.date} · {r.recommendation}</span>
                   <button
                     onClick={() =>
                       external(`https://tidal.com/album/${r.id}`).catch(
@@ -748,7 +763,7 @@ function App() {
                 </div>
               ))
             ) : (
-              <p>Completed downloads will appear here.</p>
+              <p>{latestMissing === null ? "Loading cached missing releases…" : "No missing releases in the cached catalogue. Scan for new releases to update it."}</p>
             )}
           </section>
         )}
@@ -1253,7 +1268,13 @@ function App() {
             }
           >
             {options.map((v) => (
-              <option key={v}>{v}</option>
+              <option key={v} value={v}>
+                {key === "theme"
+                  ? v === "system"
+                    ? "System"
+                    : v[0].toUpperCase() + v.slice(1)
+                  : v}
+              </option>
             ))}
           </select>
         ) : (
@@ -1890,8 +1911,8 @@ function App() {
   }
   return (
     <div className="app">
+      <div className="drag-region" data-tauri-drag-region aria-hidden="true" />
       <aside>
-        <div className="drag-region" data-tauri-drag-region />
         <button
           className={"nav-item " + (route === "overview" ? "current" : "")}
           onClick={() => setRoute("overview")}
@@ -1963,7 +1984,7 @@ function App() {
               value={root}
               onChange={(e) => setRoot(e.target.value)}
             >
-              <option value="">Choose library</option>
+              <option value="">{!state ? "Loading libraries…" : state.roots.length ? "Choose library" : "Add a library to begin"}</option>
               {state?.roots.map((r) => (
                 <option key={r.root} value={r.root}>
                   {r.root.split("/").pop()}

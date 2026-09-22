@@ -94,9 +94,42 @@ def build_view(store,market):
             entry=releases.setdefault(str(release['id']),dict(release=release,artist_id=artist['id'],local_artists=set(),artist_ids=set()))
             entry['local_artists'].add(name);entry['artist_ids'].add(artist['id'])
             if release.get('tracks_loaded'):entry['release']=release
+    # Read the shared detail cache once; never make network requests to render a view.
+    evidence_fields = ('album_artists','album_artist_ids','label','copyright','official','is_compilation')
+    projection = ','.join(f"'{field}',json_extract(payload,'$.{field}')" for field in evidence_fields)
+    track_projection = ','.join(f"'{field}',json_extract(value,'$.{field}')" for field in ('id','isrc','credits','artists'))
+    projection += f",'evidence_tracks',(SELECT json_group_array(json_object({track_projection})) FROM json_each(payload,'$.tracks'))"
+    detail_cache = {r['key'].rsplit(':', 1)[-1]: json.loads(r['payload'])
+                    for r in store.rows(f"SELECT key,json_object({projection}) AS payload FROM app_preferences WHERE key LIKE ?", (f'tag-review:{market}:%',))}
+    # Reuse contributor metadata collected by linking/enrichment; no render-time API calls.
+    track_cache = {r['key'].rsplit(':', 1)[-1]: json.loads(r['payload']).get('track', {})
+                   for r in store.rows("SELECT key,payload FROM app_preferences WHERE key LIKE ?", (f'tag-track:{market}:%',))}
+    # Rich local tags are reused only while their indexed fingerprint agrees.
+    local_tags = {}
+    for record in store.rows("SELECT payload FROM app_preferences WHERE key LIKE 'inspection:%'"):
+        for row in json.loads(record['payload']).get('rows', []):
+            stamp = row.get('stamp') or []
+            if len(stamp) >= 4 and indexed.get(row.get('path')) == (stamp[2], stamp[3]):
+                local_tags[row['path']] = row.get('tags', {})
+    references = {}
+    for name, local_tracks in artists.items():
+        references[name] = []
+        for track in local_tracks:
+            evidence = dict(track, tags=local_tags.get(track["path"], {}))
+            linked = track_cache.get(str(track.get('tidal_track_id') or ''), {})
+            for field in ('credits', 'artists', 'isrc'):
+                if linked.get(field): evidence[field] = linked[field]
+            verified = detail_cache.get(str(track.get('tidal_album_id') or ''), {})
+            for field in ('label', 'copyright'):
+                if not evidence.get(field) and verified.get(field): evidence[field] = verified[field]
+            references[name].append(evidence)
+    profiles = {}
     compared=[]
     for entry in releases.values():
-        release=entry['release'];tracks={}
+        release=dict(entry['release']);tracks={}
+        details=detail_cache.get(str(release['id']), {})
+        for field in ('album_artists','album_artist_ids','label','copyright','official','is_compilation'):
+            if details.get(field) is not None:release[field]=bool(details[field]) if field in ('official','is_compilation') else details[field]
         for name in entry['local_artists']:
             for key in [('title',title_key(release['title'])),('base',base_title(release['title'])),('id',str(release['id']))]:tracks.update(indexes[name].get(key,{}))
         item=coverage(list(tracks.values()),dict(releases=[release]))[0]
@@ -106,8 +139,13 @@ def build_view(store,market):
         copy_match = copyright_matches(rel_copy, known) if known and rel_copy else None
         item['copyright_match'] = copy_match
         item['copyright'] = rel_copy.get('text', '') if isinstance(rel_copy, dict) else (rel_copy or '')
-        from .recommendations import recommend
-        item['recommendation'] = recommend(release, [t for name in entry['local_artists'] for t in artists.get(name, [])], entry['local_artists'], linked_catalogue=True)
+        from .recommendations import recommend, reference_profile
+        reference = [t for name in entry['local_artists'] for t in references.get(name, [])]
+        profile_key = tuple(sorted(entry['local_artists']))
+        if profile_key not in profiles: profiles[profile_key] = reference_profile(reference)
+        evidence_tracks = release.get('tracks') or details.get('evidence_tracks') or []
+        recommendation_release = dict(release, tracks=[dict(t, **track_cache.get(str(t.get('id') or ''), {})) for t in evidence_tracks])
+        item['recommendation'] = recommend(recommendation_release, reference, entry['local_artists'], linked_catalogue=True, artist_ids=entry['artist_ids'], profile=profiles[profile_key])
         compared.append(item)
         if item['state'] in ('Owned complete','Owned partial','Present locally'):
             if release.get('date'):

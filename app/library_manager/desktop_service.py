@@ -179,6 +179,7 @@ class DesktopService:
                     "Checked ",
                     "Reading audio",
                     "Checking folder",
+                    "Using saved ",
                 )
             )
             if routine and current - self._last_progress < 0.5:
@@ -259,20 +260,23 @@ class DesktopService:
         return self.snapshots[root]
 
     def inspect(self, root, force=False):
-        from .freshness import prepare_library, save_inspection
-        from .core import scan
+        from .freshness import prepare_library
 
-        if force:
-            scan(
-                self.store,
-                root,
-                cancelled=self.cancel_event.is_set,
-                progress=self.log,
-                force=True,
+        self.log(
+            f"Checking library · {root} · "
+            + (
+                "manual full tag refresh"
+                if force
+                else "reading only new or changed files"
             )
-            self.snapshots.pop(root, None)
+        )
         rows = prepare_library(
-            self.store, root, self.snapshot(root), self.cancel_event.is_set, self.log
+            self.store,
+            root,
+            self.snapshot(root),
+            self.cancel_event.is_set,
+            self.log,
+            force=force,
         )
         from .linking import attach_links
 
@@ -412,12 +416,6 @@ class DesktopService:
                         )
                     ),
                 ),
-                recent_downloads=[
-                    self.release_row(json.loads(q["payload"]), "Downloaded")
-                    for q in self.store.rows(
-                        "SELECT payload FROM queue WHERE decision='downloaded' ORDER BY updated DESC LIMIT 5"
-                    )
-                ],
                 job=copy.deepcopy(self.job),
                 logs=self.logs[-100:],
                 auth_url=self.auth_url,
@@ -806,6 +804,18 @@ class DesktopService:
 
             def run():
                 try:
+                    label = {
+                        "startup": "Prepare library",
+                        "scan": "Refresh local files",
+                        "link": "Link releases",
+                        "match_artists": "Link artists",
+                        "discography": "Refresh release list",
+                        "metadata": "Find missing tags",
+                        "artwork": "Find artwork",
+                        "mqa": "MQA audit",
+                    }.get(kind, kind.replace("_", " ").capitalize())
+                    scope = args.get("root") or "shared library database"
+                    self.log(f"{label} · {scope}")
                     value = self.run_job(kind, copy.deepcopy(args))
                     if (
                         kind
@@ -825,6 +835,14 @@ class DesktopService:
                         and not self.cancel_event.is_set()
                     ):
                         self.refresh_health(force=kind not in ("startup", "scan"))
+                    self.log(
+                        f"{label} · "
+                        + (
+                            "cancelled; completed results retained"
+                            if self.cancel_event.is_set()
+                            else "finished; saved results available across the app"
+                        )
+                    )
                     self.job.update(
                         status="cancelled"
                         if self.cancel_event.is_set()
@@ -1067,7 +1085,7 @@ class DesktopService:
                     break
                 self.log(f"Refreshing releases · {i}/{len(ids)}")
                 r = self.api().artist(
-                    str(ident), self.log, detailed=a.get("detailed", False)
+                    str(ident), self.log, detailed=a.get("detailed", False), force=True
                 )
                 self.store.save_catalogue(str(ident), self.market, r)
             return {"checked": len(ids)}
@@ -1075,9 +1093,9 @@ class DesktopService:
         if kind == "scan":
             rows = self.inspect(root, a.get("force", False))
             return {"files": len(rows)}
+        # Navigation and dependent jobs reuse even an empty completed snapshot.
+        # Startup and explicit refresh own filesystem discovery.
         rows = self.snapshot(root)
-        if not rows:
-            rows = self.inspect(root)
         selected = (
             self.paths(root, a.get("ids"))
             if kind
@@ -1616,7 +1634,7 @@ class DesktopService:
                 view = self.view()
                 decisions = {q["id"]: q["decision"] for q in view["queue"]}
                 filters = (
-                    a.get("timeline", "Newer than newest owned"),
+                    ("All releases" if a.get("filter") == "Ignored" else a.get("timeline", "Newer than newest owned")),
                     "",
                     a.get("status", "All statuses"),
                     a.get("type", "All types"),

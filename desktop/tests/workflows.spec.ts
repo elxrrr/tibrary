@@ -65,7 +65,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Working", exact: true }),
   ).toHaveCount(0);
-  await page.screenshot({ path: "test-results/overview.png" });
+  await page.screenshot({ path: "test-results/overview.png", animations: "disabled" });
   for (const name of [
     "Prepare library",
     "Correct tags",
@@ -76,7 +76,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     "Link artists",
     "Link releases",
     "Favourite artists",
-    "Fix library",
+    "Update library",
     "Add missing tags",
     "Fix artwork",
     "Online replacements",
@@ -250,4 +250,56 @@ test("missing releases queue only the selected audio tracks", async ({
       exact: true,
     }),
   ).not.toBeChecked();
+});
+
+test("window panes stay isolated and theme labels are readable", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const nav = page.locator("aside");
+  const names = await nav
+    .locator(".nav-heading button:last-child")
+    .allTextContents();
+  expect(names.indexOf("Update library")).toBe(
+    names.indexOf("Complete library") + 1,
+  );
+  await nav.getByRole("button", { name: "General", exact: true }).click();
+  const theme = page.getByLabel("Colour theme");
+  await expect(theme.locator("option")).toHaveText(["System", "Light", "Dark"]);
+  const light = await page.evaluate(() => {
+    document.documentElement.dataset.theme = "light";
+    return getComputedStyle(document.body).backgroundColor;
+  });
+  const dark = await page.evaluate(() => {
+    document.documentElement.dataset.theme = "dark";
+    return getComputedStyle(document.body).backgroundColor;
+  });
+  expect(dark).not.toBe(light);
+  await page.screenshot({ path: "test-results/system-dark.png" });
+  await page.setViewportSize({ width: 1000, height: 680 });
+  const drag = await page.locator(".drag-region").boundingBox();
+  expect(drag?.width).toBe(1000);
+  expect(drag?.y).toBe(0);
+  await nav.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await page.locator(".scroll-page").evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  expect((await page.locator(".drag-region").boundingBox())?.y).toBe(0);
+  expect(
+    await page
+      .locator("main")
+      .evaluate((el) => el.getBoundingClientRect().bottom),
+  ).toBeLessThanOrEqual(680);
+});
+
+test("overview restores the library and shows cached missing releases", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("tibrary.root", "/old-library"));
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Latest missing releases" })).toBeVisible();
+  await expect(page.getByLabel("Active library")).not.toHaveValue("/old-library");
+  await expect(page.getByText("Choose a registered library first")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "View missing releases" })).toBeVisible();
 });

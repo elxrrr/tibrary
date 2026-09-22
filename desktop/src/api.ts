@@ -10,7 +10,6 @@ export type Job = {
   result?: any;
 };
 export type AppState = {
-  recent_downloads?: Row[];
   revision: number;
   roots: Row[];
   stats: Record<string, number>;

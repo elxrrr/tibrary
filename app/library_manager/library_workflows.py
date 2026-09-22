@@ -27,12 +27,10 @@ def inspect_snapshot(root, snapshot=(), cancel=lambda:False, progress=lambda s:N
     root=Path(root).resolve(strict=True)
     cached={r['path']:r for r in snapshot}
     if paths is None:
-        paths=[]
-        def fail(error):raise error
-        for directory,dirs,files in os.walk(root,followlinks=False,onerror=fail):
-            if cancel():return list(snapshot)
-            dirs[:]=[d for d in dirs if not Path(directory,d).is_symlink()]
-            paths.extend(str(Path(directory,name)) for name in files if Path(name).suffix.casefold()=='.flac' and not Path(directory,name).is_symlink())
+        from .file_services import inventory
+        entries, complete = inventory(root, {'.flac'}, cancel, progress)
+        if not complete:return list(snapshot)
+        paths=[path for path, _, _ in entries]
     result=[];read=0
     for path in paths:
         if cancel():return list(snapshot)

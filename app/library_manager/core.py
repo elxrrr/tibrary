@@ -263,62 +263,58 @@ def scan(store, root, reader=read_metadata, cancelled=lambda: False, progress=la
     seen = set()
     restored = []
     status = 'complete'
+    pending_writes = []
+    def flush_index():
+        if pending_writes:
+            with store.connect() as db:
+                db.executemany('INSERT OR REPLACE INTO local_files VALUES(?,?,?,?,?,?,1)', pending_writes)
+            pending_writes.clear()
     try:
         if not Path(root).is_dir():
             raise OSError('Library is offline; saved snapshot retained')
         progress('Loading the saved file inventory for incremental comparison')
         previous = {r['path']: r for r in store.rows('SELECT * FROM local_files WHERE root=?', (root,))}
         progress(f'Loaded {len(previous):,} cached files · walking folders and comparing size and modification time')
-        def walk_error(error):
-            raise OSError('A folder could not be read; missing-file reconciliation skipped') from error
-        for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
-            if time.monotonic() - last_report >= .25:
-                progress(f'Checking folder · {directory}')
-                last_report = time.monotonic()
-            dirs[:] = [d for d in dirs if not Path(directory, d).is_symlink()]
-            for filename in files:
-                if cancelled():
-                    status = 'cancelled'
-                    break
-                path = Path(directory, filename)
-                if path.suffix.casefold() not in AUDIO or path.is_symlink():
-                    continue
-                name = str(path)
-                seen.add(name)
-                stat = path.stat()
-                old = previous.get(name)
-                old_metadata=json.loads(old['metadata'] or '{}') if old else {}
-                old_grouping=reader is read_metadata and old and (old_metadata.get('artist_grouping_version')!=3 or 'track_artist' not in old_metadata)
-                if not force and not old_grouping and old and (old['size'], old['mtime']) == (stat.st_size, stat.st_mtime_ns) and not old['error']:
-                    counts['unchanged'] += 1
-                    if not old['present']:
-                        restored.append((name,))
-                    if len(seen) % 250 == 0:
-                        progress(f'Checked {len(seen):,} files · {counts["unchanged"]:,} unchanged')
-                    continue
-                metadata, error = None, None
-                try:
-                    if counts['read'] == 0 or time.monotonic() - last_report >= .25:
-                        progress(f'Reading audio tags · {path} · {len(seen):,} files checked')
-                        last_report = time.monotonic()
-                    metadata = json.dumps(reader(path))
-                    current=json.loads(metadata);prior=json.loads(old['metadata'] or '{}') if old else {}
-                    if current.get('artist') and any(current.get(k)!=prior.get(k) for k in ('artist','album')):
-                        changed_artists.add(current['artist'])
-                except Exception:
-                    error = 'Metadata could not be read; retry on next scan'
-                    metadata = old['metadata'] if old else None
-                    counts['errors'] += 1
-                    progress(f'Could not read tags · {path} · will retry on the next scan')
-                counts['read'] += 1
-                with store.connect() as db:
-                    db.execute('INSERT OR REPLACE INTO local_files VALUES(?,?,?,?,?,?,1)',
-                               (name, root, stat.st_size, stat.st_mtime_ns, metadata, error))
-                if time.monotonic() - last_report >= .25:
-                    progress(f"Scanned {len(seen):,} files · {counts['read']:,} read · {counts['errors']} errors")
-                    last_report = time.monotonic()
-            if status == 'cancelled':
+        from .file_services import inventory
+        entries, complete = inventory(root, AUDIO, cancelled, progress)
+        if not complete:
+            status = 'cancelled'
+        for name, size, modified in entries:
+            if cancelled():
+                status = 'cancelled'
                 break
+            path = Path(name)
+            seen.add(name)
+            old = previous.get(name)
+            old_metadata=json.loads(old['metadata'] or '{}') if old else {}
+            old_grouping=reader is read_metadata and old and (old_metadata.get('artist_grouping_version')!=3 or 'track_artist' not in old_metadata)
+            if not force and not old_grouping and old and (old['size'], old['mtime']) == (size, modified) and not old['error']:
+                counts['unchanged'] += 1
+                if not old['present']:
+                    restored.append((name,))
+                if len(seen) % 250 == 0:
+                    progress(f'Checked {len(seen):,} files · {counts["unchanged"]:,} unchanged')
+                continue
+            metadata, error = None, None
+            try:
+                if counts['read'] == 0 or time.monotonic() - last_report >= .25:
+                    progress(f'Reading audio tags · {path} · {len(seen):,} files checked')
+                    last_report = time.monotonic()
+                metadata = json.dumps(reader(path))
+                current=json.loads(metadata);prior=json.loads(old['metadata'] or '{}') if old else {}
+                if current.get('artist') and any(current.get(k)!=prior.get(k) for k in ('artist','album')):
+                    changed_artists.add(current['artist'])
+            except Exception:
+                error = 'Metadata could not be read; retry on next scan'
+                metadata = old['metadata'] if old else None
+                counts['errors'] += 1
+                progress(f'Could not read tags · {path} · will retry on the next scan')
+            counts['read'] += 1
+            pending_writes.append((name, root, size, modified, metadata, error))
+            if len(pending_writes) >= 64:flush_index()
+            if time.monotonic() - last_report >= .25:
+                progress(f"Scanned {len(seen):,} files · {counts['read']:,} read · {counts['errors']} errors")
+                last_report = time.monotonic()
         if cancelled():
             status = 'cancelled'
         if status == 'complete':
@@ -331,6 +327,7 @@ def scan(store, root, reader=read_metadata, cancelled=lambda: False, progress=la
         status = 'offline or incomplete'
         progress(str(exc))
     finally:
+        flush_index()
         with store.connect() as db:
             db.executemany('UPDATE local_files SET present=1 WHERE path=?', restored)
             db.execute('UPDATE scans SET ended=?,status=?,summary=? WHERE id=?',

@@ -1,4 +1,6 @@
 //! Small in-process boundary: native comments stay native; I/O releases Python's GIL.
+mod filesystem;
+mod recommendations;
 use lofty::{
     config::{ParseOptions, ParsingMode, WriteOptions},
     file::AudioFile,
@@ -145,6 +147,9 @@ fn write_flac(
 
 #[pymodule]
 fn _lofty(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(recommendations::recommendation_score, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::inventory, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::copy_flac_verified, m)?)?;
     m.add_function(wrap_pyfunction!(digest_flac, m)?)?;
     m.add_function(wrap_pyfunction!(mqa_signal, m)?)?;
     m.add("LOFTY_VERSION", "0.25.3")?;

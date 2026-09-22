@@ -1,6 +1,6 @@
 """Build the macOS app with a relocatable, private Python runtime."""
 
-import json, os, platform, shutil, subprocess, sys
+import json, os, platform, shutil, subprocess, sys, tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,7 +39,8 @@ def main():
         wheels,
     )
     arch_tag = "arm64" if platform.machine() == "arm64" else "x86_64"
-    wheel = next(wheels.glob(f"tibrary_tags-*-cp312-abi3-*_{arch_tag}.whl"))
+    native_version = tomllib.loads((native / "pyproject.toml").read_text())["project"]["version"]
+    wheel = next(wheels.glob(f"tibrary_tags-{native_version}-cp312-abi3-*_{arch_tag}.whl"))
     runtime = TAURI / "runtime"
     home = runtime / "python"
     run(uv, "python", "install", "3.13.15", "--install-dir", home, "--no-bin")
