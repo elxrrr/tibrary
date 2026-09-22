@@ -700,6 +700,7 @@ function App() {
               Add library
             </button>
           </div>
+          <div className="overview-list" role="region" aria-label="Your libraries" tabIndex={0}>
           {state?.roots.length ? (
             state.roots.map((r) => (
               <div className="library-row" key={r.root}>
@@ -734,6 +735,7 @@ function App() {
               files.
             </p>
           )}
+          </div>
         </section>
         {route === "overview" && (
           <section className="card">
@@ -743,6 +745,7 @@ function App() {
                 View missing releases
               </button>
             </div>
+            <div className="overview-list" role="region" aria-label="Latest missing releases" tabIndex={0}>
             {latestMissing?.length ? (
               latestMissing.map((r) => (
                 <div className="library-row" key={r.id}>
@@ -765,6 +768,7 @@ function App() {
             ) : (
               <p>{latestMissing === null ? "Loading cached missing releases…" : "No missing releases in the cached catalogue. Scan for new releases to update it."}</p>
             )}
+            </div>
           </section>
         )}
         {route === "overview" && (

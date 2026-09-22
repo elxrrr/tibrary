@@ -44,6 +44,13 @@ def main():
     runtime = TAURI / "runtime"
     home = runtime / "python"
     run(uv, "python", "install", "3.13.15", "--install-dir", home, "--no-bin")
+    # Keep runtime aliases relocatable when promoting a staged build.
+    for alias in home.iterdir():
+        if alias.is_symlink():
+            target = Path(alias.readlink()).name
+            if (home / target).exists():
+                alias.unlink()
+                alias.symlink_to(target)
     python = next(home.glob("cpython-*/bin/python3"))
     run(
         uv,

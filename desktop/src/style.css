@@ -957,3 +957,26 @@ dialog p {
     animation: none;
   }
 }
+
+/* Keep overview headings fixed while their rows scroll independently. */
+.overview-list {
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+.overview-list > .library-row {
+  height: 64px;
+  box-sizing: border-box;
+  padding: 10px 0;
+}
+.overview-list .library-row > strong {
+  flex: 1;
+  min-width: 0;
+}
+.overview-list .library-row > button,
+.overview-list .library-row > svg,
+.overview-list .library-row > span {
+  flex-shrink: 0;
+}
