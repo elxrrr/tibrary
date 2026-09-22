@@ -4,7 +4,7 @@
 
 🚨 Primarily built by **Gemini 3.8** and **GPT-6 Astra**, only small fixes and amendments have been done by me
 
-![Overview of Tibrary](./support/imgs/overview.jpg?raw=true)
+![Overview of Tibrary](./support/imgs/overview.png)
 
 ## What It Does
 
@@ -16,7 +16,7 @@ Tibrary aims to: **scan once, match as many files as possible to the online cata
 
 * **Missing Music Detection:** Automatically maps artist discographies to find gaps between existing releases, flag incomplete albums, and discover new releases
 
-![Missing releases from online catalogue](./support/imgs/missing_releases.jpg?raw=true)
+![Missing releases from online catalogue](./support/imgs/missing_releases.png)
 
 * **Safe Library Maintenance:** Preview date normalizations, track zero-padding (`01` vs `1`), Camelot `INITIALKEY` conversions, and tag-based folder reorganization before writing any changes to disk. Tracks can have local ID3 tag and folder structure fixes applied without linking to an online release, whilst linked releases can have higher resolution artwork and tag enrichment applied
 
@@ -30,15 +30,17 @@ Tibrary aims to: **scan once, match as many files as possible to the online cata
 
 2. **Prepare & Correct:** Standardize tags, clean up dates, convert musical keys, and preview file organization.
 
-![Enrich local files with tags from linked online releases](./support/imgs/add_tags.jpg?raw=true)
+![Enrich local files with tags from linked online releases](./support/imgs/add_tags.png)
 
 3. **Link Catalogue:** Associate local tracks with online IDs. *Linking only updates the database, not your audio files.*
 
-![Missing releases from online catalogue](./support/imgs/link_releases.jpg?raw=true)
+![Missing releases from online catalogue](./support/imgs/link_releases.png)
 
 4. **Find Missing Releases:** Compare your local library against online discographies. Spot missing tracks, alternate editions, or entirely missing albums.
 
 5. **Queue & Download:** Approve specific tracks or albums, then export the list or route them directly to the download pipeline.
+
+![Connection setup and status](./support/imgs/connections.png)
 
 ## Installation & Setup
 
@@ -74,8 +76,6 @@ Tibrary aims to: **scan once, match as many files as possible to the online cata
 **Optional Tools:**
 
 * **Download Runtime:** Run `./app/tools/Setup\ downloads.command` (requires Python 3.13) to configure the isolated download bridge (`app/resources/tidaler/.venv`).
-
-![Connection setup and status](./support/imgs/connections.jpg?raw=true)
 
 ## Credits
 
