@@ -38,7 +38,12 @@ def download_approved(store, output, cancel, progress, authenticate, process_fac
     try:python=active_runtime()
     except ValueError as exc:raise CatalogueError(str(exc)) from None
     if not python.is_file():raise CatalogueError('Tidaler runtime missing. Run app/tools/Setup downloads.command.')
-    env=dict(os.environ,PYTHONUNBUFFERED='1',XDG_CONFIG_HOME=str(store.path.parent/'downloader-session'))
+    from .tag_io import _lofty
+    env=dict(os.environ,TIBRARY_NATIVE_MODULE=_lofty.__file__,PYTHONUNBUFFERED='1',XDG_CONFIG_HOME=str(store.path.parent/'downloader-session'))
+    try:
+        import imageio_ffmpeg
+        env['TIBRARY_FFMPEG']=imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:pass
     settings=dict(store.preferences('downloads'),**store.preferences('provider'))
     request=dict(output=str(Path(output).expanduser().resolve()),settings=settings,layout=store.preferences('organisation'),items=[dict(id=r['id'],release=json.loads(r['payload'])) for r in rows])
     process=process_factory([str(python),'-u',str(Path(__file__).with_name('download_bridge.py'))],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,start_new_session=True)
@@ -103,7 +108,8 @@ def check_download_connection(store):
     if not python.is_file(): return 'Download account: install the downloader using app/tools/Setup downloads.command.'
     config = store.path.parent / 'downloader-session'
     if not config.is_dir(): return 'Download account: not connected. Connect in Settings → Connections.'
-    env = dict(os.environ, PYTHONUNBUFFERED='1', XDG_CONFIG_HOME=str(config))
+    from .tag_io import _lofty
+    env = dict(os.environ, TIBRARY_NATIVE_MODULE=_lofty.__file__, PYTHONUNBUFFERED='1', XDG_CONFIG_HOME=str(config))
     try:
         timeout=max(5,min(60,int(store.preferences('provider').get('request_timeout_sec',20))))
         result = subprocess.run([str(python), '-u', str(Path(__file__).with_name('download_bridge.py'))],

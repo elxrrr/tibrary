@@ -9,7 +9,7 @@ import re
 from .tidal import CatalogueError
 from pathlib import Path
 
-RESOURCES=Path(__file__).resolve().parents[1]/'resources'
+RESOURCES=Path(os.environ.get('TIBRARY_RESOURCES') or Path(__file__).resolve().parents[1]/'resources')
 UPSTREAMS={'tidaler':'https://github.com/maya-doshi/tidaler.git',
            'python-tidal':'https://github.com/EbbLabs/python-tidal.git'}
 
@@ -22,7 +22,8 @@ def active_runtime(resources=RESOURCES):
         if not candidate.is_relative_to((resources/'backends').resolve()):raise ValueError('Invalid backend installation path')
         python=candidate/'.venv/bin/python'
     else:python=resources/'tidaler/.venv/bin/python'
-    if not python.is_file():raise ValueError('Downloader is not installed. Run app/tools/Setup downloads.command or update it in Settings.')
+    if not python.is_file() and os.environ.get('TIBRARY_BUNDLED_PYTHON'):python=Path(os.environ['TIBRARY_BUNDLED_PYTHON'])
+    if not python.is_file():raise ValueError('Download components are unavailable. Update components in Settings → Downloads.')
     return python
 
 
@@ -134,7 +135,7 @@ def update(cancel=lambda:False,progress=lambda message:None,resources=RESOURCES,
             commits[name]=runner(['git','-C',str(build/name),'rev-parse','HEAD'],cancel)
         bootstrap=resources/'tidaler/.venv/bin/python'
         if not bootstrap.is_file():
-            bootstrap=Path(shutil.which('python3.13') or '/opt/homebrew/bin/python3.13')
+            bootstrap=Path(os.environ.get('TIBRARY_BUNDLED_PYTHON') or shutil.which('python3.13') or '/opt/homebrew/bin/python3.13')
         progress('Building the separate Python runtime; the current downloader remains available')
         runner([str(bootstrap),'-m','venv',str(build/'.venv')],cancel)
         python=build/'.venv/bin/python'

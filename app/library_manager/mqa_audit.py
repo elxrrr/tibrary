@@ -5,7 +5,6 @@ purpl3F0x/MQA_identifier and Dniel97/MQA-identifier-python. See THIRD_PARTY.md.
 This implementation uses integer PCM, repeated syncs and matching rate fields.
 """
 from pathlib import Path
-from mutagen import MutagenError
 from .maintenance import fingerprint
 
 SYNC = 0xBE0498C88
@@ -14,32 +13,18 @@ SCHEMA = 1
 
 
 def scan_samples(samples):
-    import numpy as np
+    import _lofty
     if samples.ndim != 2 or samples.shape[1] != 2: return None
-    xor = np.bitwise_xor(samples[:, 0], samples[:, 1])
-    for bit in range(16, 24):
-        stream = ((xor >> bit) & 1).astype(np.uint8).tobytes()
-        hits = {}
-        offset = 0
-        while True:
-            start = stream.find(PATTERN, offset)
-            if start < 0: break
-            end = start + 35
-            offset = start + 36
-            if end+34 > len(stream): continue
-            code = int(''.join(str(b) for b in stream[end+3:end+7]), 2)
-            provenance = int(''.join(str(b) for b in stream[end+29:end+34]), 2)
-            hits.setdefault(code, []).append(provenance)
-            if len(hits[code]) >= 3:
-                factor = 1 << ((code >> 1) & 7)
-                rate = (48000 if code & 1 else 44100)*factor*(2 if factor > 16 else 1)
-                return dict(original_rate=rate, studio=all(p > 8 for p in hits[code]),
-                            evidence=f'Repeated 36-bit stereo signal · bit {bit} · {len(hits[code])} frames')
+    match = _lofty.mqa_signal(samples.astype('<i4', copy=False).tobytes())
+    if match:
+        rate, studio, bit, hits = match
+        return dict(original_rate=rate, studio=studio,
+                    evidence=f'Repeated 36-bit stereo signal · bit {bit} · {hits} frames')
     return None
 
 
 def audit_file(path):
-    from mutagen.flac import FLAC
+    from .tag_io import FLAC
     audio = FLAC(path)
     result = dict(path=str(path), status='No signal found', detected=False,
                   bits=audio.info.bits_per_sample, rate=audio.info.sample_rate,
@@ -85,7 +70,7 @@ def audit_library(store, root, cancel=lambda:False, progress=lambda s:None, forc
                 if list(fingerprint(path)) != stamp: raise ValueError('File changed during inspection; retry')
                 cached[str(path)] = dict(stamp=stamp, result=result, schema=SCHEMA)
             results.append(dict(result,stamp=stamp))
-        except (OSError, ValueError, MutagenError) as exc:
+        except (OSError, ValueError) as exc:
             results.append(dict(path=str(path), status='Not checked', detected=False, evidence=str(exc)))
         if index % 25 == 0: progress(f'MQA audit · {index+1:,}/{len(rows):,} files')
     store.save_preferences('mqa-audit', dict(files=cached))

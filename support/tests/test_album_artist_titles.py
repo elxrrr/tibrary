@@ -10,7 +10,7 @@ class AlbumArtistTests(unittest.TestCase):
         audio=SimpleNamespace(tags={'albumartist':['Canopy'],'artist':['Canopy, Tom Finster'],
                                    'album':['Refraction (Remixes)'],'title':['Incandescent (Tom Finster Remix)']},
                               info=SimpleNamespace(length=180))
-        with patch('mutagen.File',return_value=audio):
+        with patch('library_manager.tag_io.open_audio',return_value=audio):
             self.assertEqual(read_metadata('song.flac')['artist'],'Canopy')
             del audio.tags['albumartist']
             self.assertEqual(read_metadata('song.flac')['artist'],'Canopy, Tom Finster')

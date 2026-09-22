@@ -57,8 +57,8 @@ def publish_files(stage, output):
 def organise_download(path,stage,layout,track_id,album_id,metadata=None,destination=None):
     # Imported here so the small subprocess can use the app's path policy without Qt.
     sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-    import mutagen
-    audio=mutagen.File(path,easy=True)
+    from library_manager.tag_io import open_audio
+    audio=open_audio(path)
     if audio is None or not audio.tags:raise ValueError('Downloaded tags are unavailable; cannot organise this file safely')
     from library_manager.download_metadata import normalize, download_path, companion_cover
     if path.suffix.casefold() in ('.m4a','.mp4'):
@@ -115,6 +115,8 @@ def main():
     from tidaler.config import Settings,Tidal
     from tidaler.download import Download
     sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+    from library_manager.download_tags import install_download_adapter
+    install_download_adapter()
     from tidaler.constants import CoverDimensions
     from tidalapi import Quality
     from rich.progress import Progress
@@ -125,10 +127,17 @@ def main():
         'High': getattr(Quality, 'high', Quality.high_lossless),
         'Low': getattr(Quality, 'low', Quality.high_lossless),
     }
-    quality = q_map.get(preferences.get('quality', 'Lossless'), Quality.high_lossless)
-    if preferences.get('quality')=='High' and int(preferences.get('aac_bitrate_cap',320))<=96:
+    quality_name = {'LOSSLESS':'Lossless','HI_RES_LOSSLESS':'Hi-res lossless','HIGH':'High','LOW':'Low'}.get(preferences.get('quality'), preferences.get('quality','Lossless'))
+    quality = q_map.get(quality_name, Quality.high_lossless)
+    if quality_name=='High' and int(preferences.get('aac_bitrate_cap',320))<=96:
         quality=q_map['Low']
     settings=Settings();settings.data.quality_audio=quality
+    # A packaged app cannot depend on a Homebrew executable in the user's PATH.
+    try:
+        import imageio_ffmpeg
+        settings.data.path_binary_ffmpeg=os.environ.get('TIBRARY_FFMPEG') or imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        if os.environ.get('TIBRARY_FFMPEG'):settings.data.path_binary_ffmpeg=os.environ['TIBRARY_FFMPEG']
     settings.data.lyrics_embed=False
     settings.data.metadata_replay_gain=bool(preferences.get('replaygain',True))
     settings.data.cover_album_file=False;settings.data.lyrics_file=False

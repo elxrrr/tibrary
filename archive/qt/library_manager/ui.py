@@ -2074,6 +2074,11 @@ class Window(QMainWindow):
         safe = re.sub(r'\bTIDAL\b', 'Online', safe)
         safe = re.sub(r'\btidal\b', 'online', safe)
         safe = re.sub(r'\bTidal\b', 'Online', safe)
+        if safe.startswith(('Updating tags: ', 'Updating artwork ·', 'Organising file ·')):
+            if hasattr(self,'activity_job_detail'):self.activity_job_detail.setText(safe)
+            current=time.monotonic()
+            if current-getattr(self,'_last_maintenance_log',0)<2:return
+            self._last_maintenance_log=current
         line = f'{datetime.now():%H:%M:%S}  {safe}'
         if not hasattr(self, '_raw_activity_lines'):
             self._raw_activity_lines = []
@@ -6241,35 +6246,41 @@ class Window(QMainWindow):
                 'metadata':'Only the displayed missing tags will be added. Existing values and file locations stay unchanged.',
                 'artwork':'Only the reviewed front covers will change. Tags, audio and file locations stay unchanged.'}
             if QMessageBox.question(self,labels[mode],f'{labels[mode]} for {len(selected):,} files?\n\n{effects.get(mode, "")}\n\nReview the exact changes in the table before continuing. No backup copies are kept.')!=QMessageBox.StandardButton.Yes:return
+        operation_root=selected[0]['root']
+        operation_snapshot=list(self.tools_snapshots.get(operation_root,self.tools_plan))
         def done(result):
             message,updates=result
             trashed_paths = {r['path'] for r in selected if r.get('superseded_by') and updates.get(r['path'], {}).get('result') == 'applied'}
-            self.tools_plan=[updates.get(row['path'],row) for row in self.tools_plan if row['path'] not in trashed_paths]
-            self.tools_snapshots[self.tools_root.currentData()]=self.tools_plan
+            refreshed=[updates.get(row['path'],row) for row in operation_snapshot if row['path'] not in trashed_paths]
+            self.tools_snapshots[operation_root]=refreshed
+            if self.tools_root.currentData()==operation_root:self.tools_plan=refreshed
             self.invalidate_tools_plan();self.tools_status.setText(message+' · Current tags, Artists and library counts updated.')
             self.tools_inspection_status.setText('Changes saved. The next Online check uses the updated tags automatically.')
             self.artist_filter.setCurrentText('All artists')
             if self._link_enabled:self._link_restart=True
-            self._library_content_changed(self.tools_root.currentData())
+            self._library_content_changed(operation_root)
         def work(cancel,progress):
             import copy
             plans=copy.deepcopy(selected)
-            message=apply_plans(plans,self.store,cancel,progress)
-            updates={}
-            for row in plans:
+            from .linking import retain_after_apply,invalidate_related_links_batch,compatible_tags
+            updates={};changed_identity=[]
+            def applied(row):
                 original=row['path']
                 if row.get('result')=='applied':
                     if row.get('superseded_by'):
                         updates[original]={'path': original, 'result': 'applied', 'blocked': 'Moved to Trash'}
-                        continue
+                        return
                     fresh=inspect_file(row['target'],row['root'],row.get('layout'));updates[original]=fresh
-                    from .linking import retain_after_apply,invalidate_related_links
                     retain_after_apply(self.store,self.market,row,fresh)
                     identity_tags={'albumartist','artist','album','title','isrc','tracknumber','track','discnumber','tracktotal','totaltracks','disctotal','totaldiscs'}
-                    if mode in ('tags','links') and identity_tags.intersection(row.get('changes',{})):
-                        invalidate_related_links(self.store,self.market,row,fresh)
+                    if mode in ('tags','links') and identity_tags.intersection(row.get('changes',{})) and not compatible_tags(fresh,dict(local_tags=row.get('tags',{}),duration=row.get('duration'))):
+                        changed_identity.append((row,fresh))
                     if mode in ('tags','links') and any(k in row['changes'] for k in ('albumartist','album')):fresh['needs_artist_match']=True
-                elif row.get('result'):row['apply_error']=row['result'];updates[original]=row
+            message=apply_plans(plans,self.store,cancel,progress,on_applied=applied)
+            for row in plans:
+                if row.get('result') and row['result']!='applied':
+                    row['apply_error']=row['result'];updates[row['path']]=row
+            if changed_identity:invalidate_related_links_batch(self.store,self.market,changed_identity)
             return message,updates
         self.job(work,done,label=labels[mode],local=True,is_disk_op=True)
 
@@ -6285,6 +6296,7 @@ class Window(QMainWindow):
             self._job_button_states=[]
 
     def job(self, operation, completed=None, label='Library operation', on_failure=None, local=False, is_disk_op=False):
+        if self._closing_requested:return
         if is_disk_op and self._preview_worker:
             self._after_preview_job=(operation,completed,label,on_failure,local,is_disk_op)
             self.log('Waiting for library inspection before changing files…');return
@@ -6335,6 +6347,7 @@ class Window(QMainWindow):
 
     @Slot(object)
     def job_result(self,result):
+        if self._closing_requested:return
         try:
             if isinstance(result,str):self.log(result)
             elif isinstance(result,dict) and 'status' in result:
@@ -6390,12 +6403,14 @@ class Window(QMainWindow):
             pass
         after = getattr(self, '_after_job', None); self._after_job = None
         if after and not self.job_failed and ending!='Cancelled': QTimer.singleShot(0, after)
+        if self._closing_requested:return
         self.resume_changed_links()
         if getattr(self, '_resume_bg_linking_after_job', False):
             self._resume_bg_linking_after_job = False
             QTimer.singleShot(1500, self._check_background_linking)
 
     def refresh(self):
+        if self._closing_requested:return
         if self._view_worker:self._view_pending=True;return
         try:
             active_artists = set(self.store.artists(include_compilations=True).keys())
@@ -7841,14 +7856,6 @@ class Window(QMainWindow):
                     QMessageBox.warning(self, 'Export failed', 'Could not write the selected file. Choose a writable location.')
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning() and getattr(self, '_is_disk_operation', False):
-            QMessageBox.warning(
-                self,
-                'Operation in progress',
-                'Cannot close while files or tags are being modified on disk. Please wait for the current operation to complete or cancel it safely first.'
-            )
-            event.ignore()
-            return
         self._closing_requested=True
         active = [getattr(self, a, None) for a in ('_link_worker', 'worker', '_preview_worker', '_view_worker', '_coverage_worker', '_startup_worker','_bg_probe_worker')]
         running=[w for w in active if w and w.isRunning()]

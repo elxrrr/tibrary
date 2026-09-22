@@ -168,8 +168,13 @@ def retain_after_apply(store,market,old,new):
 
 def invalidate_related_links(store,market,old,new):
     """Schedule only the affected local release group for another link pass."""
+    return invalidate_related_links_batch(store,market,[(old,new)])
+
+
+def invalidate_related_links_batch(store,market,pairs):
     from .release_matching import group_key
-    affected={group_key(old),group_key(new)};updates=[]
+    affected={group_key(row) for pair in pairs for row in pair};updates=[]
+    if not affected:return 0
     for record in store.rows('SELECT path,payload FROM track_links WHERE market=?',(market,)):
         try:payload=json.loads(record['payload'])
         except (TypeError,ValueError):continue

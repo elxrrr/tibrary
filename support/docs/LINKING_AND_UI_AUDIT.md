@@ -2,7 +2,7 @@
 
 ## Scope and safety
 
-This is an update to the existing PySide6/SQLite application, not a framework replacement. Linking writes associations to the database. It does not write music tags, rename files, download audio, or retire originals. Tag correction, organisation, download approval and consolidation retain separate actions.
+The linking algorithm audit below remains applicable to the Python/SQLite core. The UI has since migrated to Tauri; see [current desktop architecture](DEVELOPMENT.md#interaction-and-safety-model). Historical Qt-specific notes are retained for the archived interface. Linking writes associations to the database. It does not write music tags, rename files, download audio, or retire originals. Tag correction, organisation, download approval and consolidation retain separate actions.
 
 Development uses temporary databases and music fixtures. The isolated test runner blocks external-volume writes and external network connections. No production music, credentials or link caches were cleared. The disposable top-level `pasted-text.txt` and Finder `.DS_Store` files were removed.
 
@@ -133,8 +133,8 @@ UI labels use generic online/source terminology. Backend module names, API URLs,
 
 | Module | Responsibility |
 | --- | --- |
-| `app/library_manager/ui.py` | Queue cascade/group sorting, Missing Releases draft selection/batch queue, match diagnostics, dashboards, sorted-action identity, Finder |
-| `app/library_manager/virtual_table.py` | Persistent hierarchical sort and checkbox roles |
+| `archive/qt/library_manager/ui.py` | Queue cascade/group sorting, Missing Releases draft selection/batch queue, match diagnostics, dashboards, sorted-action identity, Finder |
+| `archive/qt/library_manager/virtual_table.py` | Persistent hierarchical sort and checkbox roles |
 | `app/library_manager/context_actions.py` | Shared native context-menu prefix and captured metadata inspection |
 | `app/library_manager/link_statistics.py` | Common indexed link totals and active-ID selector |
 | `app/library_manager/view_data.py` | Supplies shared statistics to Overview |
@@ -143,6 +143,6 @@ UI labels use generic online/source terminology. Backend module names, API URLs,
 | `app/library_manager/audit_pages.py` | Transparent audit columns, selection, reviewed batch operations |
 | `app/library_manager/maintenance.py`, `library_workflows.py` | Validated local track/disc padding |
 | `app/library_manager/enrichment.py`, `download_metadata.py` | Padded proposed/download tags |
-| `app/tests/test_selection_and_identity.py` | Regression tests for this update |
+| `support/tests/test_selection_and_identity.py` | Regression tests for this update |
 
 Validation results and outstanding release checks are recorded in [RELEASE_CHECK.md](RELEASE_CHECK.md). A passing isolated suite demonstrates the tested behaviours; it is not a guarantee that all live provider metadata is correct or that every possible desktop interaction is defect-free.

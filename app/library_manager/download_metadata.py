@@ -39,7 +39,8 @@ def normalize(audio, metadata=None):
 
 def companion_cover(audio, album_root):
     pictures = getattr(audio, 'pictures', [])
-    pictures = sorted((p for p in pictures if p.type==3), key=lambda p:p.width*p.height, reverse=True)
+    from .tag_io import MP4
+    pictures = sorted((p for p in pictures if p.type==3 or isinstance(audio, MP4)), key=lambda p:p.width*p.height, reverse=True)
     data = pictures[0].data if pictures else next(iter((audio.tags or {}).get('covr',[])),None)
     if data is None:return
     from PIL import Image
@@ -60,22 +61,7 @@ def download_path(stage, tags, template=None, extension='.flac'):
 
 def normalize_m4a(audio, metadata, track_id, album_id):
     """Keep the existing AAC quality options working; MP4 stores totals as tuples."""
-    class TagMap(dict):
-        @property
-        def tags(self):return self
-    from mutagen.easymp4 import EasyMP4Tags
-    from mutagen.mp4 import MP4,MP4FreeForm
-    raw=MP4(audio.filename)
-    bag=TagMap({k:list(v) for k,v in audio.tags.items()})
-    key_atom='----:com.apple.iTunes:initialkey'
-    if raw.get(key_atom):bag['initialkey']=[bytes(v).decode('utf-8') for v in raw[key_atom]]
-    tags=normalize(bag,metadata)
-    for key,values in tags.items():
-        if key in EasyMP4Tags.Set:audio[key]=values
-    for kind in ('track','disc'):audio[kind+'number']=[tags[kind+'number'][0]+'/'+tags[kind+'total'][0]]
-    audio.save()
-    raw=MP4(audio.filename)
-    for key,values in dict(tidal_track_id=[track_id],tidal_album_id=[album_id],initialkey=tags.get('initialkey',[])).items():
-        if values:raw['----:com.apple.iTunes:'+key]=[MP4FreeForm(str(v).encode('utf-8')) for v in values]
-    raw.pop('©lyr',None);raw.save()
-    return tags,raw
+    tags = normalize(audio, metadata)
+    audio['tidal_track_id'] = [str(track_id)]
+    audio['tidal_album_id'] = [str(album_id)]
+    return tags, audio

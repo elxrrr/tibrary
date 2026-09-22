@@ -1,0 +1,1 @@
+{"main":{"identifier":"main","description":"Local desktop UI: folder dialogs only. Python access uses explicit Rust commands.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save"]}}

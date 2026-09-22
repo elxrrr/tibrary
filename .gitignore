@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Tauri frontend and packaged sidecar
+desktop/node_modules/
+desktop/src-tauri/binaries/tibrary-service-*
+desktop/src-tauri/runtime/
+desktop/test-results/
+
+# Native metadata engine build products
+native/*/target/
+.migration-baseline.json

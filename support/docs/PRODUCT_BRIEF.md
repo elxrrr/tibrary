@@ -1,4 +1,4 @@
-> Historical product brief. For current behaviour, see the [user guide](../README.md) and [linking architecture](LINKING_AND_UI_AUDIT.md).
+> Historical product brief. For current behaviour, see the [user guide](../../README.md) and [linking architecture](LINKING_AND_UI_AUDIT.md).
 
 # TIDAL Library Manager — Product and Technical Brief
 

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tidal-library-manager"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Local music catalogue, reviewed library maintenance and approved acquisition"
 requires-python = ">=3.12"
-dependencies = ["mutagen>=1.47,<2", "PySide6>=6.8,<7", "keyring>=25.6,<26", "soundfile>=0.13,<0.14", "Pillow>=11,<13", "Send2Trash>=1.8,<2"]
+dependencies = ["tibrary-tags==0.1.0", "keyring>=25.6,<26", "soundfile>=0.13,<0.14", "Pillow>=11,<13", "imageio-ffmpeg>=0.6,<1", "Send2Trash>=1.8,<2"]
 
 [project.scripts]
-tidal-library-manager = "library_manager.ui:main"
+tidal-library-manager = "library_manager.sidecar:main"
 
 [tool.setuptools.packages.find]
 include = ["library_manager*"]

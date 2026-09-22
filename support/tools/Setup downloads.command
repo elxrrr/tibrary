@@ -1,5 +1,5 @@
 #!/bin/sh
-PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)" || exit 1
+PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../../app" && pwd -P)" || exit 1
 cd "$PROJECT_ROOT" || exit 1
 PYTHON_BIN="$(command -v python3.13)"
 if [ -z "$PYTHON_BIN" ] && [ -x /opt/homebrew/bin/python3.13 ]; then

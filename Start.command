@@ -1,12 +1,9 @@
 #!/bin/sh
-PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 1
-cd "$PROJECT_ROOT/app" || exit 1
-if [ ! -x "$PROJECT_ROOT/.venv/bin/python" ]; then
-  printf '%s\n' 'Install dependencies using app/docs/reference/DEVELOPMENT.md first.'
-  if [ -t 0 ]; then
-    printf '%s' 'Press Return to close.'
-    read -r answer
-  fi
-  exit 1
+set -eu
+PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+APP="$PROJECT_ROOT/desktop/src-tauri/target/release/bundle/macos/Tibrary.app"
+if [ -d "$APP" ]; then
+  exec /usr/bin/open "$APP"
 fi
-exec "$PROJECT_ROOT/.venv/bin/python" -m library_manager "$@"
+printf '%s\n' 'Build the Tauri application first:' '  .venv/bin/python support/tools/build_desktop.py' 'See support/docs/DEVELOPMENT.md for setup.'
+exit 1

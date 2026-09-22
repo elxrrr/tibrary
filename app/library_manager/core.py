@@ -221,8 +221,8 @@ class Store:
 
 
 def read_metadata(path):
-    import mutagen
-    audio = mutagen.File(path, easy=True)
+    from .tag_io import open_audio
+    audio = open_audio(path, pictures=False)
     if audio is None:
         raise ValueError('Unsupported or unreadable audio file')
     tags = audio.tags or {}
@@ -245,7 +245,7 @@ def read_metadata(path):
                 bpm=first('bpm','tempo','TBPM','tmpo'), musical_key=first('key','initialkey','TKEY'),
                 track=first('tracknumber', 'TRCK'), tracktotal=first('tracktotal', 'totaltracks'),
                 discnumber=first('discnumber', 'TPOS'), disctotal=first('disctotal', 'totaldiscs'),
-                label=first('label', 'organization', 'TPUB'), releasetype=first('releasetype'), duration=round(audio.info.length, 3),
+                label=first('label', 'organization', 'publisher', 'TPUB'), releasetype=first('releasetype'), duration=round(audio.info.length, 3),
                 copyright=first('copyright', 'TCOP'),
                 tidal_track_id=first('tidal_track_id', 'tidaltrackid'),
                 tidal_album_id=first('tidal_album_id', 'tidalalbumid'))

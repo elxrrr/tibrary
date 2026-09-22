@@ -1,90 +1,112 @@
-# Development and setup
+# Tibrary desktop development
 
-See the [user guide](../README.md) for current workflows and the [linking audit](LINKING_AND_UI_AUDIT.md) for matching algorithms, scoring and UI state ownership.
+## Run on macOS
 
-## Application setup
+The rebuilt app uses Tauri 2, React and a private Python 3.13 service. The packaged application includes Python, the audio/tag libraries, FFmpeg and both streaming adapters. End users do not need Node, Rust, Python or Qt installed.
 
-From the application root (`source_app`), with Python 3.12 or newer:
+1. Open `desktop/src-tauri/target/release/bundle/dmg/Tibrary_1.0.0-rc.1_aarch64.dmg`.
+2. Drag **Tibrary** to Applications and open it. Alternatively double-click the repository's `Start.command` to open the local build.
+3. Existing libraries, SQLite catalogue/link caches, Keychain credentials and account sessions retain their previous locations. The old Qt download destination and appearance are imported on first launch.
+4. Use **Settings → Connections** to check the saved accounts; **Settings → Downloads** contains the destination, structure and streaming settings.
+
+The local build is not Developer ID signed or notarized. Distribution outside this development machine requires signing/notarization with the publisher's Apple credentials. The current artifact targets Apple Silicon and macOS 13 or later; build on Intel for an Intel artifact.
+
+For an isolated fictional library, run `support/tools/Demo.command`. It cannot apply file changes or download music. Do not run the archived Qt application against the same database concurrently.
+
+## Build from source
+
+Developer prerequisites: macOS, Xcode Command Line Tools, Node 22.12+ with npm, Rust stable with Cargo, and Python 3.12+ for the build environment. Upstream source checkouts must be present under `app/resources/` (including submodules when cloning).
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -e ./app
-./Start.command
+.venv/bin/python -m pip install uv==0.12.17
+# The build installs the native engine and app into the private runtime.
+.venv/bin/python support/tools/build_desktop.py
 ```
 
-An existing workspace may already contain `.venv`. The launcher resolves its own directory, independently of the terminal's current directory.
+The build script installs a private, relocatable Python 3.13.15 distribution, installs the backend and upstream adapters, probes their interfaces without signing in, and builds the `.app` and `.dmg`. It never reads or writes music libraries. Generated runtime/package files are ignored by Git. `desktop/package-lock.json` and `desktop/src-tauri/Cargo.lock` pin frontend/shell dependencies. The package contains an installed-package inventory and upstream source/licences.
 
-For the separate fictional library, double-click `app/tools/Demo.command` or run:
+For frontend development:
 
 ```sh
-./app/tools/Demo.command
+npm --prefix desktop ci
+cd desktop
+npm run tauri dev
 ```
 
-Demo mode disables real-library writes/downloads. To install the optional bundled download runtime, install Python 3.13 and run:
+Install the native engine and service for development (Rust must be on PATH):
 
 ```sh
-"./app/tools/Setup downloads.command"
+.venv/bin/uv pip install ./native/tibrary-tags -e ./app ./app/resources/python-tidal ./app/resources/tidaler
 ```
 
-This creates `app/resources/tidaler/.venv`. Streaming components can subsequently be managed in the application's Settings; updates are built separately, checked and activated with rollback support.
-
-## Source layout
-
-| Location | Purpose |
-| --- | --- |
-| `Start.command` | Normal application launcher |
-| `app/tools/` | Demo and optional download setup commands |
-| `app/library_manager/` | Application implementation |
-| `app/tests/` | Automated tests and UI smoke scripts |
-| `app/docs/` | Current user, developer, architecture and release documentation |
-| `app/docs/reference/` | Original historical product brief |
-| `.venv/` | Application Python runtime |
-| `app/resources/tidaler/`, `app/resources/python-tidal/` | Upstream source repositories, Git histories and licences |
-| `app/resources/backends/` | Managed backend builds, created on update |
-
-The [architecture code map](LINKING_AND_UI_AUDIT.md#4-code-map) identifies the modules responsible for tables, matching, statistics and file operations. Catalogue access, browser account authorization and credentials live in `tidal.py`, `account.py` and `credentials.py`. Downloads and extended metadata use isolated bridge processes. Long-running work belongs in cancellable workers, with queued delivery to the GUI thread.
-
-## Data and credentials
-
-The normal catalogue is `~/Library/Application Support/Tibrary/library.sqlite3`; demo uses `demo.sqlite3`. `--db` overrides the database location. SQLite uses transactions and WAL; close the app before copying its database. Legacy organizer databases are imported read-only.
-
-Client credentials and remembered official-API account tokens use the OS credential store. Session-only overrides do not replace saved credentials. Environment fallbacks are `TIDAL_CLIENT_ID`, `TIDAL_CLIENT_SECRET` and `TIDAL_MARKET` (default GB). Secrets are masked/redacted.
-
-The catalogue account uses PKCE, checked state and `http://127.0.0.1:8765/callback`. Its developer application needs `collection.read` and `search.read`; an older collection-only grant needs reconnection for search. Client authentication alone does not establish catalogue/collection authorization.
-
-The subscriber/download session is separately stored under the app data directory's `downloader-session` with restricted permissions. It does not receive the catalogue client secret. Startup checks saved sessions without initiating browser sign-in or downloads.
-
-## Safety and consistency
-
-- Local grouping uses the complete Album Artist tag, falling back to Track Artist only when absent. Compilation tracks remain in totals even when Various Artists is excluded from artist discovery.
-- Linking persists associations and evidence, never file mutations. Shared statistics and identity rules are documented in the linking audit.
-- Replanning reuses inspected tags. Before applying file changes, fingerprints must still agree; stale sources, symlinks and collisions are rejected.
-- Tag/artwork writes verify audio and expected metadata before publication. Same-volume moves preserve file bytes; verified-copy fallback handles unsupported or cross-volume operations.
-- No persistent backup/quarantine copies are created. Destructive consolidation uses Trash and explicit review. Unrelated files and sidecars remain protected.
-- Applied changes update the index and invalidate affected linking state. There is no filesystem watcher; external changes require an incremental or explicit full tag refresh.
-- Existing DJ analysis is protected; lyrics are excluded from acquisition. Unsupported or conflicting metadata must not be invented.
-- User-facing wording is provider-neutral; backend identifiers, credentials, tag names and API addresses retain their actual names.
+Development uses the repository `.venv`; production uses the packaged private runtime. Streaming component updates create checked builds under `~/Library/Application Support/Tibrary/streaming`, with rollback. The bundled runtime remains the fallback.
 
 ## Tests
 
-From the application root, run focused modules for changed behaviour:
-
 ```sh
-.venv/bin/python app/tests/run_isolated.py test_selection_and_identity
+PYTHONPATH=app:support/tests .venv/bin/python -m unittest test_desktop_service
+npm --prefix desktop test
+npm --prefix desktop exec -- playwright install webkit
+npm --prefix desktop run test:e2e
 ```
 
-At a release milestone:
+WebKit tests communicate with a real Python service using disposable databases and temporary FLAC fixtures. The HTTP test interception exists only in the test build; production communication is private standard input/output, with no listening HTTP port.
+
+For the retained backend and historical UI regression suite, install `PySide6>=6.8,<7` into the **development** environment only and run:
 
 ```sh
-.venv/bin/python app/tests/run_isolated.py
+.venv/bin/python support/tests/run_isolated.py
 ```
 
-For native macOS checks (requires a graphical session):
+That runner supplies the archived Qt module path, blocks external network requests, uses test credentials and rejects writes to external volumes. Qt is not a production dependency.
 
-```sh
-TIBRARY_NATIVE_TEST=1 .venv/bin/python app/tests/run_isolated.py test_navigation_and_consolidation
-```
+## Source map
 
-The isolated runner uses temporary settings, credential storage, databases and music fixtures. It blocks external networking and writes to external volumes. Use mocked provider responses for routine testing; do not run mutation tests against a user's library.
+| Location | Responsibility |
+| --- | --- |
+| `desktop/src/` | React interface, shared tables and selection state |
+| `desktop/src-tauri/src/` | Native process supervision, dialogs, Finder/web integration, safe quitting |
+| `app/library_manager/desktop_service.py` | Named operations, background job lifecycle, trusted previews and shared state |
+| `app/library_manager/sidecar.py` | Private NDJSON request/event transport and database instance lock |
+| `native/tibrary-tags/` | Lofty metadata I/O, padding-aware FLAC writes, cancellable audio hashing and MQA signal analysis |
+| Remaining `app/library_manager/` modules | Scanning, linking, metadata, artwork, audit, consolidation, downloading and cache logic |
+| `archive/qt/` | Previous Qt screens, retained for reference and regression tests |
+| `support/tests/`, `desktop/tests/` | Backend and WebKit integration tests |
 
-See [Release checks](RELEASE_CHECK.md) for recorded results and the outstanding live-account/distribution milestones. Dependency references and attribution are in [THIRD_PARTY.md](../THIRD_PARTY.md).
+## Interaction and safety model
+
+Pages read cached state and do not start scans when mounted. Startup performs one incremental library update in the Python job thread. Navigation does not cancel jobs. Each operation has one owner; duplicate starts and conflicting mutations are rejected. Activity is available in the header and Settings, without a permanent bottom status bar.
+
+File changes require a server-held preview and explicit confirmation. The interface submits selected IDs, not writable tag/path payloads. Existing fingerprint, collision, audio verification and Trash safeguards remain in the Python core. Cancellation stops between safe file boundaries. Closing the window or choosing Quit requests cancellation and waits for the current safe operation before stopping Python.
+
+Selection and expansion use stable release/track IDs. Sorting runs over complete cached datasets before pagination. Parent approval cascades to child audio tracks; partial selections persist in the acquisition queue. Statistics use the shared release-link query.
+
+The architecture follows [Tauri's sidecar guidance](https://v2.tauri.app/develop/sidecar/) and [capability model](https://tauri.app/security/capabilities/), with loading feedback guided by [Apple's loading guidance](https://developer.apple.com/design/human-interface-guidelines/loading). Native file dialogs, system fonts and system light/dark appearance are retained; web tables provide consistent keyboard and pointer interaction.
+
+## Native audio services
+
+`native/tibrary-tags` is an in-process PyO3 extension (Python 3.12+ ABI), not a
+per-file subprocess. Lofty reads the supported audio formats; FLAC comments and
+MP4 atoms are edited in their native representations. It preserves repeated and
+empty comments, credit order, custom DJ tags and embedded artwork. FLAC writes
+reuse padding instead of shifting the audio unnecessarily. SHA-256 audio-frame
+verification and the existing repeated-signal MQA detector also run in Rust.
+I/O releases the Python GIL; integrity hashing checks cancellation between chunks.
+Database transactions, provider calls, linking decisions, previews and publication
+safeguards remain in the Python service.
+
+The reviewed copy/verify/publish workflow remains authoritative. Native tag
+writers must only receive staging files, never bypass a maintenance preview to
+edit library originals. Leading legacy ID3 blocks in FLAC are rejected for writes
+rather than stripped. Parsing failures leave the original files intact.
+
+Upstream streaming sources stay independently updatable. The application installs
+its own download-tag adapter in the isolated downloader process and supplies the
+bundled ABI-compatible extension when that environment lacks it. Mutagen remains
+an upstream dependency and a test oracle, not an application metadata backend.
+
+Run the native contract tests with `test_native_tags` through the isolated runner.
+`support/tools/benchmark_tags.py <library> --limit 100` compares readers without
+changing source files; write measurements use temporary copies only. Benchmark
+results do not imply faster network/API requests or already-cached scans.

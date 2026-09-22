@@ -17,16 +17,18 @@ class CleanExitSafetyTests(unittest.TestCase):
         self.store = Store(Path(self.temp.name) / 'db')
         self.window = Window(self.store)
 
-    def test_close_blocked_during_disk_operation(self):
+    def test_close_cancels_disk_operation_without_modal_deadlock(self):
         self.window.worker = Mock()
         self.window.worker.isRunning.return_value = True
         self.window._is_disk_operation = True
 
         event = QCloseEvent()
-        with patch('PySide6.QtWidgets.QMessageBox.warning') as mock_warn:
+        with patch('PySide6.QtWidgets.QMessageBox.warning') as mock_warn, patch('library_manager.ui.QTimer.singleShot'):
             self.window.closeEvent(event)
             self.assertFalse(event.isAccepted())
-            mock_warn.assert_called_once()
+            mock_warn.assert_not_called()
+            self.window.worker.requestInterruption.assert_called_once()
+            self.window.worker.wait.assert_not_called()
 
     def test_close_interrupts_non_disk_worker_without_blocking_ui(self):
         self.window._is_disk_operation = False
@@ -46,6 +48,16 @@ class CleanExitSafetyTests(unittest.TestCase):
         finished = QCloseEvent()
         self.window.closeEvent(finished)
         self.assertTrue(finished.isAccepted())
+
+    def test_shutdown_does_not_start_result_rendering_or_new_jobs(self):
+        self.window._closing_requested=True
+        self.window._job_completed=Mock()
+        self.window.job_result('Saved')
+        self.window._job_completed.assert_not_called()
+        with patch('library_manager.ui.Worker') as worker:
+            self.window.job(lambda *args:None)
+            self.window.refresh()
+        worker.assert_not_called()
 
     def test_close_shows_closing_overlay_when_workers_active(self):
         self.window._is_disk_operation = False

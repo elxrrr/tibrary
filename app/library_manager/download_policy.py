@@ -10,7 +10,7 @@ def validate_stream(manifest,stream):
 
 
 def validate_file(path):
-    from mutagen.flac import FLAC
+    from .tag_io import FLAC
     if path.suffix.lower()!='.flac':raise ValueError('Expected a FLAC file; download not published.')
     audio=FLAC(path)
     if audio.info.bits_per_sample!=16 or audio.info.sample_rate!=44100:

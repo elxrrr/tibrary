@@ -1,2 +1,3 @@
-from .ui import main
-raise SystemExit(main())
+from .sidecar import main
+if __name__ == "__main__":
+    main()

@@ -18,4 +18,6 @@ for name in ('metadata_replay_gain','lyrics_embed','use_primary_album_artist','s
 assert int(CoverDimensions.Px1280)==1280
 for name in ('bpm','key','key_scale'):assert hasattr(Track,name),name
 assert 'file_template' in inspect.signature(Download.item).parameters
+from tidaler.metadata import Metadata
+assert {'path_file','target_upc','albumartist','artists','bpm','initial_key','totaltrack','totaldisc'} <= set(inspect.signature(Metadata).parameters), 'Download metadata adapter changed'
 print('Backend adapter interfaces verified; no sign-in or downloads performed.')

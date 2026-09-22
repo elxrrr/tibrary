@@ -13,7 +13,7 @@ from datetime import date
 from pathlib import Path
 import subprocess
 import sys
-from mutagen.flac import FLAC
+from .tag_io import FLAC
 from .core import now, read_metadata
 
 
@@ -495,16 +495,17 @@ def set_album_artist(plans, value):
             row['target']=str(destination(row['root'],dict(row['tags'],**row['changes']),row.get('multi_disc',False),row['path'],row.get('layout')))
 
 
-def audio_digest(path):
-    with open(path,'rb') as source:
-        if source.read(4)!=b'fLaC': raise ValueError('Unsupported FLAC header')
-        while True:
-            header=source.read(4)
-            if len(header)!=4: raise ValueError('Invalid FLAC metadata')
-            size=int.from_bytes(header[1:],'big')
-            if len(source.read(size))!=size:raise ValueError('Truncated FLAC metadata')
-            if header[0]&128:break
-        return hashlib.file_digest(source,'sha256').digest()
+class MaintenanceCancelled(Exception):
+    """Cancellation before publication leaves the original file untouched."""
+
+
+def check_cancelled(cancel):
+    if cancel():raise MaintenanceCancelled('Cancelled; original file retained')
+
+
+def audio_digest(path,cancel=lambda:False):
+    from .tag_io import audio_digest as native_digest
+    return native_digest(path, lambda: check_cancelled(cancel))
 
 
 def guarded_path(path, root):
@@ -529,7 +530,8 @@ def _cleanup_empty_parents(source: Path, root: Path):
             break
 
 
-def apply_one(row, store):
+def apply_one(row, store, cancel=lambda:False):
+    check_cancelled(cancel)
     source,target,root=map(Path,(row['path'],row['target'],row['root']))
     if row['blocked'] or row.get('collision'):raise ValueError(row['blocked'] or row['collision'])
     guarded_path(source,root);guarded_path(target,root)
@@ -579,8 +581,14 @@ def apply_one(row, store):
         target.parent.mkdir(parents=True,exist_ok=True)
         guarded_path(target,root)
         fd,temporary=tempfile.mkstemp(prefix='.library-tags-',suffix='.flac',dir=target.parent);os.close(fd)
-        shutil.copy2(source,temporary)
-        digest=audio_digest(source)
+        with open(source,'rb') as original,open(temporary,'wb') as output:
+            while True:
+                check_cancelled(cancel)
+                block=original.read(1024*1024)
+                if not block:break
+                output.write(block)
+        shutil.copystat(source,temporary)
+        digest=audio_digest(source,cancel)
         audio=FLAC(temporary)
         original_tags={k:list(v) for k,v in audio.tags.items()}
         pictures=[p.write() for p in audio.pictures]
@@ -598,13 +606,14 @@ def apply_one(row, store):
         checked=FLAC(temporary)
         expected=dict(original_tags,**row['changes'])
         expected={key:value for key,value in expected.items() if key not in row['changes'] or value}
-        if dict(checked.tags)!=expected or [p.write() for p in checked.pictures]!=pictures or audio_digest(temporary)!=digest:
+        if dict(checked.tags)!=expected or [p.write() for p in checked.pictures]!=pictures or audio_digest(temporary,cancel)!=digest:
             raise ValueError('Verification failed; original file retained')
         metadata=read_metadata(temporary)
         if not first(expected,'title'):metadata['title']=target.stem
         with open(temporary,'rb') as f:os.fsync(f.fileno())
         if fingerprint(source)!=tuple(row['stamp']):raise ValueError('Source changed while applying; original retained')
         guarded_path(source,root);guarded_path(target,root)
+        check_cancelled(cancel)
         if target==source:
             os.replace(temporary,source);temporary=None
         else:
@@ -636,16 +645,26 @@ def index_applied(store,source,target,root,metadata):
         raise AppliedButNotIndexed('File updated, but index refresh failed; rescan this library') from exc
 
 
-def apply_plans(plans,store,cancel=lambda:False,progress=lambda s:None):
+def apply_plans(plans,store,cancel=lambda:False,progress=lambda s:None,on_applied=lambda row:None):
     applied=failed=processed=0
     for index,row in enumerate(plans,1):
         if cancel():break
-        progress(f'Applying file {index}/{len(plans)} · {Path(row["path"]).name}')
-        try:row['result']=apply_one(row,store);applied+=row['result']=='applied'
+        tags=row.get('tags',{})
+        name=' — '.join(filter(None,(first(tags,'albumartist'),first(tags,'title') or Path(row['path']).name)))
+        action='Updating artwork' if row.get('artwork_change') else 'Updating tags: '+', '.join(row['changes']) if row.get('changes') else 'Organising file'
+        progress(f'{action} · {index:,}/{len(plans):,} · {name}')
+        try:row['result']=apply_one(row,store,cancel);applied+=row['result']=='applied'
+        except MaintenanceCancelled:
+            row['result']='Cancelled; original file retained'
+            progress(row['result']);break
         except AppliedButNotIndexed as exc:row['result']=str(exc);applied+=1;failed+=1
         except Exception as exc:row['result']='Not applied: '+str(exc);failed+=1
+        if row.get('result')=='applied':
+            try:on_applied(row)
+            except Exception as exc:
+                row['result']='File updated; dependent refresh failed: '+str(exc);failed+=1
         processed+=1
-        progress(row['result'])
+        if row['result'] not in ('applied','unchanged'):progress(row['result'])
         try:
             with store.connect() as db:
                 db.execute('CREATE TABLE IF NOT EXISTS maintenance_history(at TEXT,path TEXT,target TEXT,changes TEXT,result TEXT)')

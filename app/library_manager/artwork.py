@@ -10,30 +10,29 @@ SIZE=1280
 
 
 def cover_dimensions(data):
-    """Read the image header: FLAC picture width/height are often left at zero."""
-    from PySide6.QtCore import QBuffer,QByteArray,QIODevice
-    from PySide6.QtGui import QImageReader
+    from PIL import Image
+    from io import BytesIO
     if len(data)>10*1024*1024:return None
-    source=QBuffer();source.setData(QByteArray(data));source.open(QIODevice.OpenModeFlag.ReadOnly)
-    size=QImageReader(source).size()
-    return (size.width(),size.height()) if size.isValid() else None
+    try:
+        with Image.open(BytesIO(data)) as image:return image.size
+    except (OSError,ValueError,Image.DecompressionBombError):return None
 
 
 def normalise_cover(data):
-    from PySide6.QtCore import QBuffer,QByteArray,QIODevice,Qt
-    from PySide6.QtGui import QImageReader
+    from PIL import Image
+    from io import BytesIO
     if len(data)>10*1024*1024:raise ValueError('Cover image exceeds the size limit')
-    source=QBuffer();source.setData(QByteArray(data));source.open(QIODevice.OpenModeFlag.ReadOnly)
-    reader=QImageReader(source);size=reader.size()
-    if size.width()!=size.height() or not SIZE<=size.width()<=4096:
-        raise ValueError('No square cover with at least 1280 × 1280 pixels; existing artwork retained')
-    image=reader.read()
-    if image.isNull():raise ValueError('Cover image could not be decoded')
-    if size.width()==SIZE and bytes(reader.format()).lower() in (b'jpeg',b'jpg'):return data
-    image=image.scaled(SIZE,SIZE,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
-    buffer=QBuffer();buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-    if not image.save(buffer,'JPEG',95):raise ValueError('Cover image could not be prepared')
-    return bytes(buffer.data())
+    try:
+        with Image.open(BytesIO(data)) as image:
+            width,height=image.size
+            if width!=height or not SIZE<=width<=4096:
+                raise ValueError('No square cover with at least 1280 × 1280 pixels; existing artwork retained')
+            image.load()
+            if width==SIZE and image.format=='JPEG':return data
+            output=BytesIO()
+            image.convert('RGB').resize((SIZE,SIZE),Image.Resampling.LANCZOS).save(output,'JPEG',quality=95)
+            return output.getvalue()
+    except OSError as exc:raise ValueError('Cover image could not be decoded') from exc
 
 
 def prepare_cover(release,store,cancel=lambda:False,transport=None):
@@ -62,7 +61,7 @@ def prepare_cover(release,store,cancel=lambda:False,transport=None):
 
 
 def checked_picture(proposal):
-    from mutagen.flac import Picture
+    from .tag_io import Picture
     data=Path(proposal['path']).read_bytes()
     if hashlib.sha256(data).hexdigest()!=proposal['sha256']:raise ValueError('Prepared artwork changed; check covers again')
     picture=Picture();picture.type=3;picture.mime='image/jpeg';picture.desc='Front cover'
@@ -71,7 +70,7 @@ def checked_picture(proposal):
 
 
 def prepare_existing_cover(row,store):
-    from mutagen.flac import FLAC
+    from .tag_io import FLAC
     from .maintenance import fingerprint
     size=row.get('cover_size')
     if not size or size[0]!=size[1] or not SIZE<size[0]<=4096:return None

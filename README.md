@@ -44,40 +44,17 @@ Tibrary aims to: **scan once, match as many files as possible to the online cata
 
 ## Installation & Setup
 
-**Requirements:**
+The rebuilt application uses **Tauri + Python**, with Rust services for metadata, audio verification and MQA analysis. The previous Qt interface is archived in `archive/qt/`.
 
-* macOS
+On Apple Silicon Macs running macOS 13 or later, open the built **Tibrary.app**, or open the DMG under `desktop/src-tauri/target/release/bundle/dmg/` and drag Tibrary to Applications. The packaged app includes its private Python runtime. In this checkout, double-click `Start.command` to launch it.
 
-* Python ≥ 3.12 (for the main app)
+Existing library records, cached links and account sessions are retained. Configure accounts in **Settings → Connections**, and download location, folder structure and audio quality in **Settings → Downloads**.
 
-1. **Clone the repository:**
-
-   ```
-   git clone https://github.com/elxrrr/tibrary.git
-   cd tibrary
-   
-   ```
-
-2. **Set up the virtual environment & install:**
-
-   ```
-   python3 -m venv .venv
-   .venv/bin/python -m pip install -e ./app
-   
-   ```
-
-3. **Launch the application:**
-
-   ```
-   ./Start.command
-   
-   ```
-
-**Optional Tools:**
-
-* **Download Runtime:** Run `./app/tools/Setup\ downloads.command` (requires Python 3.13) to configure the isolated download bridge (`app/resources/tidaler/.venv`).
+See [Development and setup](support/docs/DEVELOPMENT.md) for source builds, testing and the isolated demo. Local builds are not yet Developer ID signed or notarized for public distribution.
 
 ## Credits
+
+* [**Lofty**](https://github.com/Serial-ATA/lofty-rs) — native audio metadata.
 
 * [**Mutagen**](https://mutagen.readthedocs.io/?utm_source=gemini)
 

@@ -50,7 +50,7 @@ class MaintenanceTests(unittest.TestCase):
         self.path.write_bytes(self.path.read_bytes()+b'changed')
         with self.assertRaises(ValueError):apply_one(row,self.store)
         row=plan_library(self.root)[0];original=self.path.read_bytes()
-        with patch.object(FLAC,'save',side_effect=OSError('disk full')):
+        with patch('library_manager.tag_io.FLAC.save',side_effect=OSError('disk full')):
             with self.assertRaises(OSError):apply_one(row,self.store)
         self.assertEqual(self.path.read_bytes(),original)
         self.assertFalse(list(self.path.parent.glob('.library-tags-*')))
