@@ -73,6 +73,9 @@ Map local tracks to definitive streaming catalog releases using ISRC matching, t
 
 ### 4. Spot Missing Music & Queue
 Audit discographies of favourite artists, pinpoint uncollected releases, singles, or bonus tracks, and stage them for retrieval.
+<div align="center">
+  <img src="./support/imgs/missing_releases.png" alt="Missing Releases to check and approve" />
+</div>
 
 ---
 
