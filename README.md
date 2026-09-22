@@ -83,19 +83,17 @@ Audit discographies of favourite artists, pinpoint uncollected releases, singles
 
 The rebuilt application uses **Tauri + Python**, with Rust services for metadata, audio verification and MQA analysis. The previous Qt interface is archived in `archive/qt/`.
 
-On Apple Silicon Macs running macOS 13 or later, open the built **Tibrary.app**, or open the DMG under `desktop/src-tauri/target/release/bundle/dmg/` and drag Tibrary to Applications. The packaged app includes its private Python runtime. In this checkout, double-click `Start.command` to launch it.
+In this checkout, double-click `Start.command` to launch it
 
 Existing library records, cached links and account sessions are retained. Configure accounts in **Settings → Connections**, and download location, folder structure and audio quality in **Settings → Downloads**.
-
-See [Development and setup](support/docs/DEVELOPMENT.md) for source builds, testing and the isolated demo. Local builds are not yet Developer ID signed or notarized for public distribution.
 
 ---
 
 ## Credits
 
 * [**Lofty**](https://github.com/Serial-ATA/lofty-rs)
-* [**Mutagen**](https://mutagen.readthedocs.io/?utm_source=gemini)
-* [**Tidaler**](https://github.com/?utm_source=gemini)
+* [**Mutagen**](https://github.com/quodlibet/mutagen)
+* [**Tidaler**](https://github.com/maya-doshi/tidaler)
 * [**python-tidal**](https://github.com/tamland/python-tidal?utm_source=gemini)
 * [**AudioAuditor**](https://github.com/Angel2mp3/AudioAuditor?utm_source=gemini)
 * **MQA Reverse Engineering** by [purpl3F0x](https://github.com/purpl3F0x/MQA_identifier?utm_source=gemini) and [Dniel97](https://github.com/Dniel97/MQA-identifier-python?utm_source=gemini)
