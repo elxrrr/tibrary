@@ -1,59 +1,90 @@
-# Tibrary
+# Tibrary 🎵
 
-A desktop app for organising tagged music, linking local releases to an online catalogue, and reviewing missing music for download.
+**Tibrary** is a local-first desktop application for macOS designed to manage, verify, and complete your local music collection for DJs with local music collections. It links your local files to an \*online streaming catalogue\* (👀), identifies missing releases or incomplete albums, and allows you to safely perform ID3 tag, artwork, and folder operations so that locally downloaded files will match online catalogue releases.
 
-## Launch
+🚨 Primarily built by **Gemini 3.8** and **GPT-6 Astra**, only small fixes and amendments have been done by me
 
-Double-click [Start.command](../../Start.command) in the application folder.
+![Overview of Tibrary](./support/imgs/overview.jpg?raw=true)
 
-Supporting commands live in `app/tools/`:
+## What It Does
 
-- [Demo.command](../tools/Demo.command) opens a fictional, separate library.
-- [Setup downloads.command](<../tools/Setup downloads.command>) installs the optional download runtime using Python 3.13.
+Tibrary aims to: **scan once, match as many files as possible to the online catalogue automatically, review clearly, and change/add only with explicit approval.** Catalogue matching runs safely in the background; local files are only altered when you say so.
 
-For a fresh application installation, see [Development and setup](reference/DEVELOPMENT.md).
+* **Smart Incremental Scanning:** Scans local directories for audio files and supports multiple drives/libraries
 
-## Suggested workflow
+* **Deterministic Catalogue Linking:** Matches your local releases to remote catalogue entities by analysing individual track and whole release tags, album/EP/single structures, ISRCs, durations, and mix versions (deluxe, remix etc.) together, never guessing based purely on track title and artist and allowing manual release/artist linking
 
-1. **Overview → Update library** reconciles new, changed and deleted files with the index. Unchanged tag inspections are reused. Use **Recheck all tags** for editors that preserve timestamps.
-2. **Prepare Library** handles local work. **Correct Tags** standardises dates, track/disc numbers and musical keys, or removes embedded lyrics. **Organise Files** previews moves based on saved tags. Choose and review one operation at a time.
-3. The **Prepare Library** dashboard summarises local preparation, **MQA Audit** and **Local Consolidation**. Consolidation verifies retained recordings and asks you to review moving redundant files to Trash. Exclusive mixes and different performer versions must be retained.
-4. **Link Catalogue → Link Releases** saves recording/release associations in the database. Linking does not edit music files. Whole-release structure, recording identifiers, mix versions and durations help distinguish editions. Multiple proven equivalent online IDs can remain associated with one local release. Ambiguous matches remain reviewable.
-5. **Fix Library** provides separate **Add Missing Tags**, **Fix Artwork** and **Online Replacements** workflows. Review proposals before applying file changes. Online replacements are downloaded before any reviewed consolidation of originals.
-6. **Complete Library → Missing Releases** lets you compare newer releases, releases between your newest two, all missing releases, or incomplete albums. Check releases or expand them to select tracks, then choose **Queue selected**. Availability must be confirmed before queueing.
-7. **Download Releases → Queue** holds the saved checklist. Approving or clearing an album selects or clears its child tracks. Approve only what you want, then explicitly start downloading or export the list.
+* **Missing Music Detection:** Automatically maps artist discographies to find gaps between existing releases, flag incomplete albums, and discover new releases
 
-Use **Settings → Activity** for progress, retries and errors. Context menus provide metadata inspection, local file reveal and actions relevant to the selected records.
+![Missing releases from online catalogue](./support/imgs/missing_releases.jpg?raw=true)
 
-## Tags, artwork and paths
+* **Safe Library Maintenance:** Preview date normalizations, track zero-padding (`01` vs `1`), Camelot `INITIALKEY` conversions, and tag-based folder reorganization before writing any changes to disk. Tracks can have local ID3 tag and folder structure fixes applied without linking to an online release, whilst linked releases can have higher resolution artwork and tag enrichment applied
 
-- Album Artist drives library grouping. Track Artist remains the performer credit; folder names do not replace these tags.
-- `01` and `1` compare equally during linking. Numeric tag standardisation uses at least two digits. Missing or impossible totals can be proposed from agreeing sibling tags or verified cached release placements; file count alone never proves an album is complete. Conflicting totals remain for review.
-- Existing BPM, keys and other DJ analysis are preserved by missing-tag enrichment. Supported online fields are filled only when available for a verified recording; ambiguous values are withheld. Conflicting album credits do not silently overwrite Album Artist.
-- **Correct Tags** can explicitly convert recognised keys to Camelot `INITIALKEY`. Unknown/conflicting keys remain unchanged.
-- Lyrics are not acquired. Removing existing embedded lyrics is a separate optional correction.
-- Artwork targets genuine **1280 × 1280** front covers. Larger square covers can be downsized; smaller images are not upscaled. Other embedded pictures are preserved.
-- Folder organisation follows saved tags and the template in **Settings → Downloads**. Disc folders/prefixes are used where appropriate; custom templates are retained.
-- Portable filenames preserve accents and literal hyphens. Slash/colon separators become spaced hyphens, unsupported characters are removed, and trailing dots/spaces are trimmed. These path rules do not rewrite title or album tags.
+* **MQA Audit:** Includes a read-only 36-bit stereo-XOR protocol check to detect MQA audio streams in FLAC files, allowing you to manually review them for deletion or replacement
 
-Changed sources, symlinks and destination collisions are guarded against. File operations update the index; changes affecting identity invalidate the relevant linking state. External edits/deletes require a library update—there is no filesystem watcher. Existing link/cache data survives ordinary restarts and navigation.
+* **Isolated Download Queue:** Send missing tracks to a persistent acquisition checklist. Approved items can be exported as URLs or handed off to an isolated background download runtime.
 
-## Connections and downloads
+## The Workflow
 
-Configure application credentials and account sessions in **Settings → Connections**. Configure audio quality, output location and download options in **Settings → Downloads**. Lossless FLAC is the default. Downloads use the tag-based folder layout, omit lyrics and preserve existing different files.
+1. **Update Library:** Scan your local folders to reconcile new, modified, or deleted files.
 
-**Update streaming components…** builds a separate runtime and checks compatibility before activation. **Restore previous components** rolls back a successful update. Failed builds leave the active runtime in place. Component updates do not update the application itself.
+2. **Prepare & Correct:** Standardize tags, clean up dates, convert musical keys, and preview file organization.
 
-## Documentation
+![Enrich local files with tags from linked online releases](./support/imgs/add_tags.jpg?raw=true)
 
-- [Development and setup](reference/DEVELOPMENT.md): installation, source layout, storage and safe tests.
-- [Linking and UI architecture](reference/LINKING_AND_UI_AUDIT.md): matching rules, scores, identity safeguards and shared state.
-- [Release checks](reference/RELEASE_CHECK.md): recorded verification and outstanding acceptance work.
-- [Third-party attribution](THIRD_PARTY.md): MQA references and licensing.
-- [Original product brief](reference/PRODUCT_BRIEF.md): historical requirements, not current operating instructions.
+3. **Link Catalogue:** Associate local tracks with online IDs. *Linking only updates the database, not your audio files.*
 
-## Cached online metadata
+![Missing releases from online catalogue](./support/imgs/link_releases.jpg?raw=true)
 
-Release details are shared between discovery, linking, missing-tag and artwork workflows, scoped to the selected market. Structural details use the release-cache age setting (30 days by default). Fresh album/track enrichment and extended BPM/key responses use a one-day cache; rechecking link decisions can reuse saved album evidence for the longer release-cache window. Expired or insufficient records are fetched again; failed requests preserve previously saved data. A changed release item count invalidates its cached track list.
+4. **Find Missing Releases:** Compare your local library against online discographies. Spot missing tracks, alternate editions, or entirely missing albums.
 
-Rechecking unresolved links reuses this evidence instead of forcing every network request again. Successful links stay saved until relevant local identity changes or an explicit recheck. Linking collects BPM/key analysis in the database and stages missing tags; it does not write tags to music files. Provider metadata can be unavailable or omit BPM/key—these cases do not fabricate values or overwrite existing DJ tags.
+5. **Queue & Download:** Approve specific tracks or albums, then export the list or route them directly to the download pipeline.
+
+## Installation & Setup
+
+**Requirements:**
+
+* macOS
+
+* Python ≥ 3.12 (for the main app)
+
+1. **Clone the repository:**
+
+   ```
+   git clone https://github.com/elxrrr/tibrary.git
+   cd tibrary
+   
+   ```
+
+2. **Set up the virtual environment & install:**
+
+   ```
+   python3 -m venv .venv
+   .venv/bin/python -m pip install -e ./app
+   
+   ```
+
+3. **Launch the application:**
+
+   ```
+   ./Start.command
+   
+   ```
+
+**Optional Tools:**
+
+* **Download Runtime:** Run `./app/tools/Setup\ downloads.command` (requires Python 3.13) to configure the isolated download bridge (`app/resources/tidaler/.venv`).
+
+![Connection setup and status](./support/imgs/connections.jpg?raw=true)
+
+## Credits
+
+* [**Mutagen**](https://mutagen.readthedocs.io/?utm_source=gemini)
+
+* [**Tidaler**](https://github.com/?utm_source=gemini)
+
+* [**python-tidal**](https://github.com/tamland/python-tidal?utm_source=gemini)
+
+* [**AudioAuditor**](https://github.com/Angel2mp3/AudioAuditor?utm_source=gemini)
+
+* **MQA Reverse Engineering** by [purpl3F0x](https://github.com/purpl3F0x/MQA_identifier?utm_source=gemini) and [Dniel97](https://github.com/Dniel97/MQA-identifier-python?utm_source=gemini)
