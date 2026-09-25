@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 1.0.0-rc.1  
+> **Version:** 1.0.0-rc.2  
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
 
@@ -113,7 +113,7 @@ Clients exchange newline-delimited JSON (NDJSON) requests (e.g. `{"id": 1, "meth
 #### Isolated Demo Mode
 To test the interface with synthetic library data without accessing real files:
 ```sh
-./support/tools/Demo.command
+./desktop/tools/Demo.command
 # Or manually:
 export TIBRARY_DEMO=1
 ./desktop/src-tauri/target/release/bundle/macos/Tibrary.app/Contents/MacOS/tibrary
@@ -139,7 +139,7 @@ npm --prefix desktop test
 npm --prefix desktop run test:e2e
 ```
 
-The Playwright E2E suite uses `support/tests/seed_desktop.py` to populate a temporary Turso/libsql database with synthetic FLAC fixtures, testing table interactions, approval cascades, and settings resets without touching any live media.
+The Playwright E2E suite uses `desktop/tests/seed_desktop.py` to populate a temporary Turso/libsql database with synthetic FLAC fixtures, testing table interactions, approval cascades, and settings resets without touching any live media.
 
 ---
 

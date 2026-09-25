@@ -18,12 +18,12 @@ test.beforeEach(async ({ page }) => {
   folder = mkdtempSync(join(tmpdir(), "tibrary-browser-"));
   const root = resolve("..");
   execFileSync(
-    join(root, ".venv/bin/python"),
-    [join(root, "support/tests/seed_desktop.py"), folder],
+    "python3",
+    [join(root, "desktop/tests/seed_desktop.py"), folder],
     {
       env: {
         ...process.env,
-        PYTHONPATH: join(root, "app") + ":" + join(root, "support/tests"),
+        PYTHONPATH: join(root, "desktop/tests"),
       },
     },
   );
@@ -65,7 +65,6 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Working", exact: true }),
   ).toHaveCount(0);
-  await page.screenshot({ path: "test-results/overview.png", animations: "disabled" });
   for (const name of [
     "Prepare library",
     "Correct tags",
@@ -103,16 +102,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
         "false",
       );
     await expect(page.getByRole("alert")).toHaveCount(0);
-    const screenshots: Record<string, string> = {
-      "Link releases": "link_releases",
-      "Missing releases": "missing_releases",
-      Connections: "connections",
-      "Add missing tags": "add_tags",
-    };
-    if (screenshots[name])
-      await page.screenshot({ path: `test-results/${screenshots[name]}.png` });
   }
-  await page.screenshot({ path: "test-results/activity.png" });
   expect(errors).toEqual([]);
 });
 test("local table sorting and filters are usable", async ({ page }) => {
@@ -124,7 +114,6 @@ test("local table sorting and filters are usable", async ({ page }) => {
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("button", { name: "Release", exact: true }).click();
   await page.getByRole("button", { name: "Release", exact: true }).click();
-  await page.screenshot({ path: "test-results/link-releases.png" });
 });
 test("queue approvals cascade, persist and survive sorting and expansion", async ({
   page,
@@ -211,7 +200,6 @@ test("dark settings fit a full window and retain defaults", async ({
   await expect(
     page.getByRole("button", { name: "Reset metadata defaults" }),
   ).toBeEnabled();
-  await page.screenshot({ path: "test-results/download-settings-dark.png" });
 });
 
 test("missing releases queue only the selected audio tracks", async ({
@@ -276,7 +264,6 @@ test("window panes stay isolated and theme labels are readable", async ({
     return getComputedStyle(document.body).backgroundColor;
   });
   expect(dark).not.toBe(light);
-  await page.screenshot({ path: "test-results/system-dark.png" });
   await page.setViewportSize({ width: 1000, height: 680 });
   const drag = await page.locator(".drag-region").boundingBox();
   expect(drag?.width).toBe(1000);

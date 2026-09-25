@@ -2016,15 +2016,6 @@ function App() {
               ))}
           </div>
         ))}
-        <div className="sidebar-bottom">
-          <span className="brand">
-            <Music2 size={17} />
-            Tibrary
-          </span>
-          <small>
-            {state?.demo ? "Demonstration library" : "Your music. In order."}
-          </small>
-        </div>
       </aside>
       <main>
         <header className="page-header">
