@@ -299,6 +299,16 @@ fn md5_hash(s: &str) -> u64 {
     hasher.finish()
 }
 
+fn is_better_master(a: &LocalRelease, b: &LocalRelease) -> bool {
+    let size_a: i64 = a.tracks.iter().map(|t| t.size).sum();
+    let size_b: i64 = b.tracks.iter().map(|t| t.size).sum();
+    if size_a != size_b {
+        return size_a > size_b;
+    }
+    // Deterministic tie breaker: prefer the alphabetically earlier folder path
+    a.folder < b.folder
+}
+
 pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluster> {
     let releases = parse_local_releases(files);
     if releases.len() < 2 {
@@ -311,9 +321,21 @@ pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluste
 
     for i in 0..releases.len() {
         for j in 0..releases.len() {
-            if i != j && is_release_contained(&releases[i], &releases[j]) {
-                parents.entry(i).or_default().push(j);
-                children.entry(j).or_default().push(i);
+            if i == j {
+                continue;
+            }
+            if is_release_contained(&releases[i], &releases[j]) {
+                // If both releases contain each other (exact duplicate releases),
+                // break symmetry so the graph is a strict DAG: only the worse release has the better release as parent
+                if is_release_contained(&releases[j], &releases[i]) {
+                    if is_better_master(&releases[j], &releases[i]) {
+                        parents.entry(i).or_default().push(j);
+                        children.entry(j).or_default().push(i);
+                    }
+                } else {
+                    parents.entry(i).or_default().push(j);
+                    children.entry(j).or_default().push(i);
+                }
             }
         }
     }
@@ -348,10 +370,13 @@ pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluste
             }
         }
 
-        // If there are multiple maximal ancestors, pick the one with the most tracks
+        // If there are multiple maximal ancestors, pick the one with the most tracks / largest size
         if let Some(&best_master) = maximal_ancestors
             .iter()
-            .max_by_key(|&&m| (releases[m].tracks.len(), releases[m].date.clone()))
+            .max_by_key(|&&m| {
+                let size: i64 = releases[m].tracks.iter().map(|t| t.size).sum();
+                (releases[m].tracks.len(), releases[m].date.clone(), size)
+            })
         {
             master_to_redundant
                 .entry(best_master)
@@ -712,5 +737,58 @@ mod tests {
         assert_eq!(rows[0].status, "Chained duplicate");
         assert!(rows[0].evidence.contains("Chained duplicate"));
         assert_eq!(rows[0].target, "Random Access Memories (Deluxe) (6 tracks)");
+    }
+
+    #[test]
+    fn test_exact_duplicate_detection() {
+        let release_orig = LocalRelease {
+            id: "rel_1".to_string(),
+            folder: "/music/Daft Punk/Discovery".to_string(),
+            artist: "Daft Punk".to_string(),
+            title: "Discovery".to_string(),
+            date: "2001".to_string(),
+            tracks: vec![
+                make_test_track("/music/Daft Punk/Discovery/01 One More Time.flac", "One More Time", "USXX1", 320.0),
+                make_test_track("/music/Daft Punk/Discovery/02 Aerodynamic.flac", "Aerodynamic", "USXX2", 210.0),
+            ],
+        };
+        let release_copy = LocalRelease {
+            id: "rel_2".to_string(),
+            folder: "/music/Daft Punk/Discovery (Copy)".to_string(),
+            artist: "Daft Punk".to_string(),
+            title: "Discovery".to_string(),
+            date: "2001".to_string(),
+            tracks: vec![
+                make_test_track("/music/Daft Punk/Discovery (Copy)/01 One More Time.flac", "One More Time", "USXX1", 320.0),
+                make_test_track("/music/Daft Punk/Discovery (Copy)/02 Aerodynamic.flac", "Aerodynamic", "USXX2", 210.0),
+            ],
+        };
+
+        let mut records = Vec::new();
+        for rel in &[&release_orig, &release_copy] {
+            for t in &rel.tracks {
+                records.push(LocalFileRecord {
+                    path: t.path.clone(),
+                    root: "/music".to_string(),
+                    size: t.size,
+                    mtime: t.mtime,
+                    metadata: Some(serde_json::json!({
+                        "title": t.title,
+                        "artist": t.artist,
+                        "album": rel.title,
+                        "isrc": t.isrc,
+                        "duration": t.duration,
+                    })),
+                    error: None,
+                    present: true,
+                });
+            }
+        }
+
+        let clusters = find_duplicate_clusters(&records);
+        assert_eq!(clusters.len(), 1, "Must find 1 duplicate cluster for exact duplicate releases");
+        assert_eq!(clusters[0].redundant.len(), 1);
+        assert_eq!(clusters[0].redundant[0].folder, "/music/Daft Punk/Discovery (Copy)");
+        assert_eq!(clusters[0].master.folder, "/music/Daft Punk/Discovery");
     }
 }

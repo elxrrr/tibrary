@@ -189,10 +189,12 @@ impl TursoDb {
         let active_links = self.get_active_links(&conn, market).await?;
         let mut result = Vec::new();
         for (root, scanned_at, status) in roots {
+            let clean = root.trim_end_matches('/');
+            let with_slash = format!("{}/", clean);
             let mut file_rows = conn
                 .query(
-                    "SELECT path FROM local_files WHERE root = ? AND present = 1 AND metadata IS NOT NULL",
-                    (root.as_str(),),
+                    "SELECT path FROM local_files WHERE (root = ? OR root = ?) AND present = 1",
+                    (clean, with_slash.as_str()),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -221,9 +223,10 @@ impl TursoDb {
 
     pub async fn add_root(&self, root: &str) -> Result<(), String> {
         let conn = self.connect()?;
+        let clean = root.trim_end_matches('/');
         conn.execute(
             "INSERT OR REPLACE INTO roots (root, status) VALUES (?, 'active')",
-            (root,),
+            (clean,),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -232,10 +235,12 @@ impl TursoDb {
 
     pub async fn remove_root(&self, root: &str) -> Result<(), String> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM roots WHERE root = ?", (root,))
+        let clean = root.trim_end_matches('/');
+        let with_slash = format!("{}/", clean);
+        conn.execute("DELETE FROM roots WHERE root = ? OR root = ?", (clean, with_slash.as_str()))
             .await
             .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM local_files WHERE root = ?", (root,))
+        conn.execute("DELETE FROM local_files WHERE root = ? OR root = ?", (clean, with_slash.as_str()))
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -380,8 +385,15 @@ impl TursoDb {
                     serde_json::from_str::<Value>(stamp_str),
                     serde_json::from_str::<Value>(payload_str),
                 ) {
-                    let stamp_matches = stamp_json.get(0).and_then(|v| v.as_i64()) == Some(size)
-                        && stamp_json.get(1).and_then(|v| v.as_i64()) == Some(mtime);
+                    let stamp_matches = match stamp_json.as_array() {
+                        Some(arr) if arr.len() == 4 => {
+                            arr[2].as_i64() == Some(size) && arr[3].as_i64() == Some(mtime)
+                        }
+                        Some(arr) if arr.len() >= 2 => {
+                            arr[0].as_i64() == Some(size) && arr[1].as_i64() == Some(mtime)
+                        }
+                        _ => false,
+                    };
                     if stamp_matches {
                         if let Some(ids) = payload_json.get("ids") {
                             if ids.get("album_id").is_some() && ids.get("track_id").is_some() {
@@ -411,13 +423,14 @@ impl TursoDb {
         let active_links = self.get_active_links(&conn, market).await?;
 
         // Query files
-        let (sql, params_vec): (&str, Vec<String>) = match root {
-            Some(r) => (
-                "SELECT path, metadata FROM local_files WHERE present = 1 AND metadata IS NOT NULL AND root = ?",
-                vec![r.to_string()],
+        let clean_root = root.map(|r| r.trim_end_matches('/').to_string());
+        let (sql, params_vec): (&str, Vec<String>) = match clean_root.as_deref() {
+            Some(r) if !r.is_empty() => (
+                "SELECT path, metadata FROM local_files WHERE present = 1 AND (root = ? OR root = ?)",
+                vec![r.to_string(), format!("{}/", r)],
             ),
-            None => (
-                "SELECT path, metadata FROM local_files WHERE present = 1 AND metadata IS NOT NULL",
+            _ => (
+                "SELECT path, metadata FROM local_files WHERE present = 1",
                 vec![],
             ),
         };
@@ -425,7 +438,7 @@ impl TursoDb {
         let mut rows = if params_vec.is_empty() {
             conn.query(sql, ()).await.map_err(|e| e.to_string())?
         } else {
-            conn.query(sql, (params_vec[0].as_str(),)).await.map_err(|e| e.to_string())?
+            conn.query(sql, (params_vec[0].as_str(), params_vec[1].as_str())).await.map_err(|e| e.to_string())?
         };
 
         let mut track_count = 0;
@@ -435,30 +448,32 @@ impl TursoDb {
 
         while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
             let path: String = row.get(0).map_err(|e| e.to_string())?;
-            let metadata_str: String = row.get(1).map_err(|e| e.to_string())?;
+            let metadata_opt: Option<String> = row.get(1).unwrap_or(None);
 
             track_count += 1;
             if active_links.contains(&path) {
                 linked_tracks += 1;
             }
 
-            if let Ok(meta) = serde_json::from_str::<Value>(&metadata_str) {
-                let artist = meta
-                    .get("album_artist")
-                    .or_else(|| meta.get("artist"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown artist");
-                let album = meta.get("album").and_then(|v| v.as_str()).unwrap_or("");
-                
-                let parent = Path::new(&path)
-                    .parent()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("");
-                let group_key = format!("{}|{}|{}", parent.to_lowercase(), artist.to_lowercase(), album.to_lowercase());
-                groups.entry(group_key).or_default().push(path);
+            if let Some(metadata_str) = metadata_opt {
+                if let Ok(meta) = serde_json::from_str::<Value>(&metadata_str) {
+                    let artist = meta
+                        .get("album_artist")
+                        .or_else(|| meta.get("artist"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown artist");
+                    let album = meta.get("album").and_then(|v| v.as_str()).unwrap_or("");
+                    
+                    let parent = Path::new(&path)
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or("");
+                    let group_key = format!("{}|{}|{}", parent.to_lowercase(), artist.to_lowercase(), album.to_lowercase());
+                    groups.entry(group_key).or_default().push(path);
 
-                if !artist.is_empty() && !is_compilation_artist(artist) {
-                    artists_set.insert(artist.to_lowercase());
+                    if !artist.is_empty() && !is_compilation_artist(artist) {
+                        artists_set.insert(artist.to_lowercase());
+                    }
                 }
             }
         }
@@ -1116,64 +1131,16 @@ impl TursoDb {
         })
     }
 
-    pub async fn get_state(&self, active_job: Option<Value>, logs: &[Value]) -> Result<Value, String> {
-        let conn = self.connect()?;
+    pub async fn get_state(&self, active_job: Option<Value>, logs: &[Value], root: Option<&str>) -> Result<Value, String> {
         let roots = self.list_roots("GB").await.unwrap_or_default();
+        let stats_record = self.get_stats("GB", root).await.unwrap_or_default();
 
-        let mut files_count: i64 = 0;
-        if let Ok(mut stmt) = conn.query("SELECT COUNT(*) FROM local_files WHERE present = 1 AND metadata IS NOT NULL", ()).await {
-            if let Ok(Some(row)) = stmt.next().await {
-                files_count = row.get(0).unwrap_or(0);
-            }
+        let mut stats_val = serde_json::to_value(&stats_record).unwrap_or(json!({}));
+        if let Some(obj) = stats_val.as_object_mut() {
+            obj.insert("files".to_string(), json!(stats_record.track_count));
+            obj.insert("linked".to_string(), json!(stats_record.linked_tracks));
+            obj.insert("missing".to_string(), json!(0));
         }
-
-        let mut linked_count: i64 = 0;
-        if let Ok(mut stmt) = conn.query("SELECT COUNT(*) FROM track_links WHERE market = 'GB'", ()).await {
-            if let Ok(Some(row)) = stmt.next().await {
-                linked_count = row.get(0).unwrap_or(0);
-            }
-        }
-
-        let mut queued_count: i64 = 0;
-        let mut approved_count: i64 = 0;
-        let mut downloaded_count: i64 = 0;
-        if let Ok(mut stmt) = conn.query("SELECT decision, approved FROM queue", ()).await {
-            while let Ok(Some(row)) = stmt.next().await {
-                let dec: String = row.get(0).unwrap_or_default();
-                let app: i64 = row.get(1).unwrap_or(0);
-                if dec == "queued" {
-                    queued_count += 1;
-                    if app != 0 {
-                        approved_count += 1;
-                    }
-                } else if dec == "downloaded" {
-                    downloaded_count += 1;
-                }
-            }
-        }
-
-        let mut artists_set = std::collections::HashSet::new();
-        if let Ok(mut stmt) = conn.query("SELECT metadata FROM local_files WHERE present = 1 AND metadata IS NOT NULL", ()).await {
-            while let Ok(Some(row)) = stmt.next().await {
-                if let Ok(Some(meta_str)) = row.get::<Option<String>>(0) {
-                    if let Ok(meta) = serde_json::from_str::<Value>(&meta_str) {
-                        if let Some(art) = extract_tag_str(&meta, &["album_artist", "albumartist", "artist"]) {
-                            artists_set.insert(art);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut mapped_artists = std::collections::HashSet::new();
-        if let Ok(mut stmt) = conn.query("SELECT artist FROM mappings WHERE status IN ('confirmed', 'auto')", ()).await {
-            while let Ok(Some(row)) = stmt.next().await {
-                if let Ok(a) = row.get::<String>(0) {
-                    mapped_artists.insert(a);
-                }
-            }
-        }
-        let unresolved_artists = artists_set.difference(&mapped_artists).count();
 
         let session = crate::account::AccountClient::load_saved_session();
         let dev_client = crate::tidal::TidalClient::from_env_or_keychain();
@@ -1197,27 +1164,21 @@ impl TursoDb {
 
         let settings = self.get_settings().await?;
 
-        let default_job = json!({
-            "id": "startup",
-            "kind": "startup",
-            "status": "complete",
-            "message": "Ready"
-        });
+        let default_job = self
+            .get_preference("desktop-last-job")
+            .await?
+            .unwrap_or_else(|| json!({
+                "id": "startup",
+                "kind": "startup",
+                "status": "complete",
+                "message": "Ready"
+            }));
         let reported_job = active_job.unwrap_or(default_job);
 
         Ok(json!({
             "revision": self.revision.load(std::sync::atomic::Ordering::SeqCst),
             "roots": roots,
-            "stats": {
-                "files": files_count,
-                "linked": linked_count,
-                "missing": 0,
-                "artists": artists_set.len(),
-                "unresolved_artists": unresolved_artists,
-                "approved_queue": approved_count,
-                "queued": queued_count,
-                "downloaded": downloaded_count,
-            },
+            "stats": stats_val,
             "job": reported_job,
             "logs": logs,
             "settings": settings["general"],
@@ -2592,7 +2553,7 @@ with sqlite3.connect('{db}') as db:
         assert_eq!(updated_queue.rows[0].selected, Some(vec!["t1".to_string()]));
 
         // 5. State
-        let state = store.get_state(None, &[]).await.unwrap();
+        let state = store.get_state(None, &[], None).await.unwrap();
         assert_eq!(state["stats"]["queued"], 1);
         assert_eq!(state["stats"]["approved_queue"], 1);
 

@@ -286,7 +286,7 @@ impl TidalClient {
             }
 
             let rel_url = format!(
-                "https://openapi.tidal.com/v2/searchResults/{}/relationships/artists?countryCode={}",
+                "https://openapi.tidal.com/v2/searchResults/{}/relationships/artists?countryCode={}&include=artists",
                 urlencoding_encode(search_id),
                 market
             );
@@ -340,7 +340,7 @@ impl TidalClient {
             }
 
             let rel_url = format!(
-                "https://openapi.tidal.com/v2/searchResults/{}/relationships/tracks?countryCode={}",
+                "https://openapi.tidal.com/v2/searchResults/{}/relationships/tracks?countryCode={}&include=tracks",
                 urlencoding_encode(search_id),
                 market
             );
@@ -411,7 +411,7 @@ impl TidalClient {
             .to_string();
 
         let mut next_url = Some(format!(
-            "https://openapi.tidal.com/v2/artists/{}/relationships/albums?countryCode={}",
+            "https://openapi.tidal.com/v2/artists/{}/relationships/albums?countryCode={}&include=albums",
             artist_id, market
         ));
 
@@ -500,7 +500,15 @@ impl TidalClient {
                 .get("links")
                 .and_then(|l| l.get("next"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(|s| {
+                    if s.starts_with("http") {
+                        s.to_string()
+                    } else if s.starts_with("/v2/") {
+                        format!("https://openapi.tidal.com{}", s)
+                    } else {
+                        format!("https://openapi.tidal.com/v2{}", s)
+                    }
+                });
         }
 
         Ok(TidalCatalogue {
@@ -666,6 +674,24 @@ mod tests {
         if let Some(c) = client {
             assert!(!c.client_id.is_empty());
             assert!(!c.client_secret.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_online_search_artists() {
+        if let Some(mut client) = TidalClient::from_env_or_keychain() {
+            let artists = client.search_artists("100 gecs", "GB").await.unwrap();
+            assert!(!artists.is_empty(), "Should find artists for '100 gecs'");
+            println!("Found {} artists: {:?}", artists.len(), artists);
+            let gecs = artists.iter().find(|a| a.name.to_lowercase() == "100 gecs");
+            assert!(gecs.is_some(), "Should find 100 gecs artist");
+            let artist = gecs.unwrap();
+            let cat = client.get_artist_catalogue(&artist.id, "GB", false).await.unwrap();
+            assert!(!cat.releases.is_empty(), "Should find releases for 100 gecs");
+            println!("Found {} releases for {}:", cat.releases.len(), cat.name);
+            for r in &cat.releases {
+                println!("  - [{}] {} ({})", r.id, r.title, r.date);
+            }
         }
     }
 }

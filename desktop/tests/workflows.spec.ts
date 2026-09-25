@@ -194,11 +194,11 @@ test("dark settings fit a full window and retain defaults", async ({
   await expect(
     page.getByRole("heading", { name: "Download engine", exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Reset metadata defaults" }).click();
+  await page.getByRole("button", { name: "Reset download defaults" }).click();
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await expect(
-    page.getByRole("button", { name: "Reset metadata defaults" }),
+    page.getByRole("button", { name: "Reset download defaults" }),
   ).toBeEnabled();
 });
 

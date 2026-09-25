@@ -1645,65 +1645,74 @@ function App() {
             </button>
           </div>
         </section>
-        <div className="settings-grid">
-          <section className="card">
-            <h2>Download engine</h2>
-            {field("Audio quality", "downloads", "quality", [
-              "LOSSLESS",
-              "HI_RES_LOSSLESS",
-              "HIGH",
-              "LOW",
-            ])}
-            <p className="hint">
-              LOSSLESS: FLAC 16-bit / 44.1 kHz. HI_RES_LOSSLESS: FLAC up to 24-bit / 192 kHz. HIGH/LOW: AAC 320/96 kbps.
-            </p>
-            {field("Embedded artwork size", "downloads", "cover_size", [
-              "1280",
-              "640",
-            ])}
-            {toggle("Skip already downloaded files", "downloads", "skip_existing")}
-            {toggle("Save companion cover.jpg to album folder", "downloads", "cover_album_file")}
-            {toggle("Embed lyrics into audio files", "downloads", "lyrics_embed")}
-            {toggle("Save separate .lrc lyrics file", "downloads", "lyrics_file")}
-            {toggle("Create .m3u8 playlist file for albums", "downloads", "playlist_create")}
-            {toggle("Write ReplayGain volume tags", "downloads", "replay_gain")}
-            {field(
-              "Parallel downloads",
-              "provider",
-              "download_concurrency",
-              undefined,
-              true,
-            )}
-            {field(
-              "Connections per audio file",
-              "provider",
-              "segment_concurrency",
-              undefined,
-              true,
-            )}
-            {field(
-              "Minimum release pause (seconds)",
-              "provider",
-              "download_delay_min_sec",
-              undefined,
-              true,
-            )}
-            {field(
-              "Maximum release pause (seconds)",
-              "provider",
-              "download_delay_max_sec",
-              undefined,
-              true,
-            )}
-            {field(
-              "AAC bitrate cap",
-              "provider",
-              "aac_bitrate_cap",
-              undefined,
-              true,
-            )}
+        <section className="card">
+          <h2>Download engine</h2>
+          {field("Audio quality", "downloads", "quality", [
+            "LOSSLESS",
+            "HI_RES_LOSSLESS",
+            "HIGH",
+            "LOW",
+          ])}
+          <p className="hint">
+            LOSSLESS: FLAC 16-bit / 44.1 kHz. HI_RES_LOSSLESS: FLAC up to 24-bit / 192 kHz. HIGH/LOW: AAC 320/96 kbps.
+          </p>
+          {field("Embedded artwork size", "downloads", "cover_size", [
+            "1280",
+            "640",
+          ])}
+          {toggle("Skip already downloaded files", "downloads", "skip_existing")}
+          {toggle("Save companion cover.jpg to album folder", "downloads", "cover_album_file")}
+          {toggle("Embed lyrics into audio files", "downloads", "lyrics_embed")}
+          {toggle("Save separate .lrc lyrics file", "downloads", "lyrics_file")}
+          {toggle("Create .m3u8 playlist file for albums", "downloads", "playlist_create")}
+          {toggle("Write ReplayGain volume tags", "downloads", "replay_gain")}
+          {field(
+            "Parallel downloads",
+            "provider",
+            "download_concurrency",
+            undefined,
+            true,
+          )}
+          {field(
+            "Connections per audio file",
+            "provider",
+            "segment_concurrency",
+            undefined,
+            true,
+          )}
+          {field(
+            "Minimum release pause (seconds)",
+            "provider",
+            "download_delay_min_sec",
+            undefined,
+            true,
+          )}
+          {field(
+            "Maximum release pause (seconds)",
+            "provider",
+            "download_delay_max_sec",
+            undefined,
+            true,
+          )}
+          {field(
+            "AAC bitrate cap",
+            "provider",
+            "aac_bitrate_cap",
+            undefined,
+            true,
+          )}
+          <div className="toolbar">
             <button
-              className="bottom"
+              className="primary"
+              disabled={busy}
+              onClick={async () => {
+                await saveSettings("provider", settings.provider);
+                await saveSettings("downloads", settings.downloads);
+              }}
+            >
+              Save download settings
+            </button>
+            <button
               disabled={busy}
               onClick={async () => {
                 const v = await mutate("settings.reset", {
@@ -1714,46 +1723,8 @@ function App() {
             >
               Reset download defaults
             </button>
-          </section>
-          <section className="card">
-            <h2>Additional metadata source</h2>
-            {[
-              ["Request spacing (milliseconds)", "request_interval_ms"],
-              ["Albums per batch", "api_batch_size"],
-              ["Request timeout (seconds)", "request_timeout_sec"],
-              ["Token renewal margin (seconds)", "token_refresh_margin_sec"],
-              ["Sign-in timeout (seconds)", "sign_in_timeout_sec"],
-              ["Request attempts", "request_attempts"],
-              ["Batch pause (seconds)", "api_batch_delay_sec"],
-            ].map(([l, k]) => (
-              <React.Fragment key={k}>
-                {field(l, "provider", k, undefined, true)}
-              </React.Fragment>
-            ))}
-            <button
-              className="bottom"
-              disabled={busy}
-              onClick={async () => {
-                const v = await mutate("settings.reset", { group: "metadata" });
-                if (v) setSettings(v);
-              }}
-            >
-              Reset metadata defaults
-            </button>
-          </section>
-        </div>
-        <div className="toolbar">
-          <button
-            className="primary"
-            disabled={busy}
-            onClick={async () => {
-              await saveSettings("provider", settings.provider);
-              await saveSettings("downloads", settings.downloads);
-            }}
-          >
-            Save engine & metadata settings
-          </button>
-        </div>
+          </div>
+        </section>
         <section className="card">
           <h2>Native streaming engine</h2>
           <p>

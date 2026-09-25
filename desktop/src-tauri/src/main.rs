@@ -51,15 +51,53 @@ impl Backend {
             "at": chrono::Utc::now().to_rfc3339(),
             "message": msg
         }));
-        if logs.len() > 500 {
+        if logs.len() > 800 {
             logs.remove(0);
         }
+    }
+
+    pub fn start_job(&self, job: Value, cancel_flag: Arc<AtomicBool>) {
+        if let Some(msg) = job.get("message").and_then(|v| v.as_str()) {
+            self.log(msg);
+        }
+        *self.active_job_cancel.lock().unwrap() = Some(cancel_flag);
+        *self.active_job.lock().unwrap() = Some(job);
+    }
+
+    pub fn update_job_progress(&self, msg: &str, job: Value) {
+        self.log(msg);
+        *self.active_job.lock().unwrap() = Some(job);
+    }
+
+    pub fn finish_job(&self, final_job: Value) {
+        if let Some(msg) = final_job.get("message").and_then(|v| v.as_str()) {
+            self.log(msg);
+        }
+        *self.active_job.lock().unwrap() = Some(final_job);
+        *self.active_job_cancel.lock().unwrap() = None;
+    }
+
+    pub fn cancel_active_job(&self, cancel_msg: &str) -> Option<Value> {
+        let cancel_flag = self.active_job_cancel.lock().unwrap().clone();
+        if let Some(flag) = cancel_flag {
+            flag.store(true, Ordering::Relaxed);
+            self.log(cancel_msg);
+            let mut lock = self.active_job.lock().unwrap();
+            if let Some(active) = lock.as_mut() {
+                if let Some(obj) = active.as_object_mut() {
+                    obj.insert("status".to_string(), json!("cancelling"));
+                    obj.insert("message".to_string(), json!(cancel_msg));
+                }
+                return Some(active.clone());
+            }
+        }
+        None
     }
 }
 
 async fn handle_rpc_call(
     app_handle: Option<&tauri::AppHandle>,
-    state: &Backend,
+    state: &Arc<Backend>,
     db: &TursoDb,
     method: String,
     args: Value,
@@ -280,7 +318,8 @@ async fn handle_rpc_call(
     if method == "state" {
         let active = state.active_job.lock().unwrap().clone();
         let logs = state.logs.lock().unwrap().clone();
-        return db.get_state(active, &logs).await;
+        let root = args.get("root").and_then(|v| v.as_str());
+        return db.get_state(active, &logs, root).await;
     }
     if method == "settings" {
         return db.get_settings().await;
@@ -733,17 +772,18 @@ async fn handle_rpc_call(
         });
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
-        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+        state.start_job(initial_job.clone(), cancel_flag.clone());
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
+        let backend_task = state.clone();
         let j_id = job_id.clone();
         let root_path = std::path::PathBuf::from(root_str);
 
         tauri::async_runtime::spawn(async move {
             let j_id_prog = j_id.clone();
             let app_prog = app_clone.clone();
+            let backend_prog = backend_task.clone();
 
             let scan_res = scanner::scan_library(
                 &db_clone,
@@ -758,6 +798,7 @@ async fn handle_rpc_call(
                         "started": started,
                         "result": null
                     });
+                    backend_prog.update_job_progress(msg, prog_job.clone());
                     if let Some(ref app) = app_prog {
                         let _ = app.emit(
                             "backend-event",
@@ -814,6 +855,7 @@ async fn handle_rpc_call(
                 "result": result_val
             });
 
+            backend_task.finish_job(final_job.clone());
             let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
 
             if let Some(ref app) = app_clone {
@@ -894,15 +936,16 @@ async fn handle_rpc_call(
         });
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
-        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+        state.start_job(initial_job.clone(), cancel_flag.clone());
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
+        let backend_task = state.clone();
         let j_id = job_id.clone();
 
         tauri::async_runtime::spawn(async move {
             let mut checked = 0;
+            let backend_prog = backend_task.clone();
 
             for (index, artist_id) in ids.iter().enumerate() {
                 if cancel_flag.load(Ordering::Relaxed) {
@@ -918,6 +961,7 @@ async fn handle_rpc_call(
                     "started": started,
                     "result": null
                 });
+                backend_prog.update_job_progress(&msg, prog_job.clone());
                 if let Some(ref app) = app_clone {
                     let _ = app.emit(
                         "backend-event",
@@ -962,6 +1006,7 @@ async fn handle_rpc_call(
                 "result": json!({ "checked": checked })
             });
 
+            backend_task.finish_job(final_job.clone());
             let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
 
             if let Some(ref app) = app_clone {
@@ -1019,17 +1064,18 @@ async fn handle_rpc_call(
         });
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
-        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+        state.start_job(initial_job.clone(), cancel_flag.clone());
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
+        let backend_task = state.clone();
         let j_id = job_id.clone();
         let mkt = market.clone();
         let rt = root_str.clone();
 
         tauri::async_runtime::spawn(async move {
             let app_prog = app_clone.clone();
+            let backend_prog = backend_task.clone();
             let j_id_prog = j_id.clone();
 
             let link_res = linking::link_library(
@@ -1046,6 +1092,7 @@ async fn handle_rpc_call(
                         "started": started,
                         "result": null
                     });
+                    backend_prog.update_job_progress(&msg, prog_job.clone());
                     if let Some(ref app) = app_prog {
                         let _ = app.emit(
                             "backend-event",
@@ -1097,6 +1144,7 @@ async fn handle_rpc_call(
                 "result": result_val
             });
 
+            backend_task.finish_job(final_job.clone());
             let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
 
             if let Some(ref app) = app_clone {
@@ -1133,8 +1181,12 @@ async fn handle_rpc_call(
             "result": json!({ "auth_url": auth_url })
         });
 
+        state.finish_job(job.clone());
+        let _ = db.set_preference("desktop-last-job", &job).await;
+
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "authentication", "auth_url": auth_url }));
+            let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
         }
 
         return Ok(job);
@@ -1151,6 +1203,8 @@ async fn handle_rpc_call(
             "finished": now,
             "result": { "message": "All native components are up to date." }
         });
+        state.finish_job(job.clone());
+        let _ = db.set_preference("desktop-last-job", &job).await;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
         }
@@ -1168,6 +1222,8 @@ async fn handle_rpc_call(
             "finished": now,
             "result": { "message": "Components are built into the binary." }
         });
+        state.finish_job(job.clone());
+        let _ = db.set_preference("desktop-last-job", &job).await;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
         }
@@ -1185,6 +1241,8 @@ async fn handle_rpc_call(
             "finished": now,
             "result": { "message": "Native components active." }
         });
+        state.finish_job(job.clone());
+        let _ = db.set_preference("desktop-last-job", &job).await;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
         }
@@ -1207,15 +1265,16 @@ async fn handle_rpc_call(
         });
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
-        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+        state.start_job(initial_job.clone(), cancel_flag.clone());
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
+        let backend_task = state.clone();
         let j_id = job_id.clone();
 
         tauri::async_runtime::spawn(async move {
             let app_prog = app_clone.clone();
+            let backend_prog = backend_task.clone();
             let j_id_prog = j_id.clone();
 
             let dl_res = if let Some(ref app) = app_clone {
@@ -1233,6 +1292,7 @@ async fn handle_rpc_call(
                             "started": started,
                             "result": null
                         });
+                        backend_prog.update_job_progress(&msg, prog_job.clone());
                         if let Some(ref a) = app_prog {
                             let _ = a.emit(
                                 "backend-event",
@@ -1275,6 +1335,7 @@ async fn handle_rpc_call(
                 "result": json!({ "completed": count })
             });
 
+            backend_task.finish_job(final_job.clone());
             let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
 
             if let Some(ref app) = app_clone {
@@ -1337,6 +1398,8 @@ async fn handle_rpc_call(
                 "chained": chained_count
             })
         });
+        state.finish_job(final_job.clone());
+        let _ = db.set_preference("desktop-last-job", &final_job).await;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "job", "job": final_job }));
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -1424,6 +1487,9 @@ async fn handle_rpc_call(
             })
         });
 
+        state.finish_job(job.clone());
+        let _ = db.set_preference("desktop-last-job", &job).await;
+
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
         }
@@ -1447,6 +1513,9 @@ async fn handle_rpc_call(
             "result": null
         });
 
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        state.start_job(initial_job.clone(), cancel_flag.clone());
+
         let mut files_to_delete = Vec::new();
         let mut folders_to_clean = Vec::new();
 
@@ -1469,6 +1538,7 @@ async fn handle_rpc_call(
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
+        let backend_task = state.clone();
         let j_id = job_id.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -1489,6 +1559,9 @@ async fn handle_rpc_call(
                 "result": json!({ "completed": count })
             });
 
+            backend_task.finish_job(final_job.clone());
+            let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
+
             if let Some(ref app) = app_clone {
                 let _ = app.emit("backend-event", json!({ "event": "job", "job": final_job }));
                 let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -1498,14 +1571,15 @@ async fn handle_rpc_call(
         return Ok(initial_job);
     }
     if method == "job.cancel" {
-        if let Some(cancel_flag) = state.active_job_cancel.lock().unwrap().as_ref() {
-            cancel_flag.store(true, Ordering::Relaxed);
+        let cancel_msg = "Cancellation requested · finishing the current safe file boundary";
+        if let Some(active) = state.cancel_active_job(cancel_msg) {
             if let Some(app) = app_handle {
+                let _ = app.emit("backend-event", json!({ "event": "job", "job": active }));
                 let _ = app.emit(
                     "backend-event",
                     json!({
                         "event": "progress",
-                        "message": "Cancellation requested · finishing the current safe file boundary",
+                        "message": cancel_msg,
                     }),
                 );
             }
@@ -1624,7 +1698,7 @@ fn main() {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         rt.block_on(async move {
             let turso_db = TursoDb::open(&db_path).await.expect("Failed to open DB");
-            let backend = Backend::new();
+            let backend = Arc::new(Backend::new());
 
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
