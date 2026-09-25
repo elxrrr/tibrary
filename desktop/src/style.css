@@ -74,13 +74,14 @@ button:disabled {
   cursor: default;
 }
 button.primary {
-  background: var(--accent);
-  color: AccentColorText;
-  border-color: var(--accent);
+  background: color-mix(in srgb, var(--text) 14%, var(--card));
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--text) 24%, var(--line));
   font-weight: 600;
 }
 button.primary:hover:not(:disabled) {
-  filter: brightness(1.12);
+  background: color-mix(in srgb, var(--text) 22%, var(--card));
+  border-color: color-mix(in srgb, var(--text) 32%, var(--line));
 }
 input,
 select {

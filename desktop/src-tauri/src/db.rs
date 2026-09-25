@@ -2402,12 +2402,13 @@ impl TursoDb {
         Ok(())
     }
 
-    pub async fn queue_export(&self, format: &str) -> Result<String, String> {
+    pub async fn queue_export(&self, format: &str, decision: Option<&str>) -> Result<String, String> {
+        let dec = decision.unwrap_or("queued");
         let conn = self.connect()?;
         let mut stmt = conn
             .query(
-                "SELECT id, payload, approved FROM queue WHERE decision = 'queued' ORDER BY id",
-                (),
+                "SELECT id, payload, approved FROM queue WHERE decision = ? ORDER BY id",
+                (dec,),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -3771,10 +3772,10 @@ with sqlite3.connect('{db}') as db:
         assert!(queue_rows.rows[0].approved);
 
         // 3. Queue export
-        let json_export = store.queue_export("json").await.unwrap();
+        let json_export = store.queue_export("json", None).await.unwrap();
         assert!(json_export.contains("Kid A"));
 
-        let csv_export = store.queue_export("csv").await.unwrap();
+        let csv_export = store.queue_export("csv", None).await.unwrap();
         assert!(csv_export.contains("Kid A"));
         assert!(csv_export.contains("Radiohead"));
 

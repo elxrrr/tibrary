@@ -1078,7 +1078,8 @@ async fn handle_rpc_uncached(
             .get("format")
             .and_then(|v| v.as_str())
             .unwrap_or("json");
-        let text = db.queue_export(format).await?;
+        let decision = args.get("decision").and_then(|v| v.as_str());
+        let text = db.queue_export(format, decision).await?;
         return Ok(json!({ "text": text }));
     }
 
@@ -2080,7 +2081,7 @@ fn main() {
             if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
-                        "Tibrary v0.9.0-beta.5 ready · workspace initialized",
+                        "Tibrary v0.9.0-beta.6 ready · workspace initialized",
                         "info",
                         Some("general"),
                     );

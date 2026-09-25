@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Download,
   Folder,
   Heart,
   House,
@@ -247,6 +248,11 @@ function App() {
   }, [route, state?.revision]);
   const [detail, setDetail] = useState<any>(null),
     [review, setReview] = useState<any>(null),
+    [exportPreview, setExportPreview] = useState<{
+      title: string;
+      content: string;
+      filename: string;
+    } | null>(null),
     [menu, setMenu] = useState<{ row: Row; x: number; y: number } | null>(null),
     [settings, setSettings] = useState<any>(null),
     [auth, setAuth] = useState(""),
@@ -588,19 +594,22 @@ function App() {
 
     await saveSettings(backendSection, nextSection);
   }
-  async function exportQueue() {
+  async function openExport(targetRoute: "queue" | "downloaded" = "queue") {
     try {
-      const { text } = await call("queue.export", { format: "json" });
-      const path = await save({
-        defaultPath: "acquisition-queue.json",
-        filters: [{ name: "JSON", extensions: ["json"] }],
+      const isDownloaded = targetRoute === "downloaded";
+      const { text } = await call("queue.export", {
+        format: "json",
+        decision: isDownloaded ? "downloaded" : "queued",
       });
-      if (path)
-        await invoke("save_export", {
-          path,
-          content:
-            typeof text === "string" ? text : JSON.stringify(text, null, 2),
-        });
+      const content =
+        typeof text === "string" ? text : JSON.stringify(text, null, 2);
+      setExportPreview({
+        title: isDownloaded ? "Export downloaded releases" : "Export queue",
+        content,
+        filename: isDownloaded
+          ? "downloaded-releases.json"
+          : "acquisition-queue.json",
+      });
     } catch (e) {
       notifyError(e);
     }
@@ -1066,7 +1075,7 @@ function App() {
               disabled={busy}
               onClick={() => run("discography")}
             >
-              Scan for new releases
+              Find new releases (online)
             </button>
             <button
               disabled={
@@ -1093,21 +1102,16 @@ function App() {
               }
             >
               <ArrowDownToLine size={16} />
-              Download approved
+              Download
             </button>
-            <button disabled={busy} onClick={exportQueue}>
-              Export queue
+            <button disabled={busy} onClick={() => openExport("queue")}>
+              Export
             </button>
           </>
         )}
-        {tree && (
-          <button
-            disabled={busy || selected.size !== 1}
-            onClick={() =>
-              run("release_details", { id: [...selected][0], force: true })
-            }
-          >
-            Refresh track details
+        {route === "downloaded" && (
+          <button disabled={busy} onClick={() => openExport("downloaded")}>
+            Export
           </button>
         )}
       </div>
@@ -2047,7 +2051,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.5 · build 5</span>
+          <span className="sidebar-version">v0.9.0-beta.6 · build 6</span>
         </div>
       </aside>
       <main>
@@ -2681,6 +2685,69 @@ function App() {
                   ? "Start download"
                   : "Confirm & continue"}
             </button>
+          </footer>
+        </Modal>
+      )}
+      {exportPreview && (
+        <Modal
+          title={exportPreview.title}
+          wide
+          onClose={() => setExportPreview(null)}
+        >
+          <div className="modal-body">
+            <pre
+              style={{
+                maxHeight: "360px",
+                overflow: "auto",
+                padding: "12px",
+                background: "var(--card)",
+                borderRadius: "6px",
+                border: "1px solid var(--line)",
+                fontSize: "11px",
+                fontFamily: "monospace",
+                userSelect: "text",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-all",
+              }}
+            >
+              {exportPreview.content}
+            </pre>
+          </div>
+          <footer>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(exportPreview.content);
+                setToast("Copied to clipboard");
+                setTimeout(() => setToast(""), 2000);
+              }}
+              title="Copy export content"
+            >
+              <Copy size={14} />
+              Copy
+            </button>
+            <button
+              className="primary"
+              onClick={async () => {
+                const path = await save({
+                  defaultPath: exportPreview.filename,
+                  filters: [{ name: "JSON", extensions: ["json"] }],
+                });
+                if (path) {
+                  await invoke("save_export", {
+                    path,
+                    content: exportPreview.content,
+                  });
+                  setToast("Saved to " + path.split("/").pop());
+                  setTimeout(() => setToast(""), 2000);
+                  setExportPreview(null);
+                }
+              }}
+              title="Save export to file"
+            >
+              <Download size={14} />
+              Save
+            </button>
+            <button onClick={() => setExportPreview(null)}>Close</button>
           </footer>
         </Modal>
       )}
