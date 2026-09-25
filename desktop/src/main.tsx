@@ -135,10 +135,10 @@ const descriptions: Record<string, string> = {
   metadata:
     "Fill missing tags from verified links, including BPM and Camelot key.",
   artwork:
-    "Find genuine 1280 × 1280 front covers. Smaller images are never upscaled.",
+    "Find genuine 1280 × 1280 front covers.",
   mqa: "Inspect local FLAC files and retain the results for replacement review.",
   local: "Review complete local replacements before removing duplicate files.",
-  online: "Find larger online releases that preserve every recording you own.",
+  online: "Find larger online releases that preserve every release you own.",
   missing:
     "Review available releases and choose whole releases or individual tracks.",
   queue: "Only approved audio tracks will be downloaded.",
@@ -314,10 +314,12 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = state?.settings.theme || "system";
   }, [state?.settings.theme]);
+  const pageSize = Number(settings?.general?.page_size || 50);
   const viewArgs = {
     route,
     root: root || undefined,
     offset,
+    limit: pageSize,
     search: query,
     filter,
     sort,
@@ -732,11 +734,13 @@ function App() {
                                 "online",
                               ].includes(id)
                             ? `${s[id] ?? "—"} ${["local", "online"].includes(id) ? "opportunities" : "files to review"}`
-                            : id === "downloaded"
-                              ? `${s.downloaded || 0} releases`
-                              : id === "downloads"
-                                ? "Lossless audio"
-                                : "Open",
+                            : id === "missing"
+                              ? `${(s.missing_releases ?? s.missing ?? 0).toLocaleString()} releases`
+                              : id === "downloaded"
+                                ? `${s.downloaded || 0} releases`
+                                : id === "downloads"
+                                  ? "Lossless audio"
+                                  : "Open",
                 descriptions[id] || "Review and manage",
                 id,
                 Icon,
@@ -748,7 +752,6 @@ function App() {
           <div className="section-heading">
             <div>
               <h2>Your libraries</h2>
-              <p>Indexed once, updated when files change.</p>
             </div>
             <button disabled={busy} onClick={addLibrary}>
               <Folder size={16} />
@@ -778,9 +781,9 @@ function App() {
                 </button>
                 <button
                   disabled={busy}
-                  onClick={() => run("scan", { root: r.root })}
+                  onClick={() => run("scan", { root: r.root, force: true })}
                 >
-                  Update
+                  Rescan tags
                 </button>
               </div>
             ))
@@ -826,20 +829,6 @@ function App() {
             </div>
           </section>
         )}
-        {route === "overview" && (
-          <div className="workflow-guide">
-            <h2>A clear path to a complete library</h2>
-            <div>
-              {groups.slice(0, 4).map((g, i) => (
-                <button key={g.id} onClick={() => setRoute(g.id)}>
-                  <span>{i + 1}</span>
-                  <strong>{g.name}</strong>
-                  <ChevronRight size={17} />
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
       </>
     );
   }
@@ -856,7 +845,9 @@ function App() {
         ].includes(route) && (
           <button disabled={busy || !root} onClick={() => run("scan")}>
             <RefreshCw size={15} />
-            Update local index
+            {["metadata", "artwork"].includes(route)
+              ? "Rescan tags (local)"
+              : "Rescan tags"}
           </button>
         )}
         {["correct", "organise"].includes(route) && (
@@ -962,8 +953,8 @@ function App() {
               onClick={() => run(route, scope())}
             >
               {route === "metadata"
-                ? "Find missing tags"
-                : "Find 1280 × 1280 artwork"}
+                ? "Find missing tags (online)"
+                : "Find artwork (online)"}
             </button>
             <button
               disabled={busy || !preview || !selected.size}
@@ -1013,7 +1004,7 @@ function App() {
                 })
               }
             >
-              {route === "local" ? "Scan for duplicates" : "Find opportunities in cache"}
+              {route === "local" ? "Scan for duplicates" : "Find cached replacements"}
             </button>
             {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
               <button
@@ -1033,7 +1024,7 @@ function App() {
                 disabled={busy || !root}
                 onClick={() => run("check_replacements", { scope: "remote" })}
               >
-                Check online candidates
+                Search online replacements
               </button>
             )}
             <button
@@ -1323,7 +1314,7 @@ function App() {
         <footer className="table-footer">
           <span>
             {data.total
-              ? `${offset + 1}–${Math.min(offset + 100, data.total)} of ${data.total.toLocaleString()}`
+              ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
               : "No items"}
             {route === "links" &&
               ` · ${state?.stats.linked_releases || 0} complete releases / ${state?.stats.linked_tracks || 0} linked tracks`}
@@ -1331,13 +1322,13 @@ function App() {
           <div>
             <button
               disabled={offset === 0}
-              onClick={() => setOffset(Math.max(0, offset - 100))}
+              onClick={() => setOffset(Math.max(0, offset - pageSize))}
             >
               Previous
             </button>
             <button
-              disabled={offset + 100 >= data.total}
-              onClick={() => setOffset(offset + 100)}
+              disabled={offset + pageSize >= data.total}
+              onClick={() => setOffset(offset + pageSize)}
             >
               Next
             </button>
@@ -1354,6 +1345,9 @@ function App() {
     number = false,
   ) {
     let curVal = settings[section]?.[key] ?? "";
+    if (key === "page_size" && (!curVal || curVal === "")) {
+      curVal = 50;
+    }
     if (key === "quality" && typeof curVal === "string") {
       const lower = curVal.toLowerCase();
       if (
@@ -1475,6 +1469,18 @@ function App() {
               "light",
               "dark",
             ])}
+            {field(
+              "Items per page",
+              "general",
+              "page_size",
+              [
+                { value: 25, label: "25" },
+                { value: 50, label: "50" },
+                { value: 100, label: "100" },
+                { value: 250, label: "250" },
+              ],
+              true,
+            )}
             {field("Catalogue market", "general", "market")}
             <label className="setting-row">
               <span>Save activity logs</span>
@@ -2041,14 +2047,13 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.4 · build 4</span>
+          <span className="sidebar-version">v0.9.0-beta.5 · build 5</span>
         </div>
       </aside>
       <main>
         <header className="page-header">
           <div>
             <h1>{titles[route] || "Overview"}</h1>
-            <p>{descriptions[route] || "Choose a step to continue."}</p>
           </div>
           <div className="header-actions">
             <select
@@ -2154,6 +2159,12 @@ function App() {
                 else if (rawKind.includes("duplicate") || rawKind.includes("consolidation") || rawKind.includes("trash") || rawKind.includes("organise") || rawKind.includes("correct")) cat = "cleanup";
                 else if (rawStatus === "failed" || rawStatus === "error") cat = "error";
 
+                const isComponentCheck = rawKind === "component_check" || Boolean(job?.message?.includes("streaming components"));
+                if (isComponentCheck) {
+                  statusLabel = "READY";
+                  statusClass = "ready";
+                }
+
                 const kindTitles: Record<string, string> = {
                   download: "Lossless Audio Download",
                   scan: "Library Scan",
@@ -2170,7 +2181,9 @@ function App() {
                   favourites: "Refresh Favourite Artists",
                   startup: "System Ready",
                 };
-                const displayTitle = kindTitles[rawKind] || (rawKind ? rawKind.split("_").map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") : "No Active Operation");
+                const displayTitle = isComponentCheck
+                  ? "System Ready"
+                  : kindTitles[rawKind] || (rawKind ? rawKind.split("_").map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") : "No Active Operation");
 
                 return (
                   <section className="card activity-status">
@@ -2183,8 +2196,10 @@ function App() {
                         </span>
                       </div>
                       <p>
-                        {job?.message ||
-                          "Operations will appear here. You can keep browsing while they run."}
+                        {isComponentCheck
+                          ? "Operations will appear here. You can keep browsing while they run."
+                          : job?.message ||
+                            "Operations will appear here. You can keep browsing while they run."}
                       </p>
                     </div>
                     <button

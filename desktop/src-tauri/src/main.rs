@@ -1705,23 +1705,7 @@ async fn handle_rpc_uncached(
     }
     if method == "job.start" && args.get("kind").and_then(|v| v.as_str()) == Some("component_check")
     {
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-        let job = json!({
-            "id": job_id,
-            "kind": "component_check",
-            "status": "complete",
-            "message": "Tibrary uses built-in high-performance native Rust streaming components. Component versions are bundled with this app release.",
-            "started": now,
-            "finished": now,
-            "result": { "message": "Native components are bundled; update Tibrary to update them." }
-        });
-        state.finish_job(job.clone());
-        let _ = db.set_preference("desktop-last-job", &job).await;
-        if let Some(app) = app_handle {
-            let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
-        }
-        return Ok(job);
+        return Ok(json!({ "status": "ok" }));
     }
     if method == "job.start"
         && args.get("kind").and_then(|v| v.as_str()) == Some("component_update")
@@ -2096,7 +2080,7 @@ fn main() {
             if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
-                        "Tibrary v0.9.0-beta.4 ready · workspace initialized",
+                        "Tibrary v0.9.0-beta.5 ready · workspace initialized",
                         "info",
                         Some("general"),
                     );

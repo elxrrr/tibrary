@@ -46,6 +46,7 @@ pub struct StatsRecord {
     pub approved_queue: usize,
     pub queued: usize,
     pub downloaded: usize,
+    pub missing_releases: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -698,6 +699,14 @@ impl TursoDb {
             }
         }
 
+        let missing_releases = match self
+            .get_missing_rows(market, Some("All missing releases"), None, None, None, None, None, None, 0, 0)
+            .await
+        {
+            Ok(page) => page.total,
+            Err(_) => 0,
+        };
+
         Ok(StatsRecord {
             track_count,
             linked_tracks,
@@ -709,6 +718,7 @@ impl TursoDb {
             approved_queue,
             queued,
             downloaded,
+            missing_releases,
         })
     }
 
@@ -1676,7 +1686,8 @@ impl TursoDb {
         if let Some(obj) = stats_val.as_object_mut() {
             obj.insert("files".to_string(), json!(stats_record.track_count));
             obj.insert("linked".to_string(), json!(stats_record.linked_tracks));
-            obj.insert("missing".to_string(), json!(0));
+            obj.insert("missing".to_string(), json!(stats_record.missing_releases));
+            obj.insert("missing_releases".to_string(), json!(stats_record.missing_releases));
         }
 
         // Include desktop-health maintenance counts (correct, organise, metadata, artwork, mqa, local, online)
@@ -1710,6 +1721,11 @@ impl TursoDb {
         let default_job = self
             .get_preference("desktop-last-job")
             .await?
+            .filter(|j| {
+                let kind = j.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let msg = j.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                kind != "component_check" && !msg.contains("streaming components")
+            })
             .unwrap_or_else(|| {
                 json!({
                     "id": "startup",
