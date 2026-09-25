@@ -7,6 +7,8 @@ from .tag_io import open_audio, FLAC, Picture
 class DownloadMetadata:
     """Small adapter for the downloader's Metadata(...).save() contract."""
 
+    current_album_artist = None
+
     def __init__(self, path_file, target_upc=None, **values):
         self.path = Path(path_file)
         self.values = values
@@ -16,7 +18,14 @@ class DownloadMetadata:
         from .download_metadata import normalize
 
         audio = open_audio(self.path)
-        values = self.values
+        values = dict(self.values)
+
+        # Enforce true album artist if set in context or fallback properly
+        if DownloadMetadata.current_album_artist:
+            values["albumartist"] = [DownloadMetadata.current_album_artist]
+        elif not values.get("albumartist") and values.get("artists"):
+            values["albumartist"] = values["artists"]
+
         fields = dict(
             title="title",
             album="album",
@@ -37,7 +46,7 @@ class DownloadMetadata:
             releasetype="release_type",
         )
         for tag, field in fields.items():
-            value = values.get(field)
+            value = values.get(field) if values.get(field) is not None else values.get(tag)
             if value is not None and value != "":
                 audio[tag] = (
                     [str(v) for v in value]

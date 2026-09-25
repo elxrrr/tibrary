@@ -82,12 +82,17 @@ impl DownloadManager {
         // Locate python runtime and download_bridge.py
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let repo_root = manifest_dir.join("../..");
-        let python_bin = repo_root.join(".venv/bin/python");
+        let tidaler_python = repo_root.join("app/resources/tidaler/.venv/bin/python");
+        let root_python = repo_root.join(".venv/bin/python");
+        let python_bin = if tidaler_python.exists() {
+            tidaler_python
+        } else if root_python.exists() {
+            root_python
+        } else {
+            return Err("Python runtime not found. Please run 'Setup downloads.command' first.".to_string());
+        };
         let bridge_script = repo_root.join("app/library_manager/download_bridge.py");
 
-        if !python_bin.exists() {
-            return Err("Python runtime not found in .venv. Ensure environment is set up.".to_string());
-        }
         if !bridge_script.exists() {
             return Err("download_bridge.py not found.".to_string());
         }

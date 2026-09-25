@@ -82,6 +82,17 @@ def layout_path(root, tags, year='', disc_relevant=False, template=DOWNLOAD_LAYO
     values.update(year=year, tracknumber=f'{int(number):0{width}d}', disc=f'Disc {disc_text}' if disc_relevant and disc_text else '')
     if disc.isdigit():
         values['discnumber'] = f'{int(disc):02d}'
+
+    # Ensure album_artist and track_number aliases are populated
+    album_artist_val = values.get('albumartist') or values.get('album_artist') or values.get('artist', '')
+    values['albumartist'] = album_artist_val
+    values['album_artist'] = album_artist_val
+    values['tracknumber'] = values.get('tracknumber', '')
+    values['track_number'] = values.get('tracknumber', '')
+    values['album'] = values.get('album', '')
+    values['album_title'] = values.get('album', '')
+    values['title'] = values.get('title', '')
+    values['track_title'] = values.get('title', '')
     parts = []
     for part in template.split('/'):
         if part == '{album} ({year})' and year and values.get('album', '').endswith(f'({year})'):

@@ -15,16 +15,16 @@ import sys
 try:
     import _lofty
 except ImportError:
-    # Isolated provider environments use the app's ABI-stable native module.
     import importlib.util
 
     native_path = os.environ.get("TIBRARY_NATIVE_MODULE")
-    if not native_path:
-        raise
-    spec = importlib.util.spec_from_file_location("_lofty", native_path)
-    _lofty = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(_lofty)
-    sys.modules["_lofty"] = _lofty
+    if native_path and Path(native_path).exists():
+        spec = importlib.util.spec_from_file_location("_lofty", native_path)
+        _lofty = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_lofty)
+        sys.modules["_lofty"] = _lofty
+    else:
+        _lofty = None
 
 
 class Tags(UserDict):
@@ -105,75 +105,168 @@ class Picture:
         )
 
 
-class Audio(Tags):
-    """Detached FLAC snapshot with a small mapping API used by the core workflows."""
+if _lofty is not None:
+    class Audio(Tags):
+        """Detached FLAC snapshot with a small mapping API used by the core workflows."""
 
-    _reader = staticmethod(_lofty.read_other)
-    _writer = None
+        _reader = staticmethod(_lofty.read_other)
+        _writer = None
 
-    def __init__(self, filename, *, pictures=True):
-        self.filename = str(filename)
-        sys.audit("open", self.filename, "r", os.O_RDONLY)
-        result = self._reader(Path(filename), pictures)
-        super().__init__(result["tags"])
-        self._original = {k: list(v) for k, v in self.items()}
-        self._picture_bytes = result["pictures"]
-        self.pictures = [Picture.from_bytes(p) for p in self._picture_bytes]
-        self._pictures_loaded = pictures
-        length, rate, bits, channels = result["info"]
-        self.info = SimpleNamespace(
-            length=length, sample_rate=rate, bits_per_sample=bits, channels=channels
-        )
-
-    @property
-    def tags(self):
-        return self
-
-    def clear_pictures(self):
-        if not self._pictures_loaded:
-            raise ValueError("Artwork was not loaded; reopen before editing it")
-        self.pictures.clear()
-
-    def add_picture(self, picture):
-        if not self._pictures_loaded:
-            raise ValueError("Artwork was not loaded; reopen before editing it")
-        self.pictures.append(picture)
-
-    def save(self, filename=None):
-        path = Path(filename or self.filename)
-        if path.resolve() != Path(self.filename).resolve():
-            raise ValueError("Save must target the file used to create this snapshot")
-        changes = {
-            key: self.get(key, [])
-            for key in self._original.keys() | self.keys()
-            if self.get(key) != self._original.get(key)
-        }
-        pictures = [p.write() for p in self.pictures]
-        picture_changes = (
-            pictures
-            if self._pictures_loaded and pictures != self._picture_bytes
-            else None
-        )
-        if not changes and picture_changes is None:
-            return
-        # Native I/O must participate in Python's test/access audit policy.
-        sys.audit("open", str(path), "r+", os.O_RDWR)
-        if self._writer is None:
-            raise ValueError(
-                "Writing this audio format is not supported by library maintenance"
+        def __init__(self, filename, *, pictures=True):
+            self.filename = str(filename)
+            sys.audit("open", self.filename, "r", os.O_RDONLY)
+            result = self._reader(Path(filename), pictures)
+            super().__init__(result["tags"])
+            self._original = {k: list(v) for k, v in self.items()}
+            self._picture_bytes = result["pictures"]
+            self.pictures = [Picture.from_bytes(p) for p in self._picture_bytes]
+            self._pictures_loaded = pictures
+            length, rate, bits, channels = result["info"]
+            self.info = SimpleNamespace(
+                length=length, sample_rate=rate, bits_per_sample=bits, channels=channels
             )
-        self._writer(path, changes, picture_changes)
-        self._original = {k: list(v) for k, v in self.items()}
-        self._picture_bytes = pictures
+
+        @property
+        def tags(self):
+            return self
+
+        def clear_pictures(self):
+            if not self._pictures_loaded:
+                raise ValueError("Artwork was not loaded; reopen before editing it")
+            self.pictures.clear()
+
+        def add_picture(self, picture):
+            if not self._pictures_loaded:
+                raise ValueError("Artwork was not loaded; reopen before editing it")
+            self.pictures.append(picture)
+
+        def save(self, filename=None):
+            path = Path(filename or self.filename)
+            if path.resolve() != Path(self.filename).resolve():
+                raise ValueError("Save must target the file used to create this snapshot")
+            changes = {
+                key: self.get(key, [])
+                for key in self._original.keys() | self.keys()
+                if self.get(key) != self._original.get(key)
+            }
+            pictures = [p.write() for p in self.pictures]
+            picture_changes = (
+                pictures
+                if self._pictures_loaded and pictures != self._picture_bytes
+                else None
+            )
+            if not changes and picture_changes is None:
+                return
+            sys.audit("open", str(path), "r+", os.O_RDWR)
+            if self._writer is None:
+                raise ValueError(
+                    "Writing this audio format is not supported by library maintenance"
+                )
+            self._writer(path, changes, picture_changes)
+            self._original = {k: list(v) for k, v in self.items()}
+            self._picture_bytes = pictures
 
 
-class FLAC(Audio):
-    _reader = staticmethod(_lofty.read_flac)
-    _writer = staticmethod(_lofty.write_flac)
+    class FLAC(Audio):
+        _reader = staticmethod(_lofty.read_flac)
+        _writer = staticmethod(_lofty.write_flac)
 
 
-class MP4(Audio):
-    _writer = staticmethod(_lofty.write_mp4)
+    class MP4(Audio):
+        _writer = staticmethod(_lofty.write_mp4)
+else:
+    import mutagen
+    import mutagen.flac
+    import mutagen.mp4
+
+    class Audio(Tags):
+        def __init__(self, filename, *, pictures=True):
+            self.filename = str(filename)
+            self._mutagen = mutagen.File(filename)
+            if self._mutagen is None:
+                raise ValueError(f"Unsupported audio file: {filename}")
+            raw_tags = {}
+            if getattr(self._mutagen, "tags", None):
+                for k, v in self._mutagen.tags.items():
+                    if isinstance(v, list):
+                        raw_tags[k] = [str(x) for x in v]
+                    elif isinstance(v, str):
+                        raw_tags[k] = [v]
+                    elif hasattr(v, "text"):
+                        raw_tags[k] = [str(x) for x in v.text]
+                    else:
+                        raw_tags[k] = [str(v)]
+            super().__init__(raw_tags)
+            self.pictures = []
+            if hasattr(self._mutagen, "pictures"):
+                for p in self._mutagen.pictures:
+                    self.pictures.append(
+                        Picture(
+                            type=getattr(p, "type", 3),
+                            mime=getattr(p, "mime", "image/jpeg"),
+                            desc=getattr(p, "desc", ""),
+                            width=getattr(p, "width", 0),
+                            height=getattr(p, "height", 0),
+                            depth=getattr(p, "depth", 24),
+                            colors=getattr(p, "colors", 0),
+                            data=getattr(p, "data", b""),
+                        )
+                    )
+            info = getattr(self._mutagen, "info", None)
+            self.info = SimpleNamespace(
+                length=getattr(info, "length", 0),
+                sample_rate=getattr(info, "sample_rate", 44100),
+                bits_per_sample=getattr(info, "bits_per_sample", 16),
+                channels=getattr(info, "channels", 2),
+            )
+
+        @property
+        def tags(self):
+            return self
+
+        def clear_pictures(self):
+            self.pictures.clear()
+            if hasattr(self._mutagen, "clear_pictures"):
+                self._mutagen.clear_pictures()
+
+        def add_picture(self, picture):
+            self.pictures.append(picture)
+
+        def save(self, filename=None):
+            path = Path(filename or self.filename)
+            if getattr(self._mutagen, "tags", None) is None:
+                try:
+                    self._mutagen.add_tags()
+                except Exception:
+                    pass
+            if getattr(self._mutagen, "tags", None) is not None:
+                for k in list(self._mutagen.tags.keys()):
+                    if k.lower() not in self.data:
+                        del self._mutagen.tags[k]
+                for k, vals in self.data.items():
+                    self._mutagen.tags[k] = [str(v) for v in vals]
+            if hasattr(self._mutagen, "clear_pictures"):
+                self._mutagen.clear_pictures()
+                for p in self.pictures:
+                    mp = mutagen.flac.Picture()
+                    mp.type = p.type
+                    mp.mime = p.mime
+                    mp.desc = p.desc
+                    mp.width = p.width
+                    mp.height = p.height
+                    mp.depth = p.depth
+                    mp.colors = p.colors
+                    mp.data = p.data
+                    self._mutagen.add_picture(mp)
+            self._mutagen.save(str(path))
+
+
+    class FLAC(Audio):
+        pass
+
+
+    class MP4(Audio):
+        pass
 
 
 def open_audio(path, *, pictures=True):

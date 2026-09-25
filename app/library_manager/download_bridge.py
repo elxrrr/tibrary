@@ -12,7 +12,7 @@ import threading
 import time
 
 _RESOURCES = Path(__file__).resolve().parents[1] / 'resources'
-for _pkg in (_RESOURCES / 'tidaler', _RESOURCES / 'python-tidal'):
+for _pkg in (_RESOURCES / 'tidaler',):
     if Path(sys.prefix).parent == _RESOURCES / 'tidaler' and _pkg.is_dir() and str(_pkg) not in sys.path:
         sys.path.insert(0, str(_pkg))
 
@@ -36,6 +36,8 @@ class QuietOutput:
 
 def publish_files(stage, output):
     """Publish new files exclusively; never replace an existing library file."""
+    stage = Path(stage).resolve()
+    output = Path(output).resolve()
     published=[]
     for source in stage.rglob('*'):
         if not source.is_file() or source.is_symlink():continue
@@ -77,7 +79,7 @@ def organise_download(path,stage,layout,track_id,album_id,metadata=None,destinat
         # Reuse the album/disc folder; new filenames still follow the portable policy.
         filename=download_path(stage,tags,extension=path.suffix).name
         target=album_root/disc_path/filename
-    if not target.resolve().is_relative_to(stage):raise ValueError('Unsafe organised download path')
+    if not target.resolve().is_relative_to(Path(stage).resolve()):raise ValueError('Unsafe organised download path')
     if path.suffix.casefold()=='.flac':
         audio['tidal_track_id']=[track_id];audio['tidal_album_id']=[album_id]
     audio.save()
@@ -151,7 +153,7 @@ def main():
     }
     dim = cover_dim_map.get(cover_size_str, CoverDimensions.Px1280)
     settings.data.metadata_cover_embed=True;settings.data.metadata_cover_dimension=dim
-    settings.data.skip_existing=True;settings.data.use_primary_album_artist=False
+    settings.data.skip_existing=True;settings.data.use_primary_album_artist=True
     settings.data.symlink_to_track=False;settings.data.album_track_num_pad_min=2
     settings.data.video_download=False;settings.data.download_dolby_atmos=False
     settings.data.extract_flac=True;settings.data.video_convert_mp4=False
@@ -184,7 +186,8 @@ def main():
     for queued in request['items']:
         if abort.is_set():break
         ident=str(queued['id']);release=queued['release']
-        emit('log',message=f"Downloading {release['artist']} — {release['title']}")
+        album_artist_name = release.get('artist') or ''
+        emit('log',message=f"Downloading {album_artist_name or 'Release'} — {release.get('title', '')}")
         selected=release.get('selected_tracks')
         destination=release.get('existing_destination')
         item_output=output
@@ -203,8 +206,17 @@ def main():
             if not tracks:raise ValueError('No audio tracks returned')
             if selected is None and release.get('track_count') is not None and len(tracks)!=release['track_count'] and not (not release.get('tracks_loaded') and int(getattr(album,'num_videos',0) or 0)>0 and len(tracks)+int(album.num_videos)==int(release['track_count'])):
                 raise ValueError('Incomplete album track list; review this release again')
+            if not album_artist_name:
+                if getattr(album, 'artist', None) and getattr(album.artist, 'name', None):
+                    album_artist_name = album.artist.name
+                elif getattr(album, 'artists', None):
+                    names = [a.name for a in album.artists if getattr(a, 'name', None)]
+                    if names:
+                        album_artist_name = ', '.join(names)
+            from library_manager.download_tags import DownloadMetadata
+            DownloadMetadata.current_album_artist = album_artist_name or None
             with tempfile.TemporaryDirectory(prefix='.tidaler-work-',dir=item_output) as temp:
-                stage=Path(temp)
+                stage=Path(temp).resolve()
                 progress=Progress(disable=True);overall=Progress(disable=True)
                 dl=Download(tidal_obj=tidal,path_base=str(stage),fn_logger=Log(),skip_existing=True,
                             progress=progress,progress_overall=overall,event_abort=abort,event_run=running)
@@ -228,9 +240,10 @@ def main():
                     if abort.is_set():break
                     if not success or not path or not Path(path).is_file():raise ValueError('Tidaler did not complete this track')
                     if not Path(path).resolve().is_relative_to(stage):raise ValueError('Unexpected download path')
-                    credits=lambda artists:[a.name for a in artists if getattr(a,'name',None)]
+                    track_artist_names = [a.name for a in track.artists if getattr(a, 'name', None)] if getattr(track, 'artists', None) else ([album_artist_name] if album_artist_name else [])
+                    album_artist_list = [album_artist_name] if album_artist_name else track_artist_names
                     disc=int(track.volume_num)
-                    metadata=dict(artist=credits(track.artists),albumartist=credits(album.artists),
+                    metadata=dict(artist=track_artist_names,albumartist=album_artist_list,
                                   album=[album.name+(f' ({album.version})' if getattr(album,'version',None) and str(album.version).casefold() not in album.name.casefold() else '')],title=[getattr(track,'full_name',None) or track.name],tracknumber=[track.track_num],
                                   tracktotal=[sum(int(t.volume_num)==disc for t in album_tracks)],
                                   discnumber=[disc],disctotal=[album.num_volumes if album.num_volumes and album.num_volumes>0 else max(int(t.volume_num) for t in album_tracks)])
