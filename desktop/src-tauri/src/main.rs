@@ -2096,7 +2096,7 @@ fn main() {
             if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
-                        "Tibrary v0.9.0-beta.3 ready · workspace initialized",
+                        "Tibrary v0.9.0-beta.4 ready · workspace initialized",
                         "info",
                         Some("general"),
                     );

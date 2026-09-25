@@ -171,7 +171,11 @@ pub async fn execute(
         if let Ok(mut client) = crate::tidal::TidalClient::from_db(db).await {
             let start = std::time::Instant::now();
             let result = client.authenticate().await;
-            metrics["catalogue"] = json!({"ok":result.is_ok(),"message":result.err().unwrap_or("Catalogue authentication verified".into()),"latency_ms":start.elapsed().as_millis()});
+            metrics["catalogue"] = json!({
+                "ok": result.is_ok(),
+                "message": result.err().unwrap_or_default(),
+                "latency_ms": start.elapsed().as_millis()
+            });
         } else {
             metrics["catalogue"] = json!({"ok":false,"message":"Application credentials required"});
         }
@@ -180,18 +184,38 @@ pub async fn execute(
             .build()
             .map_err(|e| e.to_string())?;
         let token = crate::stream_download::get_valid_token(db, &http).await;
+        let mut user_detail = String::new();
         let result = match token {
-            Ok(token) => http
+            Ok(token) => match http
                 .get("https://api.tidal.com/v1/sessions")
                 .bearer_auth(token)
                 .send()
                 .await
-                .and_then(|r| r.error_for_status())
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(sess) = resp.json::<Value>().await {
+                        if let Some(uid) = sess.get("userId").and_then(|v| v.as_i64()) {
+                            user_detail = format!("Account ID: {}", uid);
+                        }
+                    }
+                    Ok(())
+                }
+                Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                Err(e) => Err(e.to_string()),
+            },
             Err(e) => Err(e),
         };
-        metrics["download"] = json!({"ok":result.is_ok(),"message":result.err().unwrap_or("Account verified".into())});
+        if user_detail.is_empty() {
+            if let Some(tok) = crate::stream_download::load_saved_token(db).await {
+                if let Some(ref uid) = tok.user_id {
+                    user_detail = format!("Account ID: {}", uid);
+                }
+            }
+        }
+        metrics["download"] = json!({
+            "ok": result.is_ok(),
+            "message": result.err().unwrap_or(user_detail)
+        });
         let diagnostics = json!({"metrics":metrics,"checked_at":chrono::Utc::now().to_rfc3339()});
         db.set_preference("connection-diagnostics", &diagnostics)
             .await?;

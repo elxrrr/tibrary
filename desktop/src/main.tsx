@@ -1477,7 +1477,7 @@ function App() {
             ])}
             {field("Catalogue market", "general", "market")}
             <label className="setting-row">
-              <span>Cache and persist activity logs</span>
+              <span>Save activity logs</span>
               <input
                 type="checkbox"
                 checked={settings.general?.persist_logs !== false}
@@ -1486,9 +1486,6 @@ function App() {
                 }
               />
             </label>
-            <p>
-              Retain historical activity and error logs in database across app restarts.
-            </p>
           </section>
           <section className="card">
             <h2>Artist matching</h2>
@@ -1502,10 +1499,6 @@ function App() {
                 }
               />
             </label>
-            <p>
-              Artists need matching local release evidence. Name-only candidates
-              remain available for review.
-            </p>
             {field(
               "Release cache age (days, 0 = no expiry)",
               "links",
@@ -1557,30 +1550,37 @@ function App() {
         <>
           <div className="metrics">
             {Object.entries(state?.diagnostics?.metrics || {}).map(
-              ([key, m]: [string, any]) => (
-                <div className="metric static" key={key}>
-                  <span className="metric-title">
-                    {key === "download"
-                      ? "User"
-                      : key === "catalogue"
-                      ? "Catalogue"
-                      : key.charAt(0).toUpperCase() + key.slice(1)}
-                  </span>
-                  <strong>{m.ok ? "Connected" : "Needs attention"}</strong>
-                  <small>
-                    {m.latency_ms ? `${m.latency_ms} ms · ` : ""}
-                    {m.message}
-                  </small>
-                </div>
-              ),
+              ([key, m]: [string, any]) => {
+                const msg =
+                  m.message === "Catalogue authentication verified" ||
+                  m.message === "Account verified"
+                    ? ""
+                    : m.message || "";
+                return (
+                  <div className="metric static" key={key}>
+                    <span className="metric-title">
+                      {key === "download"
+                        ? "User"
+                        : key === "catalogue"
+                        ? "Catalogue"
+                        : key.charAt(0).toUpperCase() + key.slice(1)}
+                    </span>
+                    <strong>{m.ok ? "Connected" : "Needs attention"}</strong>
+                    <small>
+                      {[
+                        m.latency_ms ? `${m.latency_ms} ms` : "",
+                        msg,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </small>
+                  </div>
+                );
+              },
             )}
           </div>
           <section className="card">
             <h2>User account</h2>
-            <p>
-              Sign in with your account to sync favourite artists and access extended
-              BPM and musical key metadata.
-            </p>
             <div className="toolbar">
               <button
                 className={state?.connections.account ? "" : "primary"}
@@ -1633,6 +1633,7 @@ function App() {
             </label>
             <div className="toolbar">
               <button
+                className={state?.connections.configured ? "" : "primary"}
                 disabled={
                   busy ||
                   state?.connections.configured ||
@@ -1649,19 +1650,19 @@ function App() {
                     setCredentials({ client: "", secret: "" });
                 }}
               >
-                Save securely
+                Connect account
               </button>
               <button
                 disabled={busy || !state?.connections.configured}
                 onClick={() => mutate("credentials.forget")}
               >
-                Forget credentials
+                Disconnect account
               </button>
             </div>
           </section>
           <button disabled={busy} onClick={() => run("connections")}>
             <RefreshCw size={16} />
-            Test configured connections
+            Test connections
           </button>
         </>
       );
@@ -2040,7 +2041,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.3 · build 3</span>
+          <span className="sidebar-version">v0.9.0-beta.4 · build 4</span>
         </div>
       </aside>
       <main>
@@ -2221,21 +2222,6 @@ function App() {
                   />
                 </div>
                 <div className="activity-actions">
-                  <label className="cache-toggle" title="Keep activity logs cached in database across app restarts">
-                    <input
-                      type="checkbox"
-                      checked={settings?.general?.persist_logs !== false}
-                      onChange={(e) => {
-                        const enabled = e.target.checked;
-                        const nextGen = { ...(settings?.general || {}), persist_logs: enabled };
-                        setSettings((s: any) => s ? { ...s, general: nextGen } : s);
-                        saveSettings("desktop", nextGen);
-                        setToast(enabled ? "Log caching enabled" : "Log caching disabled");
-                        setTimeout(() => setToast(""), 2000);
-                      }}
-                    />
-                    <span>Cache logs</span>
-                  </label>
                   <span className="log-count">
                     {(() => {
                       const allLogs = state?.logs || [];
