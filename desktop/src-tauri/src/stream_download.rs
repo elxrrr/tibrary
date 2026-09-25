@@ -504,6 +504,21 @@ pub struct PlaybackStreamInfo {
     pub track_peak_amplitude: Option<f64>,
 }
 
+pub fn normalize_quality(q: &str) -> &'static str {
+    let lower = q.to_lowercase();
+    if lower.contains("hi_res") || lower.contains("24") || lower.contains("192") || lower.contains("hires") {
+        "HI_RES_LOSSLESS"
+    } else if lower.contains("lossless") || lower.contains("16") || lower.contains("44") || lower.contains("flac") {
+        "LOSSLESS"
+    } else if lower.contains("low") || lower.contains("96") {
+        "LOW"
+    } else if lower.contains("high") || lower.contains("320") || lower.contains("mp3") || lower.contains("aac") {
+        "HIGH"
+    } else {
+        "LOSSLESS"
+    }
+}
+
 /// Queries Tidal's playbackinfopostpaywall endpoint and parses manifest.
 pub async fn get_playback_info(
     http: &reqwest::Client,
@@ -512,9 +527,10 @@ pub async fn get_playback_info(
     quality: &str,
     market: &str,
 ) -> Result<PlaybackStreamInfo, String> {
+    let norm_quality = normalize_quality(quality);
     let url = format!(
         "{}/tracks/{}/playbackinfopostpaywall?audioquality={}&playbackmode=STREAM&assetpresentation=FULL",
-        API_V1_BASE, track_id, quality
+        API_V1_BASE, track_id, norm_quality
     );
 
     let res = http
@@ -1902,6 +1918,18 @@ mod tests {
         assert!(content.contains("01 Track One.flac\n02 Track Two.flac\n"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_normalize_quality() {
+        assert_eq!(normalize_quality("FLAC (24/192khz)"), "HI_RES_LOSSLESS");
+        assert_eq!(normalize_quality("HI_RES_LOSSLESS"), "HI_RES_LOSSLESS");
+        assert_eq!(normalize_quality("FLAC (16/44.1khz)"), "LOSSLESS");
+        assert_eq!(normalize_quality("LOSSLESS"), "LOSSLESS");
+        assert_eq!(normalize_quality("MP3 (320kbps)"), "HIGH");
+        assert_eq!(normalize_quality("HIGH"), "HIGH");
+        assert_eq!(normalize_quality("MP3 (96kbps)"), "LOW");
+        assert_eq!(normalize_quality("LOW"), "LOW");
     }
 
     fn hex_decode(s: &str) -> Vec<u8> {

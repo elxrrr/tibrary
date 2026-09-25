@@ -1857,7 +1857,13 @@ impl TursoDb {
     }
 
     pub async fn save_settings(&self, section: &str, values: &Value) -> Result<Value, String> {
-        let sec = if section == "ui" { "desktop" } else { section };
+        let sec = if section == "ui" || section == "general" {
+            "desktop"
+        } else if section == "links" {
+            "release_links"
+        } else {
+            section
+        };
         self.set_preference(sec, values).await?;
         if sec == "desktop" {
             let _ = self.set_preference("ui", values).await;

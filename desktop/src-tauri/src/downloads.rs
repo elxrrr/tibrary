@@ -236,11 +236,12 @@ impl DownloadManager {
 
             fs::create_dir_all(&item_output).map_err(|e| e.to_string())?;
 
-            let item_quality = release
+            let raw_quality = release
                 .get("replacement_audit")
                 .and_then(|v| v.get("quality"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(default_quality);
+            let item_quality = stream_download::normalize_quality(raw_quality);
 
             let token = get_valid_token(db, &http).await?;
             // Fetch album info and tracks

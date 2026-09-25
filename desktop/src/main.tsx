@@ -570,6 +570,21 @@ function App() {
   async function saveSettings(section: string, values: any) {
     const result = await mutate("settings.save", { section, values });
     if (result) setSettings(result);
+    return result;
+  }
+  async function updateSetting(section: string, key: string, value: any) {
+    const currentSection = settings?.[section] || {};
+    const nextSection = { ...currentSection, [key]: value };
+    setSettings((prev: any) => (prev ? { ...prev, [section]: nextSection } : prev));
+
+    const backendSection =
+      section === "general"
+        ? "desktop"
+        : section === "links"
+        ? "release_links"
+        : section;
+
+    await saveSettings(backendSection, nextSection);
   }
   async function exportQueue() {
     try {
@@ -1335,31 +1350,63 @@ function App() {
     label: string,
     section: string,
     key: string,
-    options?: string[],
+    options?: (string | { value: string | number; label: string })[],
     number = false,
   ) {
+    let curVal = settings[section]?.[key] ?? "";
+    if (key === "quality" && typeof curVal === "string") {
+      const lower = curVal.toLowerCase();
+      if (
+        lower.includes("hi_res") ||
+        lower.includes("24") ||
+        lower.includes("192") ||
+        lower.includes("hires")
+      ) {
+        curVal = "HI_RES_LOSSLESS";
+      } else if (lower.includes("low") || lower.includes("96")) {
+        curVal = "LOW";
+      } else if (
+        lower.includes("high") ||
+        lower.includes("320") ||
+        lower.includes("mp3") ||
+        lower.includes("aac")
+      ) {
+        curVal = "HIGH";
+      } else {
+        curVal = "LOSSLESS";
+      }
+    }
+
     return (
       <label className="setting-row">
         <span>{label}</span>
         {options ? (
           <select
-            value={settings[section]?.[key] ?? ""}
-            onChange={(e) =>
-              setSettings({
-                ...settings,
-                [section]: { ...settings[section], [key]: e.target.value },
-              })
-            }
+            value={String(curVal)}
+            onChange={(e) => {
+              const val = number ? Number(e.target.value) : e.target.value;
+              if (key === "theme") {
+                document.documentElement.dataset.theme = String(val);
+              }
+              updateSetting(section, key, val);
+            }}
           >
-            {options.map((v) => (
-              <option key={v} value={v}>
-                {key === "theme"
-                  ? v === "system"
-                    ? "System"
-                    : v[0].toUpperCase() + v.slice(1)
-                  : v}
-              </option>
-            ))}
+            {options.map((opt) => {
+              const val = typeof opt === "string" ? opt : String(opt.value);
+              const lab =
+                typeof opt === "string"
+                  ? key === "theme"
+                    ? opt === "system"
+                      ? "System"
+                      : opt[0].toUpperCase() + opt.slice(1)
+                    : opt
+                  : opt.label;
+              return (
+                <option key={val} value={val}>
+                  {lab}
+                </option>
+              );
+            })}
           </select>
         ) : (
           <input
@@ -1370,10 +1417,27 @@ function App() {
                 ...settings,
                 [section]: {
                   ...settings[section],
-                  [key]: number ? Number(e.target.value) : e.target.value,
+                  [key]: number
+                    ? e.target.value === ""
+                      ? 0
+                      : Number(e.target.value)
+                    : e.target.value,
                 },
               })
             }
+            onBlur={(e) => {
+              const val = number
+                ? e.target.value === ""
+                  ? 0
+                  : Number(e.target.value)
+                : e.target.value;
+              updateSetting(section, key, val);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.currentTarget.blur();
+              }
+            }}
           />
         )}
       </label>
@@ -1391,12 +1455,9 @@ function App() {
         <input
           type="checkbox"
           checked={Boolean(settings[section]?.[key])}
-          onChange={(e) =>
-            setSettings({
-              ...settings,
-              [section]: { ...settings[section], [key]: e.target.checked },
-            })
-          }
+          onChange={(e) => {
+            updateSetting(section, key, e.target.checked);
+          }}
         />
         {hint && <span className="hint">{hint}</span>}
       </label>
@@ -1421,25 +1482,13 @@ function App() {
                 type="checkbox"
                 checked={settings.general?.persist_logs !== false}
                 onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    general: {
-                      ...settings.general,
-                      persist_logs: e.target.checked,
-                    },
-                  })
+                  updateSetting("general", "persist_logs", e.target.checked)
                 }
               />
             </label>
             <p>
               Retain historical activity and error logs in database across app restarts.
             </p>
-            <button
-              disabled={busy}
-              onClick={() => saveSettings("desktop", settings.general)}
-            >
-              Save appearance & market
-            </button>
           </section>
           <section className="card">
             <h2>Artist matching</h2>
@@ -1447,15 +1496,9 @@ function App() {
               <span>Auto-accept verified release matches</span>
               <input
                 type="checkbox"
-                checked={settings.matching.enabled}
+                checked={Boolean(settings.matching?.enabled)}
                 onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    matching: {
-                      ...settings.matching,
-                      enabled: e.target.checked,
-                    },
-                  })
+                  updateSetting("matching", "enabled", e.target.checked)
                 }
               />
             </label>
@@ -1470,20 +1513,6 @@ function App() {
               undefined,
               true,
             )}
-            <div className="toolbar">
-              <button
-                disabled={busy}
-                onClick={() => saveSettings("matching", settings.matching)}
-              >
-                Save matching preferences
-              </button>
-              <button
-                disabled={busy}
-                onClick={() => saveSettings("release_links", settings.links)}
-              >
-                Save cache age
-              </button>
-            </div>
           </section>
           <section className="card">
             <div className="section-heading">
@@ -1666,22 +1695,27 @@ function App() {
           <label className="setting-row">
             <span>Download folder</span>
             <input
-              value={settings.downloads.output || ""}
+              value={settings.downloads?.output || ""}
               onChange={(e) =>
                 setSettings({
                   ...settings,
                   downloads: { ...settings.downloads, output: e.target.value },
                 })
               }
+              onBlur={(e) => updateSetting("downloads", "output", e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.currentTarget.blur();
+                }
+              }}
             />
             <button
               onClick={async () => {
                 const path = await open({ directory: true, multiple: false });
-                if (path)
-                  setSettings({
-                    ...settings,
-                    downloads: { ...settings.downloads, output: path },
-                  });
+                const selectedPath = Array.isArray(path) ? path[0] : path;
+                if (selectedPath && typeof selectedPath === "string") {
+                  updateSetting("downloads", "output", selectedPath);
+                }
               }}
             >
               Choose…
@@ -1711,38 +1745,22 @@ function App() {
               path punctuation is normalised.
             </p>
           </details>
-          <div className="toolbar">
-            <button
-              disabled={busy}
-              onClick={() => saveSettings("downloads", settings.downloads)}
-            >
-              Save download location
-            </button>
-            <button
-              disabled={busy}
-              onClick={() =>
-                saveSettings("organisation", settings.organisation)
-              }
-            >
-              Save folder structure
-            </button>
-          </div>
         </section>
         <section className="card">
           <h2>Download engine</h2>
           {field("Audio quality", "downloads", "quality", [
-            "LOSSLESS",
-            "HI_RES_LOSSLESS",
-            "HIGH",
-            "LOW",
+            { value: "HI_RES_LOSSLESS", label: "FLAC (24/192khz)" },
+            { value: "LOSSLESS", label: "FLAC (16/44.1khz)" },
+            { value: "HIGH", label: "MP3 (320kbps)" },
+            { value: "LOW", label: "MP3 (96kbps)" },
           ])}
           <p className="hint">
-            LOSSLESS: FLAC 16-bit / 44.1 kHz. HI_RES_LOSSLESS: FLAC up to 24-bit / 192 kHz. HIGH/LOW: AAC 320/96 kbps.
+            FLAC up to 24-bit / 192 kHz (Hi-Res Lossless), FLAC 16-bit / 44.1 kHz (Lossless CD quality), or compressed AAC/MP3.
           </p>
           {field("Embedded artwork size", "downloads", "cover_size", [
-            "1280",
-            "640",
-          ])}
+            { value: "1280", label: "1280 × 1280 px" },
+            { value: "640", label: "640 × 640 px" },
+          ], true)}
           {toggle("Skip already downloaded files", "downloads", "skip_existing")}
           {toggle("Save companion cover.jpg to album folder", "downloads", "cover_album_file")}
           {toggle("Embed lyrics into audio files", "downloads", "lyrics_embed")}
@@ -1766,16 +1784,6 @@ function App() {
           )}
           <div className="toolbar">
             <button
-              className="primary"
-              disabled={busy}
-              onClick={async () => {
-                await saveSettings("provider", settings.provider);
-                await saveSettings("downloads", settings.downloads);
-              }}
-            >
-              Save download settings
-            </button>
-            <button
               disabled={busy}
               onClick={async () => {
                 const v = await mutate("settings.reset", {
@@ -1785,17 +1793,6 @@ function App() {
               }}
             >
               Reset download defaults
-            </button>
-          </div>
-        </section>
-        <section className="card">
-          <h2>Native streaming engine</h2>
-          <p>
-            Downloads and audio tagging are included with the app. Engine updates arrive with app updates.
-          </p>
-          <div className="toolbar">
-            <button disabled={busy} onClick={() => run("component_check")}>
-              Engine status
             </button>
           </div>
         </section>
