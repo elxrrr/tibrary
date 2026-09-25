@@ -33,6 +33,7 @@ use db::TursoDb;
 
 #[derive(Default)]
 pub struct Backend {
+    pub db: Mutex<Option<Arc<TursoDb>>>,
     pub active_job_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub active_job: Mutex<Option<Value>>,
     pub logs: Mutex<Vec<Value>>,
@@ -43,6 +44,10 @@ pub struct Backend {
 impl Backend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_db(&self, db: Arc<TursoDb>) {
+        *self.db.lock().unwrap() = Some(db);
     }
 
     pub fn log(&self, msg: &str) {
@@ -66,34 +71,73 @@ impl Backend {
                 "general"
             }
         });
+        let at = chrono::Utc::now().to_rfc3339();
+        let log_level = if cat == "error" || level == "error" { "error" } else { level };
         let mut logs = self.logs.lock().unwrap();
         logs.push(json!({
-            "at": chrono::Utc::now().to_rfc3339(),
+            "at": &at,
             "message": msg,
-            "level": if cat == "error" || level == "error" { "error" } else { level },
+            "level": log_level,
             "category": cat
         }));
         if logs.len() > 1000 {
             logs.remove(0);
         }
+
+        // Persist to database if initialized
+        if let Some(db) = self.db.lock().unwrap().clone() {
+            let at_str = at;
+            let msg_str = msg.to_string();
+            let lvl_str = log_level.to_string();
+            let cat_str = cat.to_string();
+            tauri::async_runtime::spawn(async move {
+                let _ = db.log_activity(&at_str, &msg_str, &lvl_str, &cat_str).await;
+            });
+        }
     }
 
     pub fn start_job(&self, job: Value, cancel_flag: Arc<AtomicBool>) {
         if let Some(msg) = job.get("message").and_then(|v| v.as_str()) {
-            self.log(msg);
+            let kind = job.get("kind").and_then(|v| v.as_str());
+            let cat = match kind {
+                Some("scan") => Some("scan"),
+                Some("download") => Some("download"),
+                Some("link") => Some("linking"),
+                Some(k) if k.contains("duplicate") || k.contains("organise") || k.contains("correct") => Some("cleanup"),
+                _ => None,
+            };
+            self.log_with_category(msg, "info", cat);
         }
         *self.active_job_cancel.lock().unwrap() = Some(cancel_flag);
         *self.active_job.lock().unwrap() = Some(job);
     }
 
     pub fn update_job_progress(&self, msg: &str, job: Value) {
-        self.log(msg);
+        let kind = job.get("kind").and_then(|v| v.as_str());
+        let cat = match kind {
+            Some("scan") => Some("scan"),
+            Some("download") => Some("download"),
+            Some("link") => Some("linking"),
+            Some(k) if k.contains("duplicate") || k.contains("organise") || k.contains("correct") => Some("cleanup"),
+            _ => None,
+        };
+        self.log_with_category(msg, "info", cat);
         *self.active_job.lock().unwrap() = Some(job);
     }
 
     pub fn finish_job(&self, final_job: Value) {
         if let Some(msg) = final_job.get("message").and_then(|v| v.as_str()) {
-            self.log(msg);
+            let kind = final_job.get("kind").and_then(|v| v.as_str());
+            let status = final_job.get("status").and_then(|v| v.as_str());
+            let cat = match kind {
+                Some("scan") => Some("scan"),
+                Some("download") => Some("download"),
+                Some("link") => Some("linking"),
+                Some(k) if k.contains("duplicate") || k.contains("organise") || k.contains("correct") => Some("cleanup"),
+                _ => None,
+            };
+            let lvl = if status == Some("failed") { "error" } else { "info" };
+            self.log_with_category(msg, lvl, cat);
         }
         *self.active_job.lock().unwrap() = Some(final_job);
         *self.active_job_cancel.lock().unwrap() = None;
@@ -103,7 +147,7 @@ impl Backend {
         let cancel_flag = self.active_job_cancel.lock().unwrap().clone();
         if let Some(flag) = cancel_flag {
             flag.store(true, Ordering::Relaxed);
-            self.log(cancel_msg);
+            self.log_with_category(cancel_msg, "warn", Some("general"));
             let mut lock = self.active_job.lock().unwrap();
             if let Some(active) = lock.as_mut() {
                 if let Some(obj) = active.as_object_mut() {
@@ -339,7 +383,15 @@ async fn handle_rpc_call(
     // STATE & SETTINGS
     if method == "state" {
         let active = state.active_job.lock().unwrap().clone();
-        let logs = state.logs.lock().unwrap().clone();
+        let mut logs = state.logs.lock().unwrap().clone();
+        if logs.is_empty() {
+            if let Ok(loaded) = db.load_recent_logs(500).await {
+                if !loaded.is_empty() {
+                    *state.logs.lock().unwrap() = loaded.clone();
+                    logs = loaded;
+                }
+            }
+        }
         let root = args.get("root").and_then(|v| v.as_str());
         return db.get_state(active, &logs, root).await;
     }
@@ -364,11 +416,20 @@ async fn handle_rpc_call(
         return Ok(res);
     }
     if method == "logs" {
-        let logs = state.logs.lock().unwrap().clone();
+        let mut logs = state.logs.lock().unwrap().clone();
+        if logs.is_empty() {
+            if let Ok(loaded) = db.load_recent_logs(500).await {
+                if !loaded.is_empty() {
+                    *state.logs.lock().unwrap() = loaded.clone();
+                    logs = loaded;
+                }
+            }
+        }
         return Ok(json!(logs));
     }
     if method == "logs.clear" {
         state.logs.lock().unwrap().clear();
+        let _ = db.clear_logs().await;
         return Ok(json!({ "cleared": true }));
     }
 
@@ -461,7 +522,8 @@ async fn handle_rpc_call(
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "artists" {
-            let page = db.get_artist_rows(filter, search, sort, direction, offset, limit).await?;
+            let root = args.get("root").and_then(|v| v.as_str());
+            let page = db.get_artist_rows(root, filter, search, sort, direction, offset, limit).await?;
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "favourites" {
@@ -1725,6 +1787,12 @@ fn main() {
         rt.block_on(async move {
             let turso_db = TursoDb::open(&db_path).await.expect("Failed to open DB");
             let backend = Arc::new(Backend::new());
+            backend.set_db(Arc::new(turso_db.clone()));
+            if let Ok(loaded) = turso_db.load_recent_logs(500).await {
+                if !loaded.is_empty() {
+                    *backend.logs.lock().unwrap() = loaded;
+                }
+            }
 
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
@@ -1750,8 +1818,8 @@ fn main() {
     let backend = Arc::new(Backend::new());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(backend)
-        .setup(|app| {
+        .manage(backend.clone())
+        .setup(move |app| {
             let db_path = if let Ok(db) = std::env::var("TIBRARY_TEST_DB") {
                 std::path::PathBuf::from(db)
             } else {
@@ -1767,6 +1835,14 @@ fn main() {
             };
             let turso_db = tauri::async_runtime::block_on(TursoDb::open(&db_path))
                 .map_err(|e| tauri::Error::from(std::io::Error::other(e)))?;
+            backend.set_db(Arc::new(turso_db.clone()));
+            if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
+                if loaded.is_empty() {
+                    backend.log_with_category("Tibrary v0.9.0-beta.1 ready · workspace initialized", "info", Some("general"));
+                } else {
+                    *backend.logs.lock().unwrap() = loaded;
+                }
+            }
             app.manage(turso_db);
             Ok(())
         })

@@ -269,18 +269,22 @@ function App() {
   const busy = submitting || active(state?.job);
   const tree = ["missing", "queue", "downloaded"].includes(route);
   const notifyError = (e: any) => setError(String(e?.message || e));
-  async function refresh() {
+  async function refresh(targetRoot?: string) {
     try {
-      const s = await call<AppState>("state");
+      const activeRoot = targetRoot !== undefined ? targetRoot : root;
+      const s = await call<AppState>("state", activeRoot ? { root: activeRoot } : {});
       setState(s);
-      if (!s.roots.some((r) => r.root === root))
+      if (!activeRoot && s.roots.length > 0) {
+        setRoot(s.roots[0].root);
+      } else if (activeRoot && !s.roots.some((r) => r.root === activeRoot)) {
         setRoot(s.roots[0]?.root || "");
+      }
     } catch (e) {
       notifyError(e);
     }
   }
   useEffect(() => {
-    refresh();
+    refresh(root);
     call("settings").then(setSettings).catch(notifyError);
   }, []);
   useEffect(() => {
@@ -288,6 +292,7 @@ function App() {
     setSelected(new Set());
     setOffset(0);
     setPreview(undefined);
+    refresh(root);
   }, [root]);
   useEffect(() => {
     localStorage.setItem("tibrary.route", route);
@@ -1481,6 +1486,30 @@ function App() {
               </div>
             ))}
           </section>
+          <section className="card about-card">
+            <h2>About Tibrary</h2>
+            <div className="about-details">
+              <div className="about-field">
+                <span className="about-label">Version</span>
+                <span className="about-val">v0.9.0-beta.1 (pre-1.0)</span>
+              </div>
+              <div className="about-field">
+                <span className="about-label">Architecture</span>
+                <span className="about-val">Native Rust + Tauri v2 Core</span>
+              </div>
+              <div className="about-field">
+                <span className="about-label">Database</span>
+                <span className="about-val">Turso / libsql Embedded SQLite</span>
+              </div>
+              <div className="about-field">
+                <span className="about-label">Audio Engine</span>
+                <span className="about-val">Native AES-CBC / MPEG-DASH / Lofty / Claxon (Pure Rust)</span>
+              </div>
+            </div>
+            <p className="about-description">
+              Tibrary is a local-first music library manager and lossless acquisition companion designed for precision audio workflows, automated discography syncing, and duplicate consolidation.
+            </p>
+          </section>
         </>
       );
     if (route === "connections")
@@ -2012,6 +2041,9 @@ function App() {
               ))}
           </div>
         ))}
+        <div className="sidebar-bottom">
+          <span className="sidebar-version">v0.9.0-beta.1</span>
+        </div>
       </aside>
       <main>
         <header className="page-header">

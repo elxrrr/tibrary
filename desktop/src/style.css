@@ -228,6 +228,12 @@ aside {
   flex-direction: column;
   gap: 5px;
 }
+.sidebar-version {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
 .brand {
   display: flex;
   gap: 8px;
@@ -609,17 +615,27 @@ tr.child td {
 .badge.linked,
 .badge.recommended,
 .badge.confirmed,
+.badge.auto,
+.badge.auto-matched,
 .badge.downloaded {
   background: #4d95681b;
   color: color-mix(in srgb, var(--text) 45%, #43805b);
 }
 .badge.potential,
 .badge.needs-choice,
+.badge.needs-review,
+.badge.review,
 .badge.unresolved,
 .badge.multi-duplicate,
 .badge.duplicate {
   background: #bf94321a;
   color: color-mix(in srgb, var(--text) 50%, #ba8b22);
+}
+.badge.suspect,
+.badge.unavailable,
+.badge.unlinked {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
 }
 .badge.chained-duplicate {
   background: #7c3aed1a;
@@ -1121,3 +1137,38 @@ dialog p {
 .overview-list .library-row > span {
   flex-shrink: 0;
 }
+
+.about-card .about-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin: 14px 0 10px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+.about-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.about-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  font-weight: 600;
+}
+.about-val {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.about-description {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin-top: 6px;
+}
+
