@@ -2,7 +2,7 @@ use base64::prelude::*;
 use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -22,7 +22,8 @@ pub struct TidalTrackSearchResult {
     pub album_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TidalTrack {
     pub id: String,
     pub title: String,
@@ -36,7 +37,8 @@ pub struct TidalTrack {
     pub copyright: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TidalRelease {
     pub id: String,
     pub artist: String,
@@ -53,11 +55,39 @@ pub struct TidalRelease {
     pub tracks_loaded: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TidalCatalogue {
     pub id: String,
     pub name: String,
     pub releases: Vec<TidalRelease>,
+}
+
+type CachedToken = (String, String, String, f64);
+type CachedCredentials = (std::time::Instant, Option<(String, String)>);
+static CREDENTIAL_CACHE: std::sync::Mutex<Option<CachedCredentials>> = std::sync::Mutex::new(None);
+static TOKEN_CACHE: std::sync::Mutex<Option<CachedToken>> = std::sync::Mutex::new(None);
+
+pub fn catalogue_next(current: &str, next: &str) -> Result<String, String> {
+    let current = Url::parse(current).map_err(|e| e.to_string())?;
+    let mut target = current.join(next).map_err(|e| e.to_string())?;
+    if target.scheme() != "https"
+        || target.host_str() != Some("openapi.tidal.com")
+        || target.port().is_some_and(|p| p != 443)
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
+        return Err("Rejected unexpected catalogue pagination destination".into());
+    }
+    if !target.path().starts_with("/v2/") {
+        target.set_path(&format!("/v2{}", target.path()));
+    }
+    if !target.query_pairs().any(|(k, _)| k == "countryCode") {
+        if let Some((_, market)) = current.query_pairs().find(|(k, _)| k == "countryCode") {
+            target.query_pairs_mut().append_pair("countryCode", &market);
+        }
+    }
+    Ok(target.to_string())
 }
 
 pub struct TidalClient {
@@ -66,6 +96,8 @@ pub struct TidalClient {
     http: reqwest::Client,
     token: Option<String>,
     expires_at: f64,
+    request_spacing: Duration,
+    attempts: usize,
 }
 
 impl TidalClient {
@@ -81,7 +113,34 @@ impl TidalClient {
             http,
             token: None,
             expires_at: 0.0,
+            request_spacing: Duration::from_millis(350),
+            attempts: 3,
         }
+    }
+
+    pub async fn from_db(db: &TursoDb) -> Result<Self, String> {
+        let mut client =
+            Self::from_env_or_keychain().ok_or("Configure catalogue credentials in Settings")?;
+        let settings = db.get_preference("provider").await?.unwrap_or(Value::Null);
+        client.request_spacing = Duration::from_millis(
+            settings["request_interval_ms"]
+                .as_u64()
+                .unwrap_or(750)
+                .clamp(100, 10000),
+        );
+        client.attempts = settings["request_attempts"]
+            .as_u64()
+            .unwrap_or(2)
+            .clamp(1, 5) as usize;
+        let timeout = settings["request_timeout_sec"]
+            .as_u64()
+            .unwrap_or(20)
+            .clamp(5, 120);
+        client.http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(client)
     }
 
     pub fn from_env_or_keychain() -> Option<Self> {
@@ -97,6 +156,31 @@ impl TidalClient {
             }
         }
 
+        if std::env::var_os("TIBRARY_TEST_MODE").is_some() {
+            return None;
+        }
+
+        {
+            let cache = CREDENTIAL_CACHE.lock().unwrap();
+            if let Some((checked, credentials)) = cache.as_ref() {
+                if checked.elapsed() < Duration::from_secs(30) {
+                    return credentials
+                        .as_ref()
+                        .map(|(id, secret)| Self::new(id, secret));
+                }
+            }
+        }
+        let result = Self::read_keychain();
+        *CREDENTIAL_CACHE.lock().unwrap() = Some((
+            std::time::Instant::now(),
+            result
+                .as_ref()
+                .map(|c| (c.client_id.clone(), c.client_secret.clone())),
+        ));
+        result
+    }
+
+    fn read_keychain() -> Option<Self> {
         // 2. macOS Keychain
         #[cfg(target_os = "macos")]
         {
@@ -125,6 +209,27 @@ impl TidalClient {
                             }
                         }
                     }
+                    // Migrate the split credential format written by the early Rust UI.
+                    if !stdout.trim().is_empty() && !stdout.trim().starts_with('{') {
+                        if let Ok(secret) = std::process::Command::new("security")
+                            .args([
+                                "find-generic-password",
+                                "-s",
+                                "Tibrary",
+                                "-a",
+                                "catalogue-secret",
+                                "-w",
+                            ])
+                            .output()
+                        {
+                            if secret.status.success() {
+                                return Some(Self::new(
+                                    stdout.trim(),
+                                    String::from_utf8_lossy(&secret.stdout).trim(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -135,17 +240,35 @@ impl TidalClient {
     pub fn save_credentials(client: &str, secret: &str) -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("security")
-                .args(["add-generic-password", "-U", "-s", "Tibrary", "-a", "catalogue-client", "-w", client])
-                .output();
-            let _ = std::process::Command::new("security")
-                .args(["add-generic-password", "-U", "-s", "Tibrary", "-a", "catalogue-secret", "-w", secret])
-                .output();
+            if client.trim().is_empty() || secret.trim().is_empty() {
+                return Err(std::io::Error::other("Client ID and secret are required"));
+            }
+            let payload =
+                serde_json::json!({"id":client.trim(),"secret":secret.trim()}).to_string();
+            let output = std::process::Command::new("security")
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-s",
+                    "Tibrary",
+                    "-a",
+                    "catalogue-client",
+                    "-w",
+                    &payload,
+                ])
+                .output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(
+                    "macOS Keychain could not save the credentials",
+                ));
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (client, secret);
         }
+        *CREDENTIAL_CACHE.lock().unwrap() = None;
+        *TOKEN_CACHE.lock().unwrap() = None;
         Ok(())
     }
 
@@ -153,12 +276,26 @@ impl TidalClient {
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("security")
-                .args(["delete-generic-password", "-s", "Tibrary", "-a", "catalogue-client"])
+                .args([
+                    "delete-generic-password",
+                    "-s",
+                    "Tibrary",
+                    "-a",
+                    "catalogue-client",
+                ])
                 .output();
             let _ = std::process::Command::new("security")
-                .args(["delete-generic-password", "-s", "Tibrary", "-a", "catalogue-secret"])
+                .args([
+                    "delete-generic-password",
+                    "-s",
+                    "Tibrary",
+                    "-a",
+                    "catalogue-secret",
+                ])
                 .output();
         }
+        *CREDENTIAL_CACHE.lock().unwrap() = None;
+        *TOKEN_CACHE.lock().unwrap() = None;
         Ok(())
     }
 
@@ -218,6 +355,12 @@ impl TidalClient {
 
         self.expires_at = now + expires_in - 30.0; // Refresh 30s before expiry
         self.token = Some(token.clone());
+        *TOKEN_CACHE.lock().unwrap() = Some((
+            self.client_id.clone(),
+            self.client_secret.clone(),
+            token.clone(),
+            self.expires_at,
+        ));
 
         Ok(token)
     }
@@ -234,30 +377,91 @@ impl TidalClient {
             }
         }
 
+        if let Some((id, secret, token, expiry)) = TOKEN_CACHE.lock().unwrap().as_ref() {
+            if id == &self.client_id && secret == &self.client_secret && now < *expiry {
+                self.token = Some(token.clone());
+                self.expires_at = *expiry;
+                return Ok(token.clone());
+            }
+        }
         self.authenticate().await
     }
 
     pub async fn get_json(&mut self, url: &str) -> Result<Value, String> {
-        let token = self.get_token().await?;
-
-        let res = self
-            .http
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .header(ACCEPT, "application/vnd.api+json")
-            .send()
-            .await
-            .map_err(|e| format!("Request to {} failed: {}", url, e))?;
-
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            return Err(format!("TIDAL API HTTP {}: {}", status, body));
+        let parsed = Url::parse(url).map_err(|e| e.to_string())?;
+        if parsed.scheme() != "https"
+            || parsed.host_str() != Some("openapi.tidal.com")
+            || !parsed.path().starts_with("/v2/")
+        {
+            return Err("Rejected unexpected catalogue URL".into());
         }
-
-        res.json::<Value>()
-            .await
-            .map_err(|e| format!("Failed to parse JSON response: {}", e))
+        static PACER: std::sync::OnceLock<tokio::sync::Mutex<std::time::Instant>> =
+            std::sync::OnceLock::new();
+        for attempt in 0..self.attempts {
+            let mut last = PACER
+                .get_or_init(|| {
+                    tokio::sync::Mutex::new(std::time::Instant::now() - Duration::from_secs(1))
+                })
+                .lock()
+                .await;
+            let wait = self.request_spacing.saturating_sub(last.elapsed());
+            tokio::time::sleep(wait).await;
+            *last = std::time::Instant::now();
+            drop(last);
+            let token = self.get_token().await?;
+            let res = self
+                .http
+                .get(url)
+                .bearer_auth(token)
+                .header(ACCEPT, "application/vnd.api+json")
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = res.status();
+            if status.is_success() {
+                return res
+                    .json()
+                    .await
+                    .map_err(|e| format!("Invalid catalogue response: {e}"));
+            }
+            if status.as_u16() == 401 && attempt == 0 {
+                self.token = None;
+                *TOKEN_CACHE.lock().unwrap() = None;
+                continue;
+            }
+            if (status.as_u16() == 429 || status.is_server_error()) && attempt + 1 < self.attempts {
+                let wait = res
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(4 * (attempt as u64 + 1));
+                if wait > 60 {
+                    return Err(format!("Service rate limit: retry after {wait} seconds"));
+                }
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+            let body: Value = res.json().await.unwrap_or(Value::Null);
+            let detail = body["errors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e["detail"].as_str().or(e["title"].as_str()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "Catalogue {} failed (HTTP {}){}",
+                parsed.path(),
+                status.as_u16(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", detail.chars().take(400).collect::<String>())
+                }
+            ));
+        }
+        Err("Catalogue retry limit reached".into())
     }
 
     pub async fn search_artists(
@@ -265,8 +469,8 @@ impl TidalClient {
         query: &str,
         market: &str,
     ) -> Result<Vec<TidalArtist>, String> {
-        let mut url = Url::parse("https://openapi.tidal.com/v2/searchResults")
-            .map_err(|e| e.to_string())?;
+        let mut url =
+            Url::parse("https://openapi.tidal.com/v2/searchResults").map_err(|e| e.to_string())?;
         url.query_pairs_mut()
             .append_pair("filter[query]", query)
             .append_pair("countryCode", market);
@@ -291,11 +495,16 @@ impl TidalClient {
                 market
             );
 
-            if let Ok(rel_payload) = self.get_json(&rel_url).await {
+            {
+                let rel_payload = self.get_json(&rel_url).await?;
                 if let Some(included) = rel_payload.get("included").and_then(|v| v.as_array()) {
                     for inc in included {
                         if inc.get("type").and_then(|v| v.as_str()) == Some("artists") {
-                            let id = inc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let id = inc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let name = inc
                                 .get("attributes")
                                 .and_then(|a| a.get("name"))
@@ -319,8 +528,8 @@ impl TidalClient {
         query: &str,
         market: &str,
     ) -> Result<Vec<TidalTrackSearchResult>, String> {
-        let mut url = Url::parse("https://openapi.tidal.com/v2/searchResults")
-            .map_err(|e| e.to_string())?;
+        let mut url =
+            Url::parse("https://openapi.tidal.com/v2/searchResults").map_err(|e| e.to_string())?;
         url.query_pairs_mut()
             .append_pair("filter[query]", query)
             .append_pair("countryCode", market);
@@ -345,11 +554,16 @@ impl TidalClient {
                 market
             );
 
-            if let Ok(rel_payload) = self.get_json(&rel_url).await {
+            {
+                let rel_payload = self.get_json(&rel_url).await?;
                 if let Some(included) = rel_payload.get("included").and_then(|v| v.as_array()) {
                     for inc in included {
                         if inc.get("type").and_then(|v| v.as_str()) == Some("tracks") {
-                            let id = inc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let id = inc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let title_val = inc
                                 .get("attributes")
                                 .and_then(|a| a.get("title"))
@@ -416,7 +630,11 @@ impl TidalClient {
         ));
 
         let mut releases = Vec::new();
+        let mut visited = std::collections::HashSet::new();
         while let Some(current_url) = next_url.take() {
+            if !visited.insert(current_url.clone()) {
+                return Err("Catalogue pagination repeated a page".into());
+            }
             let payload = self.get_json(&current_url).await?;
 
             if let Some(included) = payload.get("included").and_then(|v| v.as_array()) {
@@ -425,14 +643,22 @@ impl TidalClient {
                         continue;
                     }
 
-                    let rel_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let rel_id = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let attrs = item.get("attributes").cloned().unwrap_or(Value::Null);
 
                     let title_raw = attrs.get("title").and_then(|v| v.as_str()).unwrap_or("");
                     let version_raw = attrs.get("version").and_then(|v| v.as_str());
                     let title = format_title(title_raw, version_raw);
 
-                    let date = attrs.get("releaseDate").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let date = attrs
+                        .get("releaseDate")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let rel_type = attrs
                         .get("albumType")
                         .or_else(|| attrs.get("type"))
@@ -447,14 +673,23 @@ impl TidalClient {
 
                     let availability = attrs.get("availability").and_then(|v| v.as_array());
                     let is_available = availability.map(|arr| {
-                        arr.iter().any(|s| {
-                            s.as_str() == Some("STREAM") || s.as_str() == Some("DJ")
-                        })
+                        arr.iter()
+                            .any(|s| s.as_str() == Some("STREAM") || s.as_str() == Some("DJ"))
                     });
 
-                    let explicit = attrs.get("explicit").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let copyright = attrs.get("copyright").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let label = attrs.get("recordLabel").or_else(|| attrs.get("label")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let explicit = attrs
+                        .get("explicit")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let copyright = attrs
+                        .get("copyright")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let label = attrs
+                        .get("recordLabel")
+                        .or_else(|| attrs.get("label"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
                     let quality = attrs
                         .get("mediaTags")
@@ -484,7 +719,8 @@ impl TidalClient {
                     };
 
                     if detailed {
-                        if let Ok(tracks) = self.get_release_details(&rel_id, market).await {
+                        {
+                            let tracks = self.get_release_details(&rel_id, market).await?;
                             release.track_count = tracks.len();
                             release.tracks = tracks;
                             release.tracks_loaded = true;
@@ -495,20 +731,12 @@ impl TidalClient {
                 }
             }
 
-            // Check pagination
-            next_url = payload
-                .get("links")
-                .and_then(|l| l.get("next"))
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    if s.starts_with("http") {
-                        s.to_string()
-                    } else if s.starts_with("/v2/") {
-                        format!("https://openapi.tidal.com{}", s)
-                    } else {
-                        format!("https://openapi.tidal.com/v2{}", s)
-                    }
-                });
+            next_url = payload["links"]["next"]
+                .as_str()
+                .or_else(|| payload["links"]["next"]["href"].as_str())
+                .map(|next| catalogue_next(&current_url, next))
+                .transpose()
+                .map_err(|e| e.to_string())?;
         }
 
         Ok(TidalCatalogue {
@@ -523,61 +751,26 @@ impl TidalClient {
         release_id: &str,
         market: &str,
     ) -> Result<Vec<TidalTrack>, String> {
-        let url = format!(
-            "https://openapi.tidal.com/v2/albums/{}/relationships/items?countryCode={}&include=items",
-            release_id, market
-        );
-        let payload = self.get_json(&url).await?;
-
+        let mut next=Some(format!("https://openapi.tidal.com/v2/albums/{release_id}/relationships/items?countryCode={market}&include=items"));
         let mut tracks = Vec::new();
-        if let Some(included) = payload.get("included").and_then(|v| v.as_array()) {
-            for item in included {
-                if item.get("type").and_then(|v| v.as_str()) != Some("tracks") {
-                    continue;
-                }
-
-                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let attrs = item.get("attributes").cloned().unwrap_or(Value::Null);
-
-                let raw_title = attrs.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let raw_ver = attrs.get("version").and_then(|v| v.as_str());
-                let title = format_title(raw_title, raw_ver);
-
-                let isrc = attrs.get("isrc").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-                let track_num = attrs
-                    .get("trackNumber")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as u32;
-
-                let disc_num = attrs
-                    .get("volumeNumber")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as u32;
-
-                let dur_str = attrs.get("duration").and_then(|v| v.as_str()).unwrap_or("");
-                let duration = parse_iso8601_duration(dur_str).unwrap_or(0.0);
-
-                let bpm = attrs.get("bpm").and_then(|v| v.as_f64());
-                let key = attrs.get("key").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let key_scale = attrs.get("keyScale").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let copyright = attrs.get("copyright").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-                tracks.push(TidalTrack {
-                    id,
-                    title,
-                    isrc,
-                    track_number: track_num,
-                    disc_number: disc_num,
-                    duration,
-                    bpm,
-                    key,
-                    key_scale,
-                    copyright,
-                });
+        let mut visited = std::collections::HashSet::new();
+        while let Some(url) = next {
+            if !visited.insert(url.clone()) {
+                return Err("Catalogue pagination repeated a page".into());
             }
+            let payload = self.get_json(&url).await?;
+            tracks.extend(parse_release_tracks(&payload)?);
+            next = payload["links"]["next"]
+                .as_str()
+                .or_else(|| payload["links"]["next"]["href"].as_str())
+                .map(|n| catalogue_next(&url, n))
+                .transpose()
+                .map_err(|e| e.to_string())?;
         }
-
+        tracks.sort_by_key(|t| (t.disc_number, t.track_number));
+        tracks.dedup_by(|a, b| {
+            a.id == b.id && a.disc_number == b.disc_number && a.track_number == b.track_number
+        });
         Ok(tracks)
     }
 
@@ -588,7 +781,35 @@ impl TidalClient {
         catalogue: &TidalCatalogue,
     ) -> Result<(), String> {
         let conn = db.connect()?;
-        let json_payload = serde_json::to_string(catalogue).map_err(|e| e.to_string())?;
+        let mut payload = serde_json::to_value(catalogue).map_err(|e| e.to_string())?;
+        let mut previous = conn
+            .query(
+                "SELECT payload FROM catalogue WHERE artist_id=? AND market=?",
+                (catalogue.id.as_str(), market),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(row) = previous.next().await.map_err(|e| e.to_string())? {
+            let raw: String = row.get(0).map_err(|e| e.to_string())?;
+            if let Ok(old) = serde_json::from_str::<Value>(&raw) {
+                if let (Some(fresh), Some(prior)) = (
+                    payload["releases"].as_array_mut(),
+                    old["releases"].as_array(),
+                ) {
+                    for release in fresh {
+                        if let Some(cached) = prior.iter().find(|r| r["id"] == release["id"]) {
+                            if release["tracks_loaded"] != true && cached["tracks_loaded"] == true {
+                                release["tracks"] = cached["tracks"].clone();
+                                release["tracks_loaded"] = json!(true);
+                                release["track_count"] = cached["track_count"].clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        drop(previous);
+        let json_payload = payload.to_string();
         let now_str = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -598,8 +819,55 @@ impl TidalClient {
         .await
         .map_err(|e| e.to_string())?;
 
+        db.bump_revision();
         Ok(())
     }
+}
+
+pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> {
+    let included = payload["included"]
+        .as_array()
+        .ok_or("Release details missing included items")?;
+    let data = payload["data"]
+        .as_array()
+        .ok_or("Release details missing item order")?;
+    let mut tracks = vec![];
+    for reference in data {
+        if reference["type"] != "tracks" {
+            continue;
+        }
+        let item = included
+            .iter()
+            .find(|i| i["id"] == reference["id"] && i["type"] == "tracks")
+            .ok_or("Incomplete release track details")?;
+        let a = &item["attributes"];
+        let m = &reference["meta"];
+        tracks.push(TidalTrack {
+            id: item["id"].as_str().ok_or("Missing track ID")?.into(),
+            title: format_title(a["title"].as_str().unwrap_or(""), a["version"].as_str()),
+            isrc: a["isrc"].as_str().map(str::to_owned),
+            track_number: m["trackNumber"]
+                .as_u64()
+                .or_else(|| a["trackNumber"].as_u64())
+                .unwrap_or(0) as u32,
+            disc_number: m["volumeNumber"]
+                .as_u64()
+                .or_else(|| a["volumeNumber"].as_u64())
+                .unwrap_or(1) as u32,
+            duration: a["duration"]
+                .as_str()
+                .and_then(parse_iso8601_duration)
+                .unwrap_or(0.),
+            bpm: a["bpm"].as_f64(),
+            key: a["key"].as_str().map(str::to_owned),
+            key_scale: a["keyScale"].as_str().map(str::to_owned),
+            copyright: a["copyright"]
+                .as_str()
+                .or_else(|| a["copyright"]["text"].as_str())
+                .map(str::to_owned),
+        });
+    }
+    Ok(tracks)
 }
 
 pub fn format_title(title: &str, version: Option<&str>) -> String {
@@ -643,6 +911,27 @@ fn urlencoding_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pagination_preserves_api_prefix_and_market() {
+        let current =
+            "https://openapi.tidal.com/v2/artists/123/relationships/albums?countryCode=GB";
+        assert_eq!(
+            super::catalogue_next(current, "/artists/123/relationships/albums?page=2").unwrap(),
+            "https://openapi.tidal.com/v2/artists/123/relationships/albums?page=2&countryCode=GB"
+        );
+        assert!(super::catalogue_next(current, "https://example.com/page").is_err());
+        assert!(super::catalogue_next(current, "http://openapi.tidal.com/page").is_err());
+    }
+
+    #[test]
+    fn release_relationship_positions_exclude_video() {
+        let payload = serde_json::json!({"data":[{"id":"t","type":"tracks","meta":{"trackNumber":5,"volumeNumber":2}},{"id":"v","type":"videos"}],"included":[{"id":"t","type":"tracks","attributes":{"title":"Song","duration":"PT3M","trackNumber":1}}]});
+        let tracks = super::parse_release_tracks(&payload).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!((tracks[0].disc_number, tracks[0].track_number), (2, 5));
+        assert_eq!(tracks[0].duration, 180.0);
+    }
+
     use super::*;
 
     #[test]
@@ -668,6 +957,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Explicit credential-store integration check"]
     fn test_from_env_or_keychain() {
         // Test loading client from Keychain / env
         let client = TidalClient::from_env_or_keychain();
@@ -678,6 +968,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Explicit live catalogue check; uses saved credentials and API quota"]
     async fn test_online_search_artists() {
         if let Some(mut client) = TidalClient::from_env_or_keychain() {
             let artists = client.search_artists("100 gecs", "GB").await.unwrap();
@@ -686,8 +977,14 @@ mod tests {
             let gecs = artists.iter().find(|a| a.name.to_lowercase() == "100 gecs");
             assert!(gecs.is_some(), "Should find 100 gecs artist");
             let artist = gecs.unwrap();
-            let cat = client.get_artist_catalogue(&artist.id, "GB", false).await.unwrap();
-            assert!(!cat.releases.is_empty(), "Should find releases for 100 gecs");
+            let cat = client
+                .get_artist_catalogue(&artist.id, "GB", false)
+                .await
+                .unwrap();
+            assert!(
+                !cat.releases.is_empty(),
+                "Should find releases for 100 gecs"
+            );
             println!("Found {} releases for {}:", cat.releases.len(), cat.name);
             for r in &cat.releases {
                 println!("  - [{}] {} ({})", r.id, r.title, r.date);

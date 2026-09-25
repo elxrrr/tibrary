@@ -102,7 +102,11 @@ pub fn decrypt_security_token(security_token_b64: &str) -> Result<([u8; 16], [u8
 /// Decrypts stream audio bytes in place using AES-128-CTR.
 /// The 128-bit counter block starts with the 8-byte nonce as prefix (upper 64 bits)
 /// and a 64-bit big-endian counter starting at 0.
-pub fn decrypt_stream_bytes(data: &mut [u8], key: &[u8; 16], nonce: &[u8; 8]) -> Result<(), String> {
+pub fn decrypt_stream_bytes(
+    data: &mut [u8],
+    key: &[u8; 16],
+    nonce: &[u8; 8],
+) -> Result<(), String> {
     let mut iv = [0u8; 16];
     iv[..8].copy_from_slice(nonce);
 
@@ -152,12 +156,13 @@ pub fn create_pkce_flow() -> PkceFlow {
     let code_challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
 
     let login_url = format!(
-        "{}?response_type=code&redirect_uri={}&client_id={}&lang=EN&appMode=android&client_unique_key={}&code_challenge={}&code_challenge_method=S256&restrict_signup=true",
+        "{}?response_type=code&redirect_uri={}&client_id={}&lang=EN&appMode=android&client_unique_key={}&code_challenge={}&code_challenge_method=S256&restrict_signup=true&state={}",
         API_PKCE_AUTH,
         urlencoding_encode(PKCE_REDIRECT_URI),
         urlencoding_encode(CLIENT_ID_PKCE),
         urlencoding_encode(&client_unique_key),
-        urlencoding_encode(&code_challenge)
+        urlencoding_encode(&code_challenge),
+        urlencoding_encode(&client_unique_key)
     );
 
     PkceFlow {
@@ -174,6 +179,18 @@ pub async fn exchange_pkce_code(
     code_verifier: &str,
     client_unique_key: &str,
 ) -> Result<TidalToken, String> {
+    let returned =
+        url::Url::parse(redirect_url).map_err(|_| "Paste the complete sign-in redirect URL")?;
+    let expected = url::Url::parse(PKCE_REDIRECT_URI).map_err(|e| e.to_string())?;
+    if returned.scheme() != expected.scheme()
+        || returned.host_str() != expected.host_str()
+        || returned.path() != expected.path()
+    {
+        return Err("This URL is not the expected account sign-in redirect".into());
+    }
+    if extract_query_param(redirect_url, "state").as_deref() != Some(client_unique_key) {
+        return Err("Sign-in response belongs to a different or expired sign-in attempt".into());
+    }
     let code = extract_query_param(redirect_url, "code")
         .ok_or_else(|| "Missing 'code' query parameter in redirect URL".to_string())?;
 
@@ -197,7 +214,10 @@ pub async fn exchange_pkce_code(
     if !res.status().is_success() {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(format!("PKCE exchange rejected (HTTP {}): {}", status, body));
+        return Err(format!(
+            "PKCE exchange rejected (HTTP {}): {}",
+            status, body
+        ));
     }
 
     let val: Value = res
@@ -259,7 +279,10 @@ pub async fn refresh_token(
     let (client_id, client_secret) = if is_pkce {
         (CLIENT_ID_PKCE, Some(CLIENT_SECRET_PKCE))
     } else {
-        ("fX2JxdmntZWK0ixT", Some("1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg="))
+        (
+            "fX2JxdmntZWK0ixT",
+            Some("1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg="),
+        )
     };
 
     let mut params = vec![
@@ -281,7 +304,10 @@ pub async fn refresh_token(
     if !res.status().is_success() {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(format!("Token refresh rejected (HTTP {}): {}", status, body));
+        return Err(format!(
+            "Token refresh rejected (HTTP {}): {}",
+            status, body
+        ));
     }
 
     let val: Value = res
@@ -327,6 +353,15 @@ pub async fn refresh_token(
 
 /// Loads a saved Tidal token from database preferences or filesystem token.json.
 pub async fn load_saved_token(db: &TursoDb) -> Option<TidalToken> {
+    if db
+        .get_preference("account-disconnected")
+        .await
+        .ok()
+        .flatten()
+        == Some(json!(true))
+    {
+        return None;
+    }
     // 1. Try DB preference "tidal_token"
     if let Ok(Some(val)) = db.get_preference("tidal_token").await {
         if let Ok(tok) = serde_json::from_value::<TidalToken>(val) {
@@ -334,6 +369,9 @@ pub async fn load_saved_token(db: &TursoDb) -> Option<TidalToken> {
         }
     }
 
+    if std::env::var_os("TIBRARY_TEST_MODE").is_some() {
+        return None;
+    }
     // 2. Try macOS keychain or session
     if let Some(session) = crate::account::AccountClient::load_saved_session() {
         return Some(TidalToken {
@@ -358,19 +396,36 @@ pub async fn load_saved_token(db: &TursoDb) -> Option<TidalToken> {
             if let Ok(content) = fs::read_to_string(path) {
                 if let Ok(val) = serde_json::from_str::<Value>(&content) {
                     if let Some(access) = val.get("access_token").and_then(|v| v.as_str()) {
-                        let refresh = val.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let exp_str = val.get("expiry_time").and_then(|v| v.as_str()).unwrap_or("");
-                        let expires_at = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp_str) {
-                            dt.timestamp() as f64
-                        } else {
-                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64() + 86400.0
-                        };
+                        let refresh = val
+                            .get("refresh_token")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let exp_str = val
+                            .get("expiry_time")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let expires_at =
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp_str) {
+                                dt.timestamp() as f64
+                            } else {
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs_f64()
+                                    + 86400.0
+                            };
                         return Some(TidalToken {
-                            token_type: val.get("token_type").and_then(|v| v.as_str()).unwrap_or("Bearer").to_string(),
+                            token_type: val
+                                .get("token_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Bearer")
+                                .to_string(),
                             access_token: access.to_string(),
                             refresh_token: refresh,
                             expires_at,
-                            user_id: val.get("user_id").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            user_id: val
+                                .get("user_id")
+                                .and_then(|v| v.as_str().map(|s| s.to_string())),
                             is_pkce: true,
                         });
                     }
@@ -382,43 +437,25 @@ pub async fn load_saved_token(db: &TursoDb) -> Option<TidalToken> {
     None
 }
 
-/// Saves the Tidal token to DB preferences, macOS keychain, and ~/.config/tidaler/token.json.
+/// Save the account in the OS credential store; retire legacy plaintext tokens.
 pub async fn save_token(db: &TursoDb, token: &TidalToken) -> Result<(), String> {
-    let val = serde_json::to_value(token).map_err(|e| e.to_string())?;
-    db.set_preference("tidal_token", &val).await?;
-
     let session = crate::account::AccountSession {
         access_token: token.access_token.clone(),
         refresh_token: token.refresh_token.clone(),
         user_id: token.user_id.clone(),
         expires_at: token.expires_at,
     };
-    let _ = crate::account::AccountClient::save_session(&session);
+    crate::account::AccountClient::save_session(&session).map_err(|e| e.to_string())?;
+    db.set_preference("tidal_token", &Value::Null).await?;
 
-    if let Ok(home) = std::env::var("HOME") {
-        let tidaler_cfg_dir = PathBuf::from(&home).join(".config/tidaler");
-        let _ = fs::create_dir_all(&tidaler_cfg_dir);
-        let token_path = tidaler_cfg_dir.join("token.json");
-        let json_data = json!({
-            "token_type": &token.token_type,
-            "access_token": &token.access_token,
-            "refresh_token": &token.refresh_token,
-            "expiry_time": token.expires_at,
-            "user_id": &token.user_id
-        });
-        if let Ok(serialized) = serde_json::to_string_pretty(&json_data) {
-            let _ = fs::write(&token_path, serialized);
-        }
-    }
+    db.set_preference("account-disconnected", &json!(false))
+        .await?;
 
     Ok(())
 }
 
 /// Retrieves a valid access token, auto-refreshing if necessary.
-pub async fn get_valid_token(
-    db: &TursoDb,
-    http: &reqwest::Client,
-) -> Result<String, String> {
+pub async fn get_valid_token(db: &TursoDb, http: &reqwest::Client) -> Result<String, String> {
     let mut token = load_saved_token(db)
         .await
         .ok_or_else(|| "No Tidal login token found. Authentication required.".to_string())?;
@@ -431,8 +468,15 @@ pub async fn get_valid_token(
     if now >= token.expires_at {
         if let Some(ref ref_token) = token.refresh_token {
             let refreshed = refresh_token(http, ref_token, token.is_pkce).await?;
+            let mut refreshed = refreshed;
+            if refreshed.refresh_token.is_none() {
+                refreshed.refresh_token = token.refresh_token.clone();
+            }
+            if refreshed.user_id.is_none() {
+                refreshed.user_id = token.user_id.clone();
+            }
             token = refreshed;
-            let _ = save_token(db, &token).await;
+            save_token(db, &token).await?;
         } else {
             return Err("Tidal login token expired and no refresh token available.".to_string());
         }
@@ -466,6 +510,7 @@ pub async fn get_playback_info(
     track_id: &str,
     token: &str,
     quality: &str,
+    market: &str,
 ) -> Result<PlaybackStreamInfo, String> {
     let url = format!(
         "{}/tracks/{}/playbackinfopostpaywall?audioquality={}&playbackmode=STREAM&assetpresentation=FULL",
@@ -474,6 +519,7 @@ pub async fn get_playback_info(
 
     let res = http
         .get(&url)
+        .query(&[("countryCode", market)])
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .send()
         .await
@@ -482,7 +528,10 @@ pub async fn get_playback_info(
     if !res.status().is_success() {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(format!("Playback info rejected (HTTP {}): {}", status, body));
+        return Err(format!(
+            "Playback info rejected (HTTP {}): {}",
+            status, body
+        ));
     }
 
     let val: Value = res
@@ -507,8 +556,14 @@ pub async fn get_playback_info(
     let album_peak_amplitude = val.get("albumPeakAmplitude").and_then(|v| v.as_f64());
     let track_replay_gain = val.get("trackReplayGain").and_then(|v| v.as_f64());
     let track_peak_amplitude = val.get("trackPeakAmplitude").and_then(|v| v.as_f64());
-    let bit_depth = val.get("bitDepth").and_then(|v| v.as_u64()).map(|n| n as u32);
-    let sample_rate = val.get("sampleRate").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let bit_depth = val
+        .get("bitDepth")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let sample_rate = val
+        .get("sampleRate")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
 
     if manifest_mime.contains("bts") {
         // BTS JSON Manifest
@@ -585,7 +640,10 @@ pub async fn get_playback_info(
             track_peak_amplitude,
         })
     } else {
-        Err(format!("Unsupported stream manifest MIME type: {}", manifest_mime))
+        Err(format!(
+            "Unsupported stream manifest MIME type: {}",
+            manifest_mime
+        ))
     }
 }
 
@@ -675,7 +733,10 @@ pub fn parse_mpd_manifest(xml: &str) -> Result<Vec<String>, String> {
                 if let Some(rel_end) = media_template[start_idx + 1..].find('$') {
                     let end_idx = start_idx + 1 + rel_end;
                     let spec = &media_template[start_idx..=end_idx];
-                    let digits = spec.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+                    let digits = spec
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect::<String>();
                     let width = digits.parse::<usize>().unwrap_or(1);
                     media_template.replace(spec, &format!("{:0width$}", i, width = width))
                 } else {
@@ -741,7 +802,10 @@ pub async fn download_stream(
 
         if !res.status().is_success() {
             let _ = fs::remove_file(dest_path);
-            return Err(format!("Segment download failed with HTTP {}", res.status()));
+            return Err(format!(
+                "Segment download failed with HTTP {}",
+                res.status()
+            ));
         }
 
         let mut seg_bytes = Vec::new();
@@ -812,8 +876,8 @@ pub fn apply_audio_tags(
     meta: &TrackDownloadMeta,
     cover_data: Option<&[u8]>,
 ) -> Result<(), String> {
-    use lofty::ogg::OggPictureStorage;
     use lofty::ogg::tag::VorbisComments;
+    use lofty::ogg::OggPictureStorage;
 
     let is_flac = file_path
         .extension()
@@ -835,10 +899,13 @@ pub fn apply_audio_tags(
         );
         // CRITICAL: ALBUMARTIST strictly set to album artist!
         comments.insert("ALBUMARTIST".to_string(), meta.album_artist.clone());
-        comments.insert("TRACKNUMBER".to_string(), meta.track_number.to_string());
-        comments.insert("TRACKTOTAL".to_string(), meta.track_total.to_string());
-        comments.insert("DISCNUMBER".to_string(), meta.disc_number.to_string());
-        comments.insert("DISCTOTAL".to_string(), meta.disc_total.to_string());
+        comments.insert(
+            "TRACKNUMBER".to_string(),
+            format!("{:02}", meta.track_number),
+        );
+        comments.insert("TRACKTOTAL".to_string(), format!("{:02}", meta.track_total));
+        comments.insert("DISCNUMBER".to_string(), format!("{:02}", meta.disc_number));
+        comments.insert("DISCTOTAL".to_string(), format!("{:02}", meta.disc_total));
 
         if let Some(ref d) = meta.date {
             comments.insert("DATE".to_string(), d.clone());
@@ -856,7 +923,9 @@ pub fn apply_audio_tags(
             }
         }
         if let Some(ref key) = meta.musical_key {
-            comments.insert("INITIALKEY".to_string(), key.clone());
+            if let Some(key) = crate::musical_keys::camelot_key(key) {
+                comments.insert("INITIALKEY".to_string(), key);
+            }
         }
         if let Some(ref rt) = meta.release_type {
             comments.insert("RELEASETYPE".to_string(), rt.clone());
@@ -955,7 +1024,9 @@ pub fn apply_audio_tags(
     }
 
     if let Some(ref key) = meta.musical_key {
-        tag.insert_text(ItemKey::InitialKey, key.clone());
+        if let Some(key) = crate::musical_keys::camelot_key(key) {
+            tag.insert_text(ItemKey::InitialKey, key);
+        }
     }
 
     if let Some(cover_bytes) = cover_data {
@@ -981,18 +1052,26 @@ pub async fn fetch_lyrics(
     http: &reqwest::Client,
     track_id: &str,
     token: &str,
+    market: &str,
 ) -> (Option<String>, Option<String>) {
     let url = format!("{}/tracks/{}/lyrics", API_V1_BASE, track_id);
     if let Ok(res) = http
         .get(&url)
+        .query(&[("countryCode", market)])
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .send()
         .await
     {
         if res.status().is_success() {
             if let Ok(val) = res.json::<Value>().await {
-                let synced = val.get("subtitles").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let unsynced = val.get("lyrics").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let synced = val
+                    .get("subtitles")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let unsynced = val
+                    .get("lyrics")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 return (synced, unsynced);
             }
         }
@@ -1065,10 +1144,12 @@ pub async fn fetch_album_info(
     http: &reqwest::Client,
     album_id: &str,
     token: &str,
+    market: &str,
 ) -> Result<TidalAlbumInfo, String> {
     let url = format!("{}/albums/{}", API_V1_BASE, album_id);
     let res = http
         .get(&url)
+        .query(&[("countryCode", market)])
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .send()
         .await
@@ -1079,15 +1160,40 @@ pub async fn fetch_album_info(
     }
 
     let val: Value = res.json().await.map_err(|e| e.to_string())?;
-    let id = val.get("id").map(|v| v.to_string()).unwrap_or_default().trim_matches('"').to_string();
-    let title = val.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let cover = val.get("cover").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let number_of_tracks = val.get("numberOfTracks").and_then(|v| v.as_u64()).map(|n| n as usize);
-    let number_of_volumes = val.get("numberOfVolumes").and_then(|v| v.as_u64()).map(|n| n as usize);
-    let release_date = val.get("releaseDate").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let version = val.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let id = val
+        .get("id")
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string();
+    let title = val
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let cover = val
+        .get("cover")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let number_of_tracks = val
+        .get("numberOfTracks")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let number_of_volumes = val
+        .get("numberOfVolumes")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let release_date = val
+        .get("releaseDate")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let version = val
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    let artist_name = val.get("artist")
+    let artist_name = val
+        .get("artist")
         .and_then(|a| a.get("name"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -1118,6 +1224,7 @@ pub async fn fetch_album_tracks(
     album_id: &str,
     token: &str,
     cancel_flag: &Arc<AtomicBool>,
+    market: &str,
 ) -> Result<Vec<TidalAlbumTrack>, String> {
     let mut tracks = Vec::new();
     let mut offset = 0usize;
@@ -1128,9 +1235,13 @@ pub async fn fetch_album_tracks(
             return Err("Cancelled".to_string());
         }
 
-        let url = format!("{}/albums/{}/tracks?limit={}&offset={}", API_V1_BASE, album_id, limit, offset);
+        let url = format!(
+            "{}/albums/{}/tracks?limit={}&offset={}",
+            API_V1_BASE, album_id, limit, offset
+        );
         let res = http
             .get(&url)
+            .query(&[("countryCode", market)])
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await
@@ -1144,19 +1255,49 @@ pub async fn fetch_album_tracks(
         let items = val.get("items").and_then(|v| v.as_array());
 
         let Some(items) = items else { break };
-        if items.is_empty() { break; }
+        if items.is_empty() {
+            break;
+        }
 
         for item in items {
-            let id = item.get("id").map(|v| v.to_string()).unwrap_or_default().trim_matches('"').to_string();
-            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let track_number = item.get("trackNumber").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let volume_number = item.get("volumeNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+            let id = item
+                .get("id")
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
+            let title = crate::tidal::format_title(
+                item.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                item.get("version").and_then(|v| v.as_str()),
+            );
+            let track_number = item
+                .get("trackNumber")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let volume_number = item
+                .get("volumeNumber")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
             let duration = item.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let isrc = item.get("isrc").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let copyright = item.get("copyright").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let explicit = item.get("explicit").and_then(|v| v.as_bool()).unwrap_or(false);
+            let isrc = item
+                .get("isrc")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let copyright = item
+                .get("copyright")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let explicit = item
+                .get("explicit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let bpm = item.get("bpm").and_then(|v| v.as_f64());
-            let key = item.get("key").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let key = item.get("key").and_then(|v| v.as_str()).map(|key| {
+                match item["keyScale"].as_str() {
+                    Some(scale) => format!("{key} {scale}"),
+                    None => key.to_string(),
+                }
+            });
 
             let mut artists = Vec::new();
             if let Some(arr) = item.get("artists").and_then(|v| v.as_array()) {
@@ -1165,7 +1306,11 @@ pub async fn fetch_album_tracks(
                         artists.push(name.to_string());
                     }
                 }
-            } else if let Some(a) = item.get("artist").and_then(|a| a.get("name")).and_then(|v| v.as_str()) {
+            } else if let Some(a) = item
+                .get("artist")
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str())
+            {
                 artists.push(a.to_string());
             }
 
@@ -1194,7 +1339,10 @@ pub async fn fetch_album_tracks(
             });
         }
 
-        let total = val.get("totalNumberOfItems").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let total = val
+            .get("totalNumberOfItems")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
         offset += items.len();
         if offset >= total || items.len() < limit {
             break;
@@ -1228,11 +1376,7 @@ pub fn safe_component(val: &str) -> String {
 }
 
 /// Generates the destination relative file path according to the layout template.
-pub fn format_download_path(
-    template: &str,
-    meta: &TrackDownloadMeta,
-    extension: &str,
-) -> PathBuf {
+pub fn format_download_path(template: &str, meta: &TrackDownloadMeta, extension: &str) -> PathBuf {
     let ext = if extension.starts_with('.') {
         extension.to_string()
     } else {
@@ -1280,6 +1424,14 @@ pub fn format_download_path(
         part = part.replace("{tracknumber}", &track_pad);
         part = part.replace("{year}", year);
         part = part.replace("{disc}", &disc_text);
+        part = part.replace(
+            "{disc_prefix}",
+            &if meta.disc_total > 1 {
+                format!("{:02}.", meta.disc_number)
+            } else {
+                String::new()
+            },
+        );
         part = part.replace("{discnumber}", &format!("{:02}", meta.disc_number));
 
         let sanitized = safe_component(&part);
@@ -1305,10 +1457,7 @@ pub fn format_download_path(
 /// Publishes downloaded files safely into target root.
 /// Existing files with identical content are safely acknowledged;
 /// different existing files result in an error to avoid data loss.
-pub fn publish_staged_files(
-    stage_dir: &Path,
-    target_root: &Path,
-) -> Result<Vec<PathBuf>, String> {
+pub fn publish_staged_files(stage_dir: &Path, target_root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut published = Vec::new();
 
     fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -1437,12 +1586,11 @@ pub fn write_m3u8_playlist(
 }
 
 pub const MINIMAL_FLAC: &[u8] = &[
-    102, 76, 97, 67, 0, 0, 0, 34, 16, 0, 16, 0, 0, 0, 14, 0, 0, 16, 10, 196, 66, 240, 0, 0,
-    17, 58, 136, 44, 112, 41, 165, 9, 119, 105, 184, 91, 209, 118, 245, 117, 38, 132, 132, 0,
-    0, 40, 32, 0, 0, 0, 114, 101, 102, 101, 114, 101, 110, 99, 101, 32, 108, 105, 98, 70, 76,
-    65, 67, 32, 49, 46, 52, 46, 51, 32, 50, 48, 50, 51, 48, 54, 50, 51, 0, 0, 0, 0, 255, 248,
-    201, 24, 0, 194, 0, 0, 0, 0, 0, 0, 184, 238, 255, 248, 121, 24, 1, 1, 57, 215, 0, 0, 0,
-    0, 0, 0, 173, 241,
+    102, 76, 97, 67, 0, 0, 0, 34, 16, 0, 16, 0, 0, 0, 14, 0, 0, 16, 10, 196, 66, 240, 0, 0, 17, 58,
+    136, 44, 112, 41, 165, 9, 119, 105, 184, 91, 209, 118, 245, 117, 38, 132, 132, 0, 0, 40, 32, 0,
+    0, 0, 114, 101, 102, 101, 114, 101, 110, 99, 101, 32, 108, 105, 98, 70, 76, 65, 67, 32, 49, 46,
+    52, 46, 51, 32, 50, 48, 50, 51, 48, 54, 50, 51, 0, 0, 0, 0, 255, 248, 201, 24, 0, 194, 0, 0, 0,
+    0, 0, 0, 184, 238, 255, 248, 121, 24, 1, 1, 57, 215, 0, 0, 0, 0, 0, 0, 173, 241,
 ];
 
 // ============================================================================
@@ -1505,7 +1653,11 @@ mod tests {
             ..Default::default()
         };
 
-        let path = format_download_path("{album_artist}/{album}/{track_number} {title}", &meta, ".flac");
+        let path = format_download_path(
+            "{album_artist}/{album}/{track_number} {title}",
+            &meta,
+            ".flac",
+        );
         assert_eq!(
             path,
             PathBuf::from("Daft Punk/Discovery/04 Harder, Better, Faster, Stronger.flac")
@@ -1572,14 +1724,18 @@ mod tests {
     fn test_flac_tagging_and_claxon_playback() {
         let temp_dir = std::env::temp_dir().join(format!(
             "flac_tag_test_{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&temp_dir).unwrap();
         let flac_file = temp_dir.join("test.flac");
         fs::write(&flac_file, MINIMAL_FLAC).expect("Failed to write initial FLAC");
 
         // Verify initial playback validity with claxon
-        let reader = claxon::FlacReader::open(&flac_file).expect("Claxon failed to open initial FLAC");
+        let reader =
+            claxon::FlacReader::open(&flac_file).expect("Claxon failed to open initial FLAC");
         assert_eq!(reader.streaminfo().channels, 2);
         assert_eq!(reader.streaminfo().sample_rate, 44100);
 
@@ -1605,33 +1761,36 @@ mod tests {
 
         // Dummy 1x1 JPEG for cover test
         let dummy_jpeg = [
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48,
-            0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x03, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03,
-            0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x04, 0x06, 0x04, 0x04, 0x04, 0x04, 0x04, 0x08, 0x06,
-            0x06, 0x05, 0x06, 0x09, 0x08, 0x0A, 0x0A, 0x09, 0x08, 0x09, 0x09, 0x0A, 0x0C, 0x0F, 0x0C, 0x0A,
-            0x0B, 0x0E, 0x0B, 0x09, 0x09, 0x0D, 0x11, 0x0D, 0x0E, 0x0F, 0x10, 0x10, 0x11, 0x10, 0x0A, 0x0C,
-            0x12, 0x13, 0x12, 0x10, 0x13, 0x0F, 0x10, 0x10, 0x10, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
-            0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01,
-            0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
-            0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F,
-            0x00, 0xBF, 0x00, 0xFF, 0xD9,
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01,
+            0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x03, 0x02, 0x02,
+            0x02, 0x02, 0x02, 0x03, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x04, 0x06, 0x04,
+            0x04, 0x04, 0x04, 0x04, 0x08, 0x06, 0x06, 0x05, 0x06, 0x09, 0x08, 0x0A, 0x0A, 0x09,
+            0x08, 0x09, 0x09, 0x0A, 0x0C, 0x0F, 0x0C, 0x0A, 0x0B, 0x0E, 0x0B, 0x09, 0x09, 0x0D,
+            0x11, 0x0D, 0x0E, 0x0F, 0x10, 0x10, 0x11, 0x10, 0x0A, 0x0C, 0x12, 0x13, 0x12, 0x10,
+            0x13, 0x0F, 0x10, 0x10, 0x10, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
+            0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
+            0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01,
+            0x01, 0x00, 0x00, 0x3F, 0x00, 0xBF, 0x00, 0xFF, 0xD9,
         ];
 
         apply_audio_tags(&flac_file, &meta, Some(&dummy_jpeg)).expect("Failed applying tags");
 
         // Verify tags using scanner::read_audio_metadata
-        let parsed = crate::scanner::read_audio_metadata(&flac_file).expect("Failed reading back tags");
+        let parsed =
+            crate::scanner::read_audio_metadata(&flac_file).expect("Failed reading back tags");
         assert_eq!(parsed.title, "Get Lucky");
         assert_eq!(parsed.album, "Random Access Memories");
         // Verify ALBUMARTIST is strictly Daft Punk!
         assert_eq!(parsed.album_artist.as_deref(), Some("Daft Punk"));
         assert_eq!(parsed.tidal_track_id.as_deref(), Some("887766"));
         assert_eq!(parsed.tidal_album_id.as_deref(), Some("112233"));
-        assert_eq!(parsed.track.as_deref(), Some("8"));
+        assert_eq!(parsed.track.as_deref(), Some("08"));
         assert_eq!(parsed.tracktotal.as_deref(), Some("13"));
 
         // Verify playback validity with claxon after tagging
-        let mut reader_after = claxon::FlacReader::open(&flac_file).expect("Claxon failed to open tagged FLAC");
+        let mut reader_after =
+            claxon::FlacReader::open(&flac_file).expect("Claxon failed to open tagged FLAC");
         let mut sample_count = 0;
         for sample in reader_after.samples() {
             let _ = sample.expect("Corrupt audio frame");
@@ -1646,7 +1805,10 @@ mod tests {
     fn test_publish_staged_files_safe() {
         let temp_dir = std::env::temp_dir().join(format!(
             "publish_test_{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let stage = temp_dir.join("stage");
         let dest = temp_dir.join("library");
@@ -1674,7 +1836,8 @@ mod tests {
         fs::create_dir_all(track_staged_new.parent().unwrap()).unwrap();
         fs::write(&track_staged_new, b"DIFFERENT-audio-payload-456").unwrap();
 
-        let err = publish_staged_files(&stage, &dest).expect_err("Should have failed due to collision");
+        let err =
+            publish_staged_files(&stage, &dest).expect_err("Should have failed due to collision");
         assert!(err.contains("Destination already exists with different contents"));
 
         let _ = fs::remove_dir_all(temp_dir);
@@ -1683,7 +1846,10 @@ mod tests {
     #[test]
     fn test_detect_audio_extension() {
         assert_eq!(detect_audio_extension(b"fLaC\x00\x00", ".m4a"), ".flac");
-        assert_eq!(detect_audio_extension(b"\x00\x00\x00\x20ftypM4A \x00\x00", ".flac"), ".m4a");
+        assert_eq!(
+            detect_audio_extension(b"\x00\x00\x00\x20ftypM4A \x00\x00", ".flac"),
+            ".m4a"
+        );
         assert_eq!(detect_audio_extension(b"ID3\x04\x00\x00", ".flac"), ".mp3");
         assert_eq!(detect_audio_extension(b"OggS\x00\x02", ".flac"), ".ogg");
         assert_eq!(detect_audio_extension(b"UNKNOWN_BYTES", ".flac"), ".flac");
@@ -1693,7 +1859,10 @@ mod tests {
     fn test_write_lrc_file() {
         let temp_dir = std::env::temp_dir().join(format!(
             "lrc_test_{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&temp_dir).unwrap();
         let audio_path = temp_dir.join("01 - Test Track.flac");
@@ -1714,7 +1883,10 @@ mod tests {
     fn test_write_m3u8_playlist() {
         let temp_dir = std::env::temp_dir().join(format!(
             "m3u8_test_{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&temp_dir).unwrap();
         let tracks = vec![

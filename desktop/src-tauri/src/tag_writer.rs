@@ -9,6 +9,48 @@ pub fn write_tags(path: &Path, updates: &HashMap<String, String>) -> Result<(), 
         return Ok(());
     }
 
+    // Use native Vorbis comments for FLAC: generic numeric tag conversion drops
+    // leading zeroes and can discard provider-specific metadata.
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("flac"))
+    {
+        use lofty::file::AudioFile;
+        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut audio = lofty::flac::FlacFile::read_from(
+            &mut file,
+            lofty::config::ParseOptions::default().implicit_conversions(false),
+        )
+        .map_err(|e| e.to_string())?;
+        drop(file);
+        if audio.vorbis_comments().is_none() {
+            audio.set_vorbis_comments(lofty::ogg::tag::VorbisComments::default());
+        }
+        let comments = audio.vorbis_comments_mut().unwrap();
+        for (key, value) in updates {
+            let lower = key.to_ascii_lowercase();
+            let key = match lower.as_str() {
+                "album_artist" => "ALBUMARTIST",
+                "track_number" => "TRACKNUMBER",
+                "track_total" => "TRACKTOTAL",
+                "disc_number" => "DISCNUMBER",
+                "disc_total" => "DISCTOTAL",
+                "year" => "DATE",
+                "initial_key" | "key" => "INITIALKEY",
+                _ => key,
+            }
+            .to_ascii_uppercase();
+            comments.remove(&key).for_each(drop);
+            if !value.trim().is_empty() {
+                comments.insert(key, value.clone());
+            }
+        }
+        return audio
+            .save_to_path(path, lofty::config::WriteOptions::default())
+            .map_err(|e| e.to_string());
+    }
+
     let mut tagged_file = Probe::open(path)
         .map_err(|e| format!("Failed to open file: {}", e))?
         .read()
@@ -99,9 +141,15 @@ mod tests {
         let tagged = Probe::open(&flac_path).unwrap().read().unwrap();
         let tag = tagged.primary_tag().or_else(|| tagged.first_tag()).unwrap();
 
-        assert_eq!(tag.get_string(ItemKey::TrackTitle), Some("Bohemian Rhapsody"));
+        assert_eq!(
+            tag.get_string(ItemKey::TrackTitle),
+            Some("Bohemian Rhapsody")
+        );
         assert_eq!(tag.get_string(ItemKey::TrackArtist), Some("Queen"));
-        assert_eq!(tag.get_string(ItemKey::AlbumTitle), Some("A Night at the Opera"));
+        assert_eq!(
+            tag.get_string(ItemKey::AlbumTitle),
+            Some("A Night at the Opera")
+        );
         assert_eq!(tag.get_string(ItemKey::TrackNumber), Some("11"));
         assert_eq!(tag.get_string(ItemKey::InitialKey), Some("8A"));
 

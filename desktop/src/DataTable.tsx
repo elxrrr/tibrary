@@ -45,6 +45,7 @@ export function DataTable({
   direction,
   onSort,
   tree,
+  grouped,
   treeSelection,
   onTreeSelect,
   onExpand,
@@ -63,6 +64,7 @@ export function DataTable({
   direction: string;
   onSort: (key: string) => void;
   tree?: boolean;
+  grouped?: boolean;
   treeSelection?: Selection;
   onTreeSelect?: (s: Selection) => void;
   onExpand?: (r: Row) => void;
@@ -89,13 +91,19 @@ export function DataTable({
     onSelect(next);
     setAnchor(index);
   }
+  function groupState(row: Row) {
+    if (selected.has(row.id)) return "checked";
+    const children = row.children || [];
+    const count = children.filter((c: Row) => selected.has(c.id)).length;
+    return count ? count === children.length ? "checked" : "mixed" : "empty";
+  }
   const checked = rows.filter((r) =>
     tree
       ? parentState(
           treeSelection?.[r.id],
           (r.children || []).map((c: Row) => c.id),
         ) === "checked"
-      : selected.has(r.id),
+      : grouped ? groupState(r) === "checked" : selected.has(r.id),
   ).length;
   return (
     <div
@@ -124,9 +132,10 @@ export function DataTable({
                     onTreeSelect(next);
                   } else {
                     const next = new Set(selected);
-                    rows.forEach((r) =>
-                      yes ? next.add(r.id) : next.delete(r.id),
-                    );
+                    rows.forEach((r) => {
+                      yes ? next.add(r.id) : next.delete(r.id);
+                      if (grouped) (r.children || []).forEach((c: Row) => next.delete(c.id));
+                    });
                     onSelect(next);
                   }
                 }}
@@ -165,7 +174,7 @@ export function DataTable({
                   treeSelection?.[r.id],
                   (r.children || []).map((c: Row) => c.id),
                 )
-              : selected.has(r.id)
+              : grouped ? groupState(r) : selected.has(r.id)
                 ? "checked"
                 : "empty";
             return (
@@ -206,6 +215,7 @@ export function DataTable({
                         else {
                           const next = new Set(selected);
                           yes ? next.add(r.id) : next.delete(r.id);
+                          if (grouped) (r.children || []).forEach((c: Row) => next.delete(c.id));
                           onSelect(next);
                         }
                       }}
@@ -213,7 +223,7 @@ export function DataTable({
                   </td>
                   {columns.map((c, j) => (
                     <td key={c.key} title={readable(r[c.key])}>
-                      {j === 0 && tree ? (
+                      {j === 0 && (tree || grouped) ? (
                         <button
                           className="disclosure"
                           aria-label={`${expanded.has(r.id) ? "Collapse" : "Expand"} ${r.release}`}
@@ -263,6 +273,17 @@ export function DataTable({
                     </button>
                   </td>
                 </tr>
+                {grouped && expanded.has(r.id) && (r.children || []).map((child: Row) => (
+                  <tr key={child.id} className={"child " + (selected.has(child.id) ? "selected" : "")}
+                    onClick={e => {const next=e.metaKey||e.ctrlKey||e.shiftKey ? new Set(selected):new Set<string>();next.add(child.id);onSelect(next);}}
+                    onDoubleClick={() => onDetail(child)}
+                    onContextMenu={e => {e.preventDefault();if (!selected.has(child.id)) onSelect(new Set([child.id]));onMenu(child,e.clientX,e.clientY);}}>
+                    <td><Check label={`Select duplicate ${child.release}`} state={selected.has(child.id)||selected.has(r.id)?"checked":"empty"} disabled={busy}
+                      onChange={yes => {const next=new Set(selected);if(next.delete(r.id)){for(const sibling of r.children)next.add(sibling.id);}yes?next.add(child.id):next.delete(child.id);onSelect(next);}} /></td>
+                    {columns.map(c => <td key={c.key} title={readable(child[c.key])}>{readable(child[c.key])}</td>)}
+                    <td className="more"><button aria-label={`Actions for ${child.release}`} onClick={e=>{e.stopPropagation();onMenu(child,e.clientX,e.clientY);}}><MoreHorizontal size={16}/></button></td>
+                  </tr>
+                ))}
                 {tree &&
                   expanded.has(r.id) &&
                   (!r.expanded_available ? (

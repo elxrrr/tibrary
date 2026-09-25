@@ -1,6 +1,5 @@
 use crate::db::{LinkRow, LocalFileRecord, TursoDb};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -52,30 +51,18 @@ pub fn normalize_text(s: &str) -> String {
 }
 
 pub fn track_matches(source: &LocalTrack, target: &LocalTrack) -> bool {
-    // 1. If both have valid non-empty ISRCs:
-    if let (Some(ref isrc_s), Some(ref isrc_t)) = (&source.isrc, &target.isrc) {
-        let s = isrc_s.trim();
-        let t = isrc_t.trim();
-        if !s.is_empty() && !t.is_empty() && s.eq_ignore_ascii_case(t) {
-            return true;
-        }
+    if normalize_text(&source.artist) != normalize_text(&target.artist) {
+        return false;
     }
-
-    // 2. Title and duration match
-    let s_norm = normalize_text(&source.title);
-    let t_norm = normalize_text(&target.title);
-    if !s_norm.is_empty() && s_norm == t_norm {
-        if source.duration > 0.0 && target.duration > 0.0 {
-            if (source.duration - target.duration).abs() <= 3.0 {
-                return true;
-            }
-        } else {
-            // Missing duration, fallback to title match
-            return true;
-        }
-    }
-
-    false
+    crate::release_matching::recording_matches(
+        &source.title,
+        source.duration,
+        source.isrc.as_deref(),
+        &target.title,
+        target.duration,
+        target.isrc.as_deref(),
+        true,
+    )
 }
 
 pub fn is_release_contained(source: &LocalRelease, target: &LocalRelease) -> bool {
@@ -148,146 +135,65 @@ pub fn extract_release_folder(file_path: &str) -> String {
 }
 
 pub fn parse_local_releases(files: &[LocalFileRecord]) -> Vec<LocalRelease> {
-    let mut by_folder: HashMap<String, Vec<LocalTrack>> = HashMap::new();
-
-    for f in files {
-        if !f.present {
-            continue;
-        }
-
-        let folder = extract_release_folder(&f.path);
-        let meta = f.metadata.as_ref();
-
-        let title = meta
-            .and_then(|m| m.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                Path::new(&f.path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Unknown")
-            })
-            .to_string();
-
-        let artist = meta
-            .and_then(|m| {
-                m.get("albumartist")
-                    .or_else(|| m.get("album_artist"))
-                    .or_else(|| m.get("artist"))
-            })
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                Value::Array(arr) => arr.first().and_then(|x| x.as_str()).map(|s| s.to_string()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "Unknown Artist".to_string());
-
-        let album = meta
-            .and_then(|m| m.get("album"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                Path::new(&folder)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Unknown Album")
-            })
-            .to_string();
-
-        let isrc = meta
-            .and_then(|m| m.get("isrc"))
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                Value::Array(arr) => arr.first().and_then(|x| x.as_str()).map(|s| s.to_string()),
-                _ => None,
+    let mut releases = HashMap::<String, LocalRelease>::new();
+    for file in files.iter().filter(|f| f.present) {
+        let tags = crate::workflows::extract_tags_map(&file.metadata);
+        let text = |key: &str| tags.get(key).cloned().unwrap_or_default();
+        let number = |key: &str| {
+            text(key)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0)
+        };
+        let folder = extract_release_folder(&file.path);
+        let artist = tags
+            .get("albumartist")
+            .or(tags.get("artist"))
+            .cloned()
+            .unwrap_or_default();
+        let release = releases
+            .entry(folder.clone())
+            .or_insert_with(|| LocalRelease {
+                id: format!("{:x}", md5_hash(&folder)),
+                folder,
+                artist,
+                title: text("album"),
+                date: text("date"),
+                tracks: vec![],
             });
-
-        let duration = meta
-            .and_then(|m| m.get("duration"))
-            .and_then(|v| match v {
-                Value::Number(n) => n.as_f64(),
-                Value::String(s) => s.parse::<f64>().ok(),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-
-        let track_number = meta
-            .and_then(|m| m.get("tracknumber").or_else(|| m.get("track_number")))
-            .and_then(|v| match v {
-                Value::Number(n) => n.as_u64().map(|x| x as u32),
-                Value::String(s) => s.split('/').next().and_then(|p| p.trim().parse::<u32>().ok()),
-                _ => None,
-            })
-            .unwrap_or(1);
-
-        let disc_number = meta
-            .and_then(|m| m.get("discnumber").or_else(|| m.get("disc_number")))
-            .and_then(|v| match v {
-                Value::Number(n) => n.as_u64().map(|x| x as u32),
-                Value::String(s) => s.split('/').next().and_then(|p| p.trim().parse::<u32>().ok()),
-                _ => None,
-            })
-            .unwrap_or(1);
-
-        let bpm = meta
-            .and_then(|m| m.get("bpm"))
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            });
-
-        let key = meta
-            .and_then(|m| m.get("initialkey").or_else(|| m.get("key")))
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            });
-
-        by_folder.entry(folder).or_default().push(LocalTrack {
-            path: f.path.clone(),
-            title,
-            artist,
-            album,
-            isrc,
-            duration,
-            track_number,
-            disc_number,
-            size: f.size,
-            mtime: f.mtime,
-            bpm,
-            key,
+        release.tracks.push(LocalTrack {
+            path: file.path.clone(),
+            title: text("title"),
+            artist: tags
+                .get("track_artist")
+                .or(tags.get("artist"))
+                .cloned()
+                .unwrap_or_default(),
+            album: text("album"),
+            isrc: tags.get("isrc").cloned(),
+            duration: file
+                .metadata
+                .as_ref()
+                .and_then(|m| m["duration"].as_f64())
+                .unwrap_or(0.),
+            track_number: number("tracknumber"),
+            disc_number: number("discnumber").max(1),
+            size: file.size,
+            mtime: file.mtime,
+            bpm: tags.get("bpm").cloned(),
+            key: tags.get("initialkey").or(tags.get("key")).cloned(),
         });
     }
-
-    let mut releases = Vec::new();
-    for (folder, mut tracks) in by_folder {
-        if tracks.is_empty() {
-            continue;
-        }
-
-        tracks.sort_by_key(|t| (t.disc_number, t.track_number, t.title.clone()));
-
-        let artist = tracks
-            .first()
-            .map(|t| t.artist.clone())
-            .unwrap_or_else(|| "Unknown Artist".to_string());
-        let title = tracks
-            .first()
-            .map(|t| t.album.clone())
-            .unwrap_or_else(|| "Unknown Album".to_string());
-        let date = String::new();
-        let id = format!("{:x}", md5_hash(&folder));
-
-        releases.push(LocalRelease {
-            id,
-            folder,
-            artist,
-            title,
-            date,
-            tracks,
-        });
+    let mut releases: Vec<_> = releases.into_values().collect();
+    for release in &mut releases {
+        release
+            .tracks
+            .sort_by_key(|t| (t.disc_number, t.track_number, t.title.clone()));
     }
-
+    releases.sort_by(|a, b| a.folder.cmp(&b.folder));
     releases
 }
 
@@ -371,13 +277,10 @@ pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluste
         }
 
         // If there are multiple maximal ancestors, pick the one with the most tracks / largest size
-        if let Some(&best_master) = maximal_ancestors
-            .iter()
-            .max_by_key(|&&m| {
-                let size: i64 = releases[m].tracks.iter().map(|t| t.size).sum();
-                (releases[m].tracks.len(), releases[m].date.clone(), size)
-            })
-        {
+        if let Some(&best_master) = maximal_ancestors.iter().max_by_key(|&&m| {
+            let size: i64 = releases[m].tracks.iter().map(|t| t.size).sum();
+            (releases[m].tracks.len(), releases[m].date.clone(), size)
+        }) {
             master_to_redundant
                 .entry(best_master)
                 .or_default()
@@ -476,6 +379,26 @@ pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluste
     clusters
 }
 
+/// Each retained release owns its redundant releases; no catalogue request is needed to expand it.
+pub fn clusters_to_group_rows(clusters: &[DuplicateCluster]) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    clusters.iter().map(|cluster| {
+        let retained=&cluster.master;
+        let covered=retained.tracks.iter().filter(|track|cluster.redundant.iter().any(|r|r.tracks.iter().any(|t|track_matches(t,track)))).count();
+        let children:Vec<_>=cluster.redundant.iter().map(|r|json!({
+            "id":format!("{}::{}",cluster.cluster_id,r.folder),"artist":r.artist,"release":r.title,"title":r.title,
+            "path":r.folder,"tracks":r.tracks.len(),"duplicates":r.tracks.len(),"gained":0,
+            "target":retained.folder,"status":"Duplicate","evidence":format!("All {} recordings are present in {} with matching mix, duration and performer credits",r.tracks.len(),retained.title),
+            "changes":"Move reviewed duplicate files to Trash","affected":true
+        })).collect();
+        json!({"id":cluster.cluster_id,"artist":retained.artist,"release":retained.title,"title":retained.title,"path":retained.folder,
+            "tracks":retained.tracks.len(),"duplicates":cluster.total_redundant_tracks,"gained":retained.tracks.len()-covered,
+            "target":retained.folder,"status":if cluster.is_chained {"Chained duplicate"}else{"Duplicate"},
+            "evidence":format!("Keep this release; review {} redundant releases · {:.1} MB recoverable",children.len(),cluster.total_recoverable_bytes as f64 / 1_000_000.),
+            "expanded_available":true,"children":children,"affected":true})
+    }).collect()
+}
+
 pub fn clusters_to_link_rows(clusters: &[DuplicateCluster]) -> Vec<LinkRow> {
     let mut rows = Vec::new();
 
@@ -486,9 +409,19 @@ pub fn clusters_to_link_rows(clusters: &[DuplicateCluster]) -> Vec<LinkRow> {
             let row_id = format!("{}::{}", cluster.cluster_id, red.folder);
 
             let release_label = if cluster.is_chained {
-                format!("{} [Chained: {} of {}]", red.title, idx + 1, cluster.redundant.len())
+                format!(
+                    "{} [Chained: {} of {}]",
+                    red.title,
+                    idx + 1,
+                    cluster.redundant.len()
+                )
             } else if is_multi {
-                format!("{} [Cluster: {} of {}]", red.title, idx + 1, cluster.redundant.len())
+                format!(
+                    "{} [Cluster: {} of {}]",
+                    red.title,
+                    idx + 1,
+                    cluster.redundant.len()
+                )
             } else {
                 red.title.clone()
             };
@@ -501,7 +434,11 @@ pub fn clusters_to_link_rows(clusters: &[DuplicateCluster]) -> Vec<LinkRow> {
                 "Duplicate".to_string()
             };
 
-            let target_label = format!("{} ({} tracks)", cluster.master.title, cluster.master.tracks.len());
+            let target_label = format!(
+                "{} ({} tracks)",
+                cluster.master.title,
+                cluster.master.tracks.len()
+            );
 
             let gained = if cluster.master.tracks.len() > red.tracks.len() {
                 format!("+{} tracks", cluster.master.tracks.len() - red.tracks.len())
@@ -548,7 +485,10 @@ pub async fn trash_file_or_directory(path_str: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let esc = path_str.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!("tell application \"Finder\" to delete POSIX file \"{}\"", esc);
+        let script = format!(
+            "tell application \"Finder\" to delete POSIX file \"{}\"",
+            esc
+        );
         let output = std::process::Command::new("osascript")
             .arg("-e")
             .arg(&script)
@@ -639,7 +579,11 @@ mod tests {
             title: title.to_string(),
             artist: "Daft Punk".to_string(),
             album: "Album".to_string(),
-            isrc: if isrc.is_empty() { None } else { Some(isrc.to_string()) },
+            isrc: if isrc.is_empty() {
+                None
+            } else {
+                Some(isrc.to_string())
+            },
             duration: dur,
             track_number: 1,
             disc_number: 1,
@@ -660,8 +604,18 @@ mod tests {
             title: "Get Lucky (Single)".to_string(),
             date: "2013".to_string(),
             tracks: vec![
-                make_test_track("/music/Daft Punk/Get Lucky (Single)/01 Get Lucky.flac", "Get Lucky", "USXX1", 248.0),
-                make_test_track("/music/Daft Punk/Get Lucky (Single)/02 Get Lucky (Radio).flac", "Get Lucky (Radio Edit)", "USXX2", 180.0),
+                make_test_track(
+                    "/music/Daft Punk/Get Lucky (Single)/01 Get Lucky.flac",
+                    "Get Lucky",
+                    "USXX1",
+                    248.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Get Lucky (Single)/02 Get Lucky (Radio).flac",
+                    "Get Lucky (Radio Edit)",
+                    "USXX2",
+                    180.0,
+                ),
             ],
         };
 
@@ -673,10 +627,30 @@ mod tests {
             title: "Get Lucky (EP)".to_string(),
             date: "2013".to_string(),
             tracks: vec![
-                make_test_track("/music/Daft Punk/Get Lucky (EP)/01 Get Lucky.flac", "Get Lucky", "USXX1", 248.0),
-                make_test_track("/music/Daft Punk/Get Lucky (EP)/02 Get Lucky (Radio).flac", "Get Lucky (Radio Edit)", "USXX2", 180.0),
-                make_test_track("/music/Daft Punk/Get Lucky (EP)/03 Remix 1.flac", "Get Lucky (Remix 1)", "USXX3", 300.0),
-                make_test_track("/music/Daft Punk/Get Lucky (EP)/04 Remix 2.flac", "Get Lucky (Remix 2)", "USXX4", 320.0),
+                make_test_track(
+                    "/music/Daft Punk/Get Lucky (EP)/01 Get Lucky.flac",
+                    "Get Lucky",
+                    "USXX1",
+                    248.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Get Lucky (EP)/02 Get Lucky (Radio).flac",
+                    "Get Lucky (Radio Edit)",
+                    "USXX2",
+                    180.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Get Lucky (EP)/03 Remix 1.flac",
+                    "Get Lucky (Remix 1)",
+                    "USXX3",
+                    300.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Get Lucky (EP)/04 Remix 2.flac",
+                    "Get Lucky (Remix 2)",
+                    "USXX4",
+                    320.0,
+                ),
             ],
         };
 
@@ -688,18 +662,57 @@ mod tests {
             title: "Random Access Memories (Deluxe)".to_string(),
             date: "2013".to_string(),
             tracks: vec![
-                make_test_track("/music/Daft Punk/Random Access Memories (Deluxe)/01 Give Life.flac", "Give Life Back to Music", "USXX5", 274.0),
-                make_test_track("/music/Daft Punk/Random Access Memories (Deluxe)/02 Get Lucky.flac", "Get Lucky", "USXX1", 248.0),
-                make_test_track("/music/Daft Punk/Random Access Memories (Deluxe)/03 Get Lucky (Radio).flac", "Get Lucky (Radio Edit)", "USXX2", 180.0),
-                make_test_track("/music/Daft Punk/Random Access Memories (Deluxe)/04 Remix 1.flac", "Get Lucky (Remix 1)", "USXX3", 300.0),
-                make_test_track("/music/Daft Punk/Random Access Memories (Deluxe)/05 Remix 2.flac", "Get Lucky (Remix 2)", "USXX4", 320.0),
-                make_test_track("/music/Daft Punk/Random Access Memories (Deluxe)/06 Lose Yourself.flac", "Lose Yourself to Dance", "USXX6", 353.0),
+                make_test_track(
+                    "/music/Daft Punk/Random Access Memories (Deluxe)/01 Give Life.flac",
+                    "Give Life Back to Music",
+                    "USXX5",
+                    274.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Random Access Memories (Deluxe)/02 Get Lucky.flac",
+                    "Get Lucky",
+                    "USXX1",
+                    248.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Random Access Memories (Deluxe)/03 Get Lucky (Radio).flac",
+                    "Get Lucky (Radio Edit)",
+                    "USXX2",
+                    180.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Random Access Memories (Deluxe)/04 Remix 1.flac",
+                    "Get Lucky (Remix 1)",
+                    "USXX3",
+                    300.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Random Access Memories (Deluxe)/05 Remix 2.flac",
+                    "Get Lucky (Remix 2)",
+                    "USXX4",
+                    320.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Random Access Memories (Deluxe)/06 Lose Yourself.flac",
+                    "Lose Yourself to Dance",
+                    "USXX6",
+                    353.0,
+                ),
             ],
         };
 
-        assert!(is_release_contained(&release_a, &release_b), "Release A must be contained in Release B");
-        assert!(is_release_contained(&release_b, &release_c), "Release B must be contained in Release C");
-        assert!(is_release_contained(&release_a, &release_c), "Release A must be contained in Release C (transitive)");
+        assert!(
+            is_release_contained(&release_a, &release_b),
+            "Release A must be contained in Release B"
+        );
+        assert!(
+            is_release_contained(&release_b, &release_c),
+            "Release B must be contained in Release C"
+        );
+        assert!(
+            is_release_contained(&release_a, &release_c),
+            "Release A must be contained in Release C (transitive)"
+        );
 
         // Convert to LocalFileRecord list and find clusters
         let mut records = Vec::new();
@@ -728,12 +741,32 @@ mod tests {
 
         let cluster = &clusters[0];
         assert_eq!(cluster.master.title, "Random Access Memories (Deluxe)");
-        assert_eq!(cluster.redundant.len(), 2, "Must absorb both Release A and Release B");
-        assert!(cluster.is_chained, "Cluster must be marked as chained duplicate");
-        assert_eq!(cluster.total_redundant_tracks, 6, "Total redundant tracks must be 2 + 4 = 6");
+        assert_eq!(
+            cluster.redundant.len(),
+            2,
+            "Must absorb both Release A and Release B"
+        );
+        assert!(
+            cluster.is_chained,
+            "Cluster must be marked as chained duplicate"
+        );
+        assert_eq!(
+            cluster.total_redundant_tracks, 6,
+            "Total redundant tracks must be 2 + 4 = 6"
+        );
 
+        let groups = clusters_to_group_rows(&clusters);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["release"], "Random Access Memories (Deluxe)");
+        assert_eq!(groups[0]["children"].as_array().unwrap().len(), 2);
+        assert_eq!(groups[0]["duplicates"], 6);
+        assert_eq!(groups[0]["gained"], 2);
         let rows = clusters_to_link_rows(&clusters);
-        assert_eq!(rows.len(), 2, "Must produce 2 rows for the 2 redundant releases");
+        assert_eq!(
+            rows.len(),
+            2,
+            "Must produce 2 rows for the 2 redundant releases"
+        );
         assert_eq!(rows[0].status, "Chained duplicate");
         assert!(rows[0].evidence.contains("Chained duplicate"));
         assert_eq!(rows[0].target, "Random Access Memories (Deluxe) (6 tracks)");
@@ -748,8 +781,18 @@ mod tests {
             title: "Discovery".to_string(),
             date: "2001".to_string(),
             tracks: vec![
-                make_test_track("/music/Daft Punk/Discovery/01 One More Time.flac", "One More Time", "USXX1", 320.0),
-                make_test_track("/music/Daft Punk/Discovery/02 Aerodynamic.flac", "Aerodynamic", "USXX2", 210.0),
+                make_test_track(
+                    "/music/Daft Punk/Discovery/01 One More Time.flac",
+                    "One More Time",
+                    "USXX1",
+                    320.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Discovery/02 Aerodynamic.flac",
+                    "Aerodynamic",
+                    "USXX2",
+                    210.0,
+                ),
             ],
         };
         let release_copy = LocalRelease {
@@ -759,8 +802,18 @@ mod tests {
             title: "Discovery".to_string(),
             date: "2001".to_string(),
             tracks: vec![
-                make_test_track("/music/Daft Punk/Discovery (Copy)/01 One More Time.flac", "One More Time", "USXX1", 320.0),
-                make_test_track("/music/Daft Punk/Discovery (Copy)/02 Aerodynamic.flac", "Aerodynamic", "USXX2", 210.0),
+                make_test_track(
+                    "/music/Daft Punk/Discovery (Copy)/01 One More Time.flac",
+                    "One More Time",
+                    "USXX1",
+                    320.0,
+                ),
+                make_test_track(
+                    "/music/Daft Punk/Discovery (Copy)/02 Aerodynamic.flac",
+                    "Aerodynamic",
+                    "USXX2",
+                    210.0,
+                ),
             ],
         };
 
@@ -786,9 +839,16 @@ mod tests {
         }
 
         let clusters = find_duplicate_clusters(&records);
-        assert_eq!(clusters.len(), 1, "Must find 1 duplicate cluster for exact duplicate releases");
+        assert_eq!(
+            clusters.len(),
+            1,
+            "Must find 1 duplicate cluster for exact duplicate releases"
+        );
         assert_eq!(clusters[0].redundant.len(), 1);
-        assert_eq!(clusters[0].redundant[0].folder, "/music/Daft Punk/Discovery (Copy)");
+        assert_eq!(
+            clusters[0].redundant[0].folder,
+            "/music/Daft Punk/Discovery (Copy)"
+        );
         assert_eq!(clusters[0].master.folder, "/music/Daft Punk/Discovery");
     }
 }

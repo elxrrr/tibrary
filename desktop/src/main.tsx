@@ -387,8 +387,9 @@ function App() {
                 ...s,
                 job: p.job || s.job,
                 logs: [
-                  ...s.logs,
+                  ...s.logs.filter(log => !p.job?.id || log.progress_id !== p.job.id),
                   {
+                    progress_id: p.job?.id,
                     at: new Date().toISOString(),
                     message: p.message,
                     level: p.job?.status === "failed" ? "error" : p.level || "info",
@@ -413,10 +414,20 @@ function App() {
   }, [root]);
   // Fallback snapshot also recovers a missed completion event during window startup.
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (active(stateRef.current?.job)) refresh();
+    let polling = false, disposed = false;
+    const timer = setInterval(async () => {
+      if (polling || !active(stateRef.current?.job)) return;
+      polling = true;
+      try {
+        const update = await call<any>("job.status");
+        if (!disposed && update.job) {
+          setState(s => s ? {...s, ...update} : s);
+          if (!active(update.job)) await refresh();
+        }
+      } catch (e) { if (!disposed) notifyError(e); }
+      finally { polling = false; }
     }, 2000);
-    return () => clearInterval(timer);
+    return () => { disposed = true; clearInterval(timer); };
   }, [root]);
   useEffect(() => {
     const j = state?.job;
@@ -476,6 +487,7 @@ function App() {
       const j = await call<Job>("job.start", { kind, args: { root, ...args } });
       setState((s) => (s ? { ...s, job: j } : s));
       if (kind === "preview") setSelected(new Set());
+      if (!active(j)) await refresh();
     } catch (e) {
       notifyError(e);
     } finally {
@@ -508,6 +520,8 @@ function App() {
         const d = await call("detail", { artist: row.artist });
         setManual((d.ids || []).join(","));
         setDetail(d);
+      } else if (route === "local" || route === "online") {
+        setDetail({operation: row});
       } else if (row.path || route === "links") {
         setDetail(await call("detail", { root, path: row.path || row.id }));
       }
@@ -595,9 +609,10 @@ function App() {
         : ["local", "online"].includes(route)
           ? [
               { key: "artist", label: "Artist" },
-              { key: "release", label: "Local release" },
+              { key: "release", label: route === "local" ? "Release to keep" : "Local release" },
               { key: "target", label: "Replacement" },
-              { key: "tracks", label: "Duplicates" },
+              { key: "tracks", label: "Tracks" },
+              { key: "duplicates", label: "Duplicates" },
               { key: "gained", label: "Tracks gained" },
               { key: "evidence", label: "Evidence" },
             ]
@@ -1007,7 +1022,7 @@ function App() {
               </button>
             )}
             <button
-              disabled={busy || !selected.size}
+              disabled={busy || route === "online" || !selected.size}
               onClick={() =>
                 run("review_consolidation", {
                   ids: [...selected],
@@ -1273,6 +1288,7 @@ function App() {
             setDirection(sort === key && direction === "asc" ? "desc" : "asc");
           }}
           tree={tree}
+          grouped={route === "local"}
           treeSelection={selection}
           onTreeSelect={selectTree}
           expanded={expanded}
@@ -1544,23 +1560,17 @@ function App() {
                 onClick={() => run("connect_account")}
               >
                 {state?.connections.account
-                  ? "Reconnect catalogue account"
-                  : "Connect catalogue account"}
-              </button>
-              <button disabled={busy} onClick={() => run("connect_download")}>
-                Connect download & metadata account
+                  ? "Reconnect account"
+                  : "Connect account"}
               </button>
               <button
                 disabled={busy || !state?.connections.account}
                 onClick={() => mutate("account.disconnect")}
               >
-                Disconnect catalogue account
+                Disconnect account
               </button>
             </div>
-            <label className="setting-row">
-              <span>Browser redirect URI</span>
-              <code>http://127.0.0.1:8765/callback</code>
-            </label>
+            <p>One account connection is shared by favourites, downloads and extended metadata. Application credentials below provide catalogue access.</p>
           </section>
           <section className="card">
             <h2>Application credentials</h2>
@@ -1720,20 +1730,7 @@ function App() {
           {toggle("Save separate .lrc lyrics file", "downloads", "lyrics_file")}
           {toggle("Create .m3u8 playlist file for albums", "downloads", "playlist_create")}
           {toggle("Write ReplayGain volume tags", "downloads", "replay_gain")}
-          {field(
-            "Parallel downloads",
-            "provider",
-            "download_concurrency",
-            undefined,
-            true,
-          )}
-          {field(
-            "Connections per audio file",
-            "provider",
-            "segment_concurrency",
-            undefined,
-            true,
-          )}
+          <p className="hint">Downloads run one track at a time to keep requests predictable and reduce throttling.</p>
           {field(
             "Minimum release pause (seconds)",
             "provider",
@@ -1745,13 +1742,6 @@ function App() {
             "Maximum release pause (seconds)",
             "provider",
             "download_delay_max_sec",
-            undefined,
-            true,
-          )}
-          {field(
-            "AAC bitrate cap",
-            "provider",
-            "aac_bitrate_cap",
             undefined,
             true,
           )}
@@ -1782,7 +1772,7 @@ function App() {
         <section className="card">
           <h2>Native streaming engine</h2>
           <p>
-            Tibrary runs a fully native Rust download and audio processing engine with zero external Python or runtime dependencies. All stream decryptors, MPEG-DASH parsers, and taggers are compiled directly into the binary.
+            Downloads and audio tagging are included with the app. Engine updates arrive with app updates.
           </p>
           <div className="toolbar">
             <button disabled={busy} onClick={() => run("component_check")}>
@@ -2408,6 +2398,7 @@ function App() {
                 </details>
               </>
             )}
+            {detail.operation && <section><h3>{detail.operation.release}</h3><p>{detail.operation.evidence}</p><dl><dt>Local folder</dt><dd>{detail.operation.path}</dd><dt>Retained / replacement destination</dt><dd>{detail.operation.target}</dd><dt>Duplicate tracks</dt><dd>{detail.operation.duplicates}</dd></dl></section>}
             {detail.artist && !detail.tags && (
               <>
                 <p>
@@ -2550,7 +2541,9 @@ function App() {
                 ? "The listed source files will move to macOS Trash only after replacement audio and metadata are verified. Review BPM/key differences below."
                 : review.operation === "remove-root"
                   ? "Only the library index is removed. Music files remain on disk."
-                  : review.operation === "download"
+                  : review.operation === "deep_apply"
+                    ? "Only database links change. Local tags and file locations remain unchanged."
+                    : review.operation === "download"
                     ? "Only approved tracks are downloaded, using the configured quality and folder structure. Videos and lyrics are excluded."
                     : review.operation === "component_update"
                       ? "Build and activate updated streaming components. The previous runtime is retained for rollback."
@@ -2577,7 +2570,7 @@ function App() {
                       </p>
                     </>
                   ) : (
-                    <p>{r.changes || r.path || r.target}</p>
+                    <p>{readable(r.changes || r.path || r.target)}</p>
                   )}
                   {r.evidence && <small style={{ display: "block", marginTop: "4px" }}>{readable(r.evidence)}</small>}
                   {r.reviewed_dj_conflicts?.length > 0 && (
@@ -2611,8 +2604,7 @@ function App() {
         >
           <div className="modal-body">
             <p>
-              Review matching releases and prepare an explicit tag-and-folder
-              repair.
+              Review recording matches and choose release links. Local tags and folders stay unchanged.
             </p>
             {deep.raw?.map((r: any, i: number) => (
               <article className="candidate" key={i}>
@@ -2629,7 +2621,7 @@ function App() {
                     setDeep(null);
                   }}
                 >
-                  Preview repair
+                  Review links
                 </button>
               </article>
             ))}
@@ -2652,7 +2644,7 @@ function App() {
       {state?.auth_url && (
         <Modal
           title="Connect download & metadata account"
-          onClose={() => call("job.cancel")}
+          onClose={() => { void mutate("job.cancel"); }}
         >
           <div className="modal-body">
             <p>
@@ -2674,12 +2666,12 @@ function App() {
             </label>
           </div>
           <footer>
-            <button onClick={() => call("job.cancel")}>Cancel</button>
+            <button onClick={() => mutate("job.cancel")}>Cancel</button>
             <button
               className="primary"
               disabled={!auth}
               onClick={() => {
-                call("auth.reply", { response: auth }).catch(notifyError);
+                mutate("auth.reply", { response: auth });
                 setAuth("");
               }}
             >

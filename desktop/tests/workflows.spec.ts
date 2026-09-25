@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -15,7 +15,7 @@ async function rpc(method: string, args: any = {}) {
   });
 }
 test.beforeEach(async ({ page }) => {
-  folder = mkdtempSync(join(tmpdir(), "tibrary-browser-"));
+  folder = realpathSync(mkdtempSync(join(tmpdir(), "tibrary-browser-")));
   const root = resolve("..");
   execFileSync(
     "python3",
@@ -30,7 +30,7 @@ test.beforeEach(async ({ page }) => {
   child = spawn(
     join(root, "desktop/src-tauri/target/debug/tibrary"),
     ["--rpc", "--db", join(folder, "db")],
-    { env: { ...process.env } },
+    { env: { ...process.env, TIBRARY_TEST_MODE: "1" } },
   );
   createInterface({ input: child.stdout }).on("line", (line) => {
     const v = JSON.parse(line);
@@ -111,6 +111,7 @@ test("local table sorting and filters are usable", async ({ page }) => {
     .locator("aside")
     .getByRole("button", { name: "Link releases", exact: true })
     .click();
+  await page.getByRole("combobox", { name: "Table filter" }).selectOption("all");
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("button", { name: "Release", exact: true }).click();
   await page.getByRole("button", { name: "Release", exact: true }).click();
@@ -165,12 +166,14 @@ test("multiple file context action affects only selected files", async ({
     .locator("aside")
     .getByRole("button", { name: "Link releases", exact: true })
     .click();
+  await page.getByRole("combobox", { name: "Table filter" }).selectOption("all");
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("checkbox", { name: "Select visible rows" }).check();
   await page.locator("tbody tr").first().click({ button: "right" });
   await page
     .getByRole("menuitem", { name: "Ignore 2 selected tracks" })
     .click();
+  await page.getByRole("combobox", { name: "Table filter" }).selectOption("unlinked");
   await expect(page.locator("tbody tr")).toHaveCount(0);
   await page
     .getByRole("combobox", { name: "Table filter" })
@@ -290,4 +293,61 @@ test("overview restores the library and shows cached missing releases", async ({
   await expect(page.getByLabel("Active library")).not.toHaveValue("/old-library");
   await expect(page.getByText("Choose a registered library first")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "View missing releases" })).toBeVisible();
+});
+
+test("reviewed number corrections run through the UI and survive navigation", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", { name: "Correct tags", exact: true }).click();
+  await page.getByRole("button", { name: /Track & disc numbers/ }).click();
+  await page.getByRole("button", { name: "Preview changes", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Preview changes", exact: true })).toBeEnabled();
+  await page.getByRole("checkbox", { name: "Select visible rows" }).check();
+  await page.getByRole("button", { name: /Review & apply/ }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByRole("dialog")).toContainText("01");
+  await page.getByRole("button", { name: "Confirm & continue" }).click();
+  await expect.poll(async () => (await rpc("state")).result?.job?.status).toBe("complete");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  const meta=await rpc("detail",{path:join(folder,"music","First Light.flac")});
+  expect(meta.result.tags.tracknumber).toEqual(["01"]);
+});
+
+test("account sign-in opens its prompt, rejects unrelated redirects and cancels", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Connections",exact:true}).click();
+  await page.getByRole("button",{name:"Connect account",exact:true}).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByRole("button",{name:"Open sign-in page"})).toBeVisible();
+  const invalid=await rpc("auth.reply",{response:"https://example.com/?code=wrong"});
+  expect(invalid.error).toBeTruthy();
+  expect((await rpc("state")).result.auth_url).toBeTruthy();
+  await page.getByRole("dialog").getByRole("button",{name:"Cancel",exact:true}).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect((await rpc("state")).result.auth_url).toBeNull();
+});
+
+test("audit results survive navigation and unknown actions fail explicitly", async ({ page }) => {
+  await page.goto("/");
+  const started = await rpc("job.start", {kind: "mqa", args: {root: join(folder, "music")}});
+  expect(started.error).toBeUndefined();
+  await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+  const first = await rpc("table", {route: "mqa", root: join(folder, "music")});
+  expect(first.result.total).toBe(2);
+  await page.locator("aside").getByRole("button", {name: "Settings", exact: true}).click();
+  await page.locator("aside").getByRole("button", {name: "MQA audit", exact: true}).click();
+  const restored = await rpc("table", {route: "mqa", root: join(folder, "music")});
+  expect(restored.result.rows).toEqual(first.result.rows);
+  expect((await rpc("job.start", {kind: "unknown_action"})).error).toBeTruthy();
+});
+
+test("download without an account fails and retains the approved queue", async () => {
+  const queued = await rpc("table", {route: "queue"});
+  expect(queued.result.total).toBeGreaterThan(0);
+  await rpc("queue.select", {selection: {[queued.result.rows[0].id]: null}});
+  const before = await rpc("table", {route: "queue"});
+  expect(before.result.rows.some((r: any) => r.approved)).toBe(true);
+  await rpc("job.start", {kind: "download"});
+  await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("failed");
+  const after = await rpc("table", {route: "queue"});
+  expect(after.result.rows).toEqual(before.result.rows);
 });

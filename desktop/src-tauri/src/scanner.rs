@@ -57,6 +57,7 @@ pub struct AudioMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tidal_album_id: Option<String>,
     pub artist_grouping_version: i64,
+    pub tags: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -91,6 +92,7 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
     if ext == "flac" {
         let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
         let options = ParseOptions::new()
+            .implicit_conversions(false)
             .parsing_mode(ParsingMode::Strict)
             .read_cover_art(false);
         let audio = FlacFile::read_from(&mut file, options).map_err(|e| e.to_string())?;
@@ -105,6 +107,7 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
         }
     } else {
         let options = ParseOptions::new()
+            .implicit_conversions(false)
             .parsing_mode(ParsingMode::Strict)
             .read_cover_art(false);
         let audio = Probe::open(path)
@@ -124,10 +127,7 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
                 };
                 if let Some(key) = mapped {
                     if let Some(value) = item.value().text().or_else(|| item.value().locator()) {
-                        tags_map
-                            .entry(key)
-                            .or_default()
-                            .push(value.to_string());
+                        tags_map.entry(key).or_default().push(value.to_string());
                     }
                 }
             }
@@ -181,6 +181,7 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
         tidal_track_id: get_first(&["tidal_track_id", "tidaltrackid"]),
         tidal_album_id: get_first(&["tidal_album_id", "tidalalbumid"]),
         artist_grouping_version: 3,
+        tags: tags_map.clone(),
     })
 }
 
@@ -188,6 +189,16 @@ pub async fn scan_library(
     db: &TursoDb,
     root: impl AsRef<Path>,
     cancelled: Arc<AtomicBool>,
+    progress: impl Fn(&str) + Send + Sync,
+) -> Result<ScanSummary, String> {
+    scan_library_with_options(db, root, cancelled, false, progress).await
+}
+
+pub async fn scan_library_with_options(
+    db: &TursoDb,
+    root: impl AsRef<Path>,
+    cancelled: Arc<AtomicBool>,
+    force: bool,
     progress: impl Fn(&str) + Send + Sync,
 ) -> Result<ScanSummary, String> {
     let root_path = root.as_ref().to_path_buf();
@@ -202,6 +213,7 @@ pub async fn scan_library(
 
     progress(&format!("Opening library · {}", root_str));
     let conn = db.connect()?;
+    let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
 
     conn.execute(
         "INSERT OR IGNORE INTO roots (root, status) VALUES (?, 'scanning')",
@@ -225,7 +237,10 @@ pub async fn scan_library(
         let size: i64 = row.get(1).map_err(|e| e.to_string())?;
         let mtime: i64 = row.get(2).map_err(|e| e.to_string())?;
         let error_opt: Option<String> = row.get::<Option<String>>(4).unwrap_or(None);
-        let has_error = error_opt.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let has_error = error_opt
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
         let present: i64 = row.get(5).unwrap_or(1);
         cached_files.insert(path, (size, mtime, has_error, present != 0));
     }
@@ -314,7 +329,7 @@ pub async fn scan_library(
             if let Some(&(cached_size, cached_mtime, has_error, is_present)) =
                 cached_files.get(&path_str)
             {
-                if cached_size == size && cached_mtime == mtime && !has_error {
+                if !force && cached_size == size && cached_mtime == mtime && !has_error {
                     summary.unchanged += 1;
                     if !is_present {
                         restored_paths.push(path_str);
@@ -334,14 +349,7 @@ pub async fn scan_library(
                 summary.errors += 1;
             }
 
-            pending_writes.push((
-                path_str,
-                root_str.clone(),
-                size,
-                mtime,
-                meta_json,
-                err_str,
-            ));
+            pending_writes.push((path_str, root_str.clone(), size, mtime, meta_json, err_str));
 
             if pending_writes.len() >= 64 {
                 flush_writes(&conn, &mut pending_writes).await?;
@@ -412,14 +420,21 @@ async fn flush_writes(
     conn: &turso::Connection,
     pending: &mut Vec<PendingWrite>,
 ) -> Result<(), String> {
-    for (path, root, size, mtime, meta, err) in pending.drain(..) {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .map_err(|e| e.to_string())?;
+    let result:Result<(),String> = async {
+    for (path, root, size, mtime, meta, err) in pending.iter() {
         conn.execute(
             "INSERT OR REPLACE INTO local_files (path, root, size, mtime, metadata, error, present) VALUES (?, ?, ?, ?, ?, ?, 1)",
             (
                 path.as_str(),
                 root.as_str(),
-                size,
-                mtime,
+                *size,
+                *mtime,
                 meta.as_deref().unwrap_or(""),
                 err.as_deref().unwrap_or(""),
             ),
@@ -427,6 +442,16 @@ async fn flush_writes(
         .await
         .map_err(|e| e.to_string())?;
     }
+    Ok(())
+    }.await;
+    if let Err(e) = result {
+        let _ = conn.execute("ROLLBACK", ()).await;
+        return Err(e);
+    }
+    conn.execute("COMMIT", ())
+        .await
+        .map_err(|e| e.to_string())?;
+    pending.clear();
     Ok(())
 }
 

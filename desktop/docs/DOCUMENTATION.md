@@ -20,6 +20,16 @@
 
 ---
 
+## Verification status — 25 September 2026
+
+This remains a beta, not a certified public release. The Rust migration audit restored previously unhandled desktop actions and removed silent-success fallbacks. Linking and extended review write database associations only; filesystem edits require a current, explicit preview. File changes invalidate reviewed writes. Jobs run independently of navigation, with lightweight progress polling and revision-based table caches.
+
+Connections now consist of application credentials for the official catalogue API and **one shared subscriber sign-in** for favourites, extended metadata and audio downloads. These are distinct authorization types; duplicate subscriber connection controls were removed. Account tokens are saved in macOS Keychain. No Python service is required.
+
+Verification uses disposable files/databases, mocked catalogue data, and WebKit against the actual Rust RPC backend. Routine Rust tests do not consume live API quota; credential-store/live catalogue tests are explicitly ignored unless requested. A read-only snapshot of the production library was used to exercise all table routes, without modifying library files. On that 19,243-track snapshot, cold link-table construction took about 7.5 seconds; cached filtering took 16–17 ms. Cold-start query optimization remains useful future work.
+
+Live official catalogue authentication, artist search and audio-only release pagination were checked. Cassie release `140303440` returns 12 audio tracks, excluding its video. Successful subscriber OAuth completion, favourites retrieval and a real authenticated audio download still require an available subscriber session and are **not verified by the automated checks**. Native decoding, tagging, staging, queue selection and missing-account failure paths are tested separately. Non-macOS packaging and notarized public distribution are not validated by this audit.
+
 ## 1. Architecture Overview
 
 Tibrary is designed with a local-first, dual-process desktop architecture pairing a high-performance **Rust native core** with a reactive **React 19** user interface:
@@ -59,6 +69,7 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 
 | Module | Responsibility |
 | --- | --- |
+| `actions.rs` | Reviewed background actions, shared release-detail cache, metadata/artwork previews, MQA audit and consolidation review. |
 | `main.rs` | Application entry point, window management, system menus, Tauri IPC command routing, and headless `--rpc` server. |
 | `db.rs` | Embedded Turso/libsql database engine, schema migrations, table views, and atomic revision counters. |
 | `scanner.rs` | Fast, non-blocking local filesystem crawler, path normalization, and audio metadata extraction via Lofty. |
@@ -87,7 +98,8 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 - **macOS** 13+ (Apple Silicon or Intel), **Linux**, or **Windows 10/11**.
 - **Rust Stable** (1.80 or later): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Node.js** (v20 or v22 LTS) and **npm**: `brew install node`
-- **No Python runtime required**: All audio downloading, streaming decryption, manifest parsing, and tagging operations are 100% native Rust.
+- **FFmpeg**: `brew install ffmpeg`. Used only to copy lossless audio from MP4 containers into FLAC, without re-encoding. Tibrary finds standard Homebrew installations when launched from Finder.
+- **No Python runtime required**: The application engine, decryption, manifest parsing and tagging run in Rust.
 
 ### Quick Start
 ```sh
@@ -162,7 +174,7 @@ The Playwright E2E suite uses `desktop/tests/seed_desktop.py` to populate a temp
 
 ### Download & Tagging Architecture
 
-- **100% Native Rust Engine:** Downloads are executed directly by Tibrary's asynchronous Tokio streaming engine (`stream_download.rs` and `downloads.rs`) with zero external Python or runtime dependencies.
+- **100% Native Rust Engine:** Downloads are executed directly by Tibrary's asynchronous Tokio streaming engine (`stream_download.rs` and `downloads.rs`) without Python. MP4-wrapped FLAC uses an external FFmpeg stream-copy step.
 - **Audio Qualities:** Supports `LOSSLESS` (16-bit / 44.1 kHz FLAC), `HI_RES_LOSSLESS` (up to 24-bit / 192 kHz FLAC), `HIGH` (320 kbps AAC), and `LOW` (96 kbps AAC).
 - **Stream Decryption:** Decrypts 32-byte master security tokens with AES-256-CBC and audio stream bytes with AES-128-CTR in real time.
 - **Streaming Manifests:** Seamlessly parses BTS JSON manifests and MPEG-DASH MPD XML manifests with segment templates and timeline offsets.
@@ -303,3 +315,11 @@ For distributing binaries outside local development environments:
      --keychain-profile "AC_PASSWORD" --wait
    xcrun stapler staple desktop/src-tauri/target/release/bundle/dmg/Tibrary_*.dmg
    ```
+
+### Authenticated verification — 25 September 2026
+
+A real account check, catalogue detail request and selected-track download completed against an isolated test database. The resulting file decoded without errors as 16-bit/44.1 kHz FLAC, with 1280×1280 embedded artwork, companion cover.jpg, zero-padded numbers and no lyrics. Country parameters were restored on subscriber API requests; official pagination retains the /v2 prefix and country. Progress updates replace one running Activity entry while errors and completion remain visible.
+
+Three disposable copies of existing FLAC files passed scan, read-only preview, reviewed number-tag application, MQA audit and duplicate analysis. Original NVME files were not modified. This verifies those exercised paths, not every possible catalogue edition or download format.
+
+Validation for this patch: 49 Rust tests passed (2 opt-in live tests skipped), 2 selection tests passed, and 12 WebKit workflows passed. A separate authenticated catalogue test traversed 34 releases across pages. Organisation moved two copied files and refused the duplicate destination for the third, preserving all files. The app remains labelled beta; these results are not a claim that every provider catalogue edge case has been verified.

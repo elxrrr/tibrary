@@ -1,10 +1,11 @@
 use crate::db::TursoDb;
 use crate::tidal::TidalArtist;
 use chrono::Utc;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+static SESSION_CACHE: OnceLock<Mutex<Option<(Instant, Option<AccountSession>)>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSession {
@@ -14,9 +15,7 @@ pub struct AccountSession {
     pub expires_at: f64,
 }
 
-pub struct AccountClient {
-    http: reqwest::Client,
-}
+pub struct AccountClient;
 
 impl Default for AccountClient {
     fn default() -> Self {
@@ -26,19 +25,40 @@ impl Default for AccountClient {
 
 impl AccountClient {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
-        Self { http }
+        Self
     }
 
     pub fn load_saved_session() -> Option<AccountSession> {
+        if std::env::var_os("TIBRARY_TEST_MODE").is_some() {
+            return None;
+        }
+        let cache = SESSION_CACHE.get_or_init(|| Mutex::new(None));
+        let mut entry = cache.lock().unwrap();
+        if let Some((at, session)) = &*entry {
+            if at.elapsed() < Duration::from_secs(30) {
+                return session.clone();
+            }
+        }
+        let session = Self::load_uncached_session();
+        *entry = Some((Instant::now(), session.clone()));
+        session
+    }
+    fn load_uncached_session() -> Option<AccountSession> {
+        if std::env::var_os("TIBRARY_TEST_MODE").is_some() {
+            return None;
+        }
         #[cfg(target_os = "macos")]
         {
-            // Query generic password for service Tibrary, account starting with collection-
+            // Read the subscriber account only, never another credential in this service.
             let output = std::process::Command::new("security")
-                .args(["find-generic-password", "-s", "Tibrary", "-w"])
+                .args([
+                    "find-generic-password",
+                    "-s",
+                    "Tibrary",
+                    "-a",
+                    "session",
+                    "-w",
+                ])
                 .output()
                 .ok()?;
 
@@ -48,9 +68,19 @@ impl AccountClient {
                     let trimmed = line.trim();
                     if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
                         if let Some(token) = val.get("access_token").and_then(|v| v.as_str()) {
-                            let refresh = val.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            let uid = val.get("user_id").or_else(|| val.get("userId")).and_then(|v| v.as_str()).map(|s| s.to_string());
-                            let exp = val.get("expires_at").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let refresh = val
+                                .get("refresh_token")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let uid = val
+                                .get("user_id")
+                                .or_else(|| val.get("userId"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let exp = val
+                                .get("expires_at")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
 
                             return Some(AccountSession {
                                 access_token: token.to_string(),
@@ -68,17 +98,38 @@ impl AccountClient {
 
     pub fn save_session(session: &AccountSession) -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
-        {
-            if let Ok(val) = serde_json::to_string(session) {
-                let _ = std::process::Command::new("security")
-                    .args(["add-generic-password", "-s", "Tibrary", "-a", "session", "-w", &val, "-U"])
-                    .output();
+        if std::env::var_os("TIBRARY_TEST_MODE").is_none() {
+            let value = serde_json::to_string(session)?;
+            let result = std::process::Command::new("security")
+                .args([
+                    "add-generic-password",
+                    "-s",
+                    "Tibrary",
+                    "-a",
+                    "session",
+                    "-w",
+                    &value,
+                    "-U",
+                ])
+                .output()?;
+            if !result.status.success() {
+                return Err(std::io::Error::other(
+                    "Unable to save account securely in Keychain",
+                ));
             }
         }
+        *SESSION_CACHE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some((Instant::now(), Some(session.clone())));
         Ok(())
     }
 
     pub fn disconnect() -> std::io::Result<()> {
+        *SESSION_CACHE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = None;
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("security")
@@ -86,63 +137,6 @@ impl AccountClient {
                 .output();
         }
         Ok(())
-    }
-
-    pub async fn fetch_favourite_artists(
-        &self,
-        token: &str,
-        user_id: &str,
-    ) -> Result<Vec<TidalArtist>, String> {
-        let url = format!(
-            "https://openapi.tidal.com/v2/users/{}/relationships/favorites/artists",
-            user_id
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", token))
-                .map_err(|e| format!("Invalid auth header: {}", e))?,
-        );
-        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.api+json"));
-
-        let res = self
-            .http
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| format!("Favorites request failed: {}", e))?;
-
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            return Err(format!("TIDAL API HTTP {}: {}", status, body));
-        }
-
-        let payload: Value = res
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse favorites JSON: {}", e))?;
-
-        let mut artists = Vec::new();
-        if let Some(data) = payload.get("data").and_then(|v| v.as_array()) {
-            for item in data {
-                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let name = item
-                    .get("attributes")
-                    .and_then(|a| a.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if !id.is_empty() {
-                    artists.push(TidalArtist { id, name });
-                }
-            }
-        }
-
-        Ok(artists)
     }
 
     pub async fn save_favourites_to_db(
@@ -181,7 +175,9 @@ mod tests {
                 .as_nanos()
         ));
         let db_path = temp_dir.join("fav.sqlite3");
-        let store = TursoDb::open(&db_path).await.expect("Failed to open TursoDb");
+        let store = TursoDb::open(&db_path)
+            .await
+            .expect("Failed to open TursoDb");
         let client = AccountClient::new();
 
         let artists = vec![
@@ -202,7 +198,10 @@ mod tests {
 
         let conn = store.connect().unwrap();
         let mut stmt = conn
-            .query("SELECT payload FROM favourite_artists WHERE cache_id = 'user_1'", ())
+            .query(
+                "SELECT payload FROM favourite_artists WHERE cache_id = 'user_1'",
+                (),
+            )
             .await
             .unwrap();
 

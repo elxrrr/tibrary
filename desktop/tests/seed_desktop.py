@@ -9,7 +9,10 @@ def write_flac(path, artist, album, title, track, total):
     path.parent.mkdir(parents=True, exist_ok=True)
     # Minimal valid FLAC container
     stream = (4096).to_bytes(2, 'big') * 2 + b'\0' * 6 + ((8000 << 44) | (15 << 36) | 8000).to_bytes(8, 'big') + b'\0' * 16
-    payload = b'fLaC' + b'\x80\x00\x00\x22' + stream + b'audio payload'
+    tags = {'ARTIST': artist, 'ALBUMARTIST': artist, 'ALBUM': album, 'TITLE': title, 'TRACKNUMBER': f'{track}/{total}', 'DISCNUMBER': '1/1', 'DATE': '2020-04-03'}
+    items=[f'{k}={v}'.encode() for k,v in tags.items()]
+    comments=(0).to_bytes(4,'little')+len(items).to_bytes(4,'little')+b''.join(len(v).to_bytes(4,'little')+v for v in items)
+    payload=b'fLaC'+b'\x00\x00\x00\x22'+stream+b'\x84'+len(comments).to_bytes(3,'big')+comments+b'audio payload'
     path.write_bytes(payload)
 
 
@@ -104,8 +107,8 @@ def main():
             'tidal_track_id': '91000101',
         }
 
-        conn.execute("INSERT OR REPLACE INTO local_files VALUES (?, ?, 1000, 2000, ?, NULL, 1)", (str(f1), str(library), json.dumps(meta1)))
-        conn.execute("INSERT OR REPLACE INTO local_files VALUES (?, ?, 1000, 2000, ?, NULL, 1)", (str(f2), str(library), json.dumps(meta2)))
+        conn.execute("INSERT OR REPLACE INTO local_files VALUES (?, ?, ?, ?, ?, NULL, 1)", (str(f1), str(library), f1.stat().st_size, f1.stat().st_mtime_ns, json.dumps(meta1)))
+        conn.execute("INSERT OR REPLACE INTO local_files VALUES (?, ?, ?, ?, ?, NULL, 1)", (str(f2), str(library), f2.stat().st_size, f2.stat().st_mtime_ns, json.dumps(meta2)))
 
         conn.execute("INSERT OR REPLACE INTO mappings VALUES ('North Assembly', '900001', 'confirmed', 'fixture', 1)")
         conn.execute("INSERT OR REPLACE INTO mappings VALUES ('Wrong', '900001', 'confirmed', 'fixture', 1)")
