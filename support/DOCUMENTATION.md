@@ -22,7 +22,7 @@
 
 ## 1. Architecture Overview
 
-Tibrary is designed with a local-first, dual-process native desktop architecture combining a high-performance **Rust native core** with a reactive **React 19** user interface:
+Tibrary is designed with a local-first, dual-process desktop architecture pairing a high-performance **Rust native core** with a reactive **React 19** user interface:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -47,10 +47,10 @@ Tibrary is designed with a local-first, dual-process native desktop architecture
 │  │ • Exponential Backoff & Cache │ • ISRC & Duration Tolerances     │  │
 │  └───────────────────────────────┴──────────────────────────────────┘  │
 └───────────────────────────────────┬────────────────────────────────────┘
-                                    │ Isolated CLI Execution
+                                    │ Isolated Worker Bridge
 ┌───────────────────────────────────┴────────────────────────────────────┐
 │                    On-Demand Download Worker                           │
-│     Tidaler (Python 3.12+) — Executed strictly for active downloads    │
+│     Tidaler (Python 3.13+) — Executed strictly for active downloads    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -59,14 +59,21 @@ Tibrary is designed with a local-first, dual-process native desktop architecture
 | Module | Responsibility |
 | --- | --- |
 | `main.rs` | Application entry point, window management, system menus, Tauri IPC command routing, and headless `--rpc` server. |
-| `db.rs` | Embedded Turso/libsql database engine, schema migrations, table views (missing, unlinked, queue, duplicate, mqa, local, online), and atomic revision counters. |
-| `scanner.rs` | High-speed, non-blocking local filesystem crawler, path normalization, and audio metadata extraction via Lofty. |
-| `tag_writer.rs` | Safe, atomic audio metadata editor using Lofty. Preserves FLAC padding, custom DJ tags, and embedded artwork. |
-| `tidal.rs` | Direct native Tidal API client with OAuth2 token persistence, search, artist discography pagination, and automatic rate limiting. |
-| `matcher.rs` | Deterministic confidence-scored artist and release matching, ISRC resolution, and structural duration gating. |
+| `db.rs` | Embedded Turso/libsql database engine, schema migrations, table views, and atomic revision counters. |
+| `scanner.rs` | Fast, non-blocking local filesystem crawler, path normalization, and audio metadata extraction via Lofty. |
+| `tag_writer.rs` | Safe audio metadata editor using Lofty. Preserves FLAC padding, custom DJ tags, and embedded artwork without modifying audio frames. |
+| `tidal.rs` | Direct native Tidal API client with OAuth2 token persistence, search, artist discography pagination, and rate limiting. |
+| `matching.rs` | Confidence-scored artist and track candidate matching, ISRC resolution, and structural duration gating. |
 | `release_matching.rs` | Whole-release track alignment, multi-disc normalization, and candidate ranking. |
+| `linking.rs` | High-level library linking pipeline connecting local tracks to confirmed Tidal releases. |
+| `enrichment.rs` | Missing DJ tag calculations (Camelot musical keys, BPM normalization). |
+| `musical_keys.rs` | Musical key conversions and Open Key / Camelot wheel notation mapping. |
 | `mqa.rs` | 36-bit stereo-XOR sync detection algorithm for verifying authentic MQA streams directly in raw PCM frames. |
+| `maintenance.rs` | Safe directory relocation, file renaming, and duplicate consolidation. |
+| `organisation.rs` | Layout path templating and file system safety checks. |
+| `recommendations.rs` | Contributor network traversal and artist discography gap discovery. |
 | `downloads.rs` | Acquisition queue state management and invocation of on-demand download workers. |
+| `account.rs` | Tidal user session management and favourite sync. |
 | `workflows.rs` | Orchestration of background library workflows (scanning, matching, retagging, auditing). |
 
 ---
@@ -77,7 +84,7 @@ Tibrary is designed with a local-first, dual-process native desktop architecture
 - **macOS** 13+ (Apple Silicon or Intel), **Linux**, or **Windows 10/11**.
 - **Rust Stable** (1.80 or later): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Node.js** (v20 or v22 LTS) and **npm**: `brew install node`
-- **Python** (3.12 or 3.13) — *Optional*: Only required for on-demand downloads via Tidaler or running Playwright test fixtures.
+- **Python** (3.13+) — *Optional*: Only required for on-demand downloads via Tidaler or running Playwright test fixtures. Run `./support/tools/Setup downloads.command` to automatically set up the Tidaler environment.
 
 ### Quick Start
 ```sh
@@ -140,7 +147,7 @@ The Playwright E2E suite uses `support/tests/seed_desktop.py` to populate a temp
 - Catalogue discovery and gap analysis are strictly read-only.
 - Downloads, tag edits, moves, and deletions remain explicit actions with previews and auditable results.
 
-### Key Features & Capabilities
+### Key Capabilities
 
 1. **Smart Incremental Scanning:** Traverses audio roots without following symlinks. Files are fingerprinted via `(path, size, mtime_nanoseconds)`. Unchanged files skip tag parsing; modified or new files are read via Lofty.
 2. **Deterministic Catalogue Linking:** Matches local releases to Tidal catalogue entities using multi-evidence scoring: exact ISRCs, track durations (±3s window), multi-disc alignments, edition variants (Deluxe, Remaster, Explicit), and whole-release structure.
@@ -149,6 +156,13 @@ The Playwright E2E suite uses `support/tests/seed_desktop.py` to populate a temp
 5. **Duplicate & Replacement Inspection:** Identifies duplicate tracks across disks and directories, scoring bit depth, sample rates, and tags so you can keep the best edition.
 6. **Non-Destructive Tag & Folder Maintenance:** Previews tag normalizations (leading zeros, Camelot `INITIALKEY` conversions, BPM standardization) and directory reorganizations (`Artist/Album (Year)/Track - Title`).
 7. **Acquisition Queue & Fulfilment:** Persistent, reviewable acquisition queue. Export approved items as URLs/JSON/CSV, or dispatch them directly to an isolated on-demand Tidaler background download worker.
+
+### Download & Tagging Architecture
+
+- **On-Demand Worker:** Downloads are dispatched to Tidaler via an isolated bridge script (`app/library_manager/download_bridge.py`).
+- **Album Artist Isolation:** The release's album artist is strictly mapped to `ALBUMARTIST`. Individual track guest artists or remixers remain in `ARTIST`, preventing track performer pollution and ensuring multi-artist albums stay grouped under the album artist folder.
+- **Staging & Safe Publishing:** Files are downloaded into an isolated temporary staging directory, tagged with verified metadata and Tidal IDs, and moved into the target folder layout (`{album_artist}/{album}/{track_number} {title}`) using hard links or atomic moves. Existing user files are never overwritten.
+- **Python Runtime:** Discovered automatically at `app/resources/tidaler/.venv/bin/python` (configured via `./support/tools/Setup downloads.command`) with fallback to root `.venv`.
 
 ---
 
@@ -258,12 +272,13 @@ npm --prefix desktop run tauri build
 | **Database** | Embedded Turso/libsql database initializes cleanly from empty or existing SQLite file. | PASS |
 | **Database** | Atomic revision counters trigger instant UI table reloads on record mutations. | PASS |
 | **Scanner** | Filesystem scan traverses nested directory structures, ignoring symlinks. | PASS |
-| **Scanner** | Sub-millisecond fingerprinting correctly detects new, modified, or deleted files. | PASS |
+| **Scanner** | Fingerprinting correctly detects new, modified, or deleted files. | PASS |
 | **Audio Engine** | Lofty reads FLAC, MP3, M4A, ALAC, WAV, and AIFF metadata accurately. | PASS |
 | **Tag Writer** | FLAC tag updates reuse existing metadata padding without rewriting audio frames. | PASS |
 | **Tag Writer** | Pre- and post-write SHA-256 frame hashes guarantee zero audio alteration. | PASS |
 | **MQA Audit** | Native 36-bit stereo-XOR sync detector identifies genuine MQA PCM streams. | PASS |
 | **Linking** | Exact ISRC, track duration, title, and release structure gates prevent false matches. | PASS |
+| **Downloads** | `ALBUMARTIST` is protected and isolated from track guest artists; files layout correctly. | PASS |
 | **Queue** | Acquisition queue persists across application restarts and prevents duplicate jobs. | PASS |
 | **Security** | Tidal OAuth tokens are stored in the OS credential store and never logged. | PASS |
 
