@@ -1741,16 +1741,22 @@ impl TursoDb {
     }
 
     pub async fn get_settings(&self) -> Result<Value, String> {
-        let general = self
+        let mut general = self
             .get_preference("desktop")
             .await?
             .or(self.get_preference("ui").await?)
             .unwrap_or_else(|| {
                 json!({
                     "market": "GB",
-                    "theme": "dark"
+                    "theme": "dark",
+                    "persist_logs": true
                 })
             });
+        if general.get("persist_logs").is_none() {
+            if let Some(obj) = general.as_object_mut() {
+                obj.insert("persist_logs".to_string(), json!(true));
+            }
+        }
         let mut provider_defaults = json!({
             "request_interval_ms": 750,
             "request_timeout_sec": 20,

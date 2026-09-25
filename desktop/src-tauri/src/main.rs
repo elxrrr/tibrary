@@ -33,7 +33,6 @@ pub mod tidal;
 pub mod workflows;
 use db::TursoDb;
 
-#[derive(Default)]
 pub struct Backend {
     pub db: Mutex<Option<Arc<TursoDb>>>,
     pub active_job_cancel: Mutex<Option<Arc<AtomicBool>>>,
@@ -44,6 +43,24 @@ pub struct Backend {
     pub read_gate: tokio::sync::Mutex<()>,
     pub view_cache: Mutex<HashMap<String, (u64, std::time::Instant, Value)>>,
     pub pending_pkce: Mutex<Option<crate::stream_download::PkceFlow>>,
+    pub persist_logs: Arc<AtomicBool>,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self {
+            db: Mutex::new(None),
+            active_job_cancel: Mutex::new(None),
+            active_job: Mutex::new(None),
+            logs: Mutex::new(Vec::new()),
+            previews: Mutex::new(HashMap::new()),
+            dispatch_gate: tokio::sync::Mutex::new(()),
+            read_gate: tokio::sync::Mutex::new(()),
+            view_cache: Mutex::new(HashMap::new()),
+            pending_pkce: Mutex::new(None),
+            persist_logs: Arc::new(AtomicBool::new(true)),
+        }
+    }
 }
 
 impl Backend {
@@ -110,15 +127,17 @@ impl Backend {
             logs.remove(0);
         }
 
-        // Persist to database if initialized
-        if let Some(db) = self.db.lock().unwrap().clone() {
-            let at_str = at;
-            let msg_str = msg.to_string();
-            let lvl_str = log_level.to_string();
-            let cat_str = cat.to_string();
-            tauri::async_runtime::spawn(async move {
-                let _ = db.log_activity(&at_str, &msg_str, &lvl_str, &cat_str).await;
-            });
+        // Persist to database if initialized and logging persistence is enabled
+        if self.persist_logs.load(Ordering::SeqCst) {
+            if let Some(db) = self.db.lock().unwrap().clone() {
+                let at_str = at;
+                let msg_str = msg.to_string();
+                let lvl_str = log_level.to_string();
+                let cat_str = cat.to_string();
+                tauri::async_runtime::spawn(async move {
+                    let _ = db.log_activity(&at_str, &msg_str, &lvl_str, &cat_str).await;
+                });
+            }
         }
     }
 
@@ -648,6 +667,11 @@ async fn handle_rpc_uncached(
     if method == "settings.save" || method == "settings.update" {
         let section = args.get("section").and_then(|v| v.as_str()).unwrap_or("ui");
         let values = args.get("values").unwrap_or(&args);
+        if section == "desktop" || section == "general" {
+            if let Some(p) = values.get("persist_logs").and_then(|v| v.as_bool()) {
+                state.persist_logs.store(p, Ordering::SeqCst);
+            }
+        }
         let res = db.save_settings(section, values).await?;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -2063,6 +2087,12 @@ fn main() {
             let turso_db = tauri::async_runtime::block_on(TursoDb::open(&db_path))
                 .map_err(|e| tauri::Error::from(std::io::Error::other(e)))?;
             backend.set_db(Arc::new(turso_db.clone()));
+            let persist = tauri::async_runtime::block_on(turso_db.get_preference("desktop"))
+                .ok()
+                .flatten()
+                .and_then(|v| v.get("persist_logs").and_then(|b| b.as_bool()))
+                .unwrap_or(true);
+            backend.persist_logs.store(persist, std::sync::atomic::Ordering::SeqCst);
             if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(

@@ -1415,6 +1415,25 @@ function App() {
               "dark",
             ])}
             {field("Catalogue market", "general", "market")}
+            <label className="setting-row">
+              <span>Cache and persist activity logs</span>
+              <input
+                type="checkbox"
+                checked={settings.general?.persist_logs !== false}
+                onChange={(e) =>
+                  setSettings({
+                    ...settings,
+                    general: {
+                      ...settings.general,
+                      persist_logs: e.target.checked,
+                    },
+                  })
+                }
+              />
+            </label>
+            <p>
+              Retain historical activity and error logs in database across app restarts.
+            </p>
             <button
               disabled={busy}
               onClick={() => saveSettings("desktop", settings.general)}
@@ -2038,7 +2057,6 @@ function App() {
       <main>
         <header className="page-header">
           <div>
-            <span className="eyebrow">YOUR MUSIC WORKSPACE</span>
             <h1>{titles[route] || "Overview"}</h1>
             <p>{descriptions[route] || "Choose a step to continue."}</p>
           </div>
@@ -2055,23 +2073,25 @@ function App() {
                 </option>
               ))}
             </select>
-            <button
-              className={
-                active(state?.job) ? "activity-pill running" : "activity-pill"
-              }
-              onClick={() => setRoute("activity")}
-            >
-              {active(state?.job) ? (
-                <LoaderCircle className="spin" size={16} />
-              ) : (
-                <Activity size={16} />
-              )}{" "}
-              {active(state?.job)
-                ? state?.job?.status === "cancelling"
-                  ? "Cancelling…"
-                  : "Working"
-                : "Activity"}
-            </button>
+            {route !== "activity" && (
+              <button
+                className={
+                  active(state?.job) ? "activity-pill running" : "activity-pill"
+                }
+                onClick={() => setRoute("activity")}
+              >
+                {active(state?.job) ? (
+                  <LoaderCircle className="spin" size={16} />
+                ) : (
+                  <Activity size={16} />
+                )}{" "}
+                {active(state?.job)
+                  ? state?.job?.status === "cancelling"
+                    ? "Cancelling…"
+                    : "Working"
+                  : "Activity"}
+              </button>
+            )}
           </div>
         </header>
         {error && (
@@ -2111,29 +2131,85 @@ function App() {
             settingsPage()
           ) : route === "activity" ? (
             <>
-              <section className="card activity-status">
-                <div>
-                  <span className="eyebrow">
-                    {state?.job?.status || "READY"}
-                  </span>
-                  <h2>
-                    {state?.job?.kind?.replaceAll("_", " ") ||
-                      "No active operation"}
-                  </h2>
-                  <p>
-                    {state?.job?.message ||
-                      "Operations will appear here. You can keep browsing while they run."}
-                  </p>
-                </div>
-                <button
-                  disabled={
-                    !active(state?.job) || state?.job?.status === "cancelling"
-                  }
-                  onClick={() => call("job.cancel").catch(notifyError)}
-                >
-                  Cancel safely
-                </button>
-              </section>
+              {(() => {
+                const job = state?.job;
+                const rawStatus = (job?.status || "ready").toLowerCase();
+                const rawKind = (job?.kind || "").toLowerCase();
+
+                let statusLabel = "READY";
+                let statusClass = "ready";
+                if (rawStatus === "failed" || rawStatus === "error") {
+                  statusLabel = "FAILED";
+                  statusClass = "failed";
+                } else if (rawStatus === "running" || rawStatus === "in_progress") {
+                  statusLabel = "RUNNING";
+                  statusClass = "running";
+                } else if (rawStatus === "complete" || rawStatus === "completed" || rawStatus === "done") {
+                  statusLabel = "COMPLETED";
+                  statusClass = "complete";
+                } else if (rawStatus === "cancelling") {
+                  statusLabel = "CANCELLING";
+                  statusClass = "cancelling";
+                } else if (rawStatus === "cancelled") {
+                  statusLabel = "CANCELLED";
+                  statusClass = "cancelled";
+                }
+
+                let cat = "general";
+                if (rawKind === "download" || rawKind.includes("download")) cat = "download";
+                else if (rawKind === "scan" || rawKind.includes("scan")) cat = "scan";
+                else if (rawKind === "link" || rawKind.includes("link") || rawKind.includes("catalogue") || rawKind.includes("artist")) cat = "linking";
+                else if (rawKind.includes("duplicate") || rawKind.includes("consolidation") || rawKind.includes("trash") || rawKind.includes("organise") || rawKind.includes("correct")) cat = "cleanup";
+                else if (rawStatus === "failed" || rawStatus === "error") cat = "error";
+
+                const kindTitles: Record<string, string> = {
+                  download: "Lossless Audio Download",
+                  scan: "Library Scan",
+                  link: "Catalogue Linker",
+                  mqa: "MQA Audio Inspection",
+                  queue_mqa: "Queue Lossless Replacements",
+                  duplicates: "Duplicate Scanner",
+                  review_consolidation: "Duplicate Consolidation",
+                  apply_consolidation: "Trash Duplicate Files",
+                  metadata: "Metadata Tagging",
+                  artwork: "Artwork Fetcher",
+                  correct: "Tag Correction",
+                  organise: "Folder Organization",
+                  favourites: "Refresh Favourite Artists",
+                  startup: "System Ready",
+                };
+                const displayTitle = kindTitles[rawKind] || (rawKind ? rawKind.split("_").map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") : "No Active Operation");
+
+                return (
+                  <section className="card activity-status">
+                    <div className="activity-status-info">
+                      <div className="activity-status-badges">
+                        <span className={`status-badge status-${statusClass}`}>
+                          {statusLabel}
+                        </span>
+                        {rawKind && rawKind !== "startup" && (
+                          <span className={`log-badge log-badge-${cat}`}>
+                            {cat.toUpperCase()}
+                          </span>
+                        )}
+                      </div>
+                      <h2>{displayTitle}</h2>
+                      <p>
+                        {job?.message ||
+                          "Operations will appear here. You can keep browsing while they run."}
+                      </p>
+                    </div>
+                    <button
+                      disabled={
+                        !active(state?.job) || state?.job?.status === "cancelling"
+                      }
+                      onClick={() => call("job.cancel").catch(notifyError)}
+                    >
+                      Cancel
+                    </button>
+                  </section>
+                );
+              })()}
               <div className="activity-controls">
                 <div className="activity-filters">
                   <select
@@ -2141,13 +2217,13 @@ function App() {
                     value={logCategory}
                     onChange={(e) => setLogCategory(e.target.value)}
                   >
-                    <option value="all">All categories</option>
-                    <option value="error">Errors & Warnings</option>
-                    <option value="download">Downloads</option>
-                    <option value="scan">Library Scans</option>
-                    <option value="linking">Linking & Catalogue</option>
-                    <option value="cleanup">Consolidation & Duplicates</option>
-                    <option value="general">General</option>
+                    <option value="all">All</option>
+                    <option value="download">DOWNLOAD</option>
+                    <option value="scan">SCAN</option>
+                    <option value="linking">LINKING</option>
+                    <option value="cleanup">CLEANUP</option>
+                    <option value="error">ERROR</option>
+                    <option value="general">GENERAL</option>
                   </select>
                   <input
                     type="search"
@@ -2158,6 +2234,21 @@ function App() {
                   />
                 </div>
                 <div className="activity-actions">
+                  <label className="cache-toggle" title="Keep activity logs cached in database across app restarts">
+                    <input
+                      type="checkbox"
+                      checked={settings?.general?.persist_logs !== false}
+                      onChange={(e) => {
+                        const enabled = e.target.checked;
+                        const nextGen = { ...(settings?.general || {}), persist_logs: enabled };
+                        setSettings((s: any) => s ? { ...s, general: nextGen } : s);
+                        saveSettings("desktop", nextGen);
+                        setToast(enabled ? "Log caching enabled" : "Log caching disabled");
+                        setTimeout(() => setToast(""), 2000);
+                      }}
+                    />
+                    <span>Cache logs</span>
+                  </label>
                   <span className="log-count">
                     {(() => {
                       const allLogs = state?.logs || [];
@@ -2694,6 +2785,7 @@ function App() {
           </div>
         </div>
       )}
+      <div className="edge-fade-right" aria-hidden="true" />
     </div>
   );
 }
