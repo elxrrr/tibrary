@@ -7,6 +7,7 @@ export type Job = {
   message: string;
   started: number;
   finished?: number;
+  historical?: boolean;
   result?: any;
 };
 export type AppState = {
@@ -47,7 +48,7 @@ export const readable = (value: any): string =>
     : typeof value === "object"
       ? Array.isArray(value)
         ? value.map(readable).join(" · ")
-        : JSON.stringify(value)
+        : Object.entries(value).map(([key, item]) => `${key.replaceAll("_", " ")}: ${readable(item)}`).join(" · ")
       : String(value);
 
 export const tursoPing = () => call("turso.ping");

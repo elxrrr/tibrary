@@ -92,6 +92,8 @@ Inspect FLAC audio frames to detect authentic MQA encoding.
 ## 🚀 Quick Start
 
 ```sh
+brew install ffmpeg
+
 # Install frontend dependencies
 npm --prefix desktop ci
 
@@ -116,6 +118,3 @@ On macOS, you can also launch the prebuilt application directly using `./Start.c
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
-### Download container support
-
-Install FFmpeg with `brew install ffmpeg` before downloading on macOS. Some lossless streams arrive in MP4 containers; Tibrary copies their encoded audio into FLAC without re-encoding. No Python runtime is required.

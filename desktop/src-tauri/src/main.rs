@@ -821,18 +821,26 @@ async fn handle_rpc_uncached(
         } else {
             None
         };
-        if route == "local"
-            && cached_rows
-                .as_ref()
-                .is_some_and(|rows| rows.iter().any(|row| row.get("children").is_none()))
-        {
+        if route == "local" && cached_rows.as_ref().is_some_and(|rows| rows.iter().any(|row| row.get("date").is_none() || row.get("children").is_none())) {
             let root = args["root"].as_str().unwrap_or("");
             let indexed = actions::files(db, root).await?;
-            let rows =
-                duplicates::clusters_to_group_rows(&duplicates::find_duplicate_clusters(&indexed));
-            db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
-                .await?;
-            cached_rows = Some(rows);
+            let mut rows = cached_rows.take().unwrap_or_default();
+            if rows.iter().any(|row| row.get("children").is_none()) {
+                rows = duplicates::clusters_to_group_rows(&duplicates::find_duplicate_clusters(&indexed));
+            } else {
+                let dates: HashMap<String,String> = indexed.iter().filter_map(|file| {
+                    let tags = workflows::extract_tags_map(&file.metadata);
+                    Some((duplicates::extract_release_folder(&file.path),tags.get("date")?.clone()))
+                }).collect();
+                for row in &mut rows {
+                    row["date"] = json!(row["path"].as_str().and_then(|path|dates.get(path)).cloned().unwrap_or_default());
+                    if let Some(children)=row["children"].as_array_mut() {
+                        for child in children { child["date"]=json!(child["path"].as_str().and_then(|path|dates.get(path)).cloned().unwrap_or_default()); }
+                    }
+                }
+            }
+            db.set_preference(&format!("desktop-local:{root}"), &json!(rows)).await?;
+            cached_rows=Some(rows);
         }
         if let Some(mut rows) = cached_rows {
             if filter == Some("affected") {
@@ -900,126 +908,38 @@ async fn handle_rpc_uncached(
                 .and_then(|v| v.get("template"))
                 .and_then(|v| v.as_str());
             let plans = workflows::plan_workflow(&files, action, template_str);
-            let mut rows = Vec::new();
-            for p in &plans {
-                let affected = !p.changes.is_empty() || p.target.is_some();
-                let change_desc = if route == "organise" {
-                    if let Some(ref target) = p.target {
-                        let current_name = std::path::Path::new(&p.path)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("");
-                        let target_name = std::path::Path::new(target)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("");
-                        if current_name != target_name {
-                            format!("Rename: {} → {}", current_name, target_name)
-                        } else {
-                            "Move to structured folder".to_string()
-                        }
-                    } else {
-                        "Correct location".to_string()
-                    }
-                } else if !p.changes.is_empty() {
-                    p.changes
-                        .iter()
-                        .map(|(k, v)| format!("{}: {}", k, v))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                } else {
-                    p.issues.join(" · ")
-                };
-
-                let evidence = if route == "organise" {
-                    if let Some(ref target) = p.target {
-                        let rel = if let Ok(rel_path) = std::path::Path::new(target).strip_prefix(&root) {
-                            rel_path.display().to_string()
-                        } else {
-                            target.clone()
-                        };
-                        format!("Target: {}", rel)
-                    } else {
-                        "File already in correct location".to_string()
-                    }
-                } else {
-                    change_desc.clone()
-                };
-
-                rows.push(crate::db::LinkRow {
-                    id: p.path.clone(),
-                    artist: p.artist.clone(),
-                    release: p.album.clone(),
-                    title: p.title.clone(),
-                    path: p.path.clone(),
-                    position: String::new(),
-                    status: if affected {
-                        "Needs update".to_string()
-                    } else {
-                        "No change".to_string()
-                    },
-                    evidence,
-                    affected,
-                    target: p.target.clone().unwrap_or_default(),
-                    changes: change_desc,
-                    bpm: None,
-                    key: None,
-                    candidates: 0,
-                    online_id: String::new(),
-                    ignored: false,
-                });
+            let file_index: HashMap<_, _> = files.iter().map(|file| (file.path.as_str(), file)).collect();
+            let preview_id = uuid::Uuid::new_v4().to_string();
+            let mut rows: Vec<Value> = plans.iter().filter_map(|plan| {
+                let file = file_index.get(plan.path.as_str())?;
+                let description = if plan.target.is_some() { "Move or rename file to match its tags" } else { "Standardise local tags" };
+                Some(json!({"id":plan.path,"path":plan.path,"artist":plan.artist,"release":plan.album,"title":plan.title,
+                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"evidence":description,
+                    "affected":true,"status":"Needs update","size":file.size,"mtime":file.mtime,
+                    "item":{"path":plan.path,"target":plan.target,"tags":plan.changes}}))
+            }).collect();
+            let affected_paths: std::collections::HashSet<String> = plans.iter().map(|plan|plan.path.clone()).collect();
+            for file in &files {
+                if affected_paths.contains(&file.path) { continue }
+                let tags = workflows::extract_tags_map(&file.metadata);
+                rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),
+                    "release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":{},"target":null,
+                    "affected":false,"status":"No change","evidence":"No changes needed for this operation"}));
             }
-
-            let preview_id = format!("{root}:{action}");
-            let preview_rows: Vec<Value> = plans
-                .iter()
-                .filter(|p| !p.changes.is_empty() || p.target.is_some())
-                .map(|p| {
-                    json!({
-                        "id": p.path,
-                        "path": p.path,
-                        "artist": p.artist,
-                        "release": p.album,
-                        "title": p.title,
-                        "tags": p.current_tags,
-                        "changes": p.changes,
-                        "target": p.target,
-                        "affected": true,
-                        "status": "Needs update",
-                        "item": {
-                            "path": p.path,
-                            "target": p.target,
-                            "tags": p.changes
-                        }
-                    })
-                })
-                .collect();
-            state.previews.lock().unwrap().insert(
-                preview_id.clone(),
-                json!({
-                    "id": preview_id,
-                    "created": chrono::Utc::now().timestamp_millis(),
-                    "operation": action,
-                    "root": root,
-                    "rows": preview_rows,
-                    "count": preview_rows.len()
-                }),
-            );
-
-            if filter == Some("affected") {
-                rows.retain(|r| r.affected);
+            state.previews.lock().unwrap().insert(preview_id.clone(), json!({"id":preview_id,
+                "created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":plans.len()}));
+            if filter == Some("affected") { rows.retain(|row| row["affected"] == true); }
+            if let Some(q) = search.filter(|q| !q.is_empty()) {
+                let query=q.to_lowercase(); rows.retain(|row|row.to_string().to_lowercase().contains(&query));
             }
-            let total = rows.len();
-            let page_rows = rows.into_iter().skip(offset).take(limit).collect();
-            return serde_json::to_value(crate::db::TablePage {
-                rows: page_rows,
-                total,
-                offset,
-                revision: 0,
-                preview_id: Some(preview_id),
-            })
-            .map_err(|e| e.to_string());
+            let key = sort.unwrap_or("artist");
+            rows.sort_by_key(|row|row[key].as_str().unwrap_or("").to_lowercase());
+            if direction == Some("desc") { rows.reverse(); }
+            let total=rows.len();
+            return Ok(json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,
+                "offset":offset,"revision":db.revision.load(Ordering::SeqCst),"preview_id":preview_id}));
         }
+
         if route == "metadata" || route == "artwork" || route == "mqa" {
             let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
             let root_opt = args.get("root").and_then(|v| v.as_str());
@@ -1116,6 +1036,11 @@ async fn handle_rpc_uncached(
     }
 
     // QUEUE ACTIONS
+    if method == "queue.preview" {
+        let page = db.get_queue_rows("queue", None, None, None, None, 0, usize::MAX).await?;
+        let rows: Vec<_> = page.rows.into_iter().filter(|row| row.approved).collect();
+        return serde_json::to_value(rows).map_err(|e| e.to_string());
+    }
     if method == "queue.select" {
         let sel_val = args.get("selection").cloned().unwrap_or(json!({}));
         let selection: HashMap<String, Option<Vec<String>>> =
@@ -2159,7 +2084,7 @@ fn main() {
             if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
-                        "Tibrary v0.9.0-beta.7 ready · workspace initialized",
+                        &format!("Tibrary v{} ready · workspace initialized", env!("CARGO_PKG_VERSION")),
                         "info",
                         Some("general"),
                     );

@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.6 (build 6)  
+> **Version:** 0.9.0-beta.8 (build 8)  
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
 
@@ -323,3 +323,15 @@ A real account check, catalogue detail request and selected-track download compl
 Three disposable copies of existing FLAC files passed scan, read-only preview, reviewed number-tag application, MQA audit and duplicate analysis. Original NVME files were not modified. This verifies those exercised paths, not every possible catalogue edition or download format.
 
 Validation for this patch: 49 Rust tests passed (2 opt-in live tests skipped), 2 selection tests passed, and 12 WebKit workflows passed. A separate authenticated catalogue test traversed 34 releases across pages. Organisation moved two copied files and refused the duplicate destination for the third, preserving all files. The app remains labelled beta; these results are not a claim that every provider catalogue edge case has been verified.
+
+
+### Table and metadata regression fixes — build 8
+
+- Every launch starts on Overview. Saved job failures remain in Activity and no longer trigger a fresh startup error.
+- Overview counts missing releases using the same filtered release data as Missing releases. Processed rows are reused until the database revision or date changes.
+- Download review loads every approved queue item, including items outside the current page/filter, and shows exact selected tracks. Release-detail dialogs accept the native catalogue fields.
+- Metadata is presented as labelled tables, with local/proposed values and distinct release/track source IDs. Raw JSON is confined to an optional export-data view.
+- Automatic local previews retain file size/modification stamps, support reviewed application, and keep an all-files view available. Page-size changes reload tables; double-clicking a disclosure arrow does not open a dialog.
+- Local duplicates retain their cached groups and display release dates before replacement destinations. Adding dates to existing cached groups uses indexed tags rather than recomputing duplicate matches.
+
+Validation used disposable fixture libraries and an isolated copy of the production database. The snapshot contained 90,714 missing release rows; subsequent sorts took 0.15–0.25 seconds. Initial state loading still took about 13 seconds in the debug build, so cold-start performance remains a known limitation. No original NVME files were changed.

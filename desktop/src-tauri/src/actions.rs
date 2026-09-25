@@ -1085,7 +1085,7 @@ pub async fn execute(
             // Page ownership is not a reliable performer or album-artist credit.
             changes.remove("artist");
             changes.remove("albumartist");
-            output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":changes,"affected":!changes.is_empty(),"size":file.size,"mtime":file.mtime,"status":if changes.is_empty(){"No supplied missing tags"}else{"Missing tags found"},"item":{"path":file.path,"tags":changes},"evidence":format!("API BPM: {} · Key: {}",track.bpm.map(|n|n.to_string()).unwrap_or("not supplied".into()),track.key.unwrap_or("not supplied".into()))}));
+            output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":changes,"affected":!changes.is_empty(),"size":file.size,"mtime":file.mtime,"status":if changes.is_empty(){"No supplied missing tags"}else{"Missing tags found"},"item":{"path":file.path,"tags":changes},"source_release_id":rel.id,"source_track_id":track.id,"evidence":format!("API BPM: {} · Key: {}",track.bpm.map(|n|n.to_string()).unwrap_or("not supplied".into()),track.key.unwrap_or("not supplied".into()))}));
         }
         if kind == "manual_candidate" {
             return Ok(json!({"checked":ids.len()}));

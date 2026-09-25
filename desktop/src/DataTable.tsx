@@ -32,6 +32,7 @@ function Check({
       checked={state === "checked"}
       disabled={disabled}
       onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
       onChange={(e) => onChange(e.target.checked)}
     />
   );
@@ -186,8 +187,12 @@ export function DataTable({
                   }
                   tabIndex={0}
                   onClick={(e) => select(r, i, e)}
-                  onDoubleClick={() => onDetail(r)}
+                  onDoubleClick={(e) => {
+                    if ((e.target as Element).closest("button,input")) return;
+                    onDetail(r);
+                  }}
                   onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
                     if (e.key === "Enter") onDetail(r);
                     if (e.key === " ") {
                       e.preventDefault();
@@ -228,8 +233,10 @@ export function DataTable({
                           className="disclosure"
                           aria-label={`${expanded.has(r.id) ? "Collapse" : "Expand"} ${r.release}`}
                           aria-expanded={expanded.has(r.id)}
+                          onDoubleClick={(e) => e.stopPropagation()}
                           onClick={(e) => {
                             e.stopPropagation();
+                            if (e.detail > 1) return;
                             const s = new Set(expanded);
                             if (s.has(r.id)) s.delete(r.id);
                             else {
@@ -276,7 +283,7 @@ export function DataTable({
                 {grouped && expanded.has(r.id) && (r.children || []).map((child: Row) => (
                   <tr key={child.id} className={"child " + (selected.has(child.id) ? "selected" : "")}
                     onClick={e => {const next=e.metaKey||e.ctrlKey||e.shiftKey ? new Set(selected):new Set<string>();next.add(child.id);onSelect(next);}}
-                    onDoubleClick={() => onDetail(child)}
+                    onDoubleClick={(e) => {if (!(e.target as Element).closest("button,input")) onDetail(child);}}
                     onContextMenu={e => {e.preventDefault();if (!selected.has(child.id)) onSelect(new Set([child.id]));onMenu(child,e.clientX,e.clientY);}}>
                     <td><Check label={`Select duplicate ${child.release}`} state={selected.has(child.id)||selected.has(r.id)?"checked":"empty"} disabled={busy}
                       onChange={yes => {const next=new Set(selected);if(next.delete(r.id)){for(const sibling of r.children)next.add(sibling.id);}yes?next.add(child.id):next.delete(child.id);onSelect(next);}} /></td>
@@ -308,9 +315,8 @@ export function DataTable({
                             ? "inactive"
                             : "")
                         }
-                        onDoubleClick={() =>
-                          onDetail({ ...t, parent: r.id, online_id: t.id })
-                        }
+                        onDoubleClick={() => onDetail({ ...t, parent: r.id, online_id: t.id })}
+                        onContextMenu={(e) => {e.preventDefault(); onMenu({...t,parent:r.id,online_id:t.id},e.clientX,e.clientY);}}
                       >
                         <td>
                           <Check
@@ -344,7 +350,8 @@ export function DataTable({
                             ? `${Math.floor(t.duration / 60)}:${String(Math.round(t.duration % 60)).padStart(2, "0")}`
                             : "—"}
                         </td>
-                        <td colSpan={2}>{t.isrc || "No ISRC"}</td>
+                        <td title={t.isrc || "No recording identifier"}>{t.isrc || "No ISRC"}</td>
+                        <td className="more"><button aria-label={`Actions for track ${t.title}`} onClick={(e)=>{e.stopPropagation();onMenu({...t,parent:r.id,online_id:t.id},e.clientX,e.clientY);}}><MoreHorizontal size={16}/></button></td>
                       </tr>
                     ))
                   ))}

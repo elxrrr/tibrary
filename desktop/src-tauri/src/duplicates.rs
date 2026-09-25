@@ -387,12 +387,12 @@ pub fn clusters_to_group_rows(clusters: &[DuplicateCluster]) -> Vec<serde_json::
         let covered=retained.tracks.iter().filter(|track|cluster.redundant.iter().any(|r|r.tracks.iter().any(|t|track_matches(t,track)))).count();
         let children:Vec<_>=cluster.redundant.iter().map(|r|json!({
             "id":format!("{}::{}",cluster.cluster_id,r.folder),"artist":r.artist,"release":r.title,"title":r.title,
-            "path":r.folder,"tracks":r.tracks.len(),"duplicates":r.tracks.len(),"gained":0,
+            "path":r.folder,"date":r.date,"tracks":r.tracks.len(),"duplicates":r.tracks.len(),"gained":0,
             "target":retained.folder,"status":"Duplicate","evidence":format!("All {} recordings are present in {} with matching mix, duration and performer credits",r.tracks.len(),retained.title),
             "changes":"Move reviewed duplicate files to Trash","affected":true
         })).collect();
         json!({"id":cluster.cluster_id,"artist":retained.artist,"release":retained.title,"title":retained.title,"path":retained.folder,
-            "tracks":retained.tracks.len(),"duplicates":cluster.total_redundant_tracks,"gained":retained.tracks.len()-covered,
+            "date":retained.date,"tracks":retained.tracks.len(),"duplicates":cluster.total_redundant_tracks,"gained":retained.tracks.len()-covered,
             "target":retained.folder,"status":if cluster.is_chained {"Chained duplicate"}else{"Duplicate"},
             "evidence":format!("Keep this release; review {} redundant releases · {:.1} MB recoverable",children.len(),cluster.total_recoverable_bytes as f64 / 1_000_000.),
             "expanded_available":true,"children":children,"affected":true})

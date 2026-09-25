@@ -115,6 +115,7 @@ pub struct TursoDb {
     pub db: Database,
     pub path: PathBuf,
     pub revision: Arc<std::sync::atomic::AtomicU64>,
+    missing_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<MissingRow>)>>>,
     link_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<LinkRow>)>>>,
 }
 
@@ -135,6 +136,7 @@ impl TursoDb {
             db,
             path: path_buf,
             revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            missing_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             link_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         instance.init_schema().await?;
@@ -756,7 +758,7 @@ impl TursoDb {
         }
 
         let missing_releases = match self
-            .get_missing_rows(market, Some("All missing releases"), None, None, None, None, None, None, 0, 0)
+            .get_missing_rows(market, Some("All missing releases"), None, Some("Missing release"), None, None, None, None, 0, 0)
             .await
         {
             Ok(page) => page.total,
@@ -1237,19 +1239,7 @@ impl TursoDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn get_missing_rows(
-        &self,
-        market: &str,
-        timeline: Option<&str>,
-        recommendation: Option<&str>,
-        status_filter: Option<&str>,
-        type_filter: Option<&str>,
-        search: Option<&str>,
-        sort: Option<&str>,
-        direction: Option<&str>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<TablePage<MissingRow>, String> {
+    async fn build_missing_rows(&self, market: &str) -> Result<Vec<MissingRow>, String> {
         let conn = self.connect()?;
 
         // 1. Load queue decisions
@@ -1597,7 +1587,7 @@ impl TursoDb {
             }
         }
 
-        let mut rows: Vec<MissingRow> = deduped_releases
+        let rows: Vec<MissingRow> = deduped_releases
             .into_values()
             .map(|rel| {
                 let display_artist = match rel.artists.len() {
@@ -1626,6 +1616,31 @@ impl TursoDb {
                 }
             })
             .collect();
+
+        Ok(rows)
+    }
+
+    pub async fn get_missing_rows(
+        &self,
+        market: &str,
+        timeline: Option<&str>,
+        recommendation: Option<&str>,
+        status_filter: Option<&str>,
+        type_filter: Option<&str>,
+        search: Option<&str>,
+        sort: Option<&str>,
+        direction: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<TablePage<MissingRow>, String> {
+        let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
+        let key = format!("{market}:{}", chrono::Utc::now().format("%Y-%m-%d"));
+        let cached = self.missing_rows_cache.lock().unwrap().get(&key).filter(|(rev,_)|*rev==revision).map(|(_,rows)|rows.clone());
+        let mut rows = if let Some(rows)=cached { rows } else {
+            let rows = self.build_missing_rows(market).await?;
+            let mut cache=self.missing_rows_cache.lock().unwrap();
+            cache.clear(); cache.insert(key,(revision,rows.clone())); rows
+        };
 
         // Apply filters
         if let Some(sf) = status_filter {
@@ -1794,6 +1809,7 @@ impl TursoDb {
                 })
             });
         let mut default_job = default_job;
+        default_job["historical"] = json!(true);
         if default_job["status"] == "running" || default_job["status"] == "cancelling" {
             default_job["status"] = json!("interrupted");
             default_job["message"] =
@@ -2945,8 +2961,27 @@ impl TursoDb {
                     value
                 }).collect();
 
+                let mut sources = Vec::new();
+                let mut seen_sources = std::collections::HashSet::new();
+                let placements = link["placements"].as_array().cloned().unwrap_or_default();
+                for source in std::iter::once(&link["ids"]).chain(placements.iter()).chain(options.iter()) {
+                    let album = source["album_id"].as_str().or(source["id"].as_str());
+                    let track = source["track_id"].as_str();
+                    let (Some(album), Some(track)) = (album, track) else { continue };
+                    if !seen_sources.insert((album.to_string(), track.to_string())) { continue }
+                    let dj = self.get_preference(&format!("dj-check:{market}:{track}")).await?;
+                    let cached = self.get_preference(&format!("tag-review:{market}:{album}")).await?.unwrap_or(Value::Null);
+                    let recording = cached["tracks"].as_array().and_then(|tracks| tracks.iter().find(|t| t["id"].as_str() == Some(track))).cloned().unwrap_or(Value::Null);
+                    sources.push(json!({"album_id":album,"track_id":track,
+                        "release":cached["title"].as_str().or(source["album"].as_str()),
+                        "artist":cached["artist"],"date":cached["date"],"label":cached["label"],"upc":cached["barcode"],
+                        "title":recording["title"],"isrc":recording["isrc"],
+                        "bpm":dj.as_ref().and_then(|d|d.get("bpm")).unwrap_or(&recording["bpm"]),
+                        "key":dj.as_ref().and_then(|d|d.get("key")).unwrap_or(&recording["key"]),
+                        "dj_check":if dj.is_some(){"Checked; blank values were not supplied by this source"}else{"No saved additional metadata check"}}));
+                }
                 return Ok(
-                    json!({"id":p,"path":p,"metadata":meta,"tags":arrays,"linked_ids":link["ids"],
+                    json!({"id":p,"path":p,"metadata":meta,"tags":arrays,"linked_ids":link["ids"],"dj_checks":sources,
                     "local_position":format!("Disc {}/{} · Track {}/{}",tags.get("discnumber").map(String::as_str).unwrap_or("?"),tags.get("disctotal").map(String::as_str).unwrap_or("?"),tags.get("tracknumber").map(String::as_str).unwrap_or("?"),tags.get("tracktotal").map(String::as_str).unwrap_or("?")),
                     "catalogue_note":link["catalogue_note"],"catalogue_options":options}),
                 );

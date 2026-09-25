@@ -1,3 +1,4 @@
+import { MetadataView, DownloadReview, TagChanges, ExportSummary } from "./MetadataView";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
@@ -206,9 +207,9 @@ function getLogCategory(log: { message: string; category?: string; level?: strin
 }
 
 function App() {
-  const initialRoute = localStorage.getItem("tibrary.route") || "overview";
+  const initialRoute: string = "overview";
   const [state, setState] = useState<AppState | null>(null),
-    [route, setRoute] = useState(initialRoute),
+    [route, setRoute] = useState("overview"),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
   const [logCategory, setLogCategory] = useState("all"),
     [logSearch, setLogSearch] = useState("");
@@ -239,12 +240,13 @@ function App() {
     [copyright, setCopyright] = useState("All copyrights"),
     [releaseType, setReleaseType] = useState("All types");
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
+  const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
   useEffect(() => {
     if (route !== "overview" || !state) return;
     let alive = true;
     call("table", {route: "missing", timeline: "All missing releases", status: "Missing release",
       sort: "date", direction: "desc", limit: 20, recommendation: "All recommendations"})
-      .then((result) => { if (alive) setLatestMissing(result.rows); })
+      .then((result) => { if (alive) { setLatestMissing(result.rows); setMissingReleaseCount(result.total); } })
       .catch((e) => { if (alive) notifyError(e); });
     return () => { alive = false; };
   }, [route, state?.revision]);
@@ -330,6 +332,7 @@ function App() {
     document.documentElement.dataset.theme = state?.settings.theme || "system";
   }, [state?.settings.theme]);
   const pageSize = Number(settings?.general?.page_size || 50);
+  useEffect(() => { setOffset(0); }, [pageSize]);
   const viewArgs = {
     route,
     root: root || undefined,
@@ -392,6 +395,7 @@ function App() {
     recommendation,
     copyright,
     releaseType,
+    pageSize,
     state?.revision,
   ]);
   useEffect(() => {
@@ -448,7 +452,7 @@ function App() {
   }, [root]);
   useEffect(() => {
     const j = state?.job;
-    if (!j || active(j) || seenJob.current === j.id) return;
+    if (!j || j.historical || active(j) || seenJob.current === j.id) return;
     seenJob.current = j.id;
     if (j.status === "failed") {
       setError(j.message);
@@ -529,8 +533,10 @@ function App() {
     setMenu(null);
     try {
       if (tree) {
+        const value = await call("detail", { release_id: row.parent || row.id });
         setDetail({
-          release: await call("detail", { release_id: row.parent || row.id }),
+          release: { ...value, release: value.release || value.title,
+            children: value.children || (value.tracks || []).map((t: Row) => ({...t, position: t.position || `Disc ${t.disc_number || 1} · Track ${t.track_number || "?"}`})) },
           track: row.parent ? row : null,
         });
       } else if (route === "artists" || route === "favourites") {
@@ -540,7 +546,7 @@ function App() {
       } else if (route === "local" || route === "online") {
         setDetail({operation: row});
       } else if (row.path || route === "links") {
-        setDetail(await call("detail", { root, path: row.path || row.id }));
+        setDetail({...await call("detail", { root, path: row.path || row.id }), proposed: row.changes, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
       }
     } catch (e) {
       notifyError(e);
@@ -575,9 +581,11 @@ function App() {
     if (!preview || !selected.size) return;
     try {
       const p = await call("preview", { id: preview });
+      const affected = p.rows.filter((r: Row) => selected.has(r.id) && r.affected !== false);
+      if (!affected.length) { setToast("No proposed changes in the selected files"); return; }
       setReview({
         ...p,
-        rows: p.rows.filter((r: Row) => selected.has(r.id)),
+        rows: affected,
         selected: [...selected],
       });
     } catch (e) {
@@ -645,6 +653,8 @@ function App() {
           ? [
               { key: "artist", label: "Artist" },
               { key: "release", label: "Release to keep" },
+              { key: "date", label: "Release date" },
+              { key: "target", label: "Replacement" },
               { key: "tracks", label: "Tracks" },
               { key: "duplicates", label: "Duplicates" },
               { key: "evidence", label: "Evidence" },
@@ -723,8 +733,8 @@ function App() {
               )}
               {card(
                 "Missing releases",
-                `${(s.missing_releases ?? s.missing ?? 0).toLocaleString()} releases`,
-                "Newer and missing albums to download",
+                missingReleaseCount?.toLocaleString(),
+                "Cached releases not owned locally",
                 "missing",
                 Disc,
               )}
@@ -1124,12 +1134,12 @@ function App() {
             <button
               className="primary"
               disabled={busy || !state?.stats.approved_queue}
-              onClick={() =>
-                setReview({
-                  operation: "download",
-                  rows: data.rows.filter((r) => r.approved),
-                })
-              }
+              onClick={async () => {
+                setSubmitting(true);
+                try { setReview({ operation: "download", rows: await call("queue.preview") }); }
+                catch (e) { notifyError(e); }
+                finally { setSubmitting(false); }
+              }}
             >
               <ArrowDownToLine size={16} />
               Download
@@ -1293,7 +1303,7 @@ function App() {
           <span>
             {selected.size
               ? `${selected.size} selected`
-              : `${data.total.toLocaleString()} items`}
+              : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}`}
           </span>
         </div>
         {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
@@ -1652,7 +1662,7 @@ function App() {
             </div>
           </section>
           <section className="card">
-            <h2>Developer account</h2>
+            <h2>Developer credentials</h2>
             <label className="setting-row">
               <span>Client ID</span>
               <input
@@ -1704,13 +1714,13 @@ function App() {
                     setCredentials({ client: "", secret: "" });
                 }}
               >
-                Connect account
+                Save credentials
               </button>
               <button
                 disabled={busy || !state?.connections.configured}
                 onClick={() => mutate("credentials.forget")}
               >
-                Disconnect account
+                Forget credentials
               </button>
             </div>
           </section>
@@ -1787,8 +1797,8 @@ function App() {
           {field("Audio quality", "downloads", "quality", [
             { value: "HI_RES_LOSSLESS", label: "FLAC (24/192khz)" },
             { value: "LOSSLESS", label: "FLAC (16/44.1khz)" },
-            { value: "HIGH", label: "MP3 (320kbps)" },
-            { value: "LOW", label: "MP3 (96kbps)" },
+            { value: "HIGH", label: "AAC (320 kbps)" },
+            { value: "LOW", label: "AAC (96 kbps)" },
           ])}
           {field("Embedded artwork size", "downloads", "cover_size", [
             { value: "1280", label: "1280 × 1280 px" },
@@ -1906,7 +1916,7 @@ function App() {
               role="menuitem"
               onClick={() => {
                 external(
-                  `https://tidal.com/${route === "artists" || route === "favourites" ? "artist" : "album"}/${r.online_id}`,
+                  `https://tidal.com/${r.parent ? "track" : route === "artists" || route === "favourites" ? "artist" : "album"}/${r.online_id}`,
                 ).catch(notifyError);
                 setMenu(null);
               }}
@@ -1957,7 +1967,7 @@ function App() {
               </button>
             </>
           )}
-          {["queue", "downloaded", "missing"].includes(route) && (
+          {!r.parent && ["queue", "downloaded", "missing"].includes(route) && (
             <>
               <hr />
               <button
@@ -2416,6 +2426,9 @@ function App() {
                     Show in Finder
                   </button>
                 </div>
+                {detail.proposed && <section><h3>Proposed changes</h3>
+                  {detail.source_release_id && <p>Online source · Release {detail.source_release_id} · Track {detail.source_track_id}</p>}
+                  <TagChanges changes={detail.proposed} current={detail.tags}/></section>}
                 <h3>Available placements</h3>
                 {detail.catalogue_options?.length ? (
                   detail.catalogue_options.map((o: any, i: number) => (
@@ -2444,7 +2457,7 @@ function App() {
                         >
                           {o.structure?.compatible
                             ? "Structure verified"
-                            : JSON.stringify(
+                            : readable(
                                 o.structure?.reason ||
                                   o.structure?.reasons ||
                                   "Structural difference; review carefully",
@@ -2514,17 +2527,12 @@ function App() {
                 </div>
                 <details>
                   <summary>All saved tags & DJ checks</summary>
-                  <pre>
-                    {JSON.stringify(
-                      {
-                        tags: detail.tags,
-                        dj_checks: detail.dj_checks,
-                        note: detail.catalogue_note,
-                      },
-                      null,
-                      2,
-                    )}
-                  </pre>
+                  <h4>Local file tags</h4>
+                  <MetadataView value={detail.tags} title="Local file tags"/>
+                  <h4>Online metadata by release</h4>
+                  <MetadataView value={detail.dj_checks} title="Online source"/>
+                  {detail.catalogue_note && <p>{readable(detail.catalogue_note)}</p>}
+
                 </details>
               </>
             )}
@@ -2539,7 +2547,7 @@ function App() {
                   <article className="candidate" key={i}>
                     <div>
                       <strong>{c.name || c.artist?.name}</strong>
-                      <p>{c.evidence || JSON.stringify(c)}</p>
+                      <p>{readable(c.evidence || c.reason || "No additional evidence saved")}</p>
                     </div>
                     <button
                       onClick={() =>
@@ -2680,7 +2688,7 @@ function App() {
                       : "Only the reviewed changes are applied. Existing audio is verified and preserved."}
             </p>
             <div className="review-list">
-              {review.rows?.map((r: any, i: number) => (
+              {review.operation === "download" ? <DownloadReview rows={review.rows || []}/> : review.rows?.map((r: any, i: number) => (
                 <article key={i} className={review.operation === "consolidate" ? "review-cluster-item" : ""}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" }}>
                     <strong>
@@ -2700,13 +2708,12 @@ function App() {
                       </p>
                     </>
                   ) : (
-                    <p>{readable(r.changes || r.path || r.target)}</p>
+                    <><p>{r.path || r.target}</p>{r.changes && <TagChanges changes={r.changes} current={r.tags}/>}</>
                   )}
+                  {r.source_release_id && <p>Online source · Release {r.source_release_id} · Track {r.source_track_id}</p>}
                   {r.evidence && <small style={{ display: "block", marginTop: "4px" }}>{readable(r.evidence)}</small>}
                   {r.reviewed_dj_conflicts?.length > 0 && (
-                    <pre>
-                      {JSON.stringify(r.reviewed_dj_conflicts, null, 2)}
-                    </pre>
+                    <MetadataView value={r.reviewed_dj_conflicts} title="Track comparison"/>
                   )}
                 </article>
               ))}
@@ -2714,7 +2721,7 @@ function App() {
           </div>
           <footer>
             <button onClick={() => setReview(null)}>Cancel</button>
-            <button className="primary" disabled={busy} onClick={confirmReview}>
+            <button className="primary" disabled={busy || (review.operation === "download" && !review.rows?.length)} onClick={confirmReview}>
               {review.operation === "consolidate"
                 ? review.count
                   ? `Move ${review.count} duplicate files to Trash`
@@ -2733,23 +2740,8 @@ function App() {
           onClose={() => setExportPreview(null)}
         >
           <div className="modal-body">
-            <pre
-              style={{
-                maxHeight: "360px",
-                overflow: "auto",
-                padding: "12px",
-                background: "var(--card)",
-                borderRadius: "6px",
-                border: "1px solid var(--line)",
-                fontSize: "11px",
-                fontFamily: "monospace",
-                userSelect: "text",
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-all",
-              }}
-            >
-              {exportPreview.content}
-            </pre>
+            <ExportSummary content={exportPreview.content}/>
+            <details><summary>Raw export data (JSON)</summary><pre>{exportPreview.content}</pre></details>
           </div>
           <footer>
             <button
@@ -2902,7 +2894,7 @@ class ErrorBoundary extends React.Component<
     return this.state.error ? (
       <div className="fatal">
         <h1>The interface needs to reload</h1>
-        <p>Background work stays in the Python service.</p>
+        <p>Background work continues independently of this window.</p>
         <pre>{this.state.error}</pre>
         <button onClick={() => location.reload()}>Reload interface</button>
       </div>

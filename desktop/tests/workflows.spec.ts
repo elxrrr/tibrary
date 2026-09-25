@@ -195,13 +195,13 @@ test("dark settings fit a full window and retain defaults", async ({
     .getByRole("button", { name: "Downloads", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: "Download engine", exact: true }),
+    page.getByRole("heading", { name: "Download & files", exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Reset download defaults" }).click();
+  await page.getByRole("button", { name: "Reset to default" }).click();
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await expect(
-    page.getByRole("button", { name: "Reset download defaults" }),
+    page.getByRole("button", { name: "Reset to default" }),
   ).toBeEnabled();
 });
 
@@ -350,4 +350,94 @@ test("download without an account fails and retains the approved queue", async (
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("failed");
   const after = await rpc("table", {route: "queue"});
   expect(after.result.rows).toEqual(before.result.rows);
+});
+
+test("startup always shows overview and does not replay a historical failure", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("tibrary.route", "local"));
+  await page.route("**/__test_rpc", async route => {
+    const request = route.request().postDataJSON();
+    const response = await rpc(request.method, request.args);
+    if (request.method === "state") response.result.job = {id:"old-failure",kind:"release_details",status:"failed",message:"Catalogue request failed (HTTP 400)",historical:true};
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", {name:"Overview",exact:true})).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  const missing = await rpc("table", {route:"missing",timeline:"All missing releases",status:"Missing release",limit:20,recommendation:"All recommendations"});
+  await expect(page.locator(".metric").filter({hasText:"Missing releases"})).toContainText(String(missing.result.total));
+});
+
+test("release details and download review show cached track names and exact approvals", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"Download queue",exact:true}).click();
+  await page.getByRole("checkbox", {name:"Select Blue Hours",exact:true}).check();
+  await page.getByRole("button", {name:"Expand Blue Hours",exact:true}).dblclick();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByRole("button", {name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await page.getByRole("button", {name:"Collapse Blue Hours",exact:true}).press("Enter");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.getByRole("button", {name:"Expand Blue Hours",exact:true}).press("Enter");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.getByRole("checkbox", {name:"Select track First Light",exact:true}).uncheck();
+  await page.getByRole("button", {name:"Download",exact:true}).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("table", {name:"Tracks in Blue Hours"})).toBeVisible();
+  await expect(dialog).toContainText("Drift");
+  await expect(dialog).not.toContainText("First Light");
+  await expect(dialog).toContainText("Release ID 910001");
+  if (process.env.TIBRARY_SCREENSHOTS) await dialog.screenshot({path:"/tmp/tibrary-review-final.png"});
+  await dialog.getByRole("button", {name:"Cancel",exact:true}).click();
+  await page.locator("tbody tr").filter({has:page.getByRole("button",{name:"Collapse Blue Hours",exact:true})}).dblclick();
+  await expect(page.getByRole("dialog")).toContainText("First Light");
+  await expect(page.getByRole("dialog")).toContainText("Blue Hours");
+  await page.getByRole("dialog").getByRole("button", {name:"Done",exact:true}).click();
+  await page.getByRole("button",{name:"Actions for track Drift",exact:true}).click();
+  await expect(page.getByRole("menuitem",{name:"Open on web",exact:true})).toBeVisible();
+  await expect(page.getByRole("menuitem",{name:"Queue whole release",exact:true})).toHaveCount(0);
+});
+
+test("metadata and settings use readable views without implementation panels", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"General",exact:true}).click();
+  await expect(page.getByRole("heading",{name:"About Tibrary"})).toHaveCount(0);
+  await page.locator("aside").getByRole("button", {name:"Link releases",exact:true}).click();
+  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await page.locator("tbody tr").first().dblclick();
+  await page.getByText("All saved tags & DJ checks",{exact:true}).click();
+  await expect(page.getByRole("table",{name:"Local file tags"})).toBeVisible();
+  await expect(page.getByRole("dialog").locator("pre")).toHaveCount(0);
+});
+
+test("automatic correction previews can be applied and all-files view remains available", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Correct tags",exact:true}).click();
+  await page.getByRole("button",{name:/Track & disc numbers/}).click();
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await page.getByRole("checkbox",{name:"Select visible rows"}).check();
+  await page.getByRole("button",{name:/Review & apply/}).click();
+  await expect(page.getByRole("dialog").getByRole("table",{name:"Tag comparison"}).first()).toBeVisible();
+  await page.getByRole("button",{name:"Confirm & continue"}).click();
+  await expect.poll(async()=> (await rpc("job.status")).result?.job?.status).toBe("complete");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.locator("tbody tr")).toHaveCount(0);
+  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+});
+
+test("table reloads when saved page size arrives after the initial table", async ({page}) => {
+  await rpc("settings.save",{section:"general",values:{market:"GB",page_size:25}});
+  let releaseSettings: () => void = ()=>{};
+  const held = new Promise<void>(resolve=>{releaseSettings=resolve});
+  const limits: number[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="settings") await held;
+    if(request.method==="table" && request.args.route==="queue") limits.push(request.args.limit);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
+  await expect.poll(()=>limits).toContain(50);
+  releaseSettings();
+  await expect.poll(()=>limits).toContain(25);
 });
