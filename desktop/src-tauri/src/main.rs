@@ -894,11 +894,34 @@ async fn handle_rpc_uncached(
                         "organise"
                     });
             let files = actions::files(db, &root).await?;
-            let plans = workflows::plan_workflow(&files, action, None);
+            let settings = db.get_settings().await.unwrap_or(json!({}));
+            let template_str = settings
+                .get("organisation")
+                .and_then(|v| v.get("template"))
+                .and_then(|v| v.as_str());
+            let plans = workflows::plan_workflow(&files, action, template_str);
             let mut rows = Vec::new();
-            for p in plans {
+            for p in &plans {
                 let affected = !p.changes.is_empty() || p.target.is_some();
-                let change_desc = if !p.changes.is_empty() {
+                let change_desc = if route == "organise" {
+                    if let Some(ref target) = p.target {
+                        let current_name = std::path::Path::new(&p.path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("");
+                        let target_name = std::path::Path::new(target)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("");
+                        if current_name != target_name {
+                            format!("Rename: {} → {}", current_name, target_name)
+                        } else {
+                            "Move to structured folder".to_string()
+                        }
+                    } else {
+                        "Correct location".to_string()
+                    }
+                } else if !p.changes.is_empty() {
                     p.changes
                         .iter()
                         .map(|(k, v)| format!("{}: {}", k, v))
@@ -907,21 +930,37 @@ async fn handle_rpc_uncached(
                 } else {
                     p.issues.join(" · ")
                 };
+
+                let evidence = if route == "organise" {
+                    if let Some(ref target) = p.target {
+                        let rel = if let Ok(rel_path) = std::path::Path::new(target).strip_prefix(&root) {
+                            rel_path.display().to_string()
+                        } else {
+                            target.clone()
+                        };
+                        format!("Target: {}", rel)
+                    } else {
+                        "File already in correct location".to_string()
+                    }
+                } else {
+                    change_desc.clone()
+                };
+
                 rows.push(crate::db::LinkRow {
                     id: p.path.clone(),
-                    artist: p.artist,
-                    release: p.album,
-                    title: p.title,
-                    path: p.path,
+                    artist: p.artist.clone(),
+                    release: p.album.clone(),
+                    title: p.title.clone(),
+                    path: p.path.clone(),
                     position: String::new(),
                     status: if affected {
                         "Needs update".to_string()
                     } else {
                         "No change".to_string()
                     },
-                    evidence: change_desc.clone(),
+                    evidence,
                     affected,
-                    target: p.target.unwrap_or_default(),
+                    target: p.target.clone().unwrap_or_default(),
                     changes: change_desc,
                     bpm: None,
                     key: None,
@@ -930,6 +969,43 @@ async fn handle_rpc_uncached(
                     ignored: false,
                 });
             }
+
+            let preview_id = format!("{root}:{action}");
+            let preview_rows: Vec<Value> = plans
+                .iter()
+                .filter(|p| !p.changes.is_empty() || p.target.is_some())
+                .map(|p| {
+                    json!({
+                        "id": p.path,
+                        "path": p.path,
+                        "artist": p.artist,
+                        "release": p.album,
+                        "title": p.title,
+                        "tags": p.current_tags,
+                        "changes": p.changes,
+                        "target": p.target,
+                        "affected": true,
+                        "status": "Needs update",
+                        "item": {
+                            "path": p.path,
+                            "target": p.target,
+                            "tags": p.changes
+                        }
+                    })
+                })
+                .collect();
+            state.previews.lock().unwrap().insert(
+                preview_id.clone(),
+                json!({
+                    "id": preview_id,
+                    "created": chrono::Utc::now().timestamp_millis(),
+                    "operation": action,
+                    "root": root,
+                    "rows": preview_rows,
+                    "count": preview_rows.len()
+                }),
+            );
+
             if filter == Some("affected") {
                 rows.retain(|r| r.affected);
             }
@@ -940,7 +1016,7 @@ async fn handle_rpc_uncached(
                 total,
                 offset,
                 revision: 0,
-                preview_id: None,
+                preview_id: Some(preview_id),
             })
             .map_err(|e| e.to_string());
         }
@@ -1192,6 +1268,8 @@ async fn handle_rpc_uncached(
         crate::account::AccountClient::disconnect().map_err(|e| e.to_string())?;
         db.set_preference("tidal_token", &Value::Null).await?;
         db.set_preference("account-disconnected", &json!(true))
+            .await?;
+        db.set_preference("account_connected_at", &Value::Null)
             .await?;
         db.bump_revision();
         if let Some(app) = app_handle {
@@ -2081,7 +2159,7 @@ fn main() {
             if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
-                        "Tibrary v0.9.0-beta.6 ready · workspace initialized",
+                        "Tibrary v0.9.0-beta.7 ready · workspace initialized",
                         "info",
                         Some("general"),
                     );

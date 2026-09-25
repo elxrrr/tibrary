@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Disc,
   Download,
   Folder,
   Heart,
@@ -205,10 +206,9 @@ function getLogCategory(log: { message: string; category?: string; level?: strin
 }
 
 function App() {
+  const initialRoute = localStorage.getItem("tibrary.route") || "overview";
   const [state, setState] = useState<AppState | null>(null),
-    [route, setRoute] = useState(
-      localStorage.getItem("tibrary.route") || "overview",
-    ),
+    [route, setRoute] = useState(initialRoute),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
   const [logCategory, setLogCategory] = useState("all"),
     [logSearch, setLogSearch] = useState("");
@@ -224,8 +224,10 @@ function App() {
     [loading, setLoading] = useState(false),
     [query, setQuery] = useState(""),
     [filter, setFilter] = useState("all"),
-    [sort, setSort] = useState("artist"),
-    [direction, setDirection] = useState("asc"),
+    [sort, setSort] = useState(initialRoute === "missing" ? "date" : "artist"),
+    [direction, setDirection] = useState(
+      initialRoute === "missing" ? "desc" : "asc",
+    ),
     [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState(new Set<string>()),
     [expanded, setExpanded] = useState(new Set<string>()),
@@ -313,6 +315,13 @@ function App() {
           ? "unlinked"
           : "all",
     );
+    if (route === "missing") {
+      setSort("date");
+      setDirection("desc");
+    } else {
+      setSort("artist");
+      setDirection("asc");
+    }
     setAction(route === "organise" ? "organise" : "dates");
     setPreview(undefined);
     lastRoute.current = route;
@@ -632,33 +641,46 @@ function App() {
             { key: "tracks", label: "Local tracks" },
             { key: "online_id", label: "Online IDs" },
           ]
-        : ["local", "online"].includes(route)
+        : route === "local"
           ? [
               { key: "artist", label: "Artist" },
-              { key: "release", label: route === "local" ? "Release to keep" : "Local release" },
-              { key: "target", label: "Replacement" },
+              { key: "release", label: "Release to keep" },
               { key: "tracks", label: "Tracks" },
               { key: "duplicates", label: "Duplicates" },
+              { key: "evidence", label: "Evidence" },
+            ]
+        : route === "online"
+          ? [
+              { key: "artist", label: "Artist" },
+              { key: "release", label: "Local release" },
+              { key: "target", label: "Replacement" },
+              { key: "tracks", label: "Tracks" },
               { key: "gained", label: "Tracks gained" },
               { key: "evidence", label: "Evidence" },
             ]
-          : route === "mqa"
-            ? [
-                { key: "artist", label: "Artist" },
-                { key: "release", label: "Release" },
-                { key: "title", label: "File" },
-                { key: "status", label: "Status" },
-                { key: "evidence", label: "Evidence" },
-                { key: "target", label: "Action" },
-              ]
-            : ["correct", "organise", "metadata", "artwork"].includes(route)
-              ? [
-                  ...fileColumns.slice(0, 3),
-                  { key: "changes", label: "Proposed tag changes" },
-                  { key: "target", label: "Destination" },
-                  { key: "evidence", label: "Evidence" },
-                ]
-              : fileColumns;
+        : route === "mqa"
+          ? [
+              { key: "artist", label: "Artist" },
+              { key: "release", label: "Release" },
+              { key: "title", label: "File" },
+              { key: "status", label: "Status" },
+              { key: "evidence", label: "Evidence" },
+              { key: "target", label: "Action" },
+            ]
+        : route === "organise"
+          ? [
+              ...fileColumns.slice(0, 3),
+              { key: "changes", label: "Folder operation" },
+              { key: "target", label: "Destination" },
+              { key: "evidence", label: "Evidence" },
+            ]
+        : ["correct", "metadata", "artwork"].includes(route)
+          ? [
+              ...fileColumns.slice(0, 3),
+              { key: "changes", label: "Proposed tag changes" },
+              { key: "evidence", label: "Evidence" },
+            ]
+          : fileColumns;
   function card(
     title: string,
     value: any,
@@ -700,11 +722,11 @@ function App() {
                 Link,
               )}
               {card(
-                "Artists to resolve",
-                s.unresolved_artists,
-                "Album artists requiring a match",
-                "artists",
-                Music2,
+                "Missing releases",
+                `${(s.missing_releases ?? s.missing ?? 0).toLocaleString()} releases`,
+                "Newer and missing albums to download",
+                "missing",
+                Disc,
               )}
               {card(
                 "Download queue",
@@ -820,7 +842,15 @@ function App() {
                   <strong>
                     {r.artist} — {r.release}
                   </strong>
-                  <span>{r.date} · {r.recommendation}</span>
+                  <span>
+                    {[
+                      r.date,
+                      r.type ? r.type.toUpperCase() : "",
+                      r.recommendation,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
                   <button
                     onClick={() =>
                       external(`https://tidal.com/album/${r.id}`).catch(
@@ -1482,6 +1512,8 @@ function App() {
                 { value: 50, label: "50" },
                 { value: 100, label: "100" },
                 { value: 250, label: "250" },
+                { value: 500, label: "500" },
+                { value: 1000, label: "1000" },
               ],
               true,
             )}
@@ -1577,12 +1609,24 @@ function App() {
                     </span>
                     <strong>{m.ok ? "Connected" : "Needs attention"}</strong>
                     <small>
-                      {[
-                        m.latency_ms ? `${m.latency_ms} ms` : "",
-                        msg,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
+                      {key === "download"
+                        ? m.ok
+                          ? m.connected_on
+                            ? `Connected on: ${m.connected_on}`
+                            : "Connected on: Today"
+                          : msg || "Needs attention"
+                        : key === "catalogue"
+                          ? m.ok
+                            ? m.latency_ms !== undefined
+                              ? `· ${m.latency_ms} ms`
+                              : ""
+                            : msg || "Needs attention"
+                          : [
+                              m.latency_ms ? `· ${m.latency_ms} ms` : "",
+                              msg,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
                     </small>
                   </div>
                 );
@@ -1795,7 +1839,7 @@ function App() {
                 if (v) setSettings(v);
               }}
             >
-              Reset download defaults
+              Reset to default
             </button>
           </div>
         </section>
@@ -2051,7 +2095,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.6 · build 6</span>
+          <span className="sidebar-version">v0.9.0-beta.7 · build 7</span>
         </div>
       </aside>
       <main>
@@ -2134,39 +2178,33 @@ function App() {
             <>
               {(() => {
                 const job = state?.job;
-                const rawStatus = (job?.status || "ready").toLowerCase();
-                const rawKind = (job?.kind || "").toLowerCase();
-
-                let statusLabel = "READY";
-                let statusClass = "ready";
-                if (rawStatus === "failed" || rawStatus === "error") {
-                  statusLabel = "FAILED";
-                  statusClass = "failed";
-                } else if (rawStatus === "running" || rawStatus === "in_progress") {
-                  statusLabel = "RUNNING";
-                  statusClass = "running";
-                } else if (rawStatus === "complete" || rawStatus === "completed" || rawStatus === "done") {
-                  statusLabel = "COMPLETED";
-                  statusClass = "complete";
-                } else if (rawStatus === "cancelling") {
-                  statusLabel = "CANCELLING";
-                  statusClass = "cancelling";
-                } else if (rawStatus === "cancelled") {
-                  statusLabel = "CANCELLED";
-                  statusClass = "cancelled";
+                const isJobActive = active(job);
+                if (!isJobActive) {
+                  return (
+                    <section className="card activity-status">
+                      <div className="activity-status-info">
+                        <div className="activity-status-title-row">
+                          <h2>No jobs currently running...</h2>
+                        </div>
+                        <p>
+                          Operations will appear here. You can keep browsing while they run.
+                        </p>
+                      </div>
+                      <button disabled={true}>
+                        Cancel
+                      </button>
+                    </section>
+                  );
                 }
 
-                let cat = "general";
-                if (rawKind === "download" || rawKind.includes("download")) cat = "download";
-                else if (rawKind === "scan" || rawKind.includes("scan")) cat = "scan";
-                else if (rawKind === "link" || rawKind.includes("link") || rawKind.includes("catalogue") || rawKind.includes("artist")) cat = "linking";
-                else if (rawKind.includes("duplicate") || rawKind.includes("consolidation") || rawKind.includes("trash") || rawKind.includes("organise") || rawKind.includes("correct")) cat = "cleanup";
-                else if (rawStatus === "failed" || rawStatus === "error") cat = "error";
+                const rawStatus = (job?.status || "running").toLowerCase();
+                const rawKind = (job?.kind || "").toLowerCase();
 
-                const isComponentCheck = rawKind === "component_check" || Boolean(job?.message?.includes("streaming components"));
-                if (isComponentCheck) {
-                  statusLabel = "READY";
-                  statusClass = "ready";
+                let statusLabel = "RUNNING";
+                let statusClass = "running";
+                if (rawStatus === "cancelling") {
+                  statusLabel = "CANCELLING";
+                  statusClass = "cancelling";
                 }
 
                 const kindTitles: Record<string, string> = {
@@ -2183,11 +2221,15 @@ function App() {
                   correct: "Tag Correction",
                   organise: "Folder Organization",
                   favourites: "Refresh Favourite Artists",
-                  startup: "System Ready",
                 };
-                const displayTitle = isComponentCheck
-                  ? "System Ready"
-                  : kindTitles[rawKind] || (rawKind ? rawKind.split("_").map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") : "No Active Operation");
+                const displayTitle =
+                  kindTitles[rawKind] ||
+                  (rawKind
+                    ? rawKind
+                        .split("_")
+                        .map((w: string) => w.charAt(0).toUpperCase() + w.slice(1))
+                        .join(" ")
+                    : "Active Operation");
 
                 return (
                   <section className="card activity-status">
@@ -2200,16 +2242,12 @@ function App() {
                         </span>
                       </div>
                       <p>
-                        {isComponentCheck
-                          ? "Operations will appear here. You can keep browsing while they run."
-                          : job?.message ||
-                            "Operations will appear here. You can keep browsing while they run."}
+                        {job?.message ||
+                          "Operations will appear here. You can keep browsing while they run."}
                       </p>
                     </div>
                     <button
-                      disabled={
-                        !active(state?.job) || state?.job?.status === "cancelling"
-                      }
+                      disabled={job?.status === "cancelling"}
                       onClick={() => call("job.cancel").catch(notifyError)}
                     >
                       Cancel

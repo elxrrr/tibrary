@@ -450,6 +450,11 @@ pub async fn save_token(db: &TursoDb, token: &TidalToken) -> Result<(), String> 
 
     db.set_preference("account-disconnected", &json!(false))
         .await?;
+    db.set_preference(
+        "account_connected_at",
+        &json!(chrono::Local::now().format("%Y-%m-%d").to_string()),
+    )
+    .await?;
 
     Ok(())
 }

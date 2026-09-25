@@ -47,6 +47,7 @@ pub struct StatsRecord {
     pub queued: usize,
     pub downloaded: usize,
     pub missing_releases: usize,
+    pub correct: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +609,7 @@ impl TursoDb {
 
         let mut track_count = 0;
         let mut linked_tracks = 0;
+        let mut correct_issues = 0;
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
         let mut artists_set: HashSet<String> = HashSet::new();
 
@@ -640,6 +642,60 @@ impl TursoDb {
 
                     if !artist.is_empty() && !is_compilation_artist(artist) {
                         artists_set.insert(artist.to_lowercase());
+                    }
+
+                    // Check for tag correction issues across dates, numbers, keys, lyrics
+                    let tags = crate::workflows::extract_tags_map(&Some(meta));
+                    let mut has_correction = false;
+
+                    if let Some(date) = tags.get("date") {
+                        let clean = date.trim().replace(['/', '.'], "-");
+                        let clean = clean.split('T').next().unwrap_or(&clean);
+                        let valid = (clean.len() == 4 && clean.parse::<u32>().is_ok())
+                            || chrono::NaiveDate::parse_from_str(clean, "%Y-%m-%d").is_ok();
+                        if valid && clean != date {
+                            has_correction = true;
+                        }
+                    }
+
+                    if !has_correction {
+                        for (number, total) in [("tracknumber", "tracktotal"), ("discnumber", "disctotal")] {
+                            if let Some(value) = tags.get(number) {
+                                let parts: Vec<_> = value.split('/').collect();
+                                if let Ok(n) = parts[0].trim().parse::<u32>() {
+                                    if n > 0 {
+                                        let formatted = format!("{n:02}");
+                                        if &formatted != value {
+                                            has_correction = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !tags.contains_key(total) && parts.len() == 2 {
+                                    has_correction = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if !has_correction && (tags.contains_key("unsyncedlyrics") || tags.contains_key("lyrics")) {
+                        has_correction = true;
+                    }
+
+                    if !has_correction {
+                        let tags_vec: HashMap<String, Vec<String>> = tags
+                            .iter()
+                            .map(|(k, v)| (k.clone(), vec![v.clone()]))
+                            .collect();
+                        let (key_edits, issue) = crate::musical_keys::key_changes(&tags_vec);
+                        if !key_edits.is_empty() || !issue.is_empty() {
+                            has_correction = true;
+                        }
+                    }
+
+                    if has_correction {
+                        correct_issues += 1;
                     }
                 }
             }
@@ -719,6 +775,7 @@ impl TursoDb {
             queued,
             downloaded,
             missing_releases,
+            correct: correct_issues,
         })
     }
 
@@ -1642,6 +1699,7 @@ impl TursoDb {
                 "type" => a.r#type.cmp(&b.r#type),
                 "tracks" => a.tracks.cmp(&b.tracks),
                 "status" => a.status.cmp(&b.status),
+                "recommendation" => a.recommendation.cmp(&b.recommendation),
                 _ => a.date.cmp(&b.date),
             };
             if desc {
@@ -1688,6 +1746,7 @@ impl TursoDb {
             obj.insert("linked".to_string(), json!(stats_record.linked_tracks));
             obj.insert("missing".to_string(), json!(stats_record.missing_releases));
             obj.insert("missing_releases".to_string(), json!(stats_record.missing_releases));
+            obj.insert("correct".to_string(), json!(stats_record.correct));
         }
 
         // Include desktop-health maintenance counts (correct, organise, metadata, artwork, mqa, local, online)

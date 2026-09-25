@@ -212,9 +212,21 @@ pub async fn execute(
                 }
             }
         }
+        let connected_on: String = if result.is_ok() {
+            if let Ok(Some(saved_date)) = db.get_preference("account_connected_at").await {
+                saved_date.as_str().unwrap_or("").to_string()
+            } else {
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let _ = db.set_preference("account_connected_at", &json!(today)).await;
+                today
+            }
+        } else {
+            String::new()
+        };
         metrics["download"] = json!({
             "ok": result.is_ok(),
-            "message": result.err().unwrap_or(user_detail)
+            "message": result.err().unwrap_or(user_detail),
+            "connected_on": connected_on,
         });
         let diagnostics = json!({"metrics":metrics,"checked_at":chrono::Utc::now().to_rfc3339()});
         db.set_preference("connection-diagnostics", &diagnostics)
