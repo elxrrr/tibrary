@@ -298,15 +298,43 @@ main {
 .running {
   color: var(--accent);
 }
+.page-body-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 .page-body {
   flex: 1;
   min-height: 0;
+}
+.edge-gradient-top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 10px;
+  height: 20px;
+  background: linear-gradient(to bottom, var(--bg), transparent);
+  pointer-events: none;
+  z-index: 10;
+}
+.edge-gradient-bottom {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 10px;
+  height: 32px;
+  background: linear-gradient(to top, var(--bg), transparent);
+  pointer-events: none;
+  z-index: 10;
 }
 .scroll-page {
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
-  padding: 4px 10px 20px 2px;
+  padding: 4px 10px 32px 2px;
 }
 .table-page {
   display: flex;

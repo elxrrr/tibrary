@@ -1728,16 +1728,13 @@ function App() {
           </details>
         </section>
         <section className="card">
-          <h2>Download engine</h2>
+          <h2>Download & files</h2>
           {field("Audio quality", "downloads", "quality", [
             { value: "HI_RES_LOSSLESS", label: "FLAC (24/192khz)" },
             { value: "LOSSLESS", label: "FLAC (16/44.1khz)" },
             { value: "HIGH", label: "MP3 (320kbps)" },
             { value: "LOW", label: "MP3 (96kbps)" },
           ])}
-          <p className="hint">
-            FLAC up to 24-bit / 192 kHz (Hi-Res Lossless), FLAC 16-bit / 44.1 kHz (Lossless CD quality), or compressed AAC/MP3.
-          </p>
           {field("Embedded artwork size", "downloads", "cover_size", [
             { value: "1280", label: "1280 × 1280 px" },
             { value: "640", label: "640 × 640 px" },
@@ -1749,7 +1746,20 @@ function App() {
           {toggle("Save separate .lrc lyrics file", "downloads", "lyrics_file")}
           {toggle("Create .m3u8 playlist file for albums", "downloads", "playlist_create")}
           {toggle("Write ReplayGain volume tags", "downloads", "replay_gain")}
-          <p className="hint">Downloads run one track at a time to keep requests predictable and reduce throttling.</p>
+          {field(
+            "Parallel downloads",
+            "provider",
+            "download_concurrency",
+            undefined,
+            true,
+          )}
+          {field(
+            "Connections per audio file",
+            "provider",
+            "segment_concurrency",
+            undefined,
+            true,
+          )}
           {field(
             "Minimum release pause (seconds)",
             "provider",
@@ -2030,7 +2040,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.2 · build 2</span>
+          <span className="sidebar-version">v0.9.0-beta.3 · build 3</span>
         </div>
       </aside>
       <main>
@@ -2089,21 +2099,23 @@ function App() {
             </button>
           </div>
         )}
-        <div
-          className={
-            "page-body " +
-            ([
-              "overview",
-              ...groups.map((g) => g.id),
-              "general",
-              "connections",
-              "downloads",
-              "activity",
-            ].includes(route)
-              ? "scroll-page"
-              : "table-page")
-          }
-        >
+        {(() => {
+          const isScrollPage = [
+            "overview",
+            ...groups.map((g) => g.id),
+            "general",
+            "connections",
+            "downloads",
+            "activity",
+          ].includes(route);
+
+          return (
+            <div className={"page-body-wrap" + (isScrollPage ? " has-scroll-fade" : "")}>
+              <div
+                className={
+                  "page-body " + (isScrollPage ? "scroll-page" : "table-page")
+                }
+              >
           {["overview", ...groups.map((g) => g.id)].includes(route) ? (
             dashboard()
           ) : ["general", "connections", "downloads"].includes(route) ? (
@@ -2325,6 +2337,15 @@ function App() {
             tablePage()
           )}
         </div>
+        {isScrollPage && (
+          <>
+            <div className="edge-gradient-top" aria-hidden="true" />
+            <div className="edge-gradient-bottom" aria-hidden="true" />
+          </>
+        )}
+      </div>
+    );
+  })()}
       </main>
       {contextMenu()}
       {detail && (
