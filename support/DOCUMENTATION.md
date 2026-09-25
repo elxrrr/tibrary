@@ -71,6 +71,7 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 | `mqa.rs` | 36-bit stereo-XOR sync detection algorithm for verifying authentic MQA streams directly in raw PCM frames. |
 | `maintenance.rs` | Safe directory relocation, file renaming, and duplicate consolidation. |
 | `organisation.rs` | Layout path templating and file system safety checks. |
+| `duplicates.rs` | Local duplicate finder and containment analyzer; detects chained absorption patterns (Single → EP → Album) and executes safe bulk deletions. |
 | `recommendations.rs` | Contributor network traversal and artist discography gap discovery. |
 | `downloads.rs` | Acquisition queue state management and invocation of on-demand download workers. |
 | `account.rs` | Tidal user session management and favourite sync. |
@@ -153,7 +154,7 @@ The Playwright E2E suite uses `support/tests/seed_desktop.py` to populate a temp
 2. **Deterministic Catalogue Linking:** Matches local releases to Tidal catalogue entities using multi-evidence scoring: exact ISRCs, track durations (±3s window), multi-disc alignments, edition variants (Deluxe, Remaster, Explicit), and whole-release structure.
 3. **Missing Music Discovery:** Cross-references confirmed local artist holdings against complete Tidal discographies (Albums, EPs, Singles) to identify missing releases, historical catalogue gaps, and incomplete albums.
 4. **MQA Signal Audit:** Runs a bit-accurate 36-bit stereo-XOR sync pattern detector directly on raw PCM audio frames to distinguish authentic MQA streams from standard lossless audio and misleading file tags.
-5. **Duplicate & Replacement Inspection:** Identifies duplicate tracks across disks and directories, scoring bit depth, sample rates, and tags so you can keep the best edition.
+5. **Duplicate & Replacement Inspection:** Identifies duplicate tracks and chained multi-release containment patterns (e.g. Single ⊆ EP ⊆ Album) across folders. Displays duplicate clusters under their master keeper album and executes bulk deletions safely to macOS Trash in a single operation.
 6. **Non-Destructive Tag & Folder Maintenance:** Previews tag normalizations (leading zeros, Camelot `INITIALKEY` conversions, BPM standardization) and directory reorganizations (`Artist/Album (Year)/Track - Title`).
 7. **Acquisition Queue & Fulfilment:** Persistent, reviewable acquisition queue. Export approved items as URLs/JSON/CSV, or dispatch them directly to an isolated on-demand Tidaler background download worker.
 

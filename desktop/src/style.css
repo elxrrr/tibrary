@@ -615,9 +615,41 @@ tr.child td {
 }
 .badge.potential,
 .badge.needs-choice,
-.badge.unresolved {
+.badge.unresolved,
+.badge.multi-duplicate,
+.badge.duplicate {
   background: #bf94321a;
   color: color-mix(in srgb, var(--text) 50%, #ba8b22);
+}
+.badge.chained-duplicate {
+  background: #7c3aed1a;
+  color: #8b5cf6;
+  font-weight: 600;
+  border: 1px solid #7c3aed33;
+}
+.cluster-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  background: color-mix(in srgb, var(--surface) 85%, #7c3aed 15%);
+  border: 1px solid color-mix(in srgb, var(--border) 60%, #7c3aed 40%);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.cluster-callout-text {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.cluster-callout-text svg {
+  color: #8b5cf6;
+  flex-shrink: 0;
+}
+.review-cluster-item {
+  border-left: 3px solid #8b5cf6;
 }
 .empty {
   position: absolute;

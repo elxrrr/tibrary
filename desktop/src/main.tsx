@@ -14,6 +14,7 @@ import {
   Heart,
   House,
   Image,
+  Layers,
   Link,
   LoaderCircle,
   Music2,
@@ -958,8 +959,21 @@ function App() {
                 })
               }
             >
-              Find opportunities in cache
+              {route === "local" ? "Scan for duplicates" : "Find opportunities in cache"}
             </button>
+            {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
+              <button
+                disabled={busy}
+                onClick={() => {
+                  const chained = data.rows
+                    .filter((r: any) => r.status === "Chained duplicate")
+                    .map((r: any) => r.id);
+                  setSelected(new Set(chained));
+                }}
+              >
+                Select all chained ({data.rows.filter((r: any) => r.status === "Chained duplicate").length})
+              </button>
+            )}
             {route === "online" && (
               <button
                 disabled={busy || !root}
@@ -977,7 +991,7 @@ function App() {
                 })
               }
             >
-              Review duplicate removal
+              Review duplicate removal {selected.size ? `(${selected.size})` : ""}
             </button>
             {route === "online" && (
               <button
@@ -1197,6 +1211,26 @@ function App() {
               : `${data.total.toLocaleString()} items`}
           </span>
         </div>
+        {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
+          <div className="cluster-callout">
+            <div className="cluster-callout-text">
+              <Layers size={16} />
+              <span>
+                <strong>Chained duplicates detected:</strong> Multiple smaller releases are completely absorbed into one comprehensive master album (e.g. Single → EP → Album). You can select all and safely trash them in a single clean operation.
+              </span>
+            </div>
+            <button
+              onClick={() => {
+                const chained = data.rows
+                  .filter((r: any) => r.status === "Chained duplicate")
+                  .map((r: any) => r.id);
+                setSelected(new Set(chained));
+              }}
+            >
+              Select all chained ({data.rows.filter((r: any) => r.status === "Chained duplicate").length})
+            </button>
+          </div>
+        )}
         <DataTable
           rows={data.rows}
           columns={columns}
@@ -2375,13 +2409,29 @@ function App() {
                       : "Only the reviewed changes are applied. Existing audio is verified and preserved."}
             </p>
             <div className="review-list">
-              {review.rows?.map((r: Row, i: number) => (
-                <article key={i}>
-                  <strong>
-                    {r.artist} — {r.release || r.title || r.id}
-                  </strong>
-                  <p>{r.changes || r.path || r.target}</p>
-                  {r.evidence && <small>{readable(r.evidence)}</small>}
+              {review.rows?.map((r: any, i: number) => (
+                <article key={i} className={review.operation === "consolidate" ? "review-cluster-item" : ""}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" }}>
+                    <strong>
+                      {r.artist} — {r.release || r.title || r.id}
+                    </strong>
+                    {r.is_chained && (
+                      <span className="badge chained-duplicate">Chained duplicate</span>
+                    )}
+                  </div>
+                  {review.operation === "consolidate" ? (
+                    <>
+                      <p style={{ marginTop: "4px", color: "var(--muted)", fontSize: "12px" }}>
+                        🎯 <strong>Master Keeper:</strong> {r.target}
+                      </p>
+                      <p style={{ color: "var(--text)", fontSize: "12px", marginTop: "2px" }}>
+                        🗑️ <strong>Safe Trash:</strong> {r.changes || r.path}
+                      </p>
+                    </>
+                  ) : (
+                    <p>{r.changes || r.path || r.target}</p>
+                  )}
+                  {r.evidence && <small style={{ display: "block", marginTop: "4px" }}>{readable(r.evidence)}</small>}
                   {r.reviewed_dj_conflicts?.length > 0 && (
                     <pre>
                       {JSON.stringify(r.reviewed_dj_conflicts, null, 2)}
@@ -2395,7 +2445,9 @@ function App() {
             <button onClick={() => setReview(null)}>Cancel</button>
             <button className="primary" disabled={busy} onClick={confirmReview}>
               {review.operation === "consolidate"
-                ? "Move reviewed duplicates to Trash"
+                ? review.count
+                  ? `Move ${review.count} duplicate files to Trash`
+                  : "Move reviewed duplicates to Trash"
                 : review.operation === "download"
                   ? "Start download"
                   : "Confirm & continue"}

@@ -325,6 +325,26 @@ impl TursoDb {
         Ok(())
     }
 
+    pub async fn remove_local_file(&self, path: &str) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE local_files SET present = 0 WHERE path = ?",
+            (path,),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        conn.execute(
+            "DELETE FROM track_links WHERE path = ?",
+            (path,),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        self.bump_revision();
+        Ok(())
+    }
+
     async fn get_active_links(&self, conn: &Connection, market: &str) -> Result<HashSet<String>, String> {
         let mut link_rows = conn
             .query("SELECT path, stamp, payload FROM track_links WHERE market = ?", (market,))

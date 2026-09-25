@@ -14,6 +14,7 @@ use tauri::{Emitter, Manager};
 pub mod account;
 pub mod db;
 pub mod downloads;
+pub mod duplicates;
 pub mod enrichment;
 pub mod linking;
 pub mod maintenance;
@@ -34,6 +35,7 @@ pub struct Backend {
     pub active_job_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub active_job: Mutex<Option<Value>>,
     pub logs: Mutex<Vec<Value>>,
+    pub previews: Mutex<HashMap<String, Value>>,
 }
 
 impl Backend {
@@ -484,6 +486,49 @@ async fn handle_rpc_call(
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
 
+        if route == "local" {
+            let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+            let root_opt = args.get("root").and_then(|v| v.as_str());
+            let root = if let Some(r) = root_opt {
+                r.to_string()
+            } else {
+                let roots = db.list_roots(market).await?;
+                roots.into_iter().next().map(|r| r.root).unwrap_or_default()
+            };
+            if root.is_empty() {
+                return Ok(json!({
+                    "rows": [],
+                    "total": 0,
+                    "offset": 0,
+                    "revision": 0,
+                    "preview_id": null
+                }));
+            }
+            let (files, _) = db.get_local_files_page(Some(&root), 20000, 0).await?;
+            let clusters = duplicates::find_duplicate_clusters(&files);
+            let mut rows = duplicates::clusters_to_link_rows(&clusters);
+
+            if let Some(q) = search {
+                let q_lower = q.to_lowercase();
+                rows.retain(|r| {
+                    r.artist.to_lowercase().contains(&q_lower)
+                        || r.release.to_lowercase().contains(&q_lower)
+                        || r.target.to_lowercase().contains(&q_lower)
+                        || r.evidence.to_lowercase().contains(&q_lower)
+                });
+            }
+
+            let total = rows.len();
+            let page_rows = rows.into_iter().skip(offset).take(limit).collect();
+            return serde_json::to_value(crate::db::TablePage {
+                rows: page_rows,
+                total,
+                offset,
+                revision: 0,
+                preview_id: Some("local_duplicates".to_string()),
+            }).map_err(|e| e.to_string());
+        }
+
         return Ok(json!({
             "rows": [],
             "total": 0,
@@ -499,6 +544,9 @@ async fn handle_rpc_call(
     }
     if method == "preview" {
         let preview_id = args.get("id").and_then(|v| v.as_str()).unwrap_or("preview");
+        if let Some(prev) = state.previews.lock().unwrap().get(preview_id) {
+            return Ok(prev.clone());
+        }
         return Ok(json!({
             "id": preview_id,
             "rows": [],
@@ -1181,6 +1229,197 @@ async fn handle_rpc_call(
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
         }
         return serde_json::to_value(res).map_err(|e| e.to_string());
+    }
+    if method == "job.start"
+        && args.get("kind").and_then(|v| v.as_str()) == Some("optimizations")
+    {
+        let inner_args = args.get("args").cloned().unwrap_or(args.clone());
+        let root = inner_args.get("root").and_then(|v| v.as_str()).unwrap_or("");
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let (files, _) = db.get_local_files_page(if root.is_empty() { None } else { Some(root) }, 20000, 0).await?;
+        let clusters = duplicates::find_duplicate_clusters(&files);
+        let chained_count = clusters.iter().filter(|c| c.is_chained).count();
+        let total_redundant: usize = clusters.iter().map(|c| c.redundant.len()).sum();
+        let finished = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let summary_msg = if chained_count > 0 {
+            format!("Found {} duplicate releases across {} consolidation clusters ({} chained)", total_redundant, clusters.len(), chained_count)
+        } else {
+            format!("Found {} duplicate releases across {} consolidation clusters", total_redundant, clusters.len())
+        };
+        let final_job = json!({
+            "id": job_id,
+            "kind": "optimizations",
+            "status": "complete",
+            "message": summary_msg.clone(),
+            "started": started,
+            "finished": finished,
+            "result": json!({
+                "summary": summary_msg,
+                "clusters": clusters.len(),
+                "redundant": total_redundant,
+                "chained": chained_count
+            })
+        });
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "job", "job": final_job }));
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(final_job);
+    }
+    if method == "job.start"
+        && args.get("kind").and_then(|v| v.as_str()) == Some("review_consolidation")
+    {
+        let inner_args = args.get("args").cloned().unwrap_or(args.clone());
+        let root = inner_args.get("root").and_then(|v| v.as_str()).unwrap_or("");
+        let ids: Vec<String> = inner_args.get("ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+
+        let (files, _) = db.get_local_files_page(if root.is_empty() { None } else { Some(root) }, 20000, 0).await?;
+        let clusters = duplicates::find_duplicate_clusters(&files);
+        let preview_id = format!("preview-consolidation-{}", uuid::Uuid::new_v4());
+
+        let mut selected_files_to_delete = Vec::new();
+        let mut preview_rows = Vec::new();
+
+        for cluster in &clusters {
+            let mut cluster_has_selection = false;
+            for red in &cluster.redundant {
+                let row_id = format!("{}::{}", cluster.cluster_id, red.folder);
+                if ids.contains(&row_id) || ids.contains(&red.folder) || ids.contains(&cluster.cluster_id) {
+                    cluster_has_selection = true;
+                    break;
+                }
+            }
+
+            if cluster_has_selection || ids.is_empty() {
+                for red in &cluster.redundant {
+                    let row_id = format!("{}::{}", cluster.cluster_id, red.folder);
+                    if ids.is_empty() || ids.contains(&row_id) || ids.contains(&red.folder) || ids.contains(&cluster.cluster_id) {
+                        for t in &red.tracks {
+                            selected_files_to_delete.push(t.path.clone());
+                        }
+                        preview_rows.push(json!({
+                            "id": row_id,
+                            "artist": red.artist,
+                            "release": red.title,
+                            "target": cluster.master.title,
+                            "path": red.folder,
+                            "changes": format!("Move to Trash: {} tracks (preserved in {})", red.tracks.len(), cluster.master.title),
+                            "evidence": cluster.chain_summary,
+                            "is_chained": cluster.is_chained,
+                            "master_folder": cluster.master.folder,
+                            "master_title": cluster.master.title,
+                            "tracks": red.tracks.len(),
+                            "files": red.tracks.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        let preview_payload = json!({
+            "id": preview_id.clone(),
+            "operation": "consolidate",
+            "scope": inner_args.get("scope").and_then(|v| v.as_str()).unwrap_or("local"),
+            "root": root,
+            "rows": preview_rows,
+            "count": selected_files_to_delete.len(),
+            "files": selected_files_to_delete,
+        });
+
+        state.previews.lock().unwrap().insert(preview_id.clone(), preview_payload.clone());
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let now_sec = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let job = json!({
+            "id": job_id,
+            "kind": "review_consolidation",
+            "status": "complete",
+            "message": format!("Reviewed {} files for duplicate removal", selected_files_to_delete.len()),
+            "started": now_sec,
+            "finished": now_sec,
+            "result": json!({
+                "preview_id": preview_id,
+                "operation": "consolidate",
+                "root": root
+            })
+        });
+
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
+        }
+
+        return Ok(job);
+    }
+    if method == "job.start"
+        && args.get("kind").and_then(|v| v.as_str()) == Some("consolidate")
+    {
+        let inner_args = args.get("args").cloned().unwrap_or(args.clone());
+        let preview_id = inner_args.get("preview_id").and_then(|v| v.as_str()).unwrap_or("");
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+        let initial_job = json!({
+            "id": job_id,
+            "kind": "consolidate",
+            "status": "running",
+            "message": "Moving reviewed duplicates to Trash…",
+            "started": started,
+            "result": null
+        });
+
+        let mut files_to_delete = Vec::new();
+        let mut folders_to_clean = Vec::new();
+
+        if let Some(prev) = state.previews.lock().unwrap().get(preview_id) {
+            if let Some(files_arr) = prev.get("files").and_then(|v| v.as_array()) {
+                for f in files_arr {
+                    if let Some(p) = f.as_str() {
+                        files_to_delete.push(p.to_string());
+                    }
+                }
+            }
+            if let Some(rows_arr) = prev.get("rows").and_then(|v| v.as_array()) {
+                for r in rows_arr {
+                    if let Some(p) = r.get("path").and_then(|v| v.as_str()) {
+                        folders_to_clean.push(p.to_string());
+                    }
+                }
+            }
+        }
+
+        let db_clone = db.clone();
+        let app_clone = app_handle.cloned();
+        let j_id = job_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let res = duplicates::consolidate_redundant_releases(&db_clone, &files_to_delete, &folders_to_clean).await;
+            let finished = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let (status, msg, count) = match res {
+                Ok(c) => ("complete", format!("Successfully moved {} duplicate files to Trash", c), c),
+                Err(e) => ("failed", format!("Error moving duplicates to Trash: {}", e), 0),
+            };
+
+            let final_job = json!({
+                "id": j_id,
+                "kind": "consolidate",
+                "status": status,
+                "message": msg,
+                "started": started,
+                "finished": finished,
+                "result": json!({ "completed": count })
+            });
+
+            if let Some(ref app) = app_clone {
+                let _ = app.emit("backend-event", json!({ "event": "job", "job": final_job }));
+                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+            }
+        });
+
+        return Ok(initial_job);
     }
     if method == "job.cancel" {
         if let Some(cancel_flag) = state.active_job_cancel.lock().unwrap().as_ref() {
