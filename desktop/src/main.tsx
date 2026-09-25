@@ -1533,7 +1533,7 @@ function App() {
                   disabled={busy}
                   onClick={() => run("scan", { root: r.root, force: true })}
                 >
-                  Recheck all tags
+                  Rescan tags
                 </button>
                 <button
                   disabled={busy}
@@ -1545,34 +1545,10 @@ function App() {
                     })
                   }
                 >
-                  Remove from index
+                  Remove
                 </button>
               </div>
             ))}
-          </section>
-          <section className="card about-card">
-            <h2>About Tibrary</h2>
-            <div className="about-details">
-              <div className="about-field">
-                <span className="about-label">Version</span>
-                <span className="about-val">v0.9.0-beta.1 (pre-1.0)</span>
-              </div>
-              <div className="about-field">
-                <span className="about-label">Architecture</span>
-                <span className="about-val">Native Rust + Tauri v2 Core</span>
-              </div>
-              <div className="about-field">
-                <span className="about-label">Database</span>
-                <span className="about-val">Turso / libsql Embedded SQLite</span>
-              </div>
-              <div className="about-field">
-                <span className="about-label">Audio Engine</span>
-                <span className="about-val">Native AES-CBC / MPEG-DASH / Lofty / Claxon (Pure Rust)</span>
-              </div>
-            </div>
-            <p className="about-description">
-              Tibrary is a local-first music library manager and lossless acquisition companion designed for precision audio workflows, automated discography syncing, and duplicate consolidation.
-            </p>
           </section>
         </>
       );
@@ -1584,7 +1560,11 @@ function App() {
               ([key, m]: [string, any]) => (
                 <div className="metric static" key={key}>
                   <span className="metric-title">
-                    {key === "download" ? "Download & metadata account" : key}
+                    {key === "download"
+                      ? "User"
+                      : key === "catalogue"
+                      ? "Catalogue"
+                      : key.charAt(0).toUpperCase() + key.slice(1)}
                   </span>
                   <strong>{m.ok ? "Connected" : "Needs attention"}</strong>
                   <small>
@@ -1596,20 +1576,18 @@ function App() {
             )}
           </div>
           <section className="card">
-            <h2>Online account</h2>
+            <h2>User account</h2>
             <p>
-              Sign in once for collection access. The download account also
-              supplies extended BPM and key metadata.
+              Sign in with your account to sync favourite artists and access extended
+              BPM and musical key metadata.
             </p>
             <div className="toolbar">
               <button
-                className="primary"
-                disabled={busy}
+                className={state?.connections.account ? "" : "primary"}
+                disabled={busy || Boolean(state?.connections.account)}
                 onClick={() => run("connect_account")}
               >
-                {state?.connections.account
-                  ? "Reconnect account"
-                  : "Connect account"}
+                Connect account
               </button>
               <button
                 disabled={busy || !state?.connections.account}
@@ -1618,21 +1596,20 @@ function App() {
                 Disconnect account
               </button>
             </div>
-            <p>One account connection is shared by favourites, downloads and extended metadata. Application credentials below provide catalogue access.</p>
           </section>
           <section className="card">
-            <h2>Application credentials</h2>
-            <p>
-              {state?.connections.configured
-                ? "Credentials are configured. Forget them to enter a replacement."
-                : "Enter the client credentials issued for your catalogue application. Saved credentials use macOS Keychain."}
-            </p>
+            <h2>Developer account</h2>
             <label className="setting-row">
               <span>Client ID</span>
               <input
+                type={state?.connections.configured ? "password" : "text"}
                 autoComplete="off"
                 disabled={state?.connections.configured}
-                value={credentials.client}
+                value={
+                  state?.connections.configured
+                    ? "••••••••••••••••"
+                    : credentials.client
+                }
                 onChange={(e) =>
                   setCredentials({ ...credentials, client: e.target.value })
                 }
@@ -1644,7 +1621,11 @@ function App() {
                 type="password"
                 autoComplete="off"
                 disabled={state?.connections.configured}
-                value={credentials.secret}
+                value={
+                  state?.connections.configured
+                    ? "••••••••••••••••"
+                    : credentials.secret
+                }
                 onChange={(e) =>
                   setCredentials({ ...credentials, secret: e.target.value })
                 }
@@ -1760,6 +1741,7 @@ function App() {
           {field("Embedded artwork size", "downloads", "cover_size", [
             { value: "1280", label: "1280 × 1280 px" },
             { value: "640", label: "640 × 640 px" },
+            { value: "0", label: "Do not embed artwork" },
           ], true)}
           {toggle("Skip already downloaded files", "downloads", "skip_existing")}
           {toggle("Save companion cover.jpg to album folder", "downloads", "cover_album_file")}
@@ -2048,7 +2030,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.1</span>
+          <span className="sidebar-version">v0.9.0-beta.2 · build 2</span>
         </div>
       </aside>
       <main>
@@ -2180,17 +2162,13 @@ function App() {
                 return (
                   <section className="card activity-status">
                     <div className="activity-status-info">
-                      <div className="activity-status-badges">
+                      <div className="activity-status-title-row">
+                        <h2>{displayTitle}</h2>
+                        <span className="dot-separator">·</span>
                         <span className={`status-badge status-${statusClass}`}>
                           {statusLabel}
                         </span>
-                        {rawKind && rawKind !== "startup" && (
-                          <span className={`log-badge log-badge-${cat}`}>
-                            {cat.toUpperCase()}
-                          </span>
-                        )}
                       </div>
-                      <h2>{displayTitle}</h2>
                       <p>
                         {job?.message ||
                           "Operations will appear here. You can keep browsing while they run."}
@@ -2782,7 +2760,6 @@ function App() {
           </div>
         </div>
       )}
-      <div className="edge-fade-right" aria-hidden="true" />
     </div>
   );
 }

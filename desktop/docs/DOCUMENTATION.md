@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.1  
+> **Version:** 0.9.0-beta.2 (build 2)  
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
 

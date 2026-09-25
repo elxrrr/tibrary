@@ -91,6 +91,13 @@ select {
   background: var(--card);
   min-width: 0;
 }
+input:disabled,
+select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: var(--surface);
+  color: var(--muted);
+}
 input[type="checkbox"] {
   appearance: auto;
   accent-color: #77818b;
@@ -296,9 +303,10 @@ main {
   min-height: 0;
 }
 .scroll-page {
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   overscroll-behavior: contain;
-  padding: 2px 2px 20px;
+  padding: 4px 10px 20px 2px;
 }
 .table-page {
   display: flex;
@@ -506,8 +514,6 @@ main {
   border-radius: 9px;
   background: var(--card);
   position: relative;
-  -webkit-mask-image: linear-gradient(to right, black calc(100% - 32px), transparent 100%);
-  mask-image: linear-gradient(to right, black calc(100% - 32px), transparent 100%);
 }
 .table-scroll.loading table {
   opacity: 0.5;
@@ -817,11 +823,19 @@ summary {
   flex-direction: column;
   gap: 3px;
 }
-.activity-status-badges {
+.activity-status-title-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 4px;
+}
+.activity-status-title-row h2 {
+  margin-bottom: 0;
+}
+.dot-separator {
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  user-select: none;
 }
 .status-badge {
   font-size: 9.5px;
@@ -942,18 +956,6 @@ summary {
   background: var(--card);
   overflow: auto;
   max-height: calc(100vh - 270px);
-  -webkit-mask-image: linear-gradient(to right, black calc(100% - 32px), transparent 100%);
-  mask-image: linear-gradient(to right, black calc(100% - 32px), transparent 100%);
-}
-.edge-fade-right {
-  position: fixed;
-  top: 52px;
-  right: 0;
-  bottom: 0;
-  width: 18px;
-  background: linear-gradient(to right, transparent, var(--bg));
-  pointer-events: none;
-  z-index: 99;
 }
 .activity-log > div {
   display: flex;
