@@ -366,7 +366,7 @@ impl TursoDb {
 
         let mut file_rows = conn
             .query(
-                "SELECT path, size, mtime, metadata FROM local_files WHERE present = 1 AND metadata IS NOT NULL",
+                "SELECT path, size, mtime, metadata FROM local_files WHERE present = 1",
                 (),
             )
             .await
@@ -377,7 +377,7 @@ impl TursoDb {
             let path: String = row.get(0).map_err(|e| e.to_string())?;
             let size: i64 = row.get(1).map_err(|e| e.to_string())?;
             let mtime: i64 = row.get(2).map_err(|e| e.to_string())?;
-            let metadata_str: String = row.get(3).map_err(|e| e.to_string())?;
+            let metadata_opt: Option<String> = row.get(3).ok().flatten();
 
             let mut has_link = false;
             if let Some((stamp_str, payload_str)) = saved_links.get(&path) {
@@ -386,7 +386,7 @@ impl TursoDb {
                     serde_json::from_str::<Value>(payload_str),
                 ) {
                     let stamp_matches = match stamp_json.as_array() {
-                        Some(arr) if arr.len() == 4 => {
+                        Some(arr) if arr.len() >= 4 => {
                             arr[2].as_i64() == Some(size) && arr[3].as_i64() == Some(mtime)
                         }
                         Some(arr) if arr.len() >= 2 => {
@@ -400,13 +400,27 @@ impl TursoDb {
                                 has_link = true;
                             }
                         }
+                        if !has_link {
+                            if let Some(cc) = payload_json.get("catalogue_choice") {
+                                let alb = cc.get("id").or_else(|| cc.get("album_id"));
+                                let trk = cc.get("track_id");
+                                if alb.is_some() && trk.is_some() {
+                                    has_link = true;
+                                }
+                            }
+                        }
                     }
                 }
-            } else if let Ok(meta) = serde_json::from_str::<Value>(&metadata_str) {
-                let album_id = meta.get("tidal_album_id").and_then(|v| v.as_str());
-                let track_id = meta.get("tidal_track_id").and_then(|v| v.as_str());
-                if album_id.is_some() && track_id.is_some() {
-                    has_link = true;
+            }
+            if !has_link {
+                if let Some(ref metadata_str) = metadata_opt {
+                    if let Ok(meta) = serde_json::from_str::<Value>(metadata_str) {
+                        let album_id = meta.get("tidal_album_id").and_then(|v| v.as_str());
+                        let track_id = meta.get("tidal_track_id").and_then(|v| v.as_str());
+                        if album_id.is_some() && track_id.is_some() {
+                            has_link = true;
+                        }
+                    }
                 }
             }
 
@@ -464,11 +478,8 @@ impl TursoDb {
                         .unwrap_or("Unknown artist");
                     let album = meta.get("album").and_then(|v| v.as_str()).unwrap_or("");
                     
-                    let parent = Path::new(&path)
-                        .parent()
-                        .and_then(|p| p.to_str())
-                        .unwrap_or("");
-                    let group_key = format!("{}|{}|{}", parent.to_lowercase(), artist.to_lowercase(), album.to_lowercase());
+                    let folder = crate::duplicates::extract_release_folder(&path);
+                    let group_key = format!("{}|{}|{}", folder.to_lowercase(), artist.to_lowercase(), album.to_lowercase());
                     groups.entry(group_key).or_default().push(path);
 
                     if !artist.is_empty() && !is_compilation_artist(artist) {
@@ -850,6 +861,35 @@ impl TursoDb {
         })
     }
 
+fn normalize_release_title(title: &str) -> String {
+    let lower = title.trim().to_lowercase();
+    let markers = [
+        "(deluxe", "[deluxe", "(clean", "[clean", "(explicit", "[explicit",
+        "(bonus", "[bonus", "(remaster", "[remaster", "(expanded", "[expanded",
+        "(anniversary", "[anniversary", "(special", "[special", "(super deluxe",
+        "[super deluxe", "(re-issue", "[re-issue", "(reissue", "[reissue",
+    ];
+    let mut cleaned = lower.as_str();
+    for m in &markers {
+        if let Some(pos) = cleaned.find(m) {
+            cleaned = cleaned[..pos].trim();
+        }
+    }
+    cleaned.trim_end_matches(['-', ':', ' ', '·']).trim().to_string()
+}
+
+fn coverage_priority(status: &str) -> i32 {
+    match status {
+        "Owned complete" => 5,
+        "Queued" => 4,
+        "Owned partial" => 3,
+        "Missing release" => 2,
+        "Unavailable" => 1,
+        "Ignored" => 0,
+        _ => 0,
+    }
+}
+
     #[allow(clippy::too_many_arguments)]
     pub async fn get_missing_rows(
         &self,
@@ -911,7 +951,9 @@ impl TursoDb {
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut rows = Vec::new();
+        let today_utc = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut deduped_map: HashMap<(String, String, usize), MissingRow> = HashMap::new();
+
         while let Some(row) = cat_stmt.next().await.map_err(|e| e.to_string())? {
             let payload_str: Option<String> = row.get(1).ok().flatten();
             let payload = match payload_str
@@ -952,6 +994,12 @@ impl TursoDb {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+
+                // Exclude future unreleased items
+                if !date.is_empty() && date > today_utc {
+                    continue;
+                }
+
                 let rel_type = rel
                     .get("type")
                     .and_then(|v| v.as_str())
@@ -1026,11 +1074,11 @@ impl TursoDb {
                     ("Missing release".to_string(), false)
                 };
 
-                rows.push(MissingRow {
+                let cand = MissingRow {
                     id: id.clone(),
                     downloaded_files: Vec::new(),
-                    artist: rel_artist,
-                    release: title,
+                    artist: rel_artist.clone(),
+                    release: title.clone(),
                     date,
                     r#type: rel_type,
                     tracks: track_count,
@@ -1043,9 +1091,31 @@ impl TursoDb {
                     approved,
                     selected: if approved { None } else { Some(Vec::new()) },
                     children,
-                });
+                };
+
+                let norm_title = Self::normalize_release_title(&title);
+                let key = (rel_artist.to_lowercase(), norm_title, track_count);
+                match deduped_map.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(cand);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let existing = e.get();
+                        let existing_pri = Self::coverage_priority(&existing.status);
+                        let cand_pri = Self::coverage_priority(&cand.status);
+                        let should_replace = cand_pri > existing_pri
+                            || (cand_pri == existing_pri
+                                && ((!existing.expanded_available && cand.expanded_available)
+                                    || (!cand.date.is_empty() && (existing.date.is_empty() || cand.date < existing.date))));
+                        if should_replace {
+                            e.insert(cand);
+                        }
+                    }
+                }
             }
         }
+
+        let mut rows: Vec<MissingRow> = deduped_map.into_values().collect();
 
         // Apply filters
         if let Some(sf) = status_filter {
@@ -1132,8 +1202,11 @@ impl TursoDb {
     }
 
     pub async fn get_state(&self, active_job: Option<Value>, logs: &[Value], root: Option<&str>) -> Result<Value, String> {
-        let roots = self.list_roots("GB").await.unwrap_or_default();
-        let stats_record = self.get_stats("GB", root).await.unwrap_or_default();
+        let settings = self.get_settings().await?;
+        let market = settings["general"].get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+
+        let roots = self.list_roots(market).await.unwrap_or_default();
+        let stats_record = self.get_stats(market, root).await.unwrap_or_default();
 
         let mut stats_val = serde_json::to_value(&stats_record).unwrap_or(json!({}));
         if let Some(obj) = stats_val.as_object_mut() {
@@ -1161,8 +1234,6 @@ impl TursoDb {
                 "expires_at": expires_at,
             }
         });
-
-        let settings = self.get_settings().await?;
 
         let default_job = self
             .get_preference("desktop-last-job")
@@ -1719,11 +1790,28 @@ impl TursoDb {
         }
     }
 
+pub fn clean_evidence_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let unescaped = if let Ok(s) = serde_json::from_str::<String>(trimmed) {
+        s
+    } else {
+        trimmed.trim_matches('"').to_string()
+    };
+    unescaped
+        .replace("\\u2014", "—")
+        .replace("\\u00b7", "·")
+        .replace("\\\"", "\"")
+}
+
     pub async fn get_artist_rows(
         &self,
+        filter: Option<&str>,
         search: Option<&str>,
-        _sort: Option<&str>,
-        _direction: Option<&str>,
+        sort: Option<&str>,
+        direction: Option<&str>,
         offset: usize,
         limit: usize,
     ) -> Result<TablePage<Value>, String> {
@@ -1758,6 +1846,7 @@ impl TursoDb {
         for (artist, tracks) in artist_tracks {
             let (online_id, status, evidence) = mappings.get(&artist).cloned().unwrap_or_else(|| (String::new(), "Unresolved".to_string(), String::new()));
             let releases = artist_albums.get(&artist).map(|s| s.len()).unwrap_or(0);
+            let clean_evidence = Self::clean_evidence_str(&evidence);
             rows.push(json!({
                 "id": artist,
                 "artist": artist,
@@ -1765,8 +1854,37 @@ impl TursoDb {
                 "release": releases,
                 "status": status,
                 "online_id": online_id,
-                "evidence": evidence,
+                "evidence": clean_evidence,
             }));
+        }
+
+        // Apply filters
+        if let Some(f) = filter {
+            let f_lower = f.trim().to_lowercase();
+            match f_lower.as_str() {
+                "unresolved" => {
+                    rows.retain(|r| {
+                        let st = r.get("status").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let oid = r.get("online_id").and_then(|v| v.as_str()).unwrap_or("");
+                        st == "unresolved" || oid.is_empty()
+                    });
+                }
+                "matched" | "confirmed" => {
+                    rows.retain(|r| {
+                        let st = r.get("status").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let oid = r.get("online_id").and_then(|v| v.as_str()).unwrap_or("");
+                        !oid.is_empty() && (st == "confirmed" || st == "auto" || st == "matched")
+                    });
+                }
+                "review" => {
+                    rows.retain(|r| {
+                        let st = r.get("status").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let ev = r.get("evidence").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        st.contains("candidate") || st.contains("ambiguous") || ev.contains("confirm identity") || ev.contains("review")
+                    });
+                }
+                _ => {} // "all" or any other
+            }
         }
 
         if let Some(q) = search {
@@ -1775,6 +1893,39 @@ impl TursoDb {
                 rows.retain(|r| r.get("artist").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().contains(&q_trimmed));
             }
         }
+
+        let sort_col = sort.unwrap_or("artist");
+        let desc = direction.map(|d| d.eq_ignore_ascii_case("desc")).unwrap_or(false);
+        rows.sort_by(|a, b| {
+            let ord = match sort_col {
+                "tracks" => {
+                    let a_val = a.get("tracks").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let b_val = b.get("tracks").and_then(|v| v.as_u64()).unwrap_or(0);
+                    a_val.cmp(&b_val)
+                }
+                "release" => {
+                    let a_val = a.get("release").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let b_val = b.get("release").and_then(|v| v.as_u64()).unwrap_or(0);
+                    a_val.cmp(&b_val)
+                }
+                "status" => {
+                    let a_val = a.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    let b_val = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    a_val.to_lowercase().cmp(&b_val.to_lowercase())
+                }
+                "online_id" => {
+                    let a_val = a.get("online_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let b_val = b.get("online_id").and_then(|v| v.as_str()).unwrap_or("");
+                    a_val.cmp(b_val)
+                }
+                _ => {
+                    let a_val = a.get("artist").and_then(|v| v.as_str()).unwrap_or("");
+                    let b_val = b.get("artist").and_then(|v| v.as_str()).unwrap_or("");
+                    a_val.to_lowercase().cmp(&b_val.to_lowercase())
+                }
+            };
+            if desc { ord.reverse() } else { ord }
+        });
 
         let total = rows.len();
         let page_rows = if offset < total {
@@ -2565,6 +2716,154 @@ with sqlite3.connect('{db}') as db:
         let dl_rows = store.get_queue_rows("downloaded", None, None, None, None, 0, 10).await.unwrap();
         assert_eq!(dl_rows.total, 1);
         assert_eq!(dl_rows.rows[0].release, "Kid A");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_clean_evidence_str() {
+        assert_eq!(TursoDb::clean_evidence_str(""), "");
+        assert_eq!(
+            TursoDb::clean_evidence_str("\"6 releases and 48 track titles/identifiers match\""),
+            "6 releases and 48 track titles/identifiers match"
+        );
+        assert_eq!(
+            TursoDb::clean_evidence_str("\"6 local release titles match; track details not checked \\u2014 confirm identity\""),
+            "6 local release titles match; track details not checked — confirm identity"
+        );
+        assert_eq!(
+            TursoDb::clean_evidence_str("12 local \\u00b7 4 online"),
+            "12 local · 4 online"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_artist_rows_filters_and_sorting() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "turso_artist_filters_{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db_path = temp_dir.join("artist_filters.sqlite3");
+        let store = TursoDb::open(&db_path).await.unwrap();
+        let conn = store.connect().unwrap();
+
+        // Seed files for artists
+        let artists = [
+            ("The Beatles", "Abbey Road", "/music/beatles/01.flac"),
+            ("The Beatles", "Let It Be", "/music/beatles/02.flac"),
+            ("Radiohead", "OK Computer", "/music/radiohead/01.flac"),
+            ("Pink Floyd", "The Wall", "/music/pinkfloyd/01.flac"),
+            ("Unknown Band", "Demo", "/music/unknown/01.flac"),
+        ];
+        for (artist, album, path) in artists {
+            let meta = json!({ "artist": artist, "album": album });
+            conn.execute(
+                "INSERT INTO local_files (path, root, size, mtime, metadata, present) VALUES (?, '/music', 100, 100, ?, 1)",
+                (path, serde_json::to_string(&meta).unwrap().as_str()),
+            ).await.unwrap();
+        }
+
+        // Seed mappings
+        conn.execute(
+            "INSERT INTO mappings (artist, tidal_id, status, evidence) VALUES ('The Beatles', '123', 'confirmed', '\"Exact discography match\"')",
+            (),
+        ).await.unwrap();
+        conn.execute(
+            "INSERT INTO mappings (artist, tidal_id, status, evidence) VALUES ('Radiohead', '456', 'auto', '\"10 releases match \\u2014 confirm identity\"')",
+            (),
+        ).await.unwrap();
+        conn.execute(
+            "INSERT INTO mappings (artist, tidal_id, status, evidence) VALUES ('Pink Floyd', '789', 'ambiguous', '\"Multiple candidate matches\"')",
+            (),
+        ).await.unwrap();
+        // Unknown Band has no mapping -> status = Unresolved
+
+        // 1. All filter
+        let all_page = store.get_artist_rows(Some("all"), None, Some("artist"), Some("asc"), 0, 10).await.unwrap();
+        assert_eq!(all_page.total, 4);
+
+        // 2. Unresolved filter
+        let unresolved_page = store.get_artist_rows(Some("unresolved"), None, None, None, 0, 10).await.unwrap();
+        assert_eq!(unresolved_page.total, 1);
+        assert_eq!(unresolved_page.rows[0]["artist"], "Unknown Band");
+
+        // 3. Matched filter (confirmed and auto with valid tidal_id)
+        let matched_page = store.get_artist_rows(Some("matched"), None, None, None, 0, 10).await.unwrap();
+        assert_eq!(matched_page.total, 2); // The Beatles and Radiohead
+
+        // 4. Review filter (candidate/ambiguous or confirm identity)
+        let review_page = store.get_artist_rows(Some("review"), None, None, None, 0, 10).await.unwrap();
+        assert_eq!(review_page.total, 2); // Radiohead (confirm identity) and Pink Floyd (ambiguous)
+
+        // 5. Search
+        let search_page = store.get_artist_rows(None, Some("beatles"), None, None, 0, 10).await.unwrap();
+        assert_eq!(search_page.total, 1);
+        assert_eq!(search_page.rows[0]["artist"], "The Beatles");
+        assert_eq!(search_page.rows[0]["evidence"], "Exact discography match");
+
+        // 6. Sort tracks desc
+        let sort_page = store.get_artist_rows(None, None, Some("tracks"), Some("desc"), 0, 10).await.unwrap();
+        assert_eq!(sort_page.rows[0]["artist"], "The Beatles");
+        assert_eq!(sort_page.rows[0]["tracks"], 2);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_missing_rows_future_and_deduplication() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "turso_missing_dedup_{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db_path = temp_dir.join("missing_dedup.sqlite3");
+        let store = TursoDb::open(&db_path).await.unwrap();
+        let conn = store.connect().unwrap();
+
+        let cat_payload = json!({
+            "name": "Dua Lipa",
+            "releases": [
+                // Future release - should be excluded
+                {
+                    "id": "rel_future",
+                    "title": "Future Nostalgia Beyond",
+                    "artist": "Dua Lipa",
+                    "date": "2099-01-01",
+                    "type": "ALBUM",
+                    "track_count": 12,
+                    "tracks": []
+                },
+                // Standard album
+                {
+                    "id": "rel_std",
+                    "title": "Future Nostalgia",
+                    "artist": "Dua Lipa",
+                    "date": "2020-03-27",
+                    "type": "ALBUM",
+                    "track_count": 11,
+                    "tracks": []
+                },
+                // Duplicate deluxe/clean edition of same album
+                {
+                    "id": "rel_deluxe",
+                    "title": "Future Nostalgia (Deluxe Edition)",
+                    "artist": "Dua Lipa",
+                    "date": "2020-03-27",
+                    "type": "ALBUM",
+                    "track_count": 11,
+                    "tracks": []
+                }
+            ]
+        });
+        conn.execute(
+            "INSERT INTO catalogue (artist_id, market, payload) VALUES ('dua_id', 'GB', ?)",
+            (serde_json::to_string(&cat_payload).unwrap().as_str(),),
+        ).await.unwrap();
+
+        let page = store.get_missing_rows("GB", None, None, None, None, None, None, None, 0, 10).await.unwrap();
+        // The future release is skipped, and the duplicate deluxe edition is deduplicated into 1 release!
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].artist, "Dua Lipa");
+        assert_eq!(page.rows[0].tracks, 11);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

@@ -10,6 +10,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   Folder,
   Heart,
   House,
@@ -191,12 +192,25 @@ function Modal({
     </dialog>
   );
 }
+function getLogCategory(log: { message: string; category?: string; level?: string }): string {
+  if (log.category) return log.category;
+  const msg = (log.message || "").toLowerCase();
+  if (log.level === "error" || msg.includes("error") || msg.includes("failed") || msg.includes("fail") || msg.includes("err")) return "error";
+  if (msg.includes("download") || msg.includes("streamrip") || msg.includes("saving track") || msg.includes("fetching track")) return "download";
+  if (msg.includes("scan") || msg.includes("read tags") || msg.includes("indexed") || msg.includes("refresh local")) return "scan";
+  if (msg.includes("link") || msg.includes("catalogue") || msg.includes("match") || msg.includes("artist")) return "linking";
+  if (msg.includes("trash") || msg.includes("duplicate") || msg.includes("clean") || msg.includes("consolidation") || msg.includes("re-scan")) return "cleanup";
+  return "general";
+}
+
 function App() {
   const [state, setState] = useState<AppState | null>(null),
     [route, setRoute] = useState(
       localStorage.getItem("tibrary.route") || "overview",
     ),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
+  const [logCategory, setLogCategory] = useState("all"),
+    [logSearch, setLogSearch] = useState("");
   const [collapsed, setCollapsed] = useState(new Set<string>()),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
@@ -369,8 +383,13 @@ function App() {
                 job: p.job || s.job,
                 logs: [
                   ...s.logs,
-                  { at: new Date().toISOString(), message: p.message },
-                ].slice(-800),
+                  {
+                    at: new Date().toISOString(),
+                    message: p.message,
+                    level: p.job?.status === "failed" ? "error" : p.level || "info",
+                    category: p.category || (p.job?.kind ? (p.job.kind === "scan" ? "scan" : p.job.kind === "download" ? "download" : p.job.kind === "link" ? "linking" : p.job.kind.includes("duplicate") ? "cleanup" : undefined) : undefined),
+                  },
+                ].slice(-1000),
               }
             : s,
         );
@@ -1176,7 +1195,9 @@ function App() {
               setOffset(0);
             }}
           >
-            <option value="all">All items</option>
+            <option value="all">
+              {route === "artists" ? "All artists" : "All items"}
+            </option>
             {["correct", "organise", "metadata", "artwork", "mqa"].includes(
               route,
             ) && <option value="affected">Affected files only</option>}
@@ -1198,7 +1219,11 @@ function App() {
                 "Unavailable",
               ].map((v) => <option key={v}>{v}</option>)}
             {route === "artists" && (
-              <option value="unresolved">Unresolved artists</option>
+              <>
+                <option value="unresolved">Unresolved artists</option>
+                <option value="matched">Matched artists</option>
+                <option value="review">Needs review</option>
+              </>
             )}
             {route === "favourites" &&
               ["Missing locally", "In library", "Local only"].map((v) => (
@@ -2087,13 +2112,125 @@ function App() {
                   Cancel safely
                 </button>
               </section>
+              <div className="activity-controls">
+                <div className="activity-filters">
+                  <select
+                    aria-label="Filter activity category"
+                    value={logCategory}
+                    onChange={(e) => setLogCategory(e.target.value)}
+                  >
+                    <option value="all">All categories</option>
+                    <option value="error">Errors & Warnings</option>
+                    <option value="download">Downloads</option>
+                    <option value="scan">Library Scans</option>
+                    <option value="linking">Linking & Catalogue</option>
+                    <option value="cleanup">Consolidation & Duplicates</option>
+                    <option value="general">General</option>
+                  </select>
+                  <input
+                    type="search"
+                    placeholder="Search logs..."
+                    aria-label="Search activity logs"
+                    value={logSearch}
+                    onChange={(e) => setLogSearch(e.target.value)}
+                  />
+                </div>
+                <div className="activity-actions">
+                  <span className="log-count">
+                    {(() => {
+                      const allLogs = state?.logs || [];
+                      const filtered = allLogs.filter((l) => {
+                        const cat = l.category || getLogCategory(l);
+                        if (logCategory !== "all" && cat !== logCategory) return false;
+                        if (logSearch.trim()) {
+                          const q = logSearch.trim().toLowerCase();
+                          return l.message.toLowerCase().includes(q) || cat.toLowerCase().includes(q);
+                        }
+                        return true;
+                      });
+                      return `${filtered.length} of ${allLogs.length} entries`;
+                    })()}
+                  </span>
+                  <button
+                    className="action-btn"
+                    onClick={() => {
+                      const allLogs = state?.logs || [];
+                      const filtered = allLogs
+                        .filter((l) => {
+                          const cat = l.category || getLogCategory(l);
+                          if (logCategory !== "all" && cat !== logCategory) return false;
+                          if (logSearch.trim()) {
+                            const q = logSearch.trim().toLowerCase();
+                            return l.message.toLowerCase().includes(q) || cat.toLowerCase().includes(q);
+                          }
+                          return true;
+                        })
+                        .map(
+                          (l) =>
+                            `[${new Date(l.at).toLocaleTimeString()}] [${(l.category || getLogCategory(l)).toUpperCase()}] ${l.message}`,
+                        )
+                        .join("\n");
+                      navigator.clipboard.writeText(filtered);
+                      setToast("Logs copied to clipboard");
+                      setTimeout(() => setToast(""), 2000);
+                    }}
+                    title="Copy filtered logs"
+                  >
+                    <Copy size={14} />
+                    Copy
+                  </button>
+                  <button
+                    className="action-btn"
+                    onClick={() => {
+                      call("logs.clear")
+                        .then(() => {
+                          setState((s) => (s ? { ...s, logs: [] } : s));
+                          setToast("Logs cleared");
+                          setTimeout(() => setToast(""), 2000);
+                        })
+                        .catch(notifyError);
+                    }}
+                    title="Clear log history"
+                  >
+                    <Trash2 size={14} />
+                    Clear
+                  </button>
+                </div>
+              </div>
               <div className="activity-log">
-                {state?.logs.map((l, i) => (
-                  <div key={i}>
-                    <time>{new Date(l.at).toLocaleTimeString()}</time>
-                    <span>{l.message}</span>
-                  </div>
-                ))}
+                {(() => {
+                  const allLogs = (state?.logs || []).slice().reverse();
+                  const filtered = allLogs.filter((l) => {
+                    const cat = l.category || getLogCategory(l);
+                    if (logCategory !== "all" && cat !== logCategory) return false;
+                    if (logSearch.trim()) {
+                      const q = logSearch.trim().toLowerCase();
+                      return l.message.toLowerCase().includes(q) || cat.toLowerCase().includes(q);
+                    }
+                    return true;
+                  });
+                  if (filtered.length === 0) {
+                    return (
+                      <div className="activity-empty">
+                        <p>No activity log entries match your filter.</p>
+                      </div>
+                    );
+                  }
+                  return filtered.map((l, i) => {
+                    const cat = l.category || getLogCategory(l);
+                    return (
+                      <div key={i} className={`log-row log-${cat}`}>
+                        <time title={new Date(l.at).toLocaleString()}>
+                          {new Date(l.at).toLocaleTimeString()}
+                        </time>
+                        <span className={`log-badge log-badge-${cat}`}>
+                          {cat.toUpperCase()}
+                        </span>
+                        <span className="log-message">{l.message}</span>
+                      </div>
+                    );
+                  });
+                })()}
               </div>
             </>
           ) : (

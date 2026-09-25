@@ -14,7 +14,7 @@ export type AppState = {
   roots: Row[];
   stats: Record<string, number>;
   job: Job | null;
-  logs: { at: string; message: string }[];
+  logs: { at: string; message: string; level?: string; category?: string }[];
   settings: { market: string; theme: string };
   connections: any;
   diagnostics: any;

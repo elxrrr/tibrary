@@ -46,12 +46,34 @@ impl Backend {
     }
 
     pub fn log(&self, msg: &str) {
+        self.log_with_category(msg, "info", None);
+    }
+
+    pub fn log_with_category(&self, msg: &str, level: &str, category: Option<&str>) {
+        let cat = category.unwrap_or_else(|| {
+            let lower = msg.to_lowercase();
+            if lower.contains("error") || lower.contains("failed") || lower.contains("fail") || lower.contains("err") {
+                "error"
+            } else if lower.contains("download") || lower.contains("fetching track") || lower.contains("saving track") || lower.contains("streamrip") {
+                "download"
+            } else if lower.contains("scan") || lower.contains("read tags") || lower.contains("indexed") || lower.contains("refresh local") {
+                "scan"
+            } else if lower.contains("link") || lower.contains("catalogue") || lower.contains("match") || lower.contains("artist") {
+                "linking"
+            } else if lower.contains("trash") || lower.contains("duplicate") || lower.contains("clean") || lower.contains("consolidation") || lower.contains("re-scan") {
+                "cleanup"
+            } else {
+                "general"
+            }
+        });
         let mut logs = self.logs.lock().unwrap();
         logs.push(json!({
             "at": chrono::Utc::now().to_rfc3339(),
-            "message": msg
+            "message": msg,
+            "level": if cat == "error" || level == "error" { "error" } else { level },
+            "category": cat
         }));
-        if logs.len() > 800 {
+        if logs.len() > 1000 {
             logs.remove(0);
         }
     }
@@ -345,6 +367,10 @@ async fn handle_rpc_call(
         let logs = state.logs.lock().unwrap().clone();
         return Ok(json!(logs));
     }
+    if method == "logs.clear" {
+        state.logs.lock().unwrap().clear();
+        return Ok(json!({ "cleared": true }));
+    }
 
     // TABLE ROUTES
     if method == "turso.links"
@@ -435,7 +461,7 @@ async fn handle_rpc_call(
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "artists" {
-            let page = db.get_artist_rows(search, sort, direction, offset, limit).await?;
+            let page = db.get_artist_rows(filter, search, sort, direction, offset, limit).await?;
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "favourites" {
