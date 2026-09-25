@@ -49,3 +49,71 @@ export const readable = (value: any): string =>
         ? value.map(readable).join(" · ")
         : JSON.stringify(value)
       : String(value);
+
+export const tursoPing = () => call("turso.ping");
+export const tursoStats = (market?: string, root?: string) =>
+  call("turso.stats", { market, root });
+export const tursoRoots = (market?: string) => call("turso.roots", { market });
+export const tursoFiles = (root?: string, limit?: number, offset?: number) =>
+  call("turso.files", { root, limit, offset });
+export const tursoLinks = (args: Record<string, any> = {}) =>
+  call("turso.links", args);
+export const tursoMissing = (args: Record<string, any> = {}) =>
+  call("turso.missing", args);
+export const tursoScan = (root?: string) =>
+  call("turso.scan", { args: { root } });
+export const tursoTidalPing = () => call("turso.tidal.ping");
+export const tursoTidalSearch = (query: string, market?: string) =>
+  call("turso.tidal.search", { query, market });
+export const tursoTidalArtist = (
+  id: string,
+  market?: string,
+  detailed?: boolean,
+) => call("turso.tidal.artist", { id, market, detailed });
+export const tursoTagsWrite = (path: string, tags: Record<string, string>) =>
+  call("turso.tags.write", { path, tags });
+export const tursoOrganisationPreview = (
+  root: string,
+  tags: Record<string, string>,
+  template?: string,
+  extension?: string,
+) => call("turso.organisation.preview", { root, tags, template, extension });
+export const tursoKeysCanonical = (key: string) =>
+  call("turso.keys.canonical", { key });
+export const tursoDiscography = (args: {
+  ids?: string[];
+  detailed?: boolean;
+  market?: string;
+} = {}) => call("turso.discography", args);
+export const tursoMaintenanceApply = (
+  root: string,
+  items: Array<{
+    path: string;
+    target?: string;
+    tags?: Record<string, string>;
+  }>,
+) => call("turso.maintenance.apply", { root, items });
+export const tursoMqaAudit = (path: string) =>
+  call("turso.mqa.audit", { path });
+export const tursoEnrichmentMissing = (args: {
+  local_tags: Record<string, string>;
+  release: any;
+  track: any;
+}) => call("turso.enrichment.missing", args);
+export const tursoLink = (root?: string, market?: string) =>
+  call("turso.link", { args: { root, market } });
+export const tursoWorkflowsPlan = (
+  root: string,
+  action: string,
+  template?: string,
+) => call("turso.workflows.plan", { root, action, template });
+export const tursoAccountStatus = () => call("turso.account.status");
+export const tursoMatchingScore = (args: {
+  local_name: string;
+  local_albums: string[];
+  candidate_id: string;
+  candidate_name: string;
+  candidate_albums: string[];
+}) => call("turso.matching.score", args);
+
+

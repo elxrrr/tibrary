@@ -2,58 +2,1219 @@
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, Command, Stdio},
+    io::Write,
+    process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
 };
 use tauri::{Emitter, Manager};
-use tokio::sync::oneshot;
 
-struct Backend {
-    input: Mutex<Option<ChildStdin>>,
-    child: Mutex<Option<Child>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
-    serial: AtomicU64,
-    closing: AtomicBool,
-    finished: AtomicBool,
+pub mod account;
+pub mod db;
+pub mod downloads;
+pub mod enrichment;
+pub mod linking;
+pub mod maintenance;
+pub mod matching;
+pub mod mqa;
+pub mod musical_keys;
+pub mod organisation;
+pub mod recommendations;
+pub mod release_matching;
+pub mod scanner;
+pub mod tag_writer;
+pub mod tidal;
+pub mod workflows;
+use db::TursoDb;
+
+#[derive(Default)]
+pub struct Backend {
+    pub active_job_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    pub active_job: Mutex<Option<Value>>,
+    pub logs: Mutex<Vec<Value>>,
 }
+
 impl Backend {
-    async fn call(&self, method: String, args: Value) -> Result<Value, String> {
-        let id = self.serial.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        let data = json!({"id":id,"method":method,"args":args}).to_string() + "\n";
-        let written = match self.input.lock().unwrap().as_mut() {
-            Some(input) => input.write_all(data.as_bytes()).map_err(|e| e.to_string()),
-            None => Err("The Python service is not running. Restart Tibrary.".into()),
-        };
-        if let Err(e) = written {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(e);
-        }
-        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
-            Ok(Ok(value)) => value,
-            _ => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(
-                    "The service did not answer. Check Activity; cancellation remains available."
-                        .into(),
-                )
-            }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn log(&self, msg: &str) {
+        let mut logs = self.logs.lock().unwrap();
+        logs.push(json!({
+            "at": chrono::Utc::now().to_rfc3339(),
+            "message": msg
+        }));
+        if logs.len() > 500 {
+            logs.remove(0);
         }
     }
 }
-#[tauri::command]
-async fn backend_call(
-    state: tauri::State<'_, Arc<Backend>>,
+
+async fn handle_rpc_call(
+    app_handle: Option<&tauri::AppHandle>,
+    state: &Backend,
+    db: &TursoDb,
     method: String,
     args: Value,
 ) -> Result<Value, String> {
-    state.call(method, args).await
+    if method == "turso.ping" {
+        return Ok(json!({
+            "status": "ok",
+            "engine": "turso",
+            "db_path": db.path.display().to_string(),
+        }));
+    }
+    if method == "turso.stats" {
+        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+        let root = args.get("root").and_then(|v| v.as_str());
+        let stats = db.get_stats(market, root).await?;
+        return serde_json::to_value(stats).map_err(|e| e.to_string());
+    }
+    if method == "turso.roots" {
+        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+        let roots = db.list_roots(market).await?;
+        return serde_json::to_value(roots).map_err(|e| e.to_string());
+    }
+    if method == "turso.files" {
+        let root = args.get("root").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let (files, total) = db.get_local_files_page(root, limit, offset).await?;
+        return Ok(json!({ "rows": files, "total": total }));
+    }
+    if method == "turso.tidal.ping" {
+        let client_opt = tidal::TidalClient::from_env_or_keychain();
+        let mut client = match client_opt {
+            Some(c) => c,
+            None => {
+                return Err(
+                    "No TIDAL developer credentials configured in Keychain or environment."
+                        .to_string(),
+                )
+            }
+        };
+        let token = client.authenticate().await?;
+        return Ok(json!({
+            "status": "ok",
+            "authenticated": true,
+            "client_id": client.client_id,
+            "token_preview": format!("{}...", &token[..token.len().min(8)]),
+        }));
+    }
+    if method == "turso.tidal.search" {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing query".to_string())?;
+        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+        let client_opt = tidal::TidalClient::from_env_or_keychain();
+        let mut client = match client_opt {
+            Some(c) => c,
+            None => {
+                return Err(
+                    "No TIDAL developer credentials configured in Keychain or environment."
+                        .to_string(),
+                )
+            }
+        };
+        let results = client.search_artists(query, market).await?;
+        return Ok(serde_json::to_value(results).unwrap_or_default());
+    }
+    if method == "turso.tidal.artist" {
+        let id = args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing artist id".to_string())?;
+        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+        let detailed = args
+            .get("detailed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let client_opt = tidal::TidalClient::from_env_or_keychain();
+        let mut client = match client_opt {
+            Some(c) => c,
+            None => {
+                return Err(
+                    "No TIDAL developer credentials configured in Keychain or environment."
+                        .to_string(),
+                )
+            }
+        };
+        let catalogue = client.get_artist_catalogue(id, market, detailed).await?;
+        return Ok(serde_json::to_value(catalogue).unwrap_or_default());
+    }
+    if method == "turso.tags.write" {
+        let path_str = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing path".to_string())?;
+        let updates_val = args
+            .get("tags")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "Missing tags object".to_string())?;
+        let mut updates = std::collections::HashMap::new();
+        for (k, v) in updates_val {
+            if let Some(s) = v.as_str() {
+                updates.insert(k.clone(), s.to_string());
+            }
+        }
+        tag_writer::write_tags(std::path::Path::new(path_str), &updates)?;
+        return Ok(json!({ "status": "ok", "updated": updates.len() }));
+    }
+    if method == "turso.organisation.preview" {
+        let root_str = args.get("root").and_then(|v| v.as_str()).unwrap_or("");
+        let template = args.get("template").and_then(|v| v.as_str());
+        let ext = args
+            .get("extension")
+            .and_then(|v| v.as_str())
+            .unwrap_or("flac");
+        let tags_val = args
+            .get("tags")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "Missing tags".to_string())?;
+        let mut tags = std::collections::HashMap::new();
+        for (k, v) in tags_val {
+            if let Some(s) = v.as_str() {
+                tags.insert(k.clone(), s.to_string());
+            }
+        }
+        let target = organisation::format_layout(
+            std::path::Path::new(root_str),
+            &tags,
+            template,
+            ext,
+        )?;
+        return Ok(json!({ "target": target.display().to_string() }));
+    }
+    if method == "turso.keys.canonical" {
+        let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let canonical = musical_keys::canonical_key(key);
+        let camelot = musical_keys::camelot_key(key);
+        return Ok(json!({ "canonical": canonical, "camelot": camelot }));
+    }
+    if method == "turso.mqa.audit" {
+        let path_str = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing path".to_string())?;
+        let res = mqa::audit_file(std::path::Path::new(path_str));
+        return serde_json::to_value(res).map_err(|e| e.to_string());
+    }
+    if method == "turso.enrichment.missing" {
+        let local_tags_val = args.get("local_tags").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+        let mut local_tags = std::collections::HashMap::new();
+        if let Some(obj) = local_tags_val.as_object() {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    local_tags.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+        let release: tidal::TidalRelease = serde_json::from_value(
+            args.get("release").cloned().unwrap_or(Value::Null)
+        ).map_err(|e| format!("Invalid release: {}", e))?;
+        let track: tidal::TidalTrack = serde_json::from_value(
+            args.get("track").cloned().unwrap_or(Value::Null)
+        ).map_err(|e| format!("Invalid track: {}", e))?;
+
+        let missing = enrichment::compute_missing_tags(&local_tags, &release, &track);
+        return serde_json::to_value(missing).map_err(|e| e.to_string());
+    }
+    if method == "turso.workflows.plan" {
+        let root = args.get("root").and_then(|v| v.as_str()).unwrap_or("");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("organise");
+        let template = args.get("template").and_then(|v| v.as_str());
+
+        let (files, _) = db.get_local_files_page(Some(root), 10000, 0).await?;
+        let plans = workflows::plan_workflow(&files, action, template);
+        return serde_json::to_value(plans).map_err(|e| e.to_string());
+    }
+    if method == "turso.account.status" {
+        let session = account::AccountClient::load_saved_session();
+        return Ok(json!({
+            "logged_in": session.is_some(),
+            "user_id": session.as_ref().and_then(|s| s.user_id.clone()),
+            "expires_at": session.as_ref().map(|s| s.expires_at),
+        }));
+    }
+    if method == "turso.matching.score" {
+        let local_name = args.get("local_name").and_then(|v| v.as_str()).unwrap_or("");
+        let local_albums: Vec<String> = args
+            .get("local_albums")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let candidate_id = args.get("candidate_id").and_then(|v| v.as_str()).unwrap_or("");
+        let candidate_name = args.get("candidate_name").and_then(|v| v.as_str()).unwrap_or("");
+        let candidate_albums: Vec<String> = args
+            .get("candidate_albums")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let score = matching::score_artist_candidate(
+            local_name,
+            &local_albums,
+            candidate_id,
+            candidate_name,
+            &candidate_albums,
+        );
+        return Ok(json!({
+            "artist_id": score.artist_id,
+            "artist_name": score.artist_name,
+            "score": score.score,
+            "matched_releases": score.matched_releases,
+            "local_releases": score.local_releases,
+            "exact_name": score.exact_name,
+            "matched_titles": score.matched_titles,
+            "evidence": score.evidence,
+        }));
+    }
+
+    // STATE & SETTINGS
+    if method == "state" {
+        let active = state.active_job.lock().unwrap().clone();
+        let logs = state.logs.lock().unwrap().clone();
+        return db.get_state(active, &logs).await;
+    }
+    if method == "settings" {
+        return db.get_settings().await;
+    }
+    if method == "settings.save" || method == "settings.update" {
+        let section = args.get("section").and_then(|v| v.as_str()).unwrap_or("ui");
+        let values = args.get("values").unwrap_or(&args);
+        let res = db.save_settings(section, values).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(res);
+    }
+    if method == "settings.reset" {
+        let group = args.get("group").and_then(|v| v.as_str()).unwrap_or("");
+        let res = db.reset_settings(group).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(res);
+    }
+    if method == "logs" {
+        let logs = state.logs.lock().unwrap().clone();
+        return Ok(json!(logs));
+    }
+
+    // TABLE ROUTES
+    if method == "turso.links"
+        || (method == "table" && (args.get("route").and_then(|v| v.as_str()) == Some("links") || args.get("route").and_then(|v| v.as_str()) == Some("files")))
+    {
+        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+        let root_opt = args.get("root").and_then(|v| v.as_str());
+        let root = if let Some(r) = root_opt {
+            r.to_string()
+        } else {
+            let roots = db.list_roots(market).await?;
+            roots.into_iter().next().map(|r| r.root).unwrap_or_default()
+        };
+        if root.is_empty() {
+            return Ok(json!({
+                "rows": [],
+                "total": 0,
+                "offset": 0,
+                "revision": 0,
+                "preview_id": null
+            }));
+        }
+        let filter = args.get("filter").and_then(|v| v.as_str());
+        let search = args.get("search").and_then(|v| v.as_str());
+        let sort = args.get("sort").and_then(|v| v.as_str());
+        let direction = args.get("direction").and_then(|v| v.as_str());
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+
+        let page = db
+            .get_link_rows(
+                market,
+                &root,
+                filter,
+                search,
+                sort,
+                direction,
+                offset,
+                limit,
+            )
+            .await?;
+        return serde_json::to_value(page).map_err(|e| e.to_string());
+    }
+    if method == "turso.missing"
+        || (method == "table" && args.get("route").and_then(|v| v.as_str()) == Some("missing"))
+    {
+        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+        let timeline = args.get("timeline").and_then(|v| v.as_str());
+        let recommendation = args.get("recommendation").and_then(|v| v.as_str());
+        let status_filter = args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("filter").and_then(|v| v.as_str()));
+        let type_filter = args.get("type").and_then(|v| v.as_str());
+        let search = args.get("search").and_then(|v| v.as_str());
+        let sort = args.get("sort").and_then(|v| v.as_str());
+        let direction = args.get("direction").and_then(|v| v.as_str());
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+
+        let page = db
+            .get_missing_rows(
+                market,
+                timeline,
+                recommendation,
+                status_filter,
+                type_filter,
+                search,
+                sort,
+                direction,
+                offset,
+                limit,
+            )
+            .await?;
+        return serde_json::to_value(page).map_err(|e| e.to_string());
+    }
+    if method == "table" {
+        let route = args.get("route").and_then(|v| v.as_str()).unwrap_or("files");
+        let search = args.get("search").and_then(|v| v.as_str());
+        let sort = args.get("sort").and_then(|v| v.as_str());
+        let direction = args.get("direction").and_then(|v| v.as_str());
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+        let filter = args.get("filter").and_then(|v| v.as_str());
+
+        if route == "queue" || route == "downloaded" {
+            let page = db.get_queue_rows(route, filter, search, sort, direction, offset, limit).await?;
+            return serde_json::to_value(page).map_err(|e| e.to_string());
+        }
+        if route == "artists" {
+            let page = db.get_artist_rows(search, sort, direction, offset, limit).await?;
+            return serde_json::to_value(page).map_err(|e| e.to_string());
+        }
+        if route == "favourites" {
+            let page = db.get_favourite_rows().await?;
+            return serde_json::to_value(page).map_err(|e| e.to_string());
+        }
+        if route == "correct" || route == "organise" {
+            let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+            let root_opt = args.get("root").and_then(|v| v.as_str());
+            let root = if let Some(r) = root_opt {
+                r.to_string()
+            } else {
+                let roots = db.list_roots(market).await?;
+                roots.into_iter().next().map(|r| r.root).unwrap_or_default()
+            };
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or(if route == "correct" { "dates" } else { "organise" });
+            let (files, _) = db.get_local_files_page(Some(&root), 10000, 0).await?;
+            let plans = workflows::plan_workflow(&files, action, None);
+            let mut rows = Vec::new();
+            for p in plans {
+                let affected = !p.changes.is_empty() || p.target.is_some();
+                let change_desc = if !p.changes.is_empty() {
+                    p.changes.iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join(" · ")
+                } else {
+                    p.issues.join(" · ")
+                };
+                rows.push(crate::db::LinkRow {
+                    id: p.path.clone(),
+                    artist: p.artist,
+                    release: p.album,
+                    title: p.title,
+                    path: p.path,
+                    position: String::new(),
+                    status: if affected { "Needs update".to_string() } else { "No change".to_string() },
+                    evidence: change_desc.clone(),
+                    affected,
+                    target: p.target.unwrap_or_default(),
+                    changes: change_desc,
+                    bpm: None,
+                    key: None,
+                    candidates: 0,
+                    online_id: String::new(),
+                    ignored: false,
+                });
+            }
+            if filter == Some("affected") {
+                rows.retain(|r| r.affected);
+            }
+            let total = rows.len();
+            let page_rows = rows.into_iter().skip(offset).take(limit).collect();
+            return serde_json::to_value(crate::db::TablePage {
+                rows: page_rows,
+                total,
+                offset,
+                revision: 0,
+                preview_id: Some("workflow".to_string()),
+            }).map_err(|e| e.to_string());
+        }
+        if route == "metadata" || route == "artwork" || route == "mqa" {
+            let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
+            let root_opt = args.get("root").and_then(|v| v.as_str());
+            let root = if let Some(r) = root_opt {
+                r.to_string()
+            } else {
+                let roots = db.list_roots(market).await?;
+                roots.into_iter().next().map(|r| r.root).unwrap_or_default()
+            };
+            if root.is_empty() {
+                return Ok(json!({
+                    "rows": [],
+                    "total": 0,
+                    "offset": 0,
+                    "revision": 0,
+                    "preview_id": null
+                }));
+            }
+            let page = db
+                .get_link_rows(
+                    market,
+                    &root,
+                    filter,
+                    search,
+                    sort,
+                    direction,
+                    offset,
+                    limit,
+                )
+                .await?;
+            return serde_json::to_value(page).map_err(|e| e.to_string());
+        }
+
+        return Ok(json!({
+            "rows": [],
+            "total": 0,
+            "offset": 0,
+            "revision": 0,
+            "preview_id": null
+        }));
+    }
+
+    // DETAILS & PREVIEW
+    if method == "detail" {
+        return db.get_detail(&args).await;
+    }
+    if method == "preview" {
+        let preview_id = args.get("id").and_then(|v| v.as_str()).unwrap_or("preview");
+        return Ok(json!({
+            "id": preview_id,
+            "rows": [],
+            "count": 0
+        }));
+    }
+
+    // QUEUE ACTIONS
+    if method == "queue.select" {
+        let sel_val = args.get("selection").cloned().unwrap_or(json!({}));
+        let selection: HashMap<String, Option<Vec<String>>> = serde_json::from_value(sel_val).unwrap_or_default();
+        db.queue_select(&selection).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "queue.decision" {
+        let ids_val = args.get("ids").cloned().unwrap_or(json!([]));
+        let ids: Vec<String> = serde_json::from_value(ids_val).unwrap_or_default();
+        let decision = args.get("decision").and_then(|v| v.as_str()).unwrap_or("queued");
+        db.queue_decision(&ids, decision).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "queue.add" {
+        let sel_val = args.get("selection").cloned().unwrap_or(json!({}));
+        let selection: HashMap<String, Option<Vec<String>>> = serde_json::from_value(sel_val).unwrap_or_default();
+        db.queue_add(&selection).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "queue.export" {
+        let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("json");
+        let text = db.queue_export(format).await?;
+        return Ok(json!({ "text": text }));
+    }
+
+    // LIBRARY ACTIONS
+    if method == "library.add" {
+        let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+        db.add_root(path).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!({ "root": path }));
+    }
+    if method == "library.remove" {
+        let root = args.get("root").and_then(|v| v.as_str()).ok_or("Missing root")?;
+        db.remove_root(root).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+
+    // TRACK & ARTIST ACTIONS
+    if method == "tracks.ignore" {
+        let paths: Vec<String> = args
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ignored = args.get("ignored").and_then(|v| v.as_bool()).unwrap_or(true);
+        db.set_local_files_ignored(&paths, ignored).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "tracks.unlink" {
+        let paths: Vec<String> = args
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        db.unlink_tracks(&paths).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "tracks.choose" {
+        db.choose_track_link(&args).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "artists.choose" {
+        let artist = args.get("artist").and_then(|v| v.as_str()).unwrap_or("");
+        let ids: Vec<String> = args
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !artist.is_empty() && !ids.is_empty() {
+            db.choose_artist(artist, &ids).await?;
+            if let Some(app) = app_handle {
+                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+            }
+        }
+        return Ok(json!(true));
+    }
+
+    // CREDENTIALS & ACCOUNT
+    if method == "credentials.save" {
+        let client = args.get("client").and_then(|v| v.as_str()).unwrap_or("");
+        let secret = args.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+        let _ = crate::tidal::TidalClient::save_credentials(client, secret);
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "credentials.forget" {
+        let _ = crate::tidal::TidalClient::forget_credentials();
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "account.disconnect" {
+        let _ = crate::account::AccountClient::disconnect();
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return Ok(json!(true));
+    }
+    if method == "shutdown" {
+        return Ok(json!({ "safe": true }));
+    }
+
+    // JOBS
+    if method == "turso.scan"
+        || (method == "job.start"
+            && args.get("kind").and_then(|v| v.as_str()) == Some("scan"))
+    {
+        if state.active_job_cancel.lock().unwrap().is_some() {
+            return Err("A job is already running".to_string());
+        }
+        let inner_args = args.get("args").cloned().unwrap_or(Value::Null);
+        let root_opt = inner_args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("root").and_then(|v| v.as_str()));
+        let root_str = if let Some(r) = root_opt {
+            r.to_string()
+        } else {
+            let roots = db.list_roots("GB").await?;
+            roots.into_iter().next().map(|r| r.root).unwrap_or_default()
+        };
+        if root_str.is_empty() {
+            return Err("Choose a registered library first".to_string());
+        }
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let initial_job = json!({
+            "id": job_id,
+            "kind": "scan",
+            "status": "running",
+            "message": "Scanning files…",
+            "started": started,
+            "result": null
+        });
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
+        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+
+        let db_clone = db.clone();
+        let app_clone = app_handle.cloned();
+        let j_id = job_id.clone();
+        let root_path = std::path::PathBuf::from(root_str);
+
+        tauri::async_runtime::spawn(async move {
+            let j_id_prog = j_id.clone();
+            let app_prog = app_clone.clone();
+
+            let scan_res = scanner::scan_library(
+                &db_clone,
+                &root_path,
+                cancel_flag.clone(),
+                move |msg| {
+                    let prog_job = json!({
+                        "id": j_id_prog,
+                        "kind": "scan",
+                        "status": "running",
+                        "message": msg,
+                        "started": started,
+                        "result": null
+                    });
+                    if let Some(ref app) = app_prog {
+                        let _ = app.emit(
+                            "backend-event",
+                            json!({
+                                "event": "progress",
+                                "message": msg,
+                                "job": prog_job
+                            }),
+                        );
+                    }
+                },
+            )
+            .await;
+
+            let is_cancelled = cancel_flag.load(Ordering::Relaxed);
+            let (status, message, result_val) = match scan_res {
+                Ok(summary) => {
+                    let st = if is_cancelled || summary.status == "cancelled" {
+                        "cancelled"
+                    } else {
+                        "complete"
+                    };
+                    let msg = if st == "cancelled" {
+                        "Refresh local files · cancelled; completed results retained".to_string()
+                    } else {
+                        format!(
+                            "Refresh local files · finished; {} tags read · {} unchanged · {} missing",
+                            summary.read, summary.unchanged, summary.missing
+                        )
+                    };
+                    (
+                        st,
+                        msg,
+                        json!({
+                            "files": summary.read + summary.unchanged,
+                            "read": summary.read,
+                            "unchanged": summary.unchanged,
+                            "missing": summary.missing,
+                            "errors": summary.errors,
+                        }),
+                    )
+                }
+                Err(e) => ("failed", format!("Scan failed: {}", e), json!(null)),
+            };
+
+            let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let final_job = json!({
+                "id": j_id,
+                "kind": "scan",
+                "status": status,
+                "message": message,
+                "started": started,
+                "finished": finished_at,
+                "result": result_val
+            });
+
+            let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
+
+            if let Some(ref app) = app_clone {
+                let _ = app.emit(
+                    "backend-event",
+                    json!({
+                        "event": "job",
+                        "job": final_job
+                    }),
+                );
+                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+            }
+        });
+
+        return Ok(initial_job);
+    }
+    if method == "turso.discography"
+        || (method == "job.start"
+            && args.get("kind").and_then(|v| v.as_str()) == Some("discography"))
+    {
+        let client_opt = tidal::TidalClient::from_env_or_keychain();
+        let mut client = match client_opt {
+            Some(c) => c,
+            None => {
+                return Err(
+                    "No TIDAL developer credentials configured in Keychain or environment."
+                        .to_string(),
+                );
+            }
+        };
+
+        if state.active_job_cancel.lock().unwrap().is_some() {
+            return Err("A job is already running".to_string());
+        }
+
+        let inner_args = args.get("args").cloned().unwrap_or(args.clone());
+        let detailed = inner_args
+            .get("detailed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let market = inner_args
+            .get("market")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GB")
+            .to_string();
+
+        let ids: Vec<String> = if let Some(ids_val) = inner_args.get("ids") {
+            if let Some(arr) = ids_val.as_array() {
+                if arr.is_empty() {
+                    return Err(
+                        "Select a linked artist before refreshing its releases".to_string(),
+                    );
+                }
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            db.get_linked_artist_ids().await?
+        };
+
+        if ids.is_empty() {
+            return Err("No linked artists found in library. Match artists first.".to_string());
+        }
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let total = ids.len();
+        let initial_job = json!({
+            "id": job_id,
+            "kind": "discography",
+            "status": "running",
+            "message": format!("Refreshing releases · 0/{}", total),
+            "started": started,
+            "result": null
+        });
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
+        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+
+        let db_clone = db.clone();
+        let app_clone = app_handle.cloned();
+        let j_id = job_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let mut checked = 0;
+
+            for (index, artist_id) in ids.iter().enumerate() {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let msg = format!("Refreshing releases · {}/{}", index + 1, total);
+                let prog_job = json!({
+                    "id": j_id.clone(),
+                    "kind": "discography",
+                    "status": "running",
+                    "message": msg.clone(),
+                    "started": started,
+                    "result": null
+                });
+                if let Some(ref app) = app_clone {
+                    let _ = app.emit(
+                        "backend-event",
+                        json!({
+                            "event": "progress",
+                            "message": msg,
+                            "job": prog_job
+                        }),
+                    );
+                }
+
+                match client.get_artist_catalogue(artist_id, &market, detailed).await {
+                    Ok(catalogue) => {
+                        if let Err(e) = client.save_catalogue_to_db(&db_clone, &market, &catalogue).await {
+                            eprintln!("Failed to save catalogue for {}: {}", artist_id, e);
+                        } else {
+                            checked += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to fetch artist catalogue for {}: {}", artist_id, e);
+                    }
+                }
+            }
+
+            let is_cancelled = cancel_flag.load(Ordering::Relaxed);
+            let status = if is_cancelled { "cancelled" } else { "complete" };
+            let message = if is_cancelled {
+                "Refresh release list · cancelled; completed results retained".to_string()
+            } else {
+                format!("Refresh release list · finished; {} artists checked", checked)
+            };
+
+            let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let final_job = json!({
+                "id": j_id,
+                "kind": "discography",
+                "status": status,
+                "message": message,
+                "started": started,
+                "finished": finished_at,
+                "result": json!({ "checked": checked })
+            });
+
+            let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
+
+            if let Some(ref app) = app_clone {
+                let _ = app.emit(
+                    "backend-event",
+                    json!({
+                        "event": "job",
+                        "job": final_job
+                    }),
+                );
+                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+            }
+        });
+
+        return Ok(initial_job);
+    }
+    if method == "turso.link"
+        || (method == "job.start"
+            && args.get("kind").and_then(|v| v.as_str()) == Some("link"))
+    {
+        if state.active_job_cancel.lock().unwrap().is_some() {
+            return Err("A job is already running".to_string());
+        }
+
+        let inner_args = args.get("args").cloned().unwrap_or(args.clone());
+        let market = inner_args
+            .get("market")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GB")
+            .to_string();
+
+        let root_opt = inner_args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("root").and_then(|v| v.as_str()));
+        let root_str = if let Some(r) = root_opt {
+            r.to_string()
+        } else {
+            let roots = db.list_roots(&market).await?;
+            roots.into_iter().next().map(|r| r.root).unwrap_or_default()
+        };
+        if root_str.is_empty() {
+            return Err("Choose a registered library first".to_string());
+        }
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let initial_job = json!({
+            "id": job_id,
+            "kind": "link",
+            "status": "running",
+            "message": "Linking releases…",
+            "started": started,
+            "result": null
+        });
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
+        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+
+        let db_clone = db.clone();
+        let app_clone = app_handle.cloned();
+        let j_id = job_id.clone();
+        let mkt = market.clone();
+        let rt = root_str.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let app_prog = app_clone.clone();
+            let j_id_prog = j_id.clone();
+
+            let link_res = linking::link_library(
+                &db_clone,
+                &mkt,
+                &rt,
+                cancel_flag.clone(),
+                move |msg| {
+                    let prog_job = json!({
+                        "id": j_id_prog.clone(),
+                        "kind": "link",
+                        "status": "running",
+                        "message": msg.clone(),
+                        "started": started,
+                        "result": null
+                    });
+                    if let Some(ref app) = app_prog {
+                        let _ = app.emit(
+                            "backend-event",
+                            json!({
+                                "event": "progress",
+                                "message": msg,
+                                "job": prog_job
+                            }),
+                        );
+                    }
+                },
+            )
+            .await;
+
+            let is_cancelled = cancel_flag.load(Ordering::Relaxed);
+            let (status, message, result_val) = match link_res {
+                Ok(summary) => {
+                    let st = if is_cancelled { "cancelled" } else { "complete" };
+                    let msg = if is_cancelled {
+                        "Link releases · cancelled; completed results retained".to_string()
+                    } else {
+                        format!(
+                            "Link releases · finished; {} linked · {} need review · {} unmatched",
+                            summary.linked, summary.review, summary.unmatched
+                        )
+                    };
+                    (
+                        st,
+                        msg,
+                        json!({
+                            "total": summary.total,
+                            "linked": summary.linked,
+                            "review": summary.review,
+                            "unmatched": summary.unmatched,
+                        }),
+                    )
+                }
+                Err(e) => ("failed", format!("Link failed: {}", e), json!(null)),
+            };
+
+            let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let final_job = json!({
+                "id": j_id,
+                "kind": "link",
+                "status": status,
+                "message": message,
+                "started": started,
+                "finished": finished_at,
+                "result": result_val
+            });
+
+            let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
+
+            if let Some(ref app) = app_clone {
+                let _ = app.emit(
+                    "backend-event",
+                    json!({
+                        "event": "job",
+                        "job": final_job
+                    }),
+                );
+                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+            }
+        });
+
+        return Ok(initial_job);
+    }
+    if method == "job.start"
+        && (args.get("kind").and_then(|v| v.as_str()) == Some("download")
+            || args.get("kind").and_then(|v| v.as_str()) == Some("connect_download"))
+    {
+        if state.active_job_cancel.lock().unwrap().is_some() {
+            return Err("A job is already running".to_string());
+        }
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let initial_job = json!({
+            "id": job_id,
+            "kind": "download",
+            "status": "running",
+            "message": "Starting downloader…",
+            "started": started,
+            "result": null
+        });
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        *state.active_job_cancel.lock().unwrap() = Some(cancel_flag.clone());
+        *state.active_job.lock().unwrap() = Some(initial_job.clone());
+
+        let db_clone = db.clone();
+        let app_clone = app_handle.cloned();
+        let j_id = job_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let app_prog = app_clone.clone();
+            let j_id_prog = j_id.clone();
+
+            let dl_res = if let Some(ref app) = app_clone {
+                downloads::DownloadManager::run_downloads(
+                    &db_clone,
+                    app,
+                    cancel_flag.clone(),
+                    &j_id,
+                    move |msg| {
+                        let prog_job = json!({
+                            "id": j_id_prog.clone(),
+                            "kind": "download",
+                            "status": "running",
+                            "message": msg.clone(),
+                            "started": started,
+                            "result": null
+                        });
+                        if let Some(ref a) = app_prog {
+                            let _ = a.emit(
+                                "backend-event",
+                                json!({
+                                    "event": "progress",
+                                    "message": msg,
+                                    "job": prog_job
+                                }),
+                            );
+                        }
+                    },
+                )
+                .await
+            } else {
+                Ok(0)
+            };
+
+            let is_cancelled = cancel_flag.load(Ordering::Relaxed);
+            let (status, message, count) = match dl_res {
+                Ok(c) => {
+                    let st = if is_cancelled { "cancelled" } else { "complete" };
+                    let msg = if is_cancelled {
+                        "Download cancelled".to_string()
+                    } else {
+                        format!("Downloads finished · {} releases completed", c)
+                    };
+                    (st, msg, c)
+                }
+                Err(e) => ("failed", format!("Download error: {}", e), 0),
+            };
+
+            let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let final_job = json!({
+                "id": j_id,
+                "kind": "download",
+                "status": status,
+                "message": message,
+                "started": started,
+                "finished": finished_at,
+                "result": json!({ "completed": count })
+            });
+
+            let _ = db_clone.set_preference("desktop-last-job", &final_job).await;
+
+            if let Some(ref app) = app_clone {
+                let _ = app.emit(
+                    "backend-event",
+                    json!({
+                        "event": "job",
+                        "job": final_job
+                    }),
+                );
+                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+            }
+        });
+
+        return Ok(initial_job);
+    }
+    if method == "turso.maintenance.apply"
+        || (method == "job.start"
+            && (args.get("kind").and_then(|v| v.as_str()) == Some("apply")
+                || args.get("kind").and_then(|v| v.as_str()) == Some("workflow")))
+    {
+        let root = args.get("root").and_then(|v| v.as_str()).unwrap_or("");
+        let items_val = args.get("items").cloned().unwrap_or(Value::Array(Vec::new()));
+        let items: Vec<maintenance::FileApplyItem> = serde_json::from_value(items_val)
+            .map_err(|e| format!("Invalid apply items: {}", e))?;
+        let res = maintenance::apply_batch(db, root, &items).await;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        }
+        return serde_json::to_value(res).map_err(|e| e.to_string());
+    }
+    if method == "job.cancel" {
+        if let Some(cancel_flag) = state.active_job_cancel.lock().unwrap().as_ref() {
+            cancel_flag.store(true, Ordering::Relaxed);
+            if let Some(app) = app_handle {
+                let _ = app.emit(
+                    "backend-event",
+                    json!({
+                        "event": "progress",
+                        "message": "Cancellation requested · finishing the current safe file boundary",
+                    }),
+                );
+            }
+        }
+        return Ok(json!(true));
+    }
+    if method == "auth.reply" {
+        return Ok(json!(true));
+    }
+
+    Ok(json!({}))
 }
+
+#[tauri::command]
+async fn backend_call(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Backend>>,
+    db: tauri::State<'_, TursoDb>,
+    method: String,
+    args: Value,
+) -> Result<Value, String> {
+    handle_rpc_call(Some(&app_handle), &state, &db, method, args).await
+}
+
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
     let parsed = url::Url::parse(&url).map_err(|e| e.to_string())?;
@@ -67,6 +1228,7 @@ fn open_external(url: String) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
+
 #[tauri::command]
 fn reveal_file(path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(path);
@@ -80,6 +1242,7 @@ fn reveal_file(path: String) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
+
 #[tauri::command]
 fn save_export(path: String, content: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(path);
@@ -91,7 +1254,6 @@ fn save_export(path: String, content: String) -> Result<(), String> {
     {
         return Err("Choose a JSON, CSV or text export file.".into());
     }
-    // Never replace a user's existing file without a separate review step.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -100,81 +1262,71 @@ fn save_export(path: String, content: String) -> Result<(), String> {
     file.write_all(content.as_bytes())
         .map_err(|e| e.to_string())
 }
+
 fn main() {
-    let backend = Arc::new(Backend {
-        input: Mutex::new(None),
-        child: Mutex::new(None),
-        pending: Mutex::new(HashMap::new()),
-        serial: AtomicU64::new(1),
-        closing: AtomicBool::new(false),
-        finished: AtomicBool::new(false),
-    });
-    let service = backend.clone();
-    tauri::Builder::default().plugin(tauri_plugin_dialog::init()).manage(backend)
-      .invoke_handler(tauri::generate_handler![backend_call,open_external,reveal_file,save_export])
-      .setup(move |app|{
-        let mut command;
-        if cfg!(debug_assertions){
-            let root=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-            command=Command::new(root.join(".venv/bin/python"));command.arg("-m").arg("library_manager.sidecar");command.env("PYTHONPATH",root.join("app"));
-        }else{
-            let exe=std::env::current_exe()?.parent().unwrap().join("tibrary-service");command=Command::new(exe);
-        }
-        if std::env::var_os("TIBRARY_DEMO").is_some(){command.arg("--demo");}
-        if let Ok(db)=std::env::var("TIBRARY_TEST_DB"){command.arg("--db").arg(db);}
-        let logs=app.path().app_log_dir()?;std::fs::create_dir_all(&logs)?;
-        let logfile=logs.join("python-service.log");
-        if std::fs::metadata(&logfile).map(|m|m.len()>2_000_000).unwrap_or(false){let _=std::fs::rename(&logfile,logs.join("python-service.previous.log"));}
-        let errors=std::fs::OpenOptions::new().create(true).append(true).open(logfile)?;
-        let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(errors)).spawn()?;
-        *service.input.lock().unwrap()=child.stdin.take();let stdout=child.stdout.take().unwrap();*service.child.lock().unwrap()=Some(child);
-        let apphandle=app.handle().clone();let s=service.clone();
-        std::thread::spawn(move||{
-            for line in BufReader::new(stdout).lines(){
-                let Ok(line)=line else{break};let Ok(value)=serde_json::from_str::<Value>(&line) else{continue};
-                if let Some(id)=value.get("id").and_then(Value::as_u64){
-                    if let Some(sender)=s.pending.lock().unwrap().remove(&id){let result=if let Some(error)=value.get("error"){Err(error.as_str().unwrap_or("Service error").into())}else{Ok(value["result"].clone())};let _=sender.send(result);}
-                }else{let _=apphandle.emit("backend-event",value);}
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--rpc") {
+        let db_path = args
+            .windows(2)
+            .find(|w| w[0] == "--db")
+            .map(|w| std::path::PathBuf::from(&w[1]))
+            .unwrap_or_else(|| std::path::PathBuf::from("library.sqlite3"));
+
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        rt.block_on(async move {
+            let turso_db = TursoDb::open(&db_path).await.expect("Failed to open DB");
+            let backend = Backend::new();
+
+            let stdin = std::io::stdin();
+            let mut stdout = std::io::stdout();
+            for line in stdin.lines() {
+                let Ok(line) = line else { break };
+                let Ok(val) = serde_json::from_str::<Value>(&line) else { continue };
+                let id = val.get("id").cloned().unwrap_or(Value::Null);
+                let method = val.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let rpc_args = val.get("args").cloned().unwrap_or(json!({}));
+
+                let res = handle_rpc_call(None, &backend, &turso_db, method, rpc_args).await;
+                let out = match res {
+                    Ok(r) => json!({ "id": id, "result": r }),
+                    Err(e) => json!({ "id": id, "error": e }),
+                };
+                let _ = writeln!(stdout, "{}", out);
+                let _ = stdout.flush();
             }
-            *s.input.lock().unwrap()=None;
-            for (_,sender) in s.pending.lock().unwrap().drain(){let _=sender.send(Err("The Python service stopped. Restart Tibrary; completed files remain indexed.".into()));}
-            let _=apphandle.emit("backend-event",json!({"event":"stopped"}));
-        });Ok(())
-      })
-      .on_window_event(|window,event|{
-        if let tauri::WindowEvent::CloseRequested{api,..}=event{
-            api.prevent_close();request_shutdown(window.app_handle().clone());
-        }
-      }).build(tauri::generate_context!()).expect("Could not start Tibrary")
-      .run(|app,event|{
-        if let tauri::RunEvent::ExitRequested{api,..}=event{
-            if !app.state::<Arc<Backend>>().finished.load(Ordering::SeqCst){
-                api.prevent_exit();request_shutdown(app.clone());
-            }
-        }
-      });
-}
-fn request_shutdown(app: tauri::AppHandle) {
-    let state = app.state::<Arc<Backend>>().inner().clone();
-    if state.closing.swap(true, Ordering::SeqCst) {
+        });
         return;
     }
-    let _ = app.emit("backend-event", json!({"event":"closing"}));
-    tauri::async_runtime::spawn(async move {
-        loop {
-            match state.call("shutdown".into(), json!({})).await {
-                Ok(v) if v["safe"].as_bool() == Some(true) => break,
-                Err(_) => break,
-                _ => {}
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        state.input.lock().unwrap().take();
-        let child = state.child.lock().unwrap().take();
-        if let Some(mut child) = child {
-            let _ = tauri::async_runtime::spawn_blocking(move || child.wait()).await;
-        }
-        state.finished.store(true, Ordering::SeqCst);
-        app.exit(0);
-    });
+
+    let backend = Arc::new(Backend::new());
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(backend)
+        .setup(|app| {
+            let db_path = if let Ok(db) = std::env::var("TIBRARY_TEST_DB") {
+                std::path::PathBuf::from(db)
+            } else {
+                let home = std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let folder = home.join("Library/Application Support/Tibrary");
+                if std::env::var_os("TIBRARY_DEMO").is_some() {
+                    folder.join("tauri-demo.sqlite3")
+                } else {
+                    folder.join("library.sqlite3")
+                }
+            };
+            let turso_db = tauri::async_runtime::block_on(TursoDb::open(&db_path))
+                .map_err(|e| tauri::Error::from(std::io::Error::other(e)))?;
+            app.manage(turso_db);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            backend_call,
+            open_external,
+            reveal_file,
+            save_export
+        ])
+        .run(tauri::generate_context!())
+        .expect("Could not start Tibrary");
 }

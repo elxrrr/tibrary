@@ -28,9 +28,9 @@ test.beforeEach(async ({ page }) => {
     },
   );
   child = spawn(
-    join(root, ".venv/bin/python"),
-    ["-m", "library_manager.sidecar", "--demo", "--db", join(folder, "db")],
-    { env: { ...process.env, PYTHONPATH: join(root, "app") } },
+    join(root, "desktop/src-tauri/target/debug/tibrary"),
+    ["--rpc", "--db", join(folder, "db")],
+    { env: { ...process.env } },
   );
   createInterface({ input: child.stdout }).on("line", (line) => {
     const v = JSON.parse(line);
@@ -176,6 +176,7 @@ test("multiple file context action affects only selected files", async ({
     .locator("aside")
     .getByRole("button", { name: "Link releases", exact: true })
     .click();
+  await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("checkbox", { name: "Select visible rows" }).check();
   await page.locator("tbody tr").first().click({ button: "right" });
   await page

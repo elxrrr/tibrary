@@ -1,8 +1,5 @@
 **/.DS_Store
 /desktop/src-tauri/target/release/bundle
-/support/tests
-/support/docs
-/support/tools
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
