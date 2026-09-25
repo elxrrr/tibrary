@@ -1333,6 +1333,29 @@ function App() {
       </label>
     );
   }
+  function toggle(
+    label: string,
+    section: string,
+    key: string,
+    hint?: string,
+  ) {
+    return (
+      <label className="setting-row">
+        <span>{label}</span>
+        <input
+          type="checkbox"
+          checked={Boolean(settings[section]?.[key])}
+          onChange={(e) =>
+            setSettings({
+              ...settings,
+              [section]: { ...settings[section], [key]: e.target.checked },
+            })
+          }
+        />
+        {hint && <span className="hint">{hint}</span>}
+      </label>
+    );
+  }
   function settingsPage() {
     if (!settings) return <div className="card">Loading settings…</div>;
     if (route === "general")
@@ -1632,12 +1655,18 @@ function App() {
               "LOW",
             ])}
             <p className="hint">
-              LOSSLESS: FLAC 16-bit / 44.1 kHz. Videos and lyrics are excluded.
+              LOSSLESS: FLAC 16-bit / 44.1 kHz. HI_RES_LOSSLESS: FLAC up to 24-bit / 192 kHz. HIGH/LOW: AAC 320/96 kbps.
             </p>
             {field("Embedded artwork size", "downloads", "cover_size", [
               "1280",
               "640",
             ])}
+            {toggle("Skip already downloaded files", "downloads", "skip_existing")}
+            {toggle("Save companion cover.jpg to album folder", "downloads", "cover_album_file")}
+            {toggle("Embed lyrics into audio files", "downloads", "lyrics_embed")}
+            {toggle("Save separate .lrc lyrics file", "downloads", "lyrics_file")}
+            {toggle("Create .m3u8 playlist file for albums", "downloads", "playlist_create")}
+            {toggle("Write ReplayGain volume tags", "downloads", "replay_gain")}
             {field(
               "Parallel downloads",
               "provider",
@@ -1726,25 +1755,13 @@ function App() {
           </button>
         </div>
         <section className="card">
-          <h2>Streaming components</h2>
+          <h2>Native streaming engine</h2>
           <p>
-            Updates are built separately and verified before activation. Your
-            library and link cache are retained.
+            Tibrary runs a fully native Rust download and audio processing engine with zero external Python or runtime dependencies. All stream decryptors, MPEG-DASH parsers, and taggers are compiled directly into the binary.
           </p>
           <div className="toolbar">
             <button disabled={busy} onClick={() => run("component_check")}>
-              Check for updates
-            </button>
-            <button
-              disabled={busy}
-              onClick={() =>
-                setReview({ operation: "component_update", rows: [] })
-              }
-            >
-              Update components…
-            </button>
-            <button disabled={busy} onClick={() => run("component_rollback")}>
-              Restore previous components
+              Engine status
             </button>
           </div>
         </section>

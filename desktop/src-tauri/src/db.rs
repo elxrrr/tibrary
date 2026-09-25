@@ -1177,14 +1177,21 @@ impl TursoDb {
 
         let session = crate::account::AccountClient::load_saved_session();
         let dev_client = crate::tidal::TidalClient::from_env_or_keychain();
+        let stream_tok = crate::stream_download::load_saved_token(self).await;
+        let is_connected = session.is_some() || stream_tok.is_some();
+        let user_id = session.as_ref().and_then(|s| s.user_id.clone())
+            .or_else(|| stream_tok.as_ref().and_then(|s| s.user_id.clone()));
+        let expires_at = session.as_ref().map(|s| s.expires_at)
+            .or_else(|| stream_tok.as_ref().map(|s| s.expires_at));
+
         let conn_state = json!({
-            "configured": dev_client.is_some(),
-            "account": session.is_some(),
+            "configured": dev_client.is_some() || is_connected,
+            "account": is_connected,
             "checked": true,
             "tidal": {
-                "connected": session.is_some(),
-                "user_id": session.as_ref().and_then(|s| s.user_id.clone()),
-                "expires_at": session.as_ref().map(|s| s.expires_at),
+                "connected": is_connected,
+                "user_id": user_id,
+                "expires_at": expires_at,
             }
         });
 
@@ -1218,8 +1225,8 @@ impl TursoDb {
             "diagnostics": {
                 "metrics": {
                     "download": {
-                        "ok": true,
-                        "message": "Connected"
+                        "ok": is_connected,
+                        "message": if is_connected { "Connected" } else { "Sign-in required" }
                     }
                 }
             },
@@ -1277,20 +1284,40 @@ impl TursoDb {
         let home_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
-        let downloads = self.get_preference("downloads").await?.unwrap_or_else(|| json!({
+        let default_downloads = json!({
             "output": home_dir.join("Downloads/Music").to_string_lossy().to_string(),
             "quality": "LOSSLESS",
-            "cover_size": 1280
-        }));
+            "cover_size": 1280,
+            "skip_existing": true,
+            "cover_album_file": true,
+            "lyrics_embed": true,
+            "lyrics_file": false,
+            "playlist_create": false,
+            "replay_gain": true,
+        });
+        let downloads = if let Some(mut saved) = self.get_preference("downloads").await? {
+            if let Some(obj) = saved.as_object_mut() {
+                if let Some(def_obj) = default_downloads.as_object() {
+                    for (k, v) in def_obj {
+                        obj.entry(k).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+            saved
+        } else {
+            default_downloads
+        };
         let organisation = self.get_preference("organisation").await?.unwrap_or_else(|| json!({
             "template": "{album_artist}/{album}/{track_number} {title}"
         }));
 
         let session = crate::account::AccountClient::load_saved_session();
         let dev_client = crate::tidal::TidalClient::from_env_or_keychain();
+        let stream_tok = crate::stream_download::load_saved_token(self).await;
+        let is_connected = session.is_some() || stream_tok.is_some();
         let connections = json!({
-            "configured": dev_client.is_some(),
-            "account": session.is_some(),
+            "configured": dev_client.is_some() || is_connected,
+            "account": is_connected,
             "checked": true
         });
 
@@ -1325,7 +1352,13 @@ impl TursoDb {
             let downloads = json!({
                 "output": home_dir.join("Downloads/Music").to_string_lossy().to_string(),
                 "quality": "LOSSLESS",
-                "cover_size": 1280
+                "cover_size": 1280,
+                "skip_existing": true,
+                "cover_album_file": true,
+                "lyrics_embed": true,
+                "lyrics_file": false,
+                "playlist_create": false,
+                "replay_gain": true,
             });
             self.set_preference("downloads", &downloads).await?;
 
@@ -2078,7 +2111,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("turso_tibrary_bi_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let db_path = temp_dir.join("shared.sqlite3");
-        let root_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let _root_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
 
         // 1. Python writes to the database using standard sqlite3
         let script = format!(
@@ -2098,7 +2131,7 @@ with sqlite3.connect('{db}') as db:
             db = db_path.display()
         );
 
-        let py_status = std::process::Command::new(root_dir.join(".venv/bin/python"))
+        let py_status = std::process::Command::new("python3")
             .arg("-c")
             .arg(&script)
             .status()
@@ -2146,7 +2179,7 @@ with sqlite3.connect('{db}') as db:
             db = db_path.display()
         );
 
-        let verify_status = std::process::Command::new(root_dir.join(".venv/bin/python"))
+        let verify_status = std::process::Command::new("python3")
             .arg("-c")
             .arg(&verify_script)
             .status()

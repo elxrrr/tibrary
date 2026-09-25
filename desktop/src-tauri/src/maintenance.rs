@@ -122,7 +122,6 @@ mod tests {
     use lofty::file::TaggedFileExt;
     use lofty::probe::Probe;
     use lofty::tag::ItemKey;
-    use std::process::Command;
     use std::time::SystemTime;
 
     #[tokio::test]
@@ -142,23 +141,9 @@ mod tests {
         let target_dir = temp_dir.join("Artist").join("Album");
         let target_file = target_dir.join("01 - New Title.flac");
 
-        // Create a minimal valid FLAC fixture with soundfile in Python
-        let py_script = format!(
-            r#"
-import soundfile as sf
-import numpy as np
-data = np.zeros((1000, 2), dtype='float32')
-sf.write('{path}', data, 44100, format='FLAC')
-"#,
-            path = source_file.display()
-        );
-        let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let py_status = Command::new(root_dir.join(".venv/bin/python"))
-            .arg("-c")
-            .arg(&py_script)
-            .status()
-            .expect("Failed to run python");
-        assert!(py_status.success(), "Failed to create FLAC fixture");
+        // Create a minimal valid FLAC fixture directly from native bytes
+        fs::write(&source_file, crate::stream_download::MINIMAL_FLAC)
+            .expect("Failed to write FLAC fixture");
 
         // Seed old file in local_files
         let conn = store.connect().unwrap();

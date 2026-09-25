@@ -66,6 +66,18 @@ impl AccountClient {
         None
     }
 
+    pub fn save_session(session: &AccountSession) -> std::io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(val) = serde_json::to_string(session) {
+                let _ = std::process::Command::new("security")
+                    .args(["add-generic-password", "-s", "Tibrary", "-a", "session", "-w", &val, "-U"])
+                    .output();
+            }
+        }
+        Ok(())
+    }
+
     pub fn disconnect() -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
         {

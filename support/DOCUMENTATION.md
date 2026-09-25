@@ -2,7 +2,7 @@
 
 > **Version:** 1.0.0-rc.1  
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
-> **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty · Tidaler  
+> **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
 
 ---
 
@@ -33,7 +33,7 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ Tauri v2 IPC / CLI JSON-RPC
 ┌───────────────────────────────────┴────────────────────────────────────┐
-│                       Native Rust Backend Engine                       │
+│                    Native Rust Application Engine                      │
 │  ┌───────────────────────────────┬──────────────────────────────────┐  │
 │  │ Storage & Data Services       │ Audio & Format Services          │  │
 │  │ • Turso / libsql Embedded DB  │ • Lofty Metadata Engine          │  │
@@ -45,12 +45,13 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 │  │ • Native reqwest Tidal Client │ • Multi-stage Candidate Linker   │  │
 │  │ • Token Lifecycle Management  │ • Whole-Release Structure Gates  │  │
 │  │ • Exponential Backoff & Cache │ • ISRC & Duration Tolerances     │  │
+│  ├───────────────────────────────┼──────────────────────────────────┤  │
+│  │ Streaming & Downloads         │ Maintenance & Organization       │  │
+│  │ • AES-256-CBC Token Decrypt   │ • Safe Move, Rename & Clean      │  │
+│  │ • AES-128-CTR Stream Decrypt  │ • Chained Duplicate Containment  │  │
+│  │ • MPEG-DASH / BTS Manifests   │ • Atomic Staging & Publishing    │  │
+│  │ • PKCE Browser Auth Flow      │ • DJ Camelot Key & BPM Enriched  │  │
 │  └───────────────────────────────┴──────────────────────────────────┘  │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ Isolated Worker Bridge
-┌───────────────────────────────────┴────────────────────────────────────┐
-│                    On-Demand Download Worker                           │
-│     Tidaler (Python 3.13+) — Executed strictly for active downloads    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,6 +63,8 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 | `db.rs` | Embedded Turso/libsql database engine, schema migrations, table views, and atomic revision counters. |
 | `scanner.rs` | Fast, non-blocking local filesystem crawler, path normalization, and audio metadata extraction via Lofty. |
 | `tag_writer.rs` | Safe audio metadata editor using Lofty. Preserves FLAC padding, custom DJ tags, and embedded artwork without modifying audio frames. |
+| `stream_download.rs` | Native Tidal stream decryptor (AES-256-CBC token decryption, AES-128-CTR stream decryption), MPEG-DASH / BTS manifest parser, PKCE OAuth flow, Vorbis comments tagger, and `.lrc` / `.m3u8` companion file generator. |
+| `downloads.rs` | Acquisition queue state management, quality selection, pacing delay coordinator, and atomic publishing pipeline. |
 | `tidal.rs` | Direct native Tidal API client with OAuth2 token persistence, search, artist discography pagination, and rate limiting. |
 | `matching.rs` | Confidence-scored artist and track candidate matching, ISRC resolution, and structural duration gating. |
 | `release_matching.rs` | Whole-release track alignment, multi-disc normalization, and candidate ranking. |
@@ -73,8 +76,7 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 | `organisation.rs` | Layout path templating and file system safety checks. |
 | `duplicates.rs` | Local duplicate finder and containment analyzer; detects chained absorption patterns (Single → EP → Album) and executes safe bulk deletions. |
 | `recommendations.rs` | Contributor network traversal and artist discography gap discovery. |
-| `downloads.rs` | Acquisition queue state management and invocation of on-demand download workers. |
-| `account.rs` | Tidal user session management and favourite sync. |
+| `account.rs` | Tidal user session management, keychain integration, and favourite sync. |
 | `workflows.rs` | Orchestration of background library workflows (scanning, matching, retagging, auditing). |
 
 ---
@@ -85,7 +87,7 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 - **macOS** 13+ (Apple Silicon or Intel), **Linux**, or **Windows 10/11**.
 - **Rust Stable** (1.80 or later): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Node.js** (v20 or v22 LTS) and **npm**: `brew install node`
-- **Python** (3.13+) — *Optional*: Only required for on-demand downloads via Tidaler or running Playwright test fixtures. Run `./support/tools/Setup downloads.command` to automatically set up the Tidaler environment.
+- **No Python runtime required**: All audio downloading, streaming decryption, manifest parsing, and tagging operations are 100% native Rust.
 
 ### Quick Start
 ```sh
@@ -124,7 +126,7 @@ export TIBRARY_DEMO=1
 Tibrary maintains a comprehensive multi-tier testing pipeline:
 
 ```sh
-# 1. Rust unit and integration tests (28 tests across DB, Lofty, MQA, Matching, Tidal API)
+# 1. Rust unit and integration tests (41 tests across DB, Lofty, MQA, Matching, Stream Decryption, Tagging, Tidal API)
 cargo test --manifest-path desktop/src-tauri/Cargo.toml --bin tibrary
 
 # 2. Strict Rust linter check (0 warnings allowed)
@@ -156,14 +158,18 @@ The Playwright E2E suite uses `support/tests/seed_desktop.py` to populate a temp
 4. **MQA Signal Audit:** Runs a bit-accurate 36-bit stereo-XOR sync pattern detector directly on raw PCM audio frames to distinguish authentic MQA streams from standard lossless audio and misleading file tags.
 5. **Duplicate & Replacement Inspection:** Identifies duplicate tracks and chained multi-release containment patterns (e.g. Single ⊆ EP ⊆ Album) across folders. Displays duplicate clusters under their master keeper album and executes bulk deletions safely to macOS Trash in a single operation.
 6. **Non-Destructive Tag & Folder Maintenance:** Previews tag normalizations (leading zeros, Camelot `INITIALKEY` conversions, BPM standardization) and directory reorganizations (`Artist/Album (Year)/Track - Title`).
-7. **Acquisition Queue & Fulfilment:** Persistent, reviewable acquisition queue. Export approved items as URLs/JSON/CSV, or dispatch them directly to an isolated on-demand Tidaler background download worker.
+7. **Acquisition Queue & Fulfilment:** Persistent, reviewable acquisition queue. Export approved items as URLs/JSON/CSV, or dispatch them directly to Tibrary's built-in native streaming download engine.
 
 ### Download & Tagging Architecture
 
-- **On-Demand Worker:** Downloads are dispatched to Tidaler via an isolated bridge script (`app/library_manager/download_bridge.py`).
+- **100% Native Rust Engine:** Downloads are executed directly by Tibrary's asynchronous Tokio streaming engine (`stream_download.rs` and `downloads.rs`) with zero external Python or runtime dependencies.
+- **Audio Qualities:** Supports `LOSSLESS` (16-bit / 44.1 kHz FLAC), `HI_RES_LOSSLESS` (up to 24-bit / 192 kHz FLAC), `HIGH` (320 kbps AAC), and `LOW` (96 kbps AAC).
+- **Stream Decryption:** Decrypts 32-byte master security tokens with AES-256-CBC and audio stream bytes with AES-128-CTR in real time.
+- **Streaming Manifests:** Seamlessly parses BTS JSON manifests and MPEG-DASH MPD XML manifests with segment templates and timeline offsets.
 - **Album Artist Isolation:** The release's album artist is strictly mapped to `ALBUMARTIST`. Individual track guest artists or remixers remain in `ARTIST`, preventing track performer pollution and ensuring multi-artist albums stay grouped under the album artist folder.
-- **Staging & Safe Publishing:** Files are downloaded into an isolated temporary staging directory, tagged with verified metadata and Tidal IDs, and moved into the target folder layout (`{album_artist}/{album}/{track_number} {title}`) using hard links or atomic moves. Existing user files are never overwritten.
-- **Python Runtime:** Discovered automatically at `app/resources/tidaler/.venv/bin/python` (configured via `./support/tools/Setup downloads.command`) with fallback to root `.venv`.
+- **Vorbis Comment & ID3 Tagging:** Writes lossless Vorbis comments for FLAC files, embedding front-cover JPEG artwork, ReplayGain tags (`REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_TRACK_PEAK`, `REPLAYGAIN_ALBUM_GAIN`, `REPLAYGAIN_ALBUM_PEAK`), lyrics, and Tidal identifiers.
+- **Staging & Safe Publishing:** Files are downloaded into an isolated temporary staging directory, tagged with verified metadata, and published into the target folder layout (`{album_artist}/{album}/{track_number} {title}`) using atomic moves. Existing user files are checked for SHA-256 idempotency and collision prevention.
+- **Comprehensive Settings:** Supports skipping existing files, companion `cover.jpg` saving, embedded lyrics, `.lrc` companion lyrics files, `_playlist.m3u8` playlist generation, pacing delays, and ReplayGain volume tags.
 
 ---
 
@@ -232,7 +238,9 @@ The native 36-bit stereo-XOR MQA signal analyzer in `desktop/src-tauri/src/mqa.r
 - **`reqwest`** (MIT OR Apache-2.0) — Asynchronous HTTP client for Tidal Web API endpoints.
 - **`tokio`** (MIT) — Asynchronous I/O runtime.
 - **`sha2`** (MIT OR Apache-2.0) — Cryptographic SHA-256 audio frame integrity verification.
-- **`flac-stream-validator`** (MIT) — Validation of FLAC frame headers during stream extraction.
+- **`aes`**, **`cbc`**, & **`ctr`** (MIT OR Apache-2.0) — Pure-Rust AES-256-CBC token decryption and AES-128-CTR audio stream keystream decryption.
+- **`quick-xml`** (MIT) — Fast, zero-allocation MPEG-DASH MPD XML manifest parsing.
+- **`claxon`** (Apache-2.0) — Pure-Rust FLAC audio frame decoding and playback verification.
 
 ### Desktop Frontend (`desktop/package.json`)
 - **`react` & `react-dom`** (v19) (MIT) — Declarative user interface components.
@@ -240,8 +248,10 @@ The native 36-bit stereo-XOR MQA signal analyzer in `desktop/src-tauri/src/mqa.r
 - **`vite`** (MIT) & **`typescript`** (Apache-2.0) — Build pipeline and static type checking.
 - **`vitest`** (MIT) & **`@playwright/test`** (Apache-2.0) — Unit and end-to-end testing frameworks.
 
-### On-Demand Download Worker (`app/resources/tidaler/`)
-- **[Tidaler](https://github.com/maya-doshi/tidaler)** (AGPL-3.0) by Maya Doshi — Standalone Tidal downloader CLI invoked strictly on-demand for fulfilling approved acquisition queue items.
+### Attributions & Design References
+- **[Tidaler](https://github.com/maya-doshi/tidaler)** (AGPL-3.0) by Maya Doshi — Streaming token exchange, quality modes, and decryption protocol reference for Tibrary's native Rust streaming downloader.
+- **[AudioAuditor](https://github.com/Angel2mp3/AudioAuditor)** by Angel2mp3 — MQA signal detection reference.
+- **MQA Reverse Engineering** — Pioneered by [purpl3F0x](https://github.com/purpl3F0x/MQA_identifier) and [Dniel97](https://github.com/Dniel97/MQA-identifier-python).
 
 ---
 

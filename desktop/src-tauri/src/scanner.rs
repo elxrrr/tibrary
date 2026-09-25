@@ -451,17 +451,9 @@ mod tests {
         let store = TursoDb::open(&db_path).await.expect("Failed to open DB");
 
         let song_path = music_dir.join("test_track.flac");
-        let root_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let flac_script = format!(
-            "import soundfile as sf, numpy as np; sf.write('{}', np.zeros((44100, 2), dtype=np.int16), 44100, subtype='PCM_16')",
-            song_path.display()
-        );
-        let py_status = std::process::Command::new(root_dir.join(".venv/bin/python"))
-            .arg("-c")
-            .arg(&flac_script)
-            .status()
+        // Create a minimal valid FLAC fixture directly from native bytes
+        fs::write(&song_path, crate::stream_download::MINIMAL_FLAC)
             .expect("Failed to write flac fixture");
-        assert!(py_status.success(), "Failed to create flac fixture");
 
         let cancel = Arc::new(AtomicBool::new(false));
         let progress_messages = Arc::new(std::sync::Mutex::new(Vec::new()));

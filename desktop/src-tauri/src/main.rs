@@ -27,6 +27,7 @@ pub mod release_matching;
 pub mod scanner;
 pub mod tag_writer;
 pub mod tidal;
+pub mod stream_download;
 pub mod workflows;
 use db::TursoDb;
 
@@ -36,6 +37,7 @@ pub struct Backend {
     pub active_job: Mutex<Option<Value>>,
     pub logs: Mutex<Vec<Value>>,
     pub previews: Mutex<HashMap<String, Value>>,
+    pub pending_pkce: Mutex<Option<crate::stream_download::PkceFlow>>,
 }
 
 impl Backend {
@@ -1112,9 +1114,83 @@ async fn handle_rpc_call(
         return Ok(initial_job);
     }
     if method == "job.start"
-        && (args.get("kind").and_then(|v| v.as_str()) == Some("download")
-            || args.get("kind").and_then(|v| v.as_str()) == Some("connect_download"))
+        && (args.get("kind").and_then(|v| v.as_str()) == Some("connect_download")
+            || args.get("kind").and_then(|v| v.as_str()) == Some("connect_account"))
     {
+        let flow = crate::stream_download::create_pkce_flow();
+        let auth_url = flow.login_url.clone();
+        *state.pending_pkce.lock().unwrap() = Some(flow);
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let job = json!({
+            "id": job_id,
+            "kind": "connect_download",
+            "status": "complete",
+            "message": "Sign-in prompt opened. Please authenticate in your browser.",
+            "started": started,
+            "finished": started,
+            "result": json!({ "auth_url": auth_url })
+        });
+
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "authentication", "auth_url": auth_url }));
+        }
+
+        return Ok(job);
+    }
+    if method == "job.start" && args.get("kind").and_then(|v| v.as_str()) == Some("component_check") {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let job = json!({
+            "id": job_id,
+            "kind": "component_check",
+            "status": "complete",
+            "message": "Tibrary uses built-in high-performance native Rust streaming components. All components are up to date.",
+            "started": now,
+            "finished": now,
+            "result": { "message": "All native components are up to date." }
+        });
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
+        }
+        return Ok(job);
+    }
+    if method == "job.start" && args.get("kind").and_then(|v| v.as_str()) == Some("component_update") {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let job = json!({
+            "id": job_id,
+            "kind": "component_update",
+            "status": "complete",
+            "message": "Native download components are built directly into Tibrary. No external components needed.",
+            "started": now,
+            "finished": now,
+            "result": { "message": "Components are built into the binary." }
+        });
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
+        }
+        return Ok(job);
+    }
+    if method == "job.start" && args.get("kind").and_then(|v| v.as_str()) == Some("component_rollback") {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let job = json!({
+            "id": job_id,
+            "kind": "component_rollback",
+            "status": "complete",
+            "message": "Native streaming engine is active.",
+            "started": now,
+            "finished": now,
+            "result": { "message": "Native components active." }
+        });
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
+        }
+        return Ok(job);
+    }
+    if method == "job.start" && args.get("kind").and_then(|v| v.as_str()) == Some("download") {
         if state.active_job_cancel.lock().unwrap().is_some() {
             return Err("A job is already running".to_string());
         }
@@ -1437,7 +1513,41 @@ async fn handle_rpc_call(
         return Ok(json!(true));
     }
     if method == "auth.reply" {
-        return Ok(json!(true));
+        let redirect_url = args
+            .get("response")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        let flow = {
+            let mut lock = state.pending_pkce.lock().unwrap();
+            lock.take()
+        };
+
+        if let Some(flow) = flow {
+            let http = reqwest::Client::new();
+            match crate::stream_download::exchange_pkce_code(
+                &http,
+                redirect_url,
+                &flow.code_verifier,
+                &flow.client_unique_key,
+            ).await {
+                Ok(token) => {
+                    let _ = crate::stream_download::save_token(db, &token).await;
+                    state.log("Tidal account connected · download authorization ready");
+                    if let Some(app) = app_handle {
+                        let _ = app.emit("backend-event", json!({ "event": "ready" }));
+                        let _ = app.emit("backend-event", json!({ "event": "changed" }));
+                    }
+                    return Ok(json!(true));
+                }
+                Err(e) => {
+                    state.log(&format!("Failed to complete sign-in: {}", e));
+                    return Err(e);
+                }
+            }
+        }
+        return Ok(json!(false));
     }
 
     Ok(json!({}))

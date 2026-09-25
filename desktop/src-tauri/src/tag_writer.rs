@@ -67,7 +67,6 @@ mod tests {
     use super::*;
     use lofty::file::TaggedFileExt;
     use std::fs;
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -82,23 +81,9 @@ mod tests {
         fs::create_dir_all(&temp_dir).unwrap();
         let flac_path = temp_dir.join("test_song.flac");
 
-        // Create a minimal valid FLAC fixture with soundfile in Python
-        let py_script = format!(
-            r#"
-import soundfile as sf
-import numpy as np
-data = np.zeros((1000, 2), dtype='float32')
-sf.write('{path}', data, 44100, format='FLAC')
-"#,
-            path = flac_path.display()
-        );
-        let root_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let py_status = Command::new(root_dir.join(".venv/bin/python"))
-            .arg("-c")
-            .arg(&py_script)
-            .status()
-            .expect("Failed to run python");
-        assert!(py_status.success(), "Failed to create FLAC fixture");
+        // Create a minimal valid FLAC fixture directly from native bytes
+        fs::write(&flac_path, crate::stream_download::MINIMAL_FLAC)
+            .expect("Failed to write FLAC fixture");
 
         let mut updates = HashMap::new();
         updates.insert("title".to_string(), "Bohemian Rhapsody".to_string());
