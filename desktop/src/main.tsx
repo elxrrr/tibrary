@@ -578,7 +578,7 @@ function App() {
       } else if (route === "local" || route === "online") {
         setDetail({operation: row});
       } else if (row.path || route === "links") {
-        setDetail({...await call("detail", { root, path: row.path || row.id }), proposed: row.changes, folder_target: route === "organise" ? (row.target || row.path || row.id) : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
+        setDetail({...await call("detail", { root, path: row.path || row.id, check_availability: route === "links" }), proposed: row.changes, folder_target: route === "organise" ? (row.target || row.path || row.id) : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
       }
     } catch (e) {
       notifyError(e);
@@ -2136,7 +2136,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.25 · build 25</span>
+          <span className="sidebar-version">v0.9.0-beta.26 · build 26</span>
         </div>
       </aside>
       <main>
@@ -2268,6 +2268,12 @@ function App() {
                   {detail.source_release_id && <p>Online source · Release {detail.source_release_id} · Track {detail.source_track_id}</p>}
                   <TagChanges changes={detail.proposed} current={detail.tags}/></section>}
                 {!detail.folder_target && <><h3>Available placements</h3>
+                {detail.availability_note && <><p>{detail.availability_note}</p><button disabled={detail.availability_checking} onClick={async () => {
+                  const path = detail.path;
+                  setDetail({...detail, availability_checking:true});
+                  try { const refreshed = await call("detail", {root,path,check_availability:true,force_availability:true}); setDetail((current:any) => current?.path === path ? refreshed : current); }
+                  catch (error) { notifyError(error); setDetail((current:any) => current?.path === path ? {...current,availability_checking:false} : current); }
+                }}>{detail.availability_checking ? "Checking availability…" : "Recheck availability"}</button></>}
                 {detail.catalogue_options?.length ? (
                   detail.catalogue_options.map((o: any, i: number) => (
                     <article
@@ -2320,6 +2326,7 @@ function App() {
                                 root,
                                 path: detail.path,
                                 album_id: o.id,
+                                require_live: true,
                                 track_id: o.track_id,
                                 choice_key: o.choice_key,
                               })

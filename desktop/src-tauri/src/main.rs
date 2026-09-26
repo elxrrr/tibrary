@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod release_artists;
 mod release_anchor;
+mod availability;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -1440,7 +1441,18 @@ async fn handle_rpc_uncached(
 
     // DETAILS & PREVIEW
     if method == "detail" {
-        return db.get_detail(&args).await;
+        let mut detail = db.get_detail(&args).await?;
+        if args["check_availability"] == true {
+            let market = db.get_settings().await?["general"]["market"].as_str().unwrap_or("GB").to_string();
+            let ids: Vec<String> = detail["catalogue_options"].as_array().into_iter().flatten().filter_map(|o|o["id"].as_str().map(str::to_owned)).collect();
+            let checked = availability::check_refresh(db,&ids,&market,args["force_availability"] == true).await;
+            let mut hidden=0;
+            if let Some(options)=detail["catalogue_options"].as_array_mut() {
+                options.retain(|o| {let keep=checked.as_ref().ok().and_then(|c|o["id"].as_str().and_then(|id|c.get(id))).copied().flatten()==Some(true);if !keep {hidden+=1;} keep});
+            }
+            detail["availability_note"] = json!(match checked {Ok(_) => format!("Showing releases confirmed available in {market}. {hidden} unavailable or unverified placements omitted. Saved links are retained."), Err(e) => format!("Availability could not be confirmed: {e}. Saved links are retained; reopen this review to retry.")});
+        }
+        return Ok(detail);
     }
     if method == "preview" {
         let preview_id = args.get("id").and_then(|v| v.as_str()).unwrap_or("preview");
@@ -1576,6 +1588,11 @@ async fn handle_rpc_uncached(
         return Ok(json!(true));
     }
     if method == "tracks.choose" {
+        if args["require_live"] == true {
+            let market = db.get_settings().await?["general"]["market"].as_str().unwrap_or("GB").to_string();
+            let id=args["album_id"].as_str().unwrap_or("").to_string();
+            if availability::check(db,&[id.clone()],&market).await?.get(&id).copied().flatten()!=Some(true) {return Err("This release is unavailable or its availability cannot be confirmed".into());}
+        }
         db.choose_track_link(&args).await?;
         let linked = release_anchor::propagate(db, args["path"].as_str().unwrap_or(""), args["market"].as_str().unwrap_or("GB")).await?;
         state.log_with_category(&format!("Manual placement saved · {linked} additional tracks linked from the complete cached release · file tags unchanged"), "info", Some("linking"));

@@ -352,6 +352,19 @@ pub async fn link_library_mode(
                 candidate_releases.push(target.clone());
             }
         }
+        if !cached_only && !candidate_releases.is_empty() {
+            progress(format!("Checking live release placements · {group_idx}/{group_count} · {}", group_tracks[0].album));
+            let ids: Vec<_> = candidate_releases.iter().map(|r|r.id.clone()).collect();
+            let availability = crate::availability::check(db,&ids,market).await?;
+            candidate_releases.retain(|r| availability.get(&r.id).copied().flatten()==Some(true));
+            if candidate_releases.is_empty() {
+                summary.review += group_tracks.iter().filter(|t|eligible.contains(&t.path)).count();
+                progress(format!("No live placements confirmed · {} · existing links retained", group_tracks[0].album));
+                continue;
+            }
+        } else {
+            candidate_releases.retain(|r|r.available != Some(false));
+        }
         // A local repair must never trigger network requests or erase a prior choice
         // when the catalogue lacks any candidate's full track list.
         if cached_only && (candidate_releases.is_empty() || candidate_releases.iter().any(|r| !r.tracks_loaded)) { continue; }
@@ -633,7 +646,7 @@ mod tests {
             id: "queen_id".to_string(),
             name: "Queen".to_string(),
             releases: vec![TidalRelease {
-                id: "album_1".to_string(),
+                id: "1001".to_string(),
                 artist: "Queen".to_string(),
                 title: "A Night at the Opera".to_string(),
                 date: "1975-11-21".to_string(),
@@ -662,14 +675,17 @@ mod tests {
             }],
         };
         let mut other = cat.releases[0].clone();
-        other.id = "other_edition".into();
+        other.id = "1002".into();
         other.tracks[0].id = "other_track".into();
         cat.releases[0].tracks[0].credits = json!([{"name":"Freddie Mercury","role":"Composer"}]);
         cat.releases.insert(0, other);
         let mut conflict = cat.releases[1].clone();
-        conflict.id = "wrong_position".into();
+        conflict.id = "1003".into();
         conflict.tracks[0].track_number = 2;
         cat.releases.insert(0, conflict);
+        for release in &cat.releases {
+            store.set_preference(&format!("release-live:GB:{}",release.id),&json!({"available":true,"checked_at":chrono::Utc::now().timestamp()})).await.unwrap();
+        }
         conn.execute(
             "INSERT INTO catalogue (artist_id, market, payload, fetched) VALUES ('queen_id', 'GB', ?, '2026-01-01')",
             (serde_json::to_string(&cat).unwrap().as_str(),),
@@ -714,7 +730,7 @@ mod tests {
         let p: Value = serde_json::from_str(&payload_str).unwrap();
         assert_eq!(p["status"], "linked");
         assert_eq!(p["ids"]["track_id"], "track_101");
-        assert_eq!(p["ids"]["album_id"], "album_1");
+        assert_eq!(p["ids"]["album_id"], "1001");
         assert_eq!(p["placements"].as_array().unwrap().len(), 2);
         assert!(p["catalogue_options"][0]["evidence"]
             .as_str()

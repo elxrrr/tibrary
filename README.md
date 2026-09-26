@@ -45,6 +45,8 @@ Catalogue workflows share HTTP connections, token renewal and rate-limit cooldow
 
 When you manually choose a track placement, the app also checks its complete local release against the cached online recording sequence. If every recording matches uniquely and in order, unlinked siblings can inherit that release; existing links and ignored tracks are preserved. **Correct tags → Track & disc numbers** offers the online numbering and totals, including a local multi-disc release represented online as one disc. Review and apply those tags first, then use **Organise files** separately to update paths. Incomplete, ambiguous or conflicting recording sets are not automatically propagated.
 
+Placement reviews in **Link releases** check release availability for your configured market and show only confirmed available releases. Online linking uses the same cache. Checks are batched (up to 20 IDs), reused for seven days for available releases and one day for unavailable releases; **Recheck availability** forces a fresh check. Metadata and artist-credit lookups also populate this cache. Network/authentication failures remain unverified, never proof that a release was removed. Saved historical links remain intact. API availability does not guarantee the provider’s website is free of temporary page errors.
+
 No database reset or full local rescan is needed to collect this online metadata. Update the local library only when files or tags have changed outside the app.
 
 ## ✨ Features

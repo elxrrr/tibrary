@@ -188,6 +188,10 @@ fn apply_release_discovery(value: &mut Value, raw: &Value, id: &str) {
     value["genres"] = json!(crate::tidal::related_genres(data, &included));
     value["replacement_id"] = json!(crate::tidal::replacement_id(data));
     value["discovery_checked_at"] = json!(chrono::Utc::now().timestamp());
+    if let Some(available) = crate::availability::available(data) {
+        value["available"] = json!(available);
+        value["availability_checked_at"] = value["discovery_checked_at"].clone();
+    }
     if let Some(artists) = data["relationships"]["artists"]["data"].as_array() {
         value["album_artist_ids"] = json!(artists.iter().filter_map(|a| a["id"].as_str()).collect::<Vec<_>>());
         value["album_artists"] = json!(artists.iter().filter_map(|a| included.iter().find(|v| v["type"] == "artists" && v["id"] == a["id"]).and_then(|v| v["attributes"]["name"].as_str())).collect::<Vec<_>>());
@@ -203,6 +207,9 @@ async fn publish_release(
 ) -> Result<Value, String> {
     let key = format!("tag-review:{market}:{id}");
     db.set_preference(&key, &value).await?;
+    if let (Some(available), Some(checked_at)) = (value["available"].as_bool(),value["availability_checked_at"].as_i64()) {
+        db.set_preference(&format!("release-live:{market}:{id}"), &json!({"available":available,"checked_at":checked_at})).await?;
+    }
     // Publish details to every catalogue reference and existing queue entry.
     let conn = db.connect()?;
     let mut rows = conn
