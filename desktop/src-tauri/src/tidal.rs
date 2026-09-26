@@ -39,6 +39,9 @@ pub struct TidalTrack {
     pub media_tags: Vec<String>,
     pub audio_modes: Vec<String>,
     pub media_metadata: Value,
+    pub genres: Vec<String>,
+    pub replacement_id: Option<String>,
+    pub discovery_checked_at: Option<i64>,
     pub credits: Value,
     pub credits_complete: bool,
     pub credits_checked_at: Option<i64>,
@@ -70,6 +73,9 @@ pub struct TidalRelease {
     pub primary_artist_verified: bool,
     #[serde(default, deserialize_with = "optional_bool_from_value")]
     pub official: Option<bool>,
+    pub genres: Vec<String>,
+    pub replacement_id: Option<String>,
+    pub discovery_checked_at: Option<i64>,
     pub original_release_date: Option<String>,
     pub audio_modes: Vec<String>,
     pub media_metadata: Value,
@@ -126,6 +132,18 @@ where
 
 #[cfg(test)]
 mod release_payload_tests {
+    #[test]
+    fn discovery_relationships_do_not_leak_between_resources() {
+        use super::{related_genres, replacement_id};
+        use serde_json::json;
+        let included = vec![json!({"type":"genres","id":"g","attributes":{"name":"Electronic"}}),json!({"type":"genres","id":"other","attributes":{"name":"Rock"}})];
+        let resource = json!({"id":"1","relationships":{"genres":{"data":[{"type":"genres","id":"g"}]},"replacement":{"data":{"type":"albums","id":"2"}}}});
+        assert_eq!(related_genres(&resource,&included), vec!["Electronic"]);
+        assert_eq!(replacement_id(&resource).as_deref(), Some("2"));
+        assert!(related_genres(&json!({}),&included).is_empty());
+        assert!(replacement_id(&json!({"id":"1","relationships":{"replacement":{"data":{"id":"1"}}}})).is_none());
+    }
+
     #[test]
     fn compound_credits_stay_with_their_track_and_preserve_roles() {
         let payload = serde_json::json!({"data":[{"id":"one","type":"tracks"},{"id":"two","type":"tracks"}],"included":[
@@ -775,7 +793,7 @@ impl TidalClient {
             .to_string();
 
         let mut next_url = Some(format!(
-            "https://openapi.tidal.com/v2/artists/{}/relationships/albums?countryCode={}&include=albums",
+            "https://openapi.tidal.com/v2/artists/{}/relationships/albums?countryCode={}&include=albums,albums.genres,albums.replacement",
             artist_id, market
         ));
 
@@ -793,6 +811,7 @@ impl TidalClient {
                         continue;
                     }
 
+                    if !payload["data"].as_array().is_some_and(|refs| refs.iter().any(|r| r["id"] == item["id"] && r["type"] == "albums")) { continue; }
                     let rel_id = item
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -917,6 +936,9 @@ impl TidalClient {
                         artist_credits,
                         primary_artist_verified,
                         official: attrs.get("official").and_then(Value::as_bool),
+                        genres: related_genres(item, included),
+                        replacement_id: replacement_id(item),
+                        discovery_checked_at: Some(Utc::now().timestamp()),
                         original_release_date: attrs
                             .get("originalReleaseDate")
                             .and_then(Value::as_str)
@@ -958,7 +980,7 @@ impl TidalClient {
         release_id: &str,
         market: &str,
     ) -> Result<Vec<TidalTrack>, String> {
-        let mut next=Some(format!("https://openapi.tidal.com/v2/albums/{release_id}/relationships/items?countryCode={market}&include=items,items.credits"));
+        let mut next=Some(format!("https://openapi.tidal.com/v2/albums/{release_id}/relationships/items?countryCode={market}&include=items,items.credits,items.genres,items.replacement"));
         let mut tracks = Vec::new();
         let mut visited = std::collections::HashSet::new();
         while let Some(url) = next {
@@ -990,8 +1012,8 @@ impl TidalClient {
             .iter()
             .enumerate()
             .filter(|(_, track)| {
-                !track.credits_complete
-                    && track.credits_checked_at.is_none_or(|at| now - at >= 86_400)
+                (!track.credits_complete && track.credits_checked_at.is_none_or(|at| now - at >= 86_400))
+                    || track.discovery_checked_at.is_none_or(|at| now - at >= 30 * 86_400)
             })
             .map(|(index, _)| index)
             .collect();
@@ -1005,15 +1027,17 @@ impl TidalClient {
             url.query_pairs_mut()
                 .append_pair("countryCode", market)
                 .append_pair("filter[id]", &ids)
-                .append_pair("include", "credits");
+                .append_pair("include", "credits,genres,replacement");
             // Stamp the attempt even on failure, preventing a broken optional
             // endpoint from creating a request loop during ordinary linking.
             for &index in batch {
                 tracks[index].credits_checked_at = Some(now);
+                tracks[index].discovery_checked_at = Some(now - 29 * 86_400);
             }
             let Ok(payload) = self.get_json(url.as_str()).await else {
                 for &index in &pending {
                     tracks[index].credits_checked_at = Some(now);
+                tracks[index].discovery_checked_at = Some(now - 29 * 86_400);
                 }
                 break;
             };
@@ -1024,6 +1048,9 @@ impl TidalClient {
                 let Some(resource) = resources.iter().find(|r| r["id"] == track.id) else {
                     continue;
                 };
+                track.discovery_checked_at = Some(now);
+                if resource["relationships"].get("genres").is_some() { track.genres = related_genres(resource, &included); }
+                if resource["relationships"].get("replacement").is_some() { track.replacement_id = replacement_id(resource); }
                 let (credits, complete) = included_credits(resource, &included);
                 let mut values = credits.as_array().cloned().unwrap_or_default();
                 if !complete {
@@ -1119,6 +1146,9 @@ impl TidalClient {
                                 if absent && !cached[field].is_null() {
                                     release[field] = cached[field].clone();
                                 }
+                            }
+                            if release["discovery_checked_at"].is_null() {
+                                for field in ["genres","replacement_id","discovery_checked_at"] { release[field] = cached[field].clone(); }
                             }
                             if release["tracks_loaded"] != true && cached["tracks_loaded"] == true {
                                 release["tracks"] = cached["tracks"].clone();
@@ -1246,12 +1276,32 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
             media_tags: string_list(a.get("mediaTags")),
             audio_modes: string_list(a.get("audioModes")),
             media_metadata: a.get("mediaMetadata").cloned().unwrap_or(Value::Null),
+            genres: related_genres(item, included),
+            replacement_id: replacement_id(item),
+            discovery_checked_at: item["relationships"].get("genres").map(|_| Utc::now().timestamp()),
             credits,
             credits_complete,
             credits_checked_at: credits_complete.then(|| Utc::now().timestamp()),
         });
     }
     Ok(tracks)
+}
+
+pub fn replacement_id(resource: &Value) -> Option<String> {
+    let data = &resource["relationships"]["replacement"]["data"];
+    let reference = data.as_array().and_then(|a| a.first()).unwrap_or(data);
+    reference["id"].as_str().filter(|id| !id.is_empty() && Some(*id) != resource["id"].as_str()).map(str::to_owned)
+}
+
+pub fn related_genres(resource: &Value, included: &[Value]) -> Vec<String> {
+    let mut values = Vec::new();
+    for reference in resource["relationships"]["genres"]["data"].as_array().into_iter().flatten() {
+        if let Some(name) = included.iter().find(|v| v["type"] == "genres" && v["id"] == reference["id"])
+            .and_then(|v| v["attributes"]["name"].as_str()) {
+            if !name.trim().is_empty() && !values.iter().any(|v: &String| v.eq_ignore_ascii_case(name.trim())) { values.push(name.trim().to_string()); }
+        }
+    }
+    values
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -1372,6 +1422,14 @@ mod tests {
         let tracks = client.get_release_details("234657671", "GB").await.unwrap();
         assert!(!tracks.is_empty());
         assert!(tracks.iter().all(|track| track.credits_complete));
+        let album = client.get_json("https://openapi.tidal.com/v2/albums/234657671?countryCode=GB&include=genres,replacement,artists").await.unwrap();
+        let resource = album["data"].as_array().and_then(|a| a.first()).unwrap_or(&album["data"]);
+        assert_eq!(resource["id"], "234657671");
+        if let Some(artist) = resource["relationships"]["artists"]["data"].as_array().and_then(|a| a.first()).and_then(|a| a["id"].as_str()) {
+            let page = client.get_json(&format!("https://openapi.tidal.com/v2/artists/{artist}/relationships/albums?countryCode=GB&include=albums,albums.genres,albums.replacement")).await.unwrap();
+            assert!(page["data"].is_array());
+        }
+        println!("Album genres: {:?}; replacement: {:?}", related_genres(resource, album["included"].as_array().unwrap_or(&Vec::new())), replacement_id(resource));
         println!(
             "{} tracks checked; {} credit entries returned (empty lists are cached too)",
             tracks.len(),

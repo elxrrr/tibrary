@@ -878,7 +878,7 @@ async fn handle_rpc_uncached(
             .unwrap_or("organise");
         let template = args.get("template").and_then(|v| v.as_str());
 
-        let (files, _) = db.get_local_files_page(Some(root), 10000, 0).await?;
+        let files = actions::files(db, root).await?;
         let plans = workflows::plan_cached(db, &files, action, template).await?;
         return serde_json::to_value(plans).map_err(|e| e.to_string());
     }

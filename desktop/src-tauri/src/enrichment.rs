@@ -101,6 +101,13 @@ pub fn compute_missing_tags(
         missing.insert("date".to_string(), release.date.clone());
     }
 
+    if !has_any_tag(local_tags, "genre") {
+        let genres = if track.genres.is_empty() { &release.genres } else { &track.genres };
+        if !genres.is_empty() { missing.insert("genre".into(), genres.join("; ")); }
+    }
+    if !has_any_tag(local_tags, "upc") {
+        if let Some(upc) = release.upc.as_ref().filter(|v| !v.trim().is_empty()) { missing.insert("upc".into(), upc.clone()); }
+    }
     // Label & Copyright
     if !has_any_tag(local_tags, "label") {
         if let Some(ref label) = release.label {
@@ -152,6 +159,16 @@ pub fn compute_missing_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn genres_prefer_recording_then_release_and_preserve_local_tags() {
+        let release = TidalRelease { genres: vec!["Electronic".into()], ..Default::default() };
+        let mut track = TidalTrack::default();
+        assert_eq!(compute_missing_tags(&HashMap::new(), &release, &track)["genre"], "Electronic");
+        track.genres = vec!["House".into()];
+        assert_eq!(compute_missing_tags(&HashMap::new(), &release, &track)["genre"], "House");
+        assert!(!compute_missing_tags(&HashMap::from([("genre".into(),"My genre".into())]), &release, &track).contains_key("genre"));
+    }
 
     #[test]
     fn test_compute_missing_dj_tags() {

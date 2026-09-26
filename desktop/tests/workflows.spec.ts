@@ -520,6 +520,13 @@ test("organise files previews and applies only to the disposable library", async
   await page.getByRole("button",{name:"Preview moves"}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
   await expect(page.locator("tbody tr").first()).toBeVisible();
+  await page.locator("tbody tr").first().dblclick();
+  await expect(page.getByRole("dialog")).toContainText("Proposed folder layout");
+  await expect(page.getByRole("dialog")).toContainText("Proposed path");
+  if (process.env.TIBRARY_FOLDER_SCREENSHOT) await page.screenshot({path:"/tmp/tibrary-folder-preview.png"});
+  await expect(page.getByRole("dialog").getByText("Available placements")).toHaveCount(0);
+  await expect(page.getByRole("dialog").getByText("Proposed changes")).toHaveCount(0);
+  await page.getByRole("button",{name:"Done",exact:true}).click();
   await page.getByRole("checkbox",{name:"Select visible rows"}).check();
   await page.getByRole("button",{name:/Review & apply/}).click();
   await expect(page.getByRole("dialog")).toBeVisible();

@@ -1358,3 +1358,13 @@ dialog p {
 .metadata-source h3, .metadata-source h4 { margin: 0 0 8px; }
 
 .metadata-table tbody th { position: static; width: 28%; }
+
+.badge.mqa-signal { color: #ef4444; background: rgba(239,68,68,.14); }
+.badge.no-signal-found { color: #10b981; background: rgba(16,185,129,.14); }
+.badge.superseded { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); }
+.detail-heading p, .metadata-source dd { overflow-wrap: anywhere; }
+.modal-body > section, .modal-body > details { margin-block: 16px; }
+
+.metadata-source dl { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; margin: 16px 0; }
+.metadata-source dt { color: var(--muted); }
+.metadata-source dd { margin: 0; line-height: 1.5; }

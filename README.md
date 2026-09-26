@@ -141,3 +141,12 @@ This project is licensed under the [MIT License](LICENSE).
 Correct tags → Track & disc numbers flags impossible totals such as `04/1`. It proposes padded totals from consistent sibling tags or agreeing cached releases with matching recordings and positions. Incomplete or conflicting evidence stays for review. Applying a number repair refreshes the affected links from cache without an online scan.
 
 Closing the window or choosing Quit while downloading asks whether to keep downloading or stop and quit. The latter waits for download cancellation before exiting. Completed downloads are retained.
+
+### Catalogue evidence and library previews
+
+- Missing tags uses provider genres (track first, release fallback) and UPC when supplied, preserving existing tags. Genre and replacement relationships share the catalogue cache; missing data is upgraded as releases are inspected. Empty provider responses are valid, and optional lookup failures retain cached data.
+- Recording links still require release/position evidence. UPC agreement ranks otherwise valid editions; provider replacement IDs add candidates without overwriting saved identities. Genres provide recommendation context, never identity proof.
+- Missing releases marks an older release **Superseded** only when a newer, available release contains every exact recording, including its mix and duration. These entries remain accessible with the Superseded or All recommendations filter. Unloaded track lists and exclusive mixes are not assumed redundant.
+- Ownership uses distinct, current recording links and checks multi-disc completeness. Deleting the database is unnecessary: refresh the catalogue and rerun previews while preserving your saved decisions.
+- Organise files shows exact current/proposed paths and component-level reasons. Years use four digits; slash-form track numbers parse correctly; Unicode/case-only differences do not propose moves. Multi-disc filenames use `02.01 - Title`.
+- MQA signal badges are red; no-signal results are green. Unaffected rows show no replacement action.

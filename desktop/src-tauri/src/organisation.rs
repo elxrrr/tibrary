@@ -1,22 +1,27 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 pub const DEFAULT_LAYOUT: &str =
     "{albumartist}/{album} ({year})/{disc}/{disc_prefix}{tracknumber} - {title}";
 
-pub fn safe_component(value: &str, final_part: bool) -> Result<String, String> {
+pub fn safe_component(value: &str, _final_part: bool) -> Result<String, String> {
     if value.trim().is_empty() {
         return Err("Component is empty".to_string());
     }
 
     // Strip/replace illegal filename characters
     let mut cleaned = String::with_capacity(value.len());
+    let mut after_separator = false;
     for c in value.chars() {
+        if after_separator && c.is_whitespace() { continue; }
+        after_separator = false;
         match c {
             '/' | '\\' | ':' | '|' => {
-                if !cleaned.ends_with(" - ") && !cleaned.is_empty() {
-                    cleaned.push_str(" - ");
-                }
+                while cleaned.ends_with(char::is_whitespace) { cleaned.pop(); }
+                if !cleaned.ends_with(" -") && !cleaned.is_empty() { cleaned.push_str(" -"); }
+                if !cleaned.is_empty() { cleaned.push(' '); }
+                after_separator = true;
             }
             '*' | '?' | '"' | '<' | '>' | '\0'..='\x1f' | '\x7f' => {
                 // skip illegal characters
@@ -25,12 +30,11 @@ pub fn safe_component(value: &str, final_part: bool) -> Result<String, String> {
         }
     }
 
-    let mut result = cleaned.trim().to_string();
+    let mut result: String = cleaned.trim().nfc().collect();
 
     // Strip trailing spaces and dots
-    if final_part {
-        result = result.trim_end_matches([' ', '.']).to_string();
-    }
+    // Windows disallows trailing dots/spaces on directories as well as files.
+    result = result.trim_end_matches([' ', '.']).to_string();
 
     if result.is_empty() || result == "." || result == ".." {
         return Err("Tags produce an empty or unsafe filename component".to_string());
@@ -79,23 +83,24 @@ pub fn format_layout(
         .or_else(|| tags.get("date"))
         .map(|s| s.as_str())
         .unwrap_or("");
+    let year = year.get(..4).filter(|s| s.chars().all(|c| c.is_ascii_digit())).unwrap_or("");
 
     let disc_num: u32 = tags
         .get("discnumber")
         .or_else(|| tags.get("disc_number"))
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.split('/').next()?.trim().parse().ok())
         .unwrap_or(1);
 
     let track_num: u32 = tags
         .get("tracknumber")
         .or_else(|| tags.get("track_number"))
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.split('/').next()?.trim().parse().ok())
         .unwrap_or(1);
 
     let disc_total: u32 = tags
         .get("disctotal")
         .or_else(|| tags.get("disc_total"))
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.split('/').next()?.trim().parse().ok())
         .unwrap_or(1);
 
     let disc_relevant = disc_total > 1 || disc_num > 1;
@@ -118,7 +123,7 @@ pub fn format_layout(
         };
 
         let disc_prefix = if disc_relevant {
-            format!("{}-", disc_num)
+            format!("{:02}.", disc_num)
         } else {
             String::new()
         };
@@ -169,6 +174,9 @@ mod tests {
             "A - BCD"
         );
         assert_eq!(safe_component("CON", true).unwrap(), "_CON");
+        assert_eq!(safe_component("Parallel / S", true).unwrap(), "Parallel - S");
+        assert_eq!(safe_component("Belong - Mirth", true).unwrap(), "Belong - Mirth");
+        assert_eq!(safe_component("Babsy.", false).unwrap(), "Babsy");
         assert_eq!(safe_component("Ending with dot.", true).unwrap(), "Ending with dot");
     }
 
@@ -179,8 +187,8 @@ mod tests {
         tags.insert("albumartist".to_string(), "Queen".to_string());
         tags.insert("album".to_string(), "A Night at the Opera".to_string());
         tags.insert("title".to_string(), "Bohemian Rhapsody".to_string());
-        tags.insert("year".to_string(), "1975".to_string());
-        tags.insert("tracknumber".to_string(), "11".to_string());
+        tags.insert("date".to_string(), "1975-11-21".to_string());
+        tags.insert("tracknumber".to_string(), "11/12".to_string());
         tags.insert("discnumber".to_string(), "1".to_string());
         tags.insert("disctotal".to_string(), "1".to_string());
 
@@ -206,7 +214,7 @@ mod tests {
         let path = format_layout(root, &tags, None, "flac").unwrap();
         assert_eq!(
             path,
-            PathBuf::from("/Music/Pink Floyd/The Wall (1979)/Disc 02/2-01 - Hey You.flac")
+            PathBuf::from("/Music/Pink Floyd/The Wall (1979)/Disc 02/02.01 - Hey You.flac")
         );
     }
 }

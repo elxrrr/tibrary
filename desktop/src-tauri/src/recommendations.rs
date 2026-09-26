@@ -175,9 +175,57 @@ pub fn recommendation_score(
     (score, badge.into(), reasons)
 }
 
+/// Prefer a newer, larger release only when every recording is positively
+/// identified. Unknown track lists, unique mixes and territory failures stay visible.
+pub fn subsumed_releases(releases: &[crate::tidal::TidalRelease]) -> std::collections::HashMap<String, String> {
+    use crate::release_matching::{clean_isrc, recording_matches};
+    let eligible = |r: &crate::tidal::TidalRelease| r.tracks_loaded && !r.tracks.is_empty()
+        && r.available == Some(true) && r.official != Some(false)
+        && !r.r#type.eq_ignore_ascii_case("compilation") && !r.artist.trim().is_empty()
+        && r.date.len() >= 10 && r.date.get(..10).is_some_and(|d| d <= chrono::Utc::now().format("%Y-%m-%d").to_string().as_str());
+    let mut index: std::collections::HashMap<(String,String), Vec<usize>> = std::collections::HashMap::new();
+    for (i,r) in releases.iter().enumerate().filter(|(_,r)| eligible(r)) {
+        for t in &r.tracks {
+            if let Some(isrc) = clean_isrc(t.isrc.as_deref()).filter(|s| !s.is_empty()) {
+                index.entry((crate::matching::name_key(&r.artist),isrc)).or_default().push(i);
+            }
+        }
+    }
+    let mut result = std::collections::HashMap::new();
+    for source in releases.iter().filter(|r| eligible(r)) {
+        let Some(isrc) = clean_isrc(source.tracks[0].isrc.as_deref()).filter(|s| !s.is_empty()) else { continue };
+        let Some(candidates) = index.get(&(crate::matching::name_key(&source.artist),isrc)) else { continue };
+        let best = candidates.iter().map(|i| &releases[*i]).filter(|target| {
+            if target.id == source.id || target.date < source.date || target.tracks.len() <= source.tracks.len()
+                || target.explicit != source.explicit || target.audio_modes != source.audio_modes { return false; }
+            let mut used = HashSet::new();
+            source.tracks.iter().all(|s| target.tracks.iter().enumerate().any(|(i,t)| {
+                let same = s.isrc.as_ref().is_some_and(|id| !id.is_empty()) && clean_isrc(s.isrc.as_deref()) == clean_isrc(t.isrc.as_deref())
+                    && recording_matches(&s.title,s.duration,s.isrc.as_deref(),&t.title,t.duration,t.isrc.as_deref(),true);
+                same && used.insert(i)
+            }))
+        }).max_by(|a,b| a.tracks.len().cmp(&b.tracks.len()).then_with(|| a.date.cmp(&b.date)).then_with(|| a.id.cmp(&b.id)));
+        if let Some(target) = best { result.insert(source.id.clone(),target.id.clone()); }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_release_must_contain_every_exact_recording() {
+        use crate::tidal::{TidalRelease,TidalTrack};
+        let track = TidalTrack { title:"Song".into(),isrc:Some("GB123".into()),duration:180.0,..Default::default() };
+        let older = TidalRelease { id:"old".into(), artist:"Artist".into(), date:"2020-01-01".into(),tracks_loaded:true,available:Some(true), tracks:vec![track.clone()],..Default::default() };
+        let mut newer = TidalRelease { id:"new".into(),date:"2021-01-01".into(),tracks:vec![track.clone(),TidalTrack {title:"Bonus".into(),isrc:Some("GB456".into()),duration:200.0,..Default::default()}],..older.clone() };
+        assert_eq!(subsumed_releases(&[older.clone(),newer.clone()]).get("old").map(String::as_str),Some("new"));
+        newer.tracks[0].title = "Song (Extended Mix)".into();
+        assert!(subsumed_releases(&[older.clone(),newer.clone()]).is_empty());
+        newer.tracks[0] = track; newer.available = Some(false);
+        assert!(subsumed_releases(&[older,newer]).is_empty());
+    }
 
     #[test]
     fn credits_need_two_local_anchors_for_strong_network() {

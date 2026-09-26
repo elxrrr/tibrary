@@ -111,6 +111,8 @@ pub async fn link_library_mode(
     let mut local_tracks = Vec::new();
     let mut file_stamps = HashMap::new();
     let mut totals = HashMap::new();
+    let mut local_upcs = HashMap::new();
+    let mut local_genres: HashMap<String, HashSet<String>> = HashMap::new();
     let mut local_credits = HashMap::new();
     let mut eligible = HashSet::new();
 
@@ -165,6 +167,8 @@ pub async fn link_library_mode(
                     .unwrap_or(0)
             }
         };
+        if let Some(genres) = tags.get("genre") { local_genres.insert(path.clone(),genres.split(';').map(crate::matching::name_key).filter(|g| !g.is_empty()).collect()); }
+        if let Some(upc) = tags.get("upc").or(tags.get("barcode")) { local_upcs.insert(path.clone(),upc.clone()); }
         totals.insert(
             path.clone(),
             (
@@ -296,6 +300,15 @@ pub async fn link_library_mode(
             }
         }
 
+        // Provider replacement IDs are candidate edges, never identity proof.
+        // Keep the original placement and require the normal recording/position checks.
+        let replacement_ids: Vec<_> = candidate_releases.iter().filter_map(|r| r.replacement_id.clone()).collect();
+        for id in replacement_ids {
+            if candidate_releases.iter().any(|r| r.id == id) { continue; }
+            if let Some(target) = catalogues_by_artist.values().flatten().find(|r| r.id == id && title_key(&r.artist) == art_key) {
+                candidate_releases.push(target.clone());
+            }
+        }
         // A local repair must never trigger network requests or erase a prior choice
         // when the catalogue lacks any candidate's full track list.
         if cached_only && (candidate_releases.is_empty() || candidate_releases.iter().any(|r| !r.tracks_loaded)) { continue; }
@@ -335,6 +348,8 @@ pub async fn link_library_mode(
         // Match against candidates
         let mut scored_candidates = Vec::new();
         let mut credit_scores = HashMap::new();
+        let mut barcode_scores = HashMap::new();
+        let mut genre_scores = HashMap::new();
         for rel in &candidate_releases {
             let mut res = structure_match(&group_tracks, rel);
             let unofficial = rel.official == Some(false)
@@ -412,6 +427,9 @@ pub async fn link_library_mode(
                         .count()
                 })
                 .sum();
+            let remote_genres: HashSet<_> = rel.genres.iter().chain(rel.tracks.iter().flat_map(|t| t.genres.iter())).map(|g| crate::matching::name_key(g)).collect();
+            genre_scores.insert(rel.id.clone(), group_tracks.iter().filter_map(|t| local_genres.get(&t.path)).map(|g| g.intersection(&remote_genres).count()).sum::<usize>());
+            barcode_scores.insert(rel.id.clone(), rel.upc.as_ref().is_some_and(|upc| !upc.is_empty() && group_tracks.iter().any(|t| local_upcs.get(&t.path) == Some(upc)) && group_tracks.iter().all(|t| local_upcs.get(&t.path).is_none_or(|local| local == upc))));
             credit_scores.insert(rel.id.clone(), shared);
             scored_candidates.push((rel, res));
         }
@@ -422,7 +440,10 @@ pub async fn link_library_mode(
                 .cmp(&a.1.compatible)
                 .then_with(|| b.1.matched_count.cmp(&a.1.matched_count))
                 .then_with(|| a.1.conflicts.len().cmp(&b.1.conflicts.len()))
+                .then_with(|| barcode_scores[&b.0.id].cmp(&barcode_scores[&a.0.id]))
                 .then_with(|| credit_scores[&b.0.id].cmp(&credit_scores[&a.0.id]))
+                .then_with(|| a.0.replacement_id.is_some().cmp(&b.0.replacement_id.is_some()))
+                .then_with(|| genre_scores[&b.0.id].cmp(&genre_scores[&a.0.id]))
         });
 
         let (best_rel, best_struct) = &scored_candidates[0];

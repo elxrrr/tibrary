@@ -81,7 +81,7 @@ pub async fn cached_mqa_rows(
         json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),
             "status":result.and_then(|value| value["status"].as_str()).unwrap_or("Not audited"),
             "evidence":result.and_then(|value| value["evidence"].as_str()).unwrap_or("New or changed audio; run the MQA audit"),
-            "affected":result.is_some_and(|value| value["detected"] == true),"target":"Queue lossless replacement"})
+            "affected":result.is_some_and(|value| value["detected"] == true),"target":if result.is_some_and(|v| v["detected"] == true) { "Queue lossless replacement" } else { "—" }})
     }).collect();
     Ok(rows)
 }
@@ -102,13 +102,15 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
         let mut tracks: Vec<crate::tidal::TidalTrack> =
             serde_json::from_value(value["tracks"].clone()).map_err(|e| e.to_string())?;
         let due = tracks.iter().any(|track| {
-            !track.credits_complete
+            track.discovery_checked_at.is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || !track.credits_complete
                 && track
                     .credits_checked_at
                     .is_none_or(|at| chrono::Utc::now().timestamp() - at >= 86_400)
         });
-        if due {
+        let release_due = value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400);
+        if due || release_due {
             if let Ok(mut client) = crate::tidal::TidalClient::from_db(db).await {
+                if release_due { fill_release_discovery(&mut client, &mut value, id, market).await; }
                 client.fill_track_credits(&mut tracks, market).await;
                 value["tracks"] = serde_json::to_value(tracks).map_err(|e| e.to_string())?;
                 return publish_release(db, id, market, value).await;
@@ -139,11 +141,29 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
             .join(", ");
         value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"original_release_date":a["originalReleaseDate"],"type":a["albumType"].as_str().unwrap_or("album"),"official":a["official"],"secondary_types":a["secondaryTypes"],"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str().or(a["copyright"]["text"].as_str()),"upc":a["barcodeId"].as_str().or(a["upc"].as_str()),"quality":a["mediaTags"].as_array().map(|values|values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),"audio_modes":a["audioModes"],"media_metadata":a["mediaMetadata"],"remote_metadata":raw});
     }
+    fill_release_discovery(&mut client, &mut value, id, market).await;
     let tracks = client.get_release_details(id, market).await?;
     value["tracks"] = serde_json::to_value(&tracks).map_err(|e| e.to_string())?;
     value["tracks_loaded"] = json!(true);
     value["track_count"] = json!(tracks.len());
     publish_release(db, id, market, value).await
+}
+
+async fn fill_release_discovery(client: &mut crate::tidal::TidalClient, value: &mut Value, id: &str, market: &str) {
+    // Optional metadata never invalidates a cached release or fails a linking job.
+    let now = chrono::Utc::now().timestamp();
+    value["discovery_checked_at"] = json!(now - 29 * 86_400); // Retry failures in one day.
+    let Ok(mut url) = url::Url::parse(&format!("https://openapi.tidal.com/v2/albums/{id}")) else { return };
+    url.query_pairs_mut().append_pair("countryCode",market).append_pair("include","genres,replacement");
+    if let Ok(raw) = client.get_json(url.as_str()).await {
+        let data = raw["data"].as_array().and_then(|a| a.first()).unwrap_or(&raw["data"]);
+        let included = raw["included"].as_array().cloned().unwrap_or_default();
+        if data["id"].as_str() == Some(id) {
+            value["genres"] = json!(crate::tidal::related_genres(data, &included));
+            value["replacement_id"] = json!(crate::tidal::replacement_id(data));
+            value["discovery_checked_at"] = json!(now);
+        }
+    }
 }
 
 async fn publish_release(
@@ -1348,7 +1368,7 @@ pub async fn execute(
             )
             .await?;
             let tags = workflows::extract_tags_map(&file.metadata);
-            rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"status":result["status"],"evidence":result["evidence"],"affected":result["detected"],"target":"Queue lossless replacement"}));
+            rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"status":result["status"],"evidence":result["evidence"],"affected":result["detected"],"target":if result["detected"] == true { "Queue lossless replacement" } else { "—" }}));
         }
         db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows))
             .await?;

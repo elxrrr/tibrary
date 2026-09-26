@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRowPlan {
@@ -282,7 +283,17 @@ pub fn plan_workflow(
                     format_layout(Path::new(&row.root), &current_tags, template, ext)
                 {
                     let target_str = target_path.display().to_string();
-                    if target_str != row.path {
+                    // APFS spelling differences alone do not require moving audio.
+                    if target_str.nfc().collect::<String>().to_lowercase() != row.path.nfc().collect::<String>().to_lowercase() {
+                        let source = Path::new(&row.path).strip_prefix(&row.root).unwrap_or(Path::new(&row.path));
+                        let destination = target_path.strip_prefix(&row.root).unwrap_or(&target_path);
+                        let old: Vec<_> = source.components().map(|p| p.as_os_str().to_string_lossy().to_string()).collect();
+                        let new: Vec<_> = destination.components().map(|p| p.as_os_str().to_string_lossy().to_string()).collect();
+                        for i in 0..old.len().max(new.len()) {
+                            let before = old.get(i).map(String::as_str).unwrap_or("(none)");
+                            let after = new.get(i).map(String::as_str).unwrap_or("(none)");
+                            if before != after { issues.push(format!("{}: {} → {}", if i == 0 { "Album artist folder" } else if i == 1 { "Release folder" } else if i + 1 == new.len() { "Filename" } else { "Disc folder" }, before, after)); }
+                        }
                         target = Some(target_str);
                     }
                 }

@@ -578,7 +578,7 @@ function App() {
       } else if (route === "local" || route === "online") {
         setDetail({operation: row});
       } else if (row.path || route === "links") {
-        setDetail({...await call("detail", { root, path: row.path || row.id }), proposed: row.changes, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
+        setDetail({...await call("detail", { root, path: row.path || row.id }), proposed: row.changes, folder_target: route === "organise" ? row.target : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
       }
     } catch (e) {
       notifyError(e);
@@ -1067,8 +1067,8 @@ function App() {
               Link selected for replacement
             </button>
             <button
-              disabled={busy || !selected.size}
-              onClick={() => run("queue_mqa", scope())}
+              disabled={busy || !data.rows.some(r => selected.has(r.id) && r.affected === true)}
+              onClick={() => run("queue_mqa", {ids: data.rows.filter(r => selected.has(r.id) && r.affected === true).map(r => r.id)})}
             >
               Queue lossless replacements
             </button>
@@ -1251,6 +1251,7 @@ function App() {
                 "Potential",
                 "Suspect / Low match",
                 "Unmatched",
+                "Superseded",
               ].map((v) => (
                 <option key={v}>{v}</option>
               ))}
@@ -1524,7 +1525,7 @@ function App() {
     hint?: string,
   ) {
     return (
-      <label className="setting-row">
+      <label className="setting-row" title={hint}>
         <span>{label}</span>
         <input
           type="checkbox"
@@ -1533,7 +1534,7 @@ function App() {
             updateSetting(section, key, e.target.checked);
           }}
         />
-        {hint && <span className="hint">{hint}</span>}
+
       </label>
     );
   }
@@ -1578,17 +1579,17 @@ function App() {
           </section>
           <section className="card">
             <h2>Release matching &amp; recommendations</h2>
-            <label className="setting-row"><span>Treat a complete standard or deluxe edition as owned</span>
+            <label className="setting-row" title="Treat a complete local standard or deluxe edition as owned when its artist and release title agree. Turn off to inspect each edition separately."><span>Treat a complete standard or deluxe edition as owned</span>
               <input type="checkbox" checked={settings.general?.treat_editions_as_owned !== false}
                 onChange={(event) => updateSetting("general", "treat_editions_as_owned", event.target.checked)}/></label>
-            {toggle("Include live releases", "general", "recommend_live")}
+            {toggle("Include live releases", "general", "recommend_live", "Allow live recordings in recommendations. Studio and live recordings still require separate recording matches.")}
             <label className="setting-row" title="Include bootlegs/unofficial live recordings in match candidates and artist recommendations">
               <span>Include bootlegs and unofficial recordings</span>
               <input type="checkbox" checked={settings.general?.recommend_bootlegs === true}
                 onChange={(event) => updateSetting("general", "recommend_bootlegs", event.target.checked)}/>
             </label>
-            {toggle("Include compilations in matching and recommendations", "general", "recommend_compilations")}
-            {toggle("Allow fuzzy title matches for review", "general", "fuzzy_release_matching")}
+            {toggle("Include compilations in matching and recommendations", "general", "recommend_compilations", "Allow compilation editions as automatic match candidates and recommendation candidates. Artist, recording and release checks still apply.")}
+            {toggle("Allow fuzzy title matches for review", "general", "fuzzy_release_matching", "Consider related release titles for manual review. Similar titles alone never authorize a link or tag change.")}
           </section>
           <section className="card">
             <h2>Artist matching</h2>
@@ -2172,7 +2173,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.13 · build 13</span>
+          <span className="sidebar-version">v0.9.0-beta.14 · build 14</span>
         </div>
       </aside>
       <main>
@@ -2299,7 +2300,7 @@ function App() {
               ? "Artist candidates"
               : detail.release
                 ? "Release details"
-                : "Recording & release match"
+                : detail.folder_target ? "Folder layout preview" : "Recording & release match"
           }
           wide
           onClose={() => setDetail(null)}
@@ -2317,10 +2318,11 @@ function App() {
                     Show in Finder
                   </button>
                 </div>
-                {detail.proposed && <section><h3>Proposed changes</h3>
+                {detail.folder_target && <section className="metadata-source"><h3>Proposed folder layout</h3><p>{detail.folder_evidence}</p><dl><dt>Current path</dt><dd>{detail.path}</dd><dt>Proposed path</dt><dd>{detail.folder_target}</dd></dl><p>Only the file location changes. Tags remain unchanged.</p></section>}
+                {detail.proposed && Object.keys(detail.proposed).length > 0 && <section><h3>Proposed changes</h3>
                   {detail.source_release_id && <p>Online source · Release {detail.source_release_id} · Track {detail.source_track_id}</p>}
                   <TagChanges changes={detail.proposed} current={detail.tags}/></section>}
-                <h3>Available placements</h3>
+                {!detail.folder_target && <><h3>Available placements</h3>
                 {detail.catalogue_options?.length ? (
                   detail.catalogue_options.map((o: any, i: number) => (
                     <article
@@ -2338,10 +2340,10 @@ function App() {
                           {o.artist} — {o.album}
                         </strong>
                         <p>
-                          {o.position_label} · ID {o.id}
+                          {o.position_label || "Position not yet verified"} · Release ID {o.id}
                         </p>
                         <p>{o.evidence}</p>
-                        <p
+                        {(o.structure?.compatible || (o.structure?.reason || o.structure?.reasons) && readable(o.structure?.reason || o.structure?.reasons) !== readable(o.evidence)) && <p
                           className={
                             o.structure?.compatible ? "success" : "warning"
                           }
@@ -2353,7 +2355,7 @@ function App() {
                                   o.structure?.reasons ||
                                   "Structural difference; review carefully",
                               )}
-                        </p>
+                        </p>}
                       </div>
                       <div className="toolbar">
                         <button
@@ -2416,12 +2418,13 @@ function App() {
                     Recheck this track
                   </button>
                 </div>
+                </>}
                 <details>
-                  <summary>All saved tags & DJ checks</summary>
+                  <summary>{detail.folder_target ? "Saved file tags" : "All saved tags & DJ checks"}</summary>
                   <h4>Local file tags</h4>
                   <MetadataView value={detail.tags} title="Local file tags"/>
-                  <h4>Online metadata by release</h4>
-                  <MetadataView value={detail.dj_checks} title="Online source"/>
+                  {!detail.folder_target && <><h4>Online metadata by release</h4>
+                  <MetadataView value={detail.dj_checks} title="Online source"/></>}
                   {detail.catalogue_note && <p>{readable(detail.catalogue_note)}</p>}
 
                 </details>
