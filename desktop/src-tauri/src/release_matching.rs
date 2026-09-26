@@ -314,6 +314,7 @@ mod tests {
                 },
             ],
             tracks_loaded: true,
+            ..Default::default()
         };
 
         let result = structure_match(&local, &release);

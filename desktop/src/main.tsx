@@ -44,6 +44,8 @@ import {
   AppState,
 } from "./api";
 import { DataTable, Column } from "./DataTable";
+import { ActivityView, streamFor } from "./ActivityView";
+import { workload } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import "./style.css";
 const groups = [
@@ -126,6 +128,7 @@ const organisationActions = [
   ],
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
+const onlineKinds = new Set(["link", "discography", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
 const descriptions: Record<string, string> = {
   overview: "Your library, from local preparation to new music.",
   correct:
@@ -149,7 +152,7 @@ const descriptions: Record<string, string> = {
   favourites: "One row per artist across all confirmed identities.",
   connections: "Catalogue access, account sessions and extended metadata.",
   downloads: "Audio quality, output folders and service pacing.",
-  general: "Appearance, libraries and matching preferences.",
+  general: "Application display, libraries and matching preferences.",
 };
 const fileColumns: Column[] = [
   { key: "artist", label: "Album artist" },
@@ -211,8 +214,6 @@ function App() {
   const [state, setState] = useState<AppState | null>(null),
     [route, setRoute] = useState("overview"),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
-  const [logCategory, setLogCategory] = useState("all"),
-    [logSearch, setLogSearch] = useState("");
   const [collapsed, setCollapsed] = useState(new Set<string>()),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
@@ -242,11 +243,17 @@ function App() {
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
   const [downloadMonitor, setDownloadMonitor] = useState<Record<string, Row>>({});
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => {
+    if (!active(state?.job) && !active(state?.online_job) && !active(state?.download_job)) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [state?.job?.status, state?.online_job?.status, state?.download_job?.status]);
   useEffect(() => {
     if (route !== "overview" || !state) return;
     let alive = true;
     call("table", {route: "missing", timeline: "All missing releases", status: "Missing release",
-      sort: "date", direction: "desc", limit: 20, recommendation: "All recommendations"})
+      sort: "date", direction: "desc", limit: 50, recommendation: "All recommendations"})
       .then((result) => { if (alive) { setLatestMissing(result.rows); setMissingReleaseCount(result.total); } })
       .catch((e) => { if (alive) notifyError(e); });
     return () => { alive = false; };
@@ -273,11 +280,12 @@ function App() {
         ?.focus();
   }, [menu]);
   const sequence = useRef(0),
-    seenJob = useRef(""),
+    seenJobs = useRef(new Set<string>()),
     lastRoute = useRef(route),
     stateRef = useRef(state);
   stateRef.current = state;
-  const busy = submitting || active(state?.job);
+  const onlineRoute = ["catalogue", "artists", "links", "favourites", "missing", "metadata", "artwork", "online", "connections", "fix"].includes(route);
+  const busy = submitting || active(onlineRoute ? state?.online_job : state?.job);
   const tree = ["missing", "queue", "downloaded"].includes(route);
   const notifyError = (e: any) => setError(String(e?.message || e));
   async function refresh(targetRoot?: string) {
@@ -307,6 +315,7 @@ function App() {
   }, [root]);
   useEffect(() => {
     localStorage.setItem("tibrary.route", route);
+    setData({rows: [], total: 0});
     setSelection({});
     setSelected(new Set());
     setOffset(0);
@@ -331,7 +340,8 @@ function App() {
   }, [route]);
   useEffect(() => {
     document.documentElement.dataset.theme = state?.settings.theme || "system";
-  }, [state?.settings.theme]);
+    document.documentElement.dataset.highlight = settings?.general?.highlight_colour || "blue";
+  }, [state?.settings.theme, settings?.general?.highlight_colour]);
   const pageSize = Number(settings?.general?.page_size || 50);
   useEffect(() => { setOffset(0); }, [pageSize]);
   const viewArgs = {
@@ -410,7 +420,13 @@ function App() {
       if (p.event === "progress" && p.download_job) {
         setState((s) => s ? { ...s, download_job: p.download_job } : s);
       }
-      if (p.event === "progress" && !p.download_job)
+      if (p.event === "progress" && p.online_job) {
+        setState((s) => s ? { ...s, online_job: p.online_job, logs: [
+          ...s.logs.filter(log => log.progress_id !== p.online_job.id),
+          {progress_id:p.online_job.id, at:new Date().toISOString(), message:p.message, category:"online", level:"info"}
+        ].slice(-1000)} : s);
+      }
+      if (p.event === "progress" && !p.download_job && !p.online_job)
         setState((s) =>
           s
             ? {
@@ -446,13 +462,13 @@ function App() {
   useEffect(() => {
     let polling = false, disposed = false;
     const timer = setInterval(async () => {
-      if (polling || !active(stateRef.current?.job)) return;
+      if (polling || ![stateRef.current?.job, stateRef.current?.online_job, stateRef.current?.download_job].some(active)) return;
       polling = true;
       try {
         const update = await call<any>("job.status");
-        if (!disposed && update.job) {
+        if (!disposed && (update.job || update.online_job || update.download_job)) {
           setState(s => s ? {...s, ...update} : s);
-          if (!active(update.job)) await refresh();
+          if (![update.job, update.online_job, update.download_job].some(active)) await refresh();
         }
       } catch (e) { if (!disposed) notifyError(e); }
       finally { polling = false; }
@@ -460,12 +476,12 @@ function App() {
     return () => { disposed = true; clearInterval(timer); };
   }, [root]);
   useEffect(() => {
-    const j = state?.job;
-    if (!j || j.historical || active(j) || seenJob.current === j.id) return;
-    seenJob.current = j.id;
+    for (const j of [state?.job, state?.online_job]) {
+    if (!j || j.historical || active(j) || seenJobs.current.has(j.id)) continue;
+    seenJobs.current.add(j.id);
     if (j.status === "failed") {
       setError(j.message);
-      return;
+      continue;
     }
     if (j.result?.preview_id) {
       const op = j.result.operation;
@@ -492,13 +508,6 @@ function App() {
     }
     if (j.kind === "manual_candidate" && selected.size)
       loadDetail({ id: [...selected][0] });
-    setToast(
-      j.status === "cancelled"
-        ? "Operation cancelled. Completed changes are saved."
-        : j.result?.message ||
-            j.result?.summary ||
-            (typeof j.result === "string" ? j.result : "Operation complete"),
-    );
     if (
       [
         "connections",
@@ -509,14 +518,15 @@ function App() {
       ].includes(j.kind)
     )
       call("settings").then(setSettings);
-  }, [state?.job]);
+    }
+  }, [state?.job, state?.online_job]);
   async function run(kind: string, args: any = {}) {
     setError("");
     setSubmitting(true);
     if (kind === "download") setDownloadMonitor({});
     try {
       const j = await call<Job>("job.start", { kind, args: { root, ...args } });
-      setState((s) => (s ? kind === "download" ? { ...s, download_job: j } : { ...s, job: j } : s));
+      setState((s) => (s ? kind === "download" ? { ...s, download_job: j } : onlineKinds.has(kind) ? { ...s, online_job: j } : { ...s, job: j } : s));
       if (kind === "preview") setSelected(new Set());
       if (!active(j)) await refresh();
     } catch (e) {
@@ -724,7 +734,7 @@ function App() {
     const s = state?.stats || {};
     const group = groups.find((g) => g.id === route);
     return (
-      <>
+      <div className={route === "overview" ? "overview-dashboard" : "dashboard"}>
         <div className="metrics">
           {route === "overview" ? (
             <>
@@ -847,7 +857,7 @@ function App() {
           </div>
         </section>
         {route === "overview" && (
-          <section className="card">
+          <section className="card latest-missing-card">
             <div className="section-heading">
               <h2>Latest missing releases</h2>
               <button onClick={() => { setTimeline("All missing releases"); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
@@ -888,7 +898,7 @@ function App() {
             </div>
           </section>
         )}
-      </>
+      </div>
     );
   }
   function toolbar() {
@@ -1127,6 +1137,9 @@ function App() {
             >
               Find new releases (online)
             </button>
+            <button disabled={busy} onClick={() => mutate("missing.rebuild")} title="Recalculate ownership and recommendations from saved local tags and catalogue data without contacting the service">
+              Recheck cached releases
+            </button>
             <button
               disabled={
                 busy || !Object.keys(selectedReleases(selection)).length
@@ -1218,7 +1231,7 @@ function App() {
             <select
               aria-label="Recommendation"
               value={recommendation}
-              onChange={(e) => setRecommendation(e.target.value)}
+              onChange={(e) => { setRecommendation(e.target.value); setOffset(0); }}
             >
               {[
                 "All recommendations",
@@ -1233,7 +1246,7 @@ function App() {
             <select
               aria-label="Copyright match"
               value={copyright}
-              onChange={(e) => setCopyright(e.target.value)}
+              onChange={(e) => { setCopyright(e.target.value); setOffset(0); }}
             >
               {[
                 "All copyrights",
@@ -1246,7 +1259,7 @@ function App() {
             <select
               aria-label="Release type"
               value={releaseType}
-              onChange={(e) => setReleaseType(e.target.value)}
+              onChange={(e) => { setReleaseType(e.target.value); setOffset(0); }}
             >
               {["All types", "ALBUM", "EP", "SINGLE"].map((v) => (
                 <option key={v}>{v}</option>
@@ -1346,6 +1359,7 @@ function App() {
           onSort={(key) => {
             setSort(key);
             setDirection(sort === key && direction === "asc" ? "desc" : "asc");
+            setOffset(0);
           }}
           tree={tree}
           grouped={route === "local"}
@@ -1517,7 +1531,8 @@ function App() {
       return (
         <>
           <section className="card">
-            <h2>Appearance & catalogue</h2>
+            <h2>Application & display</h2>
+            {field("Highlight colour", "general", "highlight_colour", [{value:"blue",label:"Blue"},{value:"grey",label:"Grey"}])}
             {field("Colour theme", "general", "theme", [
               "system",
               "light",
@@ -1538,6 +1553,17 @@ function App() {
               true,
             )}
             {field("Catalogue market", "general", "market")}
+            <label className="setting-row">
+              <span>Treat a complete standard or deluxe edition as owned</span>
+              <input type="checkbox" checked={settings.general?.treat_editions_as_owned !== false}
+                onChange={(event) => updateSetting("general", "treat_editions_as_owned", event.target.checked)}/>
+            </label>
+            <label className="setting-row"><span>Include live releases in recommendations</span>
+              <input type="checkbox" checked={settings.general?.recommend_live === true}
+                onChange={(event) => updateSetting("general", "recommend_live", event.target.checked)}/></label>
+            <label className="setting-row"><span>Include bootlegs in recommendations</span>
+              <input type="checkbox" checked={settings.general?.recommend_bootlegs === true}
+                onChange={(event) => updateSetting("general", "recommend_bootlegs", event.target.checked)}/></label>
             <label className="setting-row">
               <span>Save activity logs</span>
               <input
@@ -1633,13 +1659,11 @@ function App() {
                         ? m.ok
                           ? m.connected_on
                             ? `Connected on: ${m.connected_on}`
-                            : "Connected on: Today"
+                            : "Connected date unavailable"
                           : msg || "Needs attention"
                         : key === "catalogue"
                           ? m.ok
-                            ? m.latency_ms !== undefined
-                              ? `· ${m.latency_ms} ms`
-                              : ""
+                            ? [m.connected_on ? `Connected on: ${m.connected_on}` : "", m.latency_ms !== undefined ? `${m.latency_ms} ms` : ""].filter(Boolean).join(" · ")
                             : msg || "Needs attention"
                           : [
                               m.latency_ms ? `· ${m.latency_ms} ms` : "",
@@ -1745,8 +1769,7 @@ function App() {
         <section className="card">
           <h2>Download folder & structure</h2>
           <p>
-            Music is arranged using saved tags. Disc folders appear only for
-            multi-disc releases.
+
           </p>
           <label className="setting-row">
             <span>Download folder</span>
@@ -2116,7 +2139,7 @@ function App() {
                 >
                   <Icon size={16} />
                   {name}
-                  {id === "activity" && (active(state?.job) || active(state?.download_job)) && (
+                  {id === "activity" && (active(state?.job) || active(state?.online_job) || active(state?.download_job)) && (
                     <span className="live-dot" />
                   )}
                 </button>
@@ -2124,7 +2147,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.9 · build 9</span>
+          <span className="sidebar-version">v0.9.0-beta.10 · build 10</span>
         </div>
       </aside>
       <main>
@@ -2133,6 +2156,18 @@ function App() {
             <h1>{titles[route] || "Overview"}</h1>
           </div>
           <div className="header-actions">
+            {(active(state?.job) || active(state?.online_job) || active(state?.download_job)) && (
+              <div className="header-workloads" role="status" aria-live="off">
+                {[state?.job, state?.online_job, state?.download_job].filter(active).map((job) => {
+                  const progress = workload(job, downloadMonitor, clock);
+                  return <div className="header-workload" key={job!.id} title={job?.message}>
+                    <LoaderCircle className="spin" size={13}/>
+                    <span>{job?.kind === "download" ? "Downloads" : job?.kind?.replaceAll("_", " ")} · {progress?.label}</span>
+                    {progress?.percent != null && <span className="header-workload-bar" style={{width: `${progress.percent}%`}}/>}
+                  </div>;
+                })}
+              </div>
+            )}
             <select
               aria-label="Active library"
               value={root}
@@ -2148,17 +2183,17 @@ function App() {
             {route !== "activity" && (
               <button
                 className={
-                  active(state?.job) || active(state?.download_job) ? "activity-pill running" : "activity-pill"
+                  active(state?.job) || active(state?.online_job) || active(state?.download_job) ? "activity-pill running" : "activity-pill"
                 }
                 onClick={() => setRoute("activity")}
               >
-                {active(state?.job) || active(state?.download_job) ? (
+                {active(state?.job) || active(state?.online_job) || active(state?.download_job) ? (
                   <LoaderCircle className="spin" size={16} />
                 ) : (
                   <Activity size={16} />
                 )}{" "}
-                {active(state?.job) || active(state?.download_job)
-                  ? state?.job?.status === "cancelling" || state?.download_job?.status === "cancelling"
+                {active(state?.job) || active(state?.online_job) || active(state?.download_job)
+                  ? state?.job?.status === "cancelling" || state?.online_job?.status === "cancelling" || state?.download_job?.status === "cancelling"
                     ? "Cancelling…"
                     : "Working"
                   : "Activity"}
@@ -2196,7 +2231,7 @@ function App() {
             <div className={"page-body-wrap" + (isScrollPage ? " has-scroll-fade" : "")}>
               <div
                 className={
-                  "page-body " + (isScrollPage ? "scroll-page" : "table-page")
+                  "page-body " + (isScrollPage ? "scroll-page" : "table-page") + (route === "overview" ? " overview-page" : "")
                 }
               >
           {["overview", ...groups.map((g) => g.id)].includes(route) ? (
@@ -2204,226 +2239,19 @@ function App() {
           ) : ["general", "connections", "downloads"].includes(route) ? (
             settingsPage()
           ) : route === "activity" ? (
-            <>
-              {(() => {
-                const job = active(state?.job) ? state?.job : state?.download_job || state?.job;
-                const isJobActive = active(job);
-                if (!isJobActive) {
-                  return (
-                    <section className="card activity-status">
-                      <div className="activity-status-info">
-                        <div className="activity-status-title-row">
-                          <h2>No jobs currently running...</h2>
-                        </div>
-                        <p>
-                          Operations will appear here. You can keep browsing while they run.
-                        </p>
-                      </div>
-                      <button disabled={true}>
-                        Cancel
-                      </button>
-                    </section>
-                  );
-                }
-
-                const rawStatus = (job?.status || "running").toLowerCase();
-                const rawKind = (job?.kind || "").toLowerCase();
-
-                let statusLabel = "RUNNING";
-                let statusClass = "running";
-                if (rawStatus === "cancelling") {
-                  statusLabel = "CANCELLING";
-                  statusClass = "cancelling";
-                }
-
-                const kindTitles: Record<string, string> = {
-                  download: "Lossless Audio Download",
-                  scan: "Library Scan",
-                  link: "Catalogue Linker",
-                  mqa: "MQA Audio Inspection",
-                  queue_mqa: "Queue Lossless Replacements",
-                  duplicates: "Duplicate Scanner",
-                  review_consolidation: "Duplicate Consolidation",
-                  apply_consolidation: "Trash Duplicate Files",
-                  metadata: "Metadata Tagging",
-                  artwork: "Artwork Fetcher",
-                  correct: "Tag Correction",
-                  organise: "Folder Organization",
-                  favourites: "Refresh Favourite Artists",
-                };
-                const displayTitle =
-                  kindTitles[rawKind] ||
-                  (rawKind
-                    ? rawKind
-                        .split("_")
-                        .map((w: string) => w.charAt(0).toUpperCase() + w.slice(1))
-                        .join(" ")
-                    : "Active Operation");
-
-                return (
-                  <section className="card activity-status">
-                    <div className="activity-status-info">
-                      <div className="activity-status-title-row">
-                        <h2>{displayTitle}</h2>
-                        <span className="dot-separator">·</span>
-                        <span className={`status-badge status-${statusClass}`}>
-                          {statusLabel}
-                        </span>
-                      </div>
-                      <p>
-                        {job?.message ||
-                          "Operations will appear here. You can keep browsing while they run."}
-                      </p>
-                    </div>
-                    <button
-                      disabled={job?.status === "cancelling"}
-                      onClick={() => call("job.cancel", { kind: job?.kind }).catch(notifyError)}
-                    >
-                      Cancel
-                    </button>
-                  </section>
-                );
-              })()}
-              <div className="activity-controls">
-                <div className="activity-filters">
-                  <select
-                    aria-label="Filter activity category"
-                    value={logCategory}
-                    onChange={(e) => setLogCategory(e.target.value)}
-                  >
-                    <option value="all">All</option>
-                    <option value="download">DOWNLOAD</option>
-                    <option value="scan">SCAN</option>
-                    <option value="linking">LINKING</option>
-                    <option value="cleanup">CLEANUP</option>
-                    <option value="error">ERROR</option>
-                    <option value="general">GENERAL</option>
-                  </select>
-                  <input
-                    type="search"
-                    placeholder="Search logs..."
-                    aria-label="Search activity logs"
-                    value={logSearch}
-                    onChange={(e) => setLogSearch(e.target.value)}
-                  />
-                </div>
-                <div className="activity-actions">
-                  <span className="log-count">
-                    {(() => {
-                      const allLogs = state?.logs || [];
-                      const filtered = allLogs.filter((l) => {
-                        const cat = l.category || getLogCategory(l);
-                        if (logCategory !== "all" && cat !== logCategory) return false;
-                        if (logSearch.trim()) {
-                          const q = logSearch.trim().toLowerCase();
-                          return l.message.toLowerCase().includes(q) || cat.toLowerCase().includes(q);
-                        }
-                        return true;
-                      });
-                      return `${filtered.length} of ${allLogs.length} entries`;
-                    })()}
-                  </span>
-                  <button
-                    className="action-btn"
-                    onClick={() => {
-                      const allLogs = state?.logs || [];
-                      const filtered = allLogs
-                        .filter((l) => {
-                          const cat = l.category || getLogCategory(l);
-                          if (logCategory !== "all" && cat !== logCategory) return false;
-                          if (logSearch.trim()) {
-                            const q = logSearch.trim().toLowerCase();
-                            return l.message.toLowerCase().includes(q) || cat.toLowerCase().includes(q);
-                          }
-                          return true;
-                        })
-                        .map(
-                          (l) =>
-                            `[${new Date(l.at).toLocaleTimeString()}] [${(l.category || getLogCategory(l)).toUpperCase()}] ${l.message}`,
-                        )
-                        .join("\n");
-                      navigator.clipboard.writeText(filtered);
-                      setToast("Logs copied to clipboard");
-                      setTimeout(() => setToast(""), 2000);
-                    }}
-                    title="Copy filtered logs"
-                  >
-                    <Copy size={14} />
-                    Copy
-                  </button>
-                  <button
-                    className="action-btn"
-                    onClick={() => {
-                      call("logs.clear")
-                        .then(() => {
-                          setState((s) => (s ? { ...s, logs: [] } : s));
-                          setToast("Logs cleared");
-                          setTimeout(() => setToast(""), 2000);
-                        })
-                        .catch(notifyError);
-                    }}
-                    title="Clear log history"
-                  >
-                    <Trash2 size={14} />
-                    Clear
-                  </button>
-                </div>
-              </div>
-              <div className="activity-split">
-              <section className="activity-panel" aria-label="General activity">
-              <h2>General activity</h2>
-              <div className="activity-log">
-                {(() => {
-                  const allLogs = (state?.logs || []).slice().reverse();
-                  const filtered = allLogs.filter((l) => {
-                    const cat = l.category || getLogCategory(l);
-                    if (cat === "download") return false;
-                    if (logCategory !== "all" && cat !== logCategory) return false;
-                    if (logSearch.trim()) {
-                      const q = logSearch.trim().toLowerCase();
-                      return l.message.toLowerCase().includes(q) || cat.toLowerCase().includes(q);
-                    }
-                    return true;
-                  });
-                  if (filtered.length === 0) {
-                    return (
-                      <div className="activity-empty">
-                        <p>No activity log entries match your filter.</p>
-                      </div>
-                    );
-                  }
-                  return filtered.map((l, i) => {
-                    const cat = l.category || getLogCategory(l);
-                    return (
-                      <div key={i} className={`log-row log-${cat}`}>
-                        <time title={new Date(l.at).toLocaleString()}>
-                          {new Date(l.at).toLocaleTimeString()}
-                        </time>
-                        <span className={`log-badge log-badge-${cat}`}>
-                          {cat.toUpperCase()}
-                        </span>
-                        <span className="log-message">{l.message}</span>
-                      </div>
-                    );
-                  });
-                })()}
-              </div>
-              </section>
-              <section className="activity-panel" aria-label="Downloads">
-                <h2>Downloads</h2>
-                {active(state?.download_job) && <div className="download-row"><strong>{state?.download_job?.message}</strong><button onClick={() => call("job.cancel", {kind:"download"}).catch(notifyError)}>Cancel download</button></div>}
-                <div className="activity-log">
-                  {Object.values(downloadMonitor).length === 0 && !(state?.logs || []).some(l => (l.category || getLogCategory(l)) === "download") && <div className="activity-empty">Download progress will appear here.</div>}
-                  {Object.values(downloadMonitor).map((item) => <div className="download-row" key={item.kind === "batch" ? `batch:${item.release_id}` : `track:${item.release_id}:${item.id}`}>
-                    <strong>{item.kind === "batch" ? `${item.artist || "Release"} — ${item.release}` : item.title}</strong>
-                    <span>{item.kind === "batch" ? (() => {const tracks=Object.values(downloadMonitor).filter(row => row.kind === "track" && row.release_id === item.release_id); const bytes=tracks.reduce((n,row)=>n+(row.bytes||0),0); const total=tracks.reduce((n,row)=>n+(row.estimated_total_bytes||row.bytes||0),0); return `${item.completed_tracks || 0} of ${item.total_tracks} tracks · ${(bytes/1048576).toFixed(1)} MB downloaded${total>bytes?` · ~${((total-bytes)/1048576).toFixed(1)} MB remaining`:""}`;})() : `${item.index} of ${item.total_tracks} · ${item.percent || 0}% · ${((item.bytes || 0) / 1048576).toFixed(1)} MB${item.estimated_total_bytes ? ` / ~${(item.estimated_total_bytes / 1048576).toFixed(1)} MB` : ""} · ${item.bytes_per_second ? `${(item.bytes_per_second / 1048576).toFixed(1)} MB/s` : "—"} · ${item.eta_seconds != null ? `${item.eta_seconds}s remaining` : "ETA —"}`}</span>
-                    <span className={`status-badge status-${item.status === "failed" ? "failed" : "running"}`}>{item.status}{item.error ? ` · ${item.error}` : ""}</span>
-                  </div>)}
-                  {(state?.logs || []).filter(l => (l.category || getLogCategory(l)) === "download" && (l.level === "error" || !l.progress_id)).slice(-30).reverse().map((l,i) => <div className="log-row log-download" key={i}><time>{new Date(l.at).toLocaleTimeString()}</time><span className="log-message">{l.message}</span></div>)}
-                </div>
-              </section>
-              </div>
-            </>
+            <ActivityView
+              logs={state?.logs || []}
+              monitor={downloadMonitor}
+              job={state?.job}
+              onlineJob={state?.online_job}
+              downloadJob={state?.download_job}
+              onClear={async (stream) => {
+                await call("logs.clear", {stream});
+                if (stream === "downloads" && !active(state?.download_job)) setDownloadMonitor({});
+                setState(old => old ? {...old, logs: old.logs.filter(entry => streamFor(entry) !== stream)} : old);
+              }}
+              onCancel={(kind) => call("job.cancel", {kind}).catch(notifyError)}
+            />
           ) : (
             tablePage()
           )}

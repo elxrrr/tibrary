@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.9 (build 9)
+> **Version:** 0.9.0-beta.10 (build 10)
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
 
@@ -28,6 +28,8 @@ Connections now consist of application credentials for the official catalogue AP
 
 Verification uses disposable files/databases, mocked catalogue data, and WebKit against the actual Rust RPC backend. Routine Rust tests do not consume live API quota; credential-store/live catalogue tests are explicitly ignored unless requested. A read-only snapshot of the production library was used to exercise all table routes, without modifying library files. On that 19,243-track snapshot, cold link-table construction took about 7.5 seconds; cached filtering took 16–17 ms. Cold-start query optimization remains useful future work.
 
+Build 10 gives local, online and download tasks separate running states and in-memory activity buffers. Each Activity panel can be searched, copied and cleared independently. Overview displays the newest 50 cached missing releases in a scrollable card. The missing-release index now prefers album-artist tags across both metadata layouts, treats complete standard/deluxe editions as owned by default, and uses cached UPC, ISRC, label, copyright and verified primary-artist evidence when present. "Recheck cached releases" rebuilds recommendations without spending API quota; it does not reread files on disk. The catalogue and account connection dates are written on first successful connection and do not change on later diagnostics. Only the official catalogue integration is active: MusicBrainz, Discogs and Spotify are not queried, so their release-group identifiers are used only if already present in cached data.
+
 Live official catalogue authentication, artist search and audio-only release pagination were checked. Cassie release `140303440` returns 12 audio tracks, excluding its video. An isolated authenticated one-track download and two-track parallel download passed using the saved account; both wrote only to temporary folders. A copied real FLAC passed local preview, tag application, MQA audit, and source-integrity checks. Segmented transfers and recoverable redownload publishing have focused tests. The cached-catalogue copyright-object format that caused the Online replacements and Optimizations deserialization failure now parses correctly. Non-macOS packaging and notarized public distribution are not validated by this audit.
 
 ## 1. Architecture Overview
@@ -37,7 +39,7 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        React 19 Desktop UI                             │
-│   • TypeScript · Tailwind CSS · Lucide Icons · Vite Bundler            │
+│   • TypeScript · CSS · Lucide Icons · Vite Bundler                     │
 │   • Virtualized Data Tables (Multi-Sort, Multi-Select, Cascades)       │
 │   • Reactive State Synchronization via Atomic Database Revisions       │
 └───────────────────────────────────┬────────────────────────────────────┘

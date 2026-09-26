@@ -493,6 +493,7 @@ mod tests {
                     copyright: None,
                 }],
                 tracks_loaded: true,
+                ..Default::default()
             }],
         };
         conn.execute(

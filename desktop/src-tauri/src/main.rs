@@ -5,7 +5,7 @@ use std::{
     io::Write,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -33,13 +33,102 @@ pub mod tidal;
 pub mod workflows;
 use db::TursoDb;
 
+fn is_online_job(kind: &str) -> bool {
+    matches!(kind, "link" | "discography" | "release_details" | "connections" | "favourites" | "match_artists" | "metadata" | "manual_candidate" | "artwork" | "check_replacements" | "optimizations" | "deep_review" | "deep_preview" | "connect_account" | "connect_download")
+}
+
+fn compare_table_cell(a: &Value, b: &Value, key: &str) -> std::cmp::Ordering {
+    match (a[key].as_f64(), b[key].as_f64()) {
+        (Some(left), Some(right)) => left.total_cmp(&right),
+        _ => {
+            let display = |value: &Value| value.as_str().map(str::to_owned).unwrap_or_else(|| if value.is_null() { String::new() } else { value.to_string() });
+            display(&a[key]).to_lowercase().cmp(&display(&b[key]).to_lowercase())
+        }
+    }
+}
+
+fn activity_stream(entry: &Value) -> &'static str {
+    let category = entry["category"].as_str().unwrap_or("general");
+    match category {
+        "download" => return "downloads",
+        "online" | "linking" => return "online",
+        "scan" | "cleanup" | "local" => return "local",
+        _ => {}
+    }
+    let message = entry["message"].as_str().unwrap_or("").to_lowercase();
+    if ["download", "fetching track", "saving track"].iter().any(|word| message.contains(word)) { "downloads" }
+    else if ["catalogue", "api", "remote", "artist search", "releases", "metadata source"].iter().any(|word| message.contains(word)) { "online" }
+    else { "local" }
+}
+
+fn activity_stream_index(stream: &str) -> usize {
+    match stream { "online" => 0, "downloads" => 2, _ => 1 }
+}
+
+#[derive(Default)]
+pub struct ActivityBuffers {
+    online: Mutex<Vec<Value>>,
+    local: Mutex<Vec<Value>>,
+    downloads: Mutex<Vec<Value>>,
+}
+
+impl ActivityBuffers {
+    fn buffer(&self, stream: &str) -> &Mutex<Vec<Value>> {
+        match stream { "online" => &self.online, "downloads" => &self.downloads, _ => &self.local }
+    }
+
+    fn push(&self, entry: Value) {
+        let mut entries = self.buffer(activity_stream(&entry)).lock().unwrap();
+        entries.push(entry);
+        if entries.len() > 1000 { entries.remove(0); }
+    }
+
+    fn replace_progress(&self, id: &str, entry: Value) {
+        let mut entries = self.buffer(activity_stream(&entry)).lock().unwrap();
+        if let Some(existing) = entries.iter_mut().find(|item| item["progress_id"].as_str() == Some(id)) { *existing = entry; }
+        else { entries.push(entry); }
+    }
+
+    fn retain(&self, mut keep: impl FnMut(&Value) -> bool) {
+        for stream in [&self.online, &self.local, &self.downloads] {
+            stream.lock().unwrap().retain(|entry| keep(entry));
+        }
+    }
+
+    fn clear(&self, stream: &str) {
+        if stream == "all" {
+            self.online.lock().unwrap().clear();
+            self.local.lock().unwrap().clear();
+            self.downloads.lock().unwrap().clear();
+        } else { self.buffer(stream).lock().unwrap().clear(); }
+    }
+
+    fn load(&self, entries: Vec<Value>) {
+        self.clear("all");
+        for entry in entries { self.push(entry); }
+    }
+
+    fn snapshot(&self) -> Vec<Value> {
+        let mut entries = Vec::new();
+        entries.extend(self.online.lock().unwrap().iter().cloned());
+        entries.extend(self.local.lock().unwrap().iter().cloned());
+        entries.extend(self.downloads.lock().unwrap().iter().cloned());
+        entries.sort_by(|a, b| a["at"].as_str().cmp(&b["at"].as_str()));
+        entries
+    }
+}
+
 pub struct Backend {
     pub db: Mutex<Option<Arc<TursoDb>>>,
     pub active_job_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub active_job: Mutex<Option<Value>>,
+    pub online_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    pub online_job: Mutex<Option<Value>>,
     pub download_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub download_job: Mutex<Option<Value>>,
-    pub logs: Mutex<Vec<Value>>,
+    pub logs: ActivityBuffers,
+    pub log_epochs: Arc<[AtomicU64; 3]>,
+    pub log_persist_gate: Arc<tokio::sync::Mutex<()>>,
     pub previews: Mutex<HashMap<String, Value>>,
     pub dispatch_gate: tokio::sync::Mutex<()>,
     pub read_gate: tokio::sync::Mutex<()>,
@@ -54,9 +143,13 @@ impl Default for Backend {
             db: Mutex::new(None),
             active_job_cancel: Mutex::new(None),
             active_job: Mutex::new(None),
+            online_cancel: Mutex::new(None),
+            online_job: Mutex::new(None),
             download_cancel: Mutex::new(None),
             download_job: Mutex::new(None),
-            logs: Mutex::new(Vec::new()),
+            logs: ActivityBuffers::default(),
+            log_epochs: Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]),
+            log_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             previews: Mutex::new(HashMap::new()),
             dispatch_gate: tokio::sync::Mutex::new(()),
             read_gate: tokio::sync::Mutex::new(()),
@@ -120,26 +213,30 @@ impl Backend {
         } else {
             level
         };
-        let mut logs = self.logs.lock().unwrap();
-        logs.push(json!({
+        self.logs.push(json!({
             "at": &at,
             "message": msg,
             "level": log_level,
             "category": cat
         }));
-        if logs.len() > 1000 {
-            logs.remove(0);
-        }
 
         // Persist to database if initialized and logging persistence is enabled
         if self.persist_logs.load(Ordering::SeqCst) {
             if let Some(db) = self.db.lock().unwrap().clone() {
+                let stream = activity_stream(&json!({"category":cat,"message":msg}));
+                let index = activity_stream_index(stream);
+                let epoch = self.log_epochs[index].load(Ordering::SeqCst);
+                let epochs = self.log_epochs.clone();
+                let gate = self.log_persist_gate.clone();
                 let at_str = at;
                 let msg_str = msg.to_string();
                 let lvl_str = log_level.to_string();
                 let cat_str = cat.to_string();
                 tauri::async_runtime::spawn(async move {
-                    let _ = db.log_activity(&at_str, &msg_str, &lvl_str, &cat_str).await;
+                    let _guard = gate.lock().await;
+                    if epochs[index].load(Ordering::SeqCst) == epoch {
+                        let _ = db.log_activity(&at_str, &msg_str, &lvl_str, &cat_str).await;
+                    }
                 });
             }
         }
@@ -153,6 +250,46 @@ impl Backend {
         } else {
             self.log(message);
         }
+    }
+
+    pub fn progress_for(&self, kind: &str, message: &str) {
+        if is_online_job(kind) {
+            let job = self.online_job.lock().unwrap().clone();
+            if let Some(mut job) = job {
+                job["message"] = json!(message);
+                self.update_online_job_progress(message, job);
+            } else { self.log_with_category(message, "info", Some("online")); }
+        } else { self.progress(message); }
+    }
+
+    pub fn start_online_job(&self, job: Value, cancel: Arc<AtomicBool>) {
+        if let Some(message) = job["message"].as_str() { self.log_with_category(message, "info", Some("online")); }
+        *self.online_cancel.lock().unwrap() = Some(cancel);
+        *self.online_job.lock().unwrap() = Some(job);
+    }
+
+    pub fn update_online_job_progress(&self, message: &str, job: Value) {
+        let id = job["id"].as_str().unwrap_or("online").to_string();
+        *self.online_job.lock().unwrap() = Some(job);
+        let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":message,"level":"info","category":"online","progress_id":id});
+        self.logs.replace_progress(&id, entry);
+    }
+
+    pub fn finish_online_job(&self, job: Value) {
+        self.view_cache.lock().unwrap().clear();
+        self.logs.retain(|entry| entry["progress_id"] != job["id"]);
+        if let Some(message) = job["message"].as_str() { self.log_with_category(message, if job["status"] == "failed" { "error" } else { "info" }, Some("online")); }
+        *self.online_job.lock().unwrap() = Some(job);
+        *self.online_cancel.lock().unwrap() = None;
+    }
+
+    pub fn cancel_online_job(&self) -> Option<Value> {
+        self.online_cancel.lock().unwrap().as_ref()?.store(true, Ordering::Relaxed);
+        let mut lock = self.online_job.lock().unwrap();
+        let job = lock.as_mut()?;
+        job["status"] = json!("cancelling");
+        job["message"] = json!("Cancelling online task after the current request");
+        Some(job.clone())
     }
 
     pub fn start_job(&self, job: Value, cancel_flag: Arc<AtomicBool>) {
@@ -237,26 +374,13 @@ impl Backend {
         }
         let id = job["id"].as_str().unwrap_or("progress");
         let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":msg,"level":"info","category":cat.unwrap_or("general"),"progress_id":id});
-        {
-            let mut logs = self.logs.lock().unwrap();
-            if let Some(existing) = logs
-                .iter_mut()
-                .find(|v| v["progress_id"].as_str() == Some(id))
-            {
-                *existing = entry;
-            } else {
-                logs.push(entry);
-            }
-        }
+        self.logs.replace_progress(id, entry);
         *self.active_job.lock().unwrap() = Some(job);
     }
 
     pub fn finish_job(&self, final_job: Value) {
         self.view_cache.lock().unwrap().clear();
-        self.logs
-            .lock()
-            .unwrap()
-            .retain(|entry| entry["progress_id"] != final_job["id"]);
+        self.logs.retain(|entry| entry["progress_id"] != final_job["id"]);
         if let Some(msg) = final_job.get("message").and_then(|v| v.as_str()) {
             let kind = final_job.get("kind").and_then(|v| v.as_str());
             let status = final_job.get("status").and_then(|v| v.as_str());
@@ -326,7 +450,8 @@ async fn handle_rpc_call(
                         value["job"] = job;
                     }
                     value["download_job"] = json!(state.download_job.lock().unwrap().clone());
-                    value["logs"] = json!(state.logs.lock().unwrap().clone());
+                    value["online_job"] = json!(state.online_job.lock().unwrap().clone());
+                    value["logs"] = json!(state.logs.snapshot());
                     value["auth_url"] = state
                         .pending_pkce
                         .lock()
@@ -373,7 +498,7 @@ async fn handle_rpc_uncached(
 ) -> Result<Value, String> {
     if method == "job.status" {
         return Ok(
-            json!({"job":state.active_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.lock().unwrap().clone(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
+            json!({"job":state.active_job.lock().unwrap().clone(),"online_job":state.online_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.snapshot(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
         );
     }
     if method == "table" || method == "detail" || method == "job.start" {
@@ -398,8 +523,10 @@ async fn handle_rpc_uncached(
     } else {
         None
     };
-    if method == "job.start" && args["kind"] != "download" && state.active_job_cancel.lock().unwrap().is_some() {
-        return Err("A job is already running. Wait for completion or cancel it first.".into());
+    if method == "job.start" && args["kind"] != "download" {
+        let kind = args["kind"].as_str().unwrap_or("");
+        let occupied = if is_online_job(kind) { state.online_cancel.lock().unwrap().is_some() } else { state.active_job_cancel.lock().unwrap().is_some() };
+        if occupied { return Err("A task in this section is already running. Wait for completion or cancel it first.".into()); }
     }
     if method == "job.start" && actions::handles(args["kind"].as_str().unwrap_or("")) {
         let kind = args["kind"].as_str().unwrap().to_string();
@@ -408,7 +535,8 @@ async fn handle_rpc_uncached(
         let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.;
         let cancel = Arc::new(AtomicBool::new(false));
         let initial = json!({"id":id,"kind":kind,"status":"running","message":format!("Started · {kind}"),"started":started});
-        state.start_job(initial.clone(), cancel.clone());
+        if is_online_job(&kind) { state.start_online_job(initial.clone(), cancel.clone()); }
+        else { state.start_job(initial.clone(), cancel.clone()); }
         let backend = state.clone();
         let database = db.clone();
         let app = app_handle.cloned();
@@ -444,11 +572,12 @@ async fn handle_rpc_uncached(
                 ),
             };
             let finished = json!({"id":id,"kind":kind,"status":status,"message":message,"started":started,"finished":chrono::Utc::now().timestamp_millis() as f64/1000.,"result":value});
-            backend.finish_job(finished.clone());
+            if is_online_job(&kind) { backend.finish_online_job(finished.clone()); }
+            else { backend.finish_job(finished.clone()); }
             database.bump_revision();
             let _ = database.set_preference("desktop-last-job", &finished).await;
             if let Some(app) = app {
-                let _ = app.emit("backend-event", json!({"event":"job","job":finished}));
+                let _ = app.emit("backend-event", if is_online_job(&kind) { json!({"event":"job","online_job":finished}) } else { json!({"event":"job","job":finished}) });
                 let _ = app.emit("backend-event", json!({"event":"changed"}));
             }
         });
@@ -678,17 +807,18 @@ async fn handle_rpc_uncached(
     // STATE & SETTINGS
     if method == "state" {
         let active = state.active_job.lock().unwrap().clone();
-        let mut logs = state.logs.lock().unwrap().clone();
+        let mut logs = state.logs.snapshot();
         if logs.is_empty() {
             if let Ok(loaded) = db.load_recent_logs(500).await {
                 if !loaded.is_empty() {
-                    *state.logs.lock().unwrap() = loaded.clone();
+                    state.logs.load(loaded.clone());
                     logs = loaded;
                 }
             }
         }
         let root = args.get("root").and_then(|v| v.as_str());
         let mut snapshot = db.get_state(active, &logs, root).await?;
+        snapshot["online_job"] = json!(state.online_job.lock().unwrap().clone());
         snapshot["download_job"] = json!(state.download_job.lock().unwrap().clone());
         snapshot["auth_url"] = state
             .pending_pkce
@@ -725,11 +855,11 @@ async fn handle_rpc_uncached(
         return Ok(res);
     }
     if method == "logs" {
-        let mut logs = state.logs.lock().unwrap().clone();
+        let mut logs = state.logs.snapshot();
         if logs.is_empty() {
             if let Ok(loaded) = db.load_recent_logs(500).await {
                 if !loaded.is_empty() {
-                    *state.logs.lock().unwrap() = loaded.clone();
+                    state.logs.load(loaded.clone());
                     logs = loaded;
                 }
             }
@@ -737,9 +867,25 @@ async fn handle_rpc_uncached(
         return Ok(json!(logs));
     }
     if method == "logs.clear" {
-        state.logs.lock().unwrap().clear();
-        let _ = db.clear_logs().await;
-        return Ok(json!({ "cleared": true }));
+        let stream = args.get("stream").and_then(Value::as_str).unwrap_or("all");
+        let _guard = state.log_persist_gate.lock().await;
+        if stream == "all" {
+            for epoch in state.log_epochs.iter() { epoch.fetch_add(1, Ordering::SeqCst); }
+            state.logs.clear("all");
+            db.clear_logs().await?;
+        } else {
+            if !["online", "local", "downloads"].contains(&stream) { return Err("Unknown activity stream".into()); }
+            state.log_epochs[activity_stream_index(stream)].fetch_add(1, Ordering::SeqCst);
+            state.logs.clear(stream);
+            db.clear_log_stream(stream).await?;
+        }
+        return Ok(json!({ "cleared": true, "stream": stream }));
+    }
+    if method == "missing.rebuild" {
+        db.invalidate_missing_rows();
+        state.view_cache.lock().unwrap().clear();
+        if let Some(app) = app_handle { let _ = app.emit("backend-event", json!({"event":"changed"})); }
+        return Ok(json!({"rebuilt":true}));
     }
 
     // TABLE ROUTES
@@ -889,14 +1035,7 @@ async fn handle_rpc_uncached(
                 rows.retain(|r| r.to_string().to_lowercase().contains(&q));
             }
             let sort = sort.unwrap_or("artist");
-            rows.sort_by(|a, b| match (a[sort].as_f64(), b[sort].as_f64()) {
-                (Some(a), Some(b)) => a.total_cmp(&b),
-                _ => a[sort]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .cmp(&b[sort].as_str().unwrap_or("").to_lowercase()),
-            });
+            rows.sort_by(|a, b| compare_table_cell(a, b, sort));
             if direction == Some("desc") {
                 rows.reverse();
             }
@@ -919,7 +1058,7 @@ async fn handle_rpc_uncached(
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "favourites" {
-            let page = db.get_favourite_rows().await?;
+            let page = db.get_favourite_rows(args.get("root").and_then(Value::as_str), filter.unwrap_or("all"), search.unwrap_or(""), sort.unwrap_or("artist"), direction.unwrap_or("asc"), offset, limit).await?;
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "correct" || route == "organise" {
@@ -971,7 +1110,7 @@ async fn handle_rpc_uncached(
                 let query=q.to_lowercase(); rows.retain(|row|row.to_string().to_lowercase().contains(&query));
             }
             let key = sort.unwrap_or("artist");
-            rows.sort_by_key(|row|row[key].as_str().unwrap_or("").to_lowercase());
+            rows.sort_by(|a, b| compare_table_cell(a, b, key));
             if direction == Some("desc") { rows.reverse(); }
             let total=rows.len();
             return Ok(json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,
@@ -1036,6 +1175,14 @@ async fn handle_rpc_uncached(
                 });
             }
 
+            if let Some(key) = sort {
+                rows.sort_by(|a, b| {
+                    let left = serde_json::to_value(a).unwrap_or(Value::Null);
+                    let right = serde_json::to_value(b).unwrap_or(Value::Null);
+                    let order = compare_table_cell(&left, &right, key);
+                    if direction == Some("desc") { order.reverse() } else { order }
+                });
+            }
             let total = rows.len();
             let page_rows = rows.into_iter().skip(offset).take(limit).collect();
             return serde_json::to_value(crate::db::TablePage {
@@ -1249,7 +1396,7 @@ async fn handle_rpc_uncached(
         return Ok(json!(true));
     }
     if method == "shutdown" {
-        return Ok(json!({ "safe": state.active_job_cancel.lock().unwrap().is_none() && state.download_cancel.lock().unwrap().is_none() }));
+        return Ok(json!({ "safe": state.active_job_cancel.lock().unwrap().is_none() && state.online_cancel.lock().unwrap().is_none() && state.download_cancel.lock().unwrap().is_none() }));
     }
 
     // JOBS
@@ -1405,7 +1552,7 @@ async fn handle_rpc_uncached(
             }
         };
 
-        if state.active_job_cancel.lock().unwrap().is_some() {
+        if state.online_cancel.lock().unwrap().is_some() {
             return Err("A job is already running".to_string());
         }
 
@@ -1452,7 +1599,7 @@ async fn handle_rpc_uncached(
         });
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        state.start_job(initial_job.clone(), cancel_flag.clone());
+        state.start_online_job(initial_job.clone(), cancel_flag.clone());
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
@@ -1478,14 +1625,14 @@ async fn handle_rpc_uncached(
                     "started": started,
                     "result": null
                 });
-                backend_prog.update_job_progress(&msg, prog_job.clone());
+                backend_prog.update_online_job_progress(&msg, prog_job.clone());
                 if let Some(ref app) = app_clone {
                     let _ = app.emit(
                         "backend-event",
                         json!({
                             "event": "progress",
                             "message": msg,
-                            "job": prog_job
+                            "online_job": prog_job
                         }),
                     );
                 }
@@ -1546,7 +1693,7 @@ async fn handle_rpc_uncached(
                 "result": json!({ "checked": checked })
             });
 
-            backend_task.finish_job(final_job.clone());
+            backend_task.finish_online_job(final_job.clone());
             let _ = db_clone
                 .set_preference("desktop-last-job", &final_job)
                 .await;
@@ -1556,7 +1703,7 @@ async fn handle_rpc_uncached(
                     "backend-event",
                     json!({
                         "event": "job",
-                        "job": final_job
+                        "online_job": final_job
                     }),
                 );
                 let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -1568,7 +1715,7 @@ async fn handle_rpc_uncached(
     if method == "turso.link"
         || (method == "job.start" && args.get("kind").and_then(|v| v.as_str()) == Some("link"))
     {
-        if state.active_job_cancel.lock().unwrap().is_some() {
+        if state.online_cancel.lock().unwrap().is_some() {
             return Err("A job is already running".to_string());
         }
 
@@ -1605,7 +1752,7 @@ async fn handle_rpc_uncached(
         });
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        state.start_job(initial_job.clone(), cancel_flag.clone());
+        state.start_online_job(initial_job.clone(), cancel_flag.clone());
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
@@ -1643,14 +1790,14 @@ async fn handle_rpc_uncached(
                         "started": started,
                         "result": null
                     });
-                    backend_prog.update_job_progress(&msg, prog_job.clone());
+                    backend_prog.update_online_job_progress(&msg, prog_job.clone());
                     if let Some(ref app) = app_prog {
                         let _ = app.emit(
                             "backend-event",
                             json!({
                                 "event": "progress",
                                 "message": msg,
-                                "job": prog_job
+                                "online_job": prog_job
                             }),
                         );
                     }
@@ -1701,7 +1848,7 @@ async fn handle_rpc_uncached(
                 "result": result_val
             });
 
-            backend_task.finish_job(final_job.clone());
+            backend_task.finish_online_job(final_job.clone());
             let _ = db_clone
                 .set_preference("desktop-last-job", &final_job)
                 .await;
@@ -1711,7 +1858,7 @@ async fn handle_rpc_uncached(
                     "backend-event",
                     json!({
                         "event": "job",
-                        "job": final_job
+                        "online_job": final_job
                     }),
                 );
                 let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -1740,7 +1887,7 @@ async fn handle_rpc_uncached(
             "result": json!({ "auth_url": auth_url })
         });
 
-        state.finish_job(job.clone());
+        state.finish_online_job(job.clone());
         let _ = db.set_preference("desktop-last-job", &job).await;
 
         if let Some(app) = app_handle {
@@ -1748,7 +1895,7 @@ async fn handle_rpc_uncached(
                 "backend-event",
                 json!({ "event": "authentication", "auth_url": auth_url }),
             );
-            let _ = app.emit("backend-event", json!({ "event": "job", "job": job }));
+            let _ = app.emit("backend-event", json!({ "event": "job", "online_job": job }));
         }
 
         return Ok(job);
@@ -1934,12 +2081,22 @@ async fn handle_rpc_uncached(
         return serde_json::to_value(res).map_err(|e| e.to_string());
     }
     if method == "job.cancel" {
-        state.pending_pkce.lock().unwrap().take();
-        if args["kind"] == "download" || state.active_job_cancel.lock().unwrap().is_none() {
+        let requested = args["kind"].as_str().unwrap_or("");
+        let pending_sign_in = if requested.is_empty() || requested.starts_with("connect_") {
+            state.pending_pkce.lock().unwrap().take().is_some()
+        } else { false };
+        if pending_sign_in && requested.is_empty() { return Ok(json!(true)); }
+        if requested == "download" || (requested.is_empty() && state.active_job_cancel.lock().unwrap().is_none() && state.online_cancel.lock().unwrap().is_none()) {
             if let Some(job) = state.cancel_download_job() {
                 if let Some(app) = app_handle {
                     let _ = app.emit("backend-event", json!({"event":"job","download_job":job}));
                 }
+            }
+            return Ok(json!(true));
+        }
+        if is_online_job(requested) || (requested.is_empty() && state.online_cancel.lock().unwrap().is_some()) {
+            if let Some(job) = state.cancel_online_job() {
+                if let Some(app) = app_handle { let _ = app.emit("backend-event", json!({"event":"job","online_job":job})); }
             }
             return Ok(json!(true));
         }
@@ -2087,7 +2244,7 @@ fn main() {
             backend.set_db(Arc::new(turso_db.clone()));
             if let Ok(loaded) = turso_db.load_recent_logs(500).await {
                 if !loaded.is_empty() {
-                    *backend.logs.lock().unwrap() = loaded;
+                    backend.logs.load(loaded);
                 }
             }
 
@@ -2153,7 +2310,7 @@ fn main() {
                         Some("general"),
                     );
                 } else {
-                    *backend.logs.lock().unwrap() = loaded;
+                    backend.logs.load(loaded);
                 }
             }
             app.manage(turso_db);
@@ -2171,6 +2328,18 @@ fn main() {
 
 #[cfg(test)]
 mod activity_tests {
+    #[test]
+    fn activity_buffers_route_categories_and_clear_independently() {
+        let buffers = super::ActivityBuffers::default();
+        buffers.push(serde_json::json!({"at":"2026-09-26T12:00:00Z","category":"scan","message":"Scanning downloads folder"}));
+        buffers.push(serde_json::json!({"at":"2026-09-26T12:00:01Z","category":"online","message":"Searching catalogue"}));
+        buffers.push(serde_json::json!({"at":"2026-09-26T12:00:02Z","category":"download","message":"Fetching track"}));
+        assert_eq!(buffers.local.lock().unwrap().len(), 1);
+        assert_eq!(buffers.online.lock().unwrap().len(), 1);
+        assert_eq!(buffers.downloads.lock().unwrap().len(), 1);
+        buffers.clear("local");
+        assert_eq!(buffers.snapshot().len(), 2);
+    }
     use super::*;
     #[test]
     fn download_and_local_jobs_have_independent_cancellation() {
@@ -2186,6 +2355,24 @@ mod activity_tests {
         assert_eq!(backend.active_job.lock().unwrap().as_ref().unwrap()["id"], "scan");
     }
     #[test]
+    fn online_local_and_download_jobs_keep_separate_progress_and_cancel_flags() {
+        let backend = Backend::new();
+        let online_cancel = Arc::new(AtomicBool::new(false));
+        let local_cancel = Arc::new(AtomicBool::new(false));
+        let download_cancel = Arc::new(AtomicBool::new(false));
+        backend.start_online_job(json!({"id":"online","kind":"link","status":"running"}), online_cancel.clone());
+        backend.start_job(json!({"id":"local","kind":"scan","status":"running"}), local_cancel.clone());
+        backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}), download_cancel.clone());
+        backend.progress_for("link", "Checking 2/10 releases");
+        backend.progress_for("scan", "Scanning 7/20 files");
+        assert_eq!(backend.online_job.lock().unwrap().as_ref().unwrap()["message"], "Checking 2/10 releases");
+        assert_eq!(backend.active_job.lock().unwrap().as_ref().unwrap()["message"], "Scanning 7/20 files");
+        backend.cancel_online_job().unwrap();
+        assert!(online_cancel.load(Ordering::Relaxed));
+        assert!(!local_cancel.load(Ordering::Relaxed));
+        assert!(!download_cancel.load(Ordering::Relaxed));
+    }
+    #[test]
     fn progress_replaces_one_row_and_preserves_errors() {
         let backend = Backend::new();
         let job = json!({"id":"one","kind":"scan","status":"running"});
@@ -2193,13 +2380,13 @@ mod activity_tests {
         for i in 0..100 {
             backend.update_job_progress(&format!("Scanning {i}"), job.clone());
         }
-        assert_eq!(backend.logs.lock().unwrap().len(), 1);
+        assert_eq!(backend.logs.snapshot().len(), 1);
         backend.update_job_progress("One file failed", job.clone());
-        assert_eq!(backend.logs.lock().unwrap().len(), 2);
+        assert_eq!(backend.logs.snapshot().len(), 2);
         backend.finish_job(
             json!({"id":"one","kind":"scan","status":"complete","message":"Scanned 100 files"}),
         );
-        let logs = backend.logs.lock().unwrap();
+        let logs = backend.logs.snapshot();
         assert_eq!(logs.len(), 2);
         assert!(logs.iter().all(|row| row.get("progress_id").is_none()));
     }

@@ -171,10 +171,21 @@ pub async fn execute(
         if let Ok(mut client) = crate::tidal::TidalClient::from_db(db).await {
             let start = std::time::Instant::now();
             let result = client.authenticate().await;
+            let connected_on = if result.is_ok() {
+                match db.get_preference("catalogue_connected_at").await? {
+                    Some(saved) if saved.as_str().is_some_and(|date| !date.is_empty()) => saved,
+                    _ => {
+                        let first_seen = json!(chrono::Local::now().format("%Y-%m-%d").to_string());
+                        db.set_preference("catalogue_connected_at", &first_seen).await?;
+                        first_seen
+                    }
+                }
+            } else { Value::Null };
             metrics["catalogue"] = json!({
                 "ok": result.is_ok(),
                 "message": result.err().unwrap_or_default(),
-                "latency_ms": start.elapsed().as_millis()
+                "latency_ms": start.elapsed().as_millis(),
+                "connected_on": connected_on
             });
         } else {
             metrics["catalogue"] = json!({"ok":false,"message":"Application credentials required"});
@@ -419,7 +430,7 @@ pub async fn execute(
             crate::duplicates::trash_file_or_directory(&path).await?;
             db.remove_local_file(&path).await?;
             completed += 1;
-            state.progress(&format!(
+            state.progress_for(kind, &format!(
                 "Moved duplicate to Trash · {}",
                 std::path::Path::new(&path)
                     .file_name()
@@ -478,7 +489,7 @@ pub async fn execute(
                 if !searched.insert(phrase.clone()) {
                     continue;
                 }
-                state.progress(&format!("Searching selected recordings · {phrase}"));
+                state.progress_for(kind, &format!("Searching selected recordings · {phrase}"));
                 let cache_key = format!("recording-search:{market}:{phrase}");
                 let matches = if let Some(cached) = db.get_preference(&cache_key).await? {
                     serde_json::from_value::<Vec<crate::tidal::TidalTrackSearchResult>>(cached)
@@ -852,7 +863,7 @@ pub async fn execute(
                 }
             }
             output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"affected":true,"status":"Artwork available","changes":"Embed verified 1280 × 1280 front cover","size":file.size,"mtime":file.mtime,"item":{"path":file.path,"artwork":target,"tags":{}}}));
-            state.progress(&format!(
+            state.progress_for(kind, &format!(
                 "Artwork ready · {}",
                 tags.get("title").unwrap_or(&file.path)
             ));
@@ -889,7 +900,7 @@ pub async fn execute(
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            state.progress(&format!("Finding artist matches · {name}"));
+            state.progress_for(kind, &format!("Finding artist matches · {name}"));
             let titles: Vec<String> = indexed
                 .iter()
                 .filter_map(|f| {
@@ -963,7 +974,7 @@ pub async fn execute(
                 db.choose_artist(name, &accepted).await?;
             }
             checked += 1;
-            state.progress(&format!(
+            state.progress_for(kind, &format!(
                 "Artist checked · {name} · {} supported matches",
                 accepted.len()
             ));
@@ -1150,7 +1161,7 @@ pub async fn execute(
                 Ok(()) => count += 1,
                 Err(e) => errors.push(format!("{path}: {e}")),
             }
-            state.progress(&format!(
+            state.progress_for(kind, &format!(
                 "Applied {count} files · {}",
                 std::path::Path::new(path)
                     .file_name()

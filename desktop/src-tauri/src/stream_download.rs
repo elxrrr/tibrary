@@ -450,11 +450,20 @@ pub async fn save_token(db: &TursoDb, token: &TidalToken) -> Result<(), String> 
 
     db.set_preference("account-disconnected", &json!(false))
         .await?;
-    db.set_preference(
-        "account_connected_at",
-        &json!(chrono::Local::now().format("%Y-%m-%d").to_string()),
-    )
-    .await?;
+    record_first_connected(db).await?;
+
+    Ok(())
+}
+
+async fn record_first_connected(db: &TursoDb) -> Result<(), String> {
+    let connected_at = db.get_preference("account_connected_at").await?;
+    if !connected_at.as_ref().and_then(Value::as_str).is_some_and(|date| !date.is_empty()) {
+        db.set_preference(
+            "account_connected_at",
+            &json!(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -1748,6 +1757,16 @@ pub const MINIMAL_FLAC: &[u8] = &[
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn first_account_connection_date_survives_token_refresh() {
+        let path = std::env::temp_dir().join(format!("tibrary_connection_date_{}.db", uuid::Uuid::new_v4()));
+        let db = crate::db::TursoDb::open(&path).await.unwrap();
+        db.set_preference("account_connected_at", &serde_json::json!("2025-01-02")).await.unwrap();
+        super::record_first_connected(&db).await.unwrap();
+        assert_eq!(db.get_preference("account_connected_at").await.unwrap(), Some(serde_json::json!("2025-01-02")));
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
     use super::*;
 
     #[test]

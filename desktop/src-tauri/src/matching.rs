@@ -1,10 +1,11 @@
 use std::collections::HashSet;
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 pub fn norm(value: &str) -> String {
     let lower = value.trim().to_lowercase();
     let mut result = String::with_capacity(lower.len());
     let mut prev_space = false;
-    for c in lower.chars() {
+    for c in lower.nfkd().filter(|c| !is_combining_mark(*c)) {
         if c.is_alphanumeric() {
             result.push(c);
             prev_space = false;
@@ -14,6 +15,14 @@ pub fn norm(value: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+#[cfg(test)]
+mod unicode_tests {
+    #[test]
+    fn accents_and_punctuation_normalize_for_matching() {
+        assert_eq!(super::title_key("Odysée / Remixes"), super::title_key("Odysee - Remixes"));
+    }
 }
 
 pub fn name_key(value: &str) -> String {

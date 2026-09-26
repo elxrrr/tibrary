@@ -56,6 +56,12 @@ pub struct TidalRelease {
     pub quality: String,
     pub tracks: Vec<TidalTrack>,
     pub tracks_loaded: bool,
+    pub upc: Option<String>,
+    pub release_group_id: Option<String>,
+    pub primary_type: Option<String>,
+    pub secondary_types: Vec<String>,
+    pub artist_credits: Vec<String>,
+    pub primary_artist_verified: bool,
 }
 
 fn artist_name_from_value<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -749,13 +755,30 @@ impl TidalClient {
                         .unwrap_or(false);
                     let copyright = attrs
                         .get("copyright")
-                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.as_str().or_else(|| v.get("text").and_then(Value::as_str)))
                         .map(|s| s.to_string());
                     let label = attrs
                         .get("recordLabel")
                         .or_else(|| attrs.get("label"))
-                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str)))
                         .map(|s| s.to_string());
+                    let upc = attrs.get("barcodeId").or_else(|| attrs.get("upc")).or_else(|| attrs.get("barcode"))
+                        .and_then(Value::as_str).map(str::to_owned);
+                    let release_group_id = attrs.get("releaseGroupId").and_then(Value::as_str).map(str::to_owned);
+                    let primary_type = attrs.get("primaryType").and_then(Value::as_str).map(str::to_owned);
+                    let secondary_types = attrs.get("secondaryTypes").and_then(Value::as_array)
+                        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                        .unwrap_or_default();
+                    let artist_refs = item["relationships"]["artists"]["data"].as_array();
+                    let artist_credits: Vec<String> = artist_refs.into_iter().flatten().filter_map(|reference| {
+                        let id = reference["id"].as_str()?;
+                        let artist = payload["included"].as_array()?.iter().find(|artist| artist["type"] == "artists" && artist["id"] == id)?;
+                        artist["attributes"]["name"].as_str().map(str::to_owned)
+                    }).collect();
+                    // The first album credit is the catalogue's primary credit. Do not
+                    // manufacture an album artist by joining every collaborator name.
+                    let primary_artist_verified = artist_refs.and_then(|refs| refs.first())
+                        .and_then(|reference| reference["id"].as_str()) == Some(artist_id);
 
                     let quality = attrs
                         .get("mediaTags")
@@ -782,6 +805,12 @@ impl TidalClient {
                         quality,
                         tracks: Vec::new(),
                         tracks_loaded: false,
+                        upc,
+                        release_group_id,
+                        primary_type,
+                        secondary_types,
+                        artist_credits,
+                        primary_artist_verified,
                     };
 
                     if detailed {

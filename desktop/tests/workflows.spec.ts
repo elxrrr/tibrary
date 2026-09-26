@@ -369,11 +369,24 @@ test("downloaded release and track menus requeue the original record", async ({p
   expect(queued.result.rows.find((row:any) => row.id === "910001")?.selected).toEqual(["91000101"]);
 });
 
-test("activity separates general events from download progress", async ({page}) => {
+test("activity has independent online, local and download panels", async ({page}) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"Activity",exact:true}).click();
-  await expect(page.getByRole("region", {name:"General activity"})).toBeVisible();
+  await expect(page.getByRole("region", {name:"Online actions"})).toBeVisible();
+  await expect(page.getByRole("region", {name:"Local actions"})).toBeVisible();
   await expect(page.getByRole("region", {name:"Downloads"})).toBeVisible();
+  expect((await page.getByRole("region", {name:"Downloads"}).boundingBox())?.height).toBeGreaterThan(500);
+  await page.getByRole("searchbox", {name:"Search local actions"}).fill("nothing matches");
+  await expect(page.getByRole("region", {name:"Online actions"}).getByRole("searchbox")).toHaveValue("");
+  await page.getByRole("button", {name:"Clear local actions"}).click();
+  await expect(page.getByRole("region", {name:"Downloads"})).toBeVisible();
+});
+
+test("display highlight preference changes focus palette", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"General",exact:true}).click();
+  await page.getByLabel("Highlight colour").selectOption("grey");
+  await expect(page.locator("html")).toHaveAttribute("data-highlight", "grey");
 });
 
 test("startup always shows overview and does not replay a historical failure", async ({ page }) => {

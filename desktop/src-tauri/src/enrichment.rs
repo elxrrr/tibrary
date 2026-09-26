@@ -151,6 +151,7 @@ mod tests {
             quality: "LOSSLESS".to_string(),
             tracks: Vec::new(),
             tracks_loaded: true,
+            ..Default::default()
         };
         let track = TidalTrack {
             id: "456".to_string(),

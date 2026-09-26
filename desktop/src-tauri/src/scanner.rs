@@ -343,7 +343,10 @@ pub async fn scan_library_with_options(
 
             // Needs tag read
             summary.read += 1;
-            let (meta_json, err_str) = match read_audio_metadata(&path) {
+            let read = tokio::task::spawn_blocking(move || read_audio_metadata(&path))
+                .await
+                .map_err(|e| format!("Tag reader stopped unexpectedly: {e}"))?;
+            let (meta_json, err_str) = match read {
                 Ok(m) => (serde_json::to_string(&m).ok(), None),
                 Err(e) => (None, Some(e)),
             };
