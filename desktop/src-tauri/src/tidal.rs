@@ -258,6 +258,34 @@ pub fn catalogue_next(current: &str, next: &str) -> Result<String, String> {
     Ok(target.to_string())
 }
 
+#[cfg(test)]
+#[test]
+fn retry_delay_accepts_seconds_dates_and_fallback() {
+    assert_eq!(retry_delay(Some("12"), 0), Duration::from_secs(12));
+    assert_eq!(retry_delay(Some("invalid"), 1), Duration::from_secs(8));
+    let future = (Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
+    assert!((29..=30).contains(&retry_delay(Some(&future), 0).as_secs()));
+}
+
+fn retry_delay(header: Option<&str>, attempt: usize) -> Duration {
+    let seconds = header.and_then(|v| v.trim().parse::<u64>().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(v).ok().map(|date| (date.timestamp() - Utc::now().timestamp()).max(0) as u64)
+    })).unwrap_or(4 * (attempt as u64 + 1));
+    Duration::from_secs(seconds)
+}
+
+// Reuse connection pools across short-lived workflow clients. Authentication is
+// attached per request, never stored in default headers on the shared client.
+fn catalogue_http(timeout: u64) -> Result<reqwest::Client, String> {
+    type Clients = std::collections::HashMap<u64, reqwest::Client>;
+    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<Clients>> = std::sync::OnceLock::new();
+    let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
+    if let Some(client) = clients.get(&timeout) { return Ok(client.clone()); }
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(timeout)).build().map_err(|e|e.to_string())?;
+    clients.insert(timeout, client.clone());
+    Ok(client)
+}
+
 pub struct TidalClient {
     pub client_id: String,
     pub client_secret: String,
@@ -270,10 +298,7 @@ pub struct TidalClient {
 
 impl TidalClient {
     pub fn new(client_id: impl Into<String>, client_secret: impl Into<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let http = catalogue_http(30).unwrap_or_default();
 
         Self {
             client_id: client_id.into(),
@@ -304,10 +329,7 @@ impl TidalClient {
             .as_u64()
             .unwrap_or(20)
             .clamp(5, 120);
-        client.http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout))
-            .build()
-            .map_err(|e| e.to_string())?;
+        client.http = catalogue_http(timeout)?;
         Ok(client)
     }
 
@@ -545,6 +567,10 @@ impl TidalClient {
             }
         }
 
+        static AUTH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = AUTH_GATE.lock().await;
+        // Another workflow may have renewed the shared token while we waited.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
         if let Some((id, secret, token, expiry)) = TOKEN_CACHE.lock().unwrap().as_ref() {
             if id == &self.client_id && secret == &self.client_secret && now < *expiry {
                 self.token = Some(token.clone());
@@ -568,13 +594,16 @@ impl TidalClient {
         for attempt in 0..self.attempts {
             let mut last = PACER
                 .get_or_init(|| {
-                    tokio::sync::Mutex::new(std::time::Instant::now() - Duration::from_secs(1))
+                    tokio::sync::Mutex::new(std::time::Instant::now())
                 })
                 .lock()
                 .await;
-            let wait = self.request_spacing.saturating_sub(last.elapsed());
+            let wait = last.saturating_duration_since(std::time::Instant::now());
+            if wait > Duration::from_secs(60) {
+                return Err(format!("Service rate limit: retry after {} seconds", wait.as_secs()));
+            }
             tokio::time::sleep(wait).await;
-            *last = std::time::Instant::now();
+            *last = std::time::Instant::now() + self.request_spacing;
             drop(last);
             let token = self.get_token().await?;
             let res = self
@@ -597,18 +626,21 @@ impl TidalClient {
                 *TOKEN_CACHE.lock().unwrap() = None;
                 continue;
             }
-            if (status.as_u16() == 429 || status.is_server_error()) && attempt + 1 < self.attempts {
-                let wait = res
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(4 * (attempt as u64 + 1));
-                if wait > 60 {
-                    return Err(format!("Service rate limit: retry after {wait} seconds"));
+            if status.as_u16() == 429 || status.is_server_error() {
+                let wait = retry_delay(res.headers().get("retry-after").and_then(|v| v.to_str().ok()), attempt);
+                // Apply cooldown even on the final attempt, so another workflow cannot
+                // immediately repeat requests against a throttled catalogue service.
+                if status.as_u16() == 429 {
+                    let mut next = PACER.get().unwrap().lock().await;
+                    *next = (*next).max(std::time::Instant::now() + wait);
                 }
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                continue;
+                if wait > Duration::from_secs(60) {
+                    return Err(format!("Service rate limit: retry after {} seconds", wait.as_secs()));
+                }
+                if attempt + 1 < self.attempts {
+                    if status.as_u16() != 429 { tokio::time::sleep(wait).await; }
+                    continue;
+                }
             }
             let body: Value = res.json().await.unwrap_or(Value::Null);
             let detail = body["errors"]

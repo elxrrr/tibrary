@@ -41,6 +41,8 @@ For a narrower artist-based list, use **Missing releases → Check release artis
 
 This filter compares the **first credited album artist ID** with your linked artists. It is a useful stricter view, not proof that a release is official; collaborations led by another artist appear under **Other artist appearances**. **Artist credits not checked** retains unknown results, and **All recommendations** keeps everything inspectable. These saved IDs also inform recommendation scoring.
 
+Catalogue workflows share HTTP connections, token renewal and rate-limit cooldowns. Concurrent requests for the same release wait for its cached result; unrelated releases can proceed independently. Album summaries fetch artist IDs, genres and replacement IDs together, and retain those IDs for the artist filter. Existing track-credit, artwork and DJ metadata caches remain reusable across workflows.
+
 No database reset or full local rescan is needed to collect this online metadata. Update the local library only when files or tags have changed outside the app.
 
 ## ✨ Features

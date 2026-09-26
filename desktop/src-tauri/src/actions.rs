@@ -87,10 +87,24 @@ pub async fn cached_mqa_rows(
     }).collect();
     Ok(rows)
 }
+// Serialize only identical releases; unrelated releases and local work stay independent.
+fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
+    type Gates = std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static GATES: std::sync::OnceLock<std::sync::Mutex<Gates>> = std::sync::OnceLock::new();
+    let mut gates = GATES.get_or_init(Default::default).lock().unwrap();
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) { return gate; }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
 pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
         return Err("Select a release with a valid online ID".into());
     }
+    let gate = release_gate(format!("{}:{market}:{id}", db.path.display()));
+    let _guard = gate.lock().await;
     let key = format!("tag-review:{market}:{id}");
     let cached = db.get_preference(&key).await?;
     let mut value = match cached {
@@ -121,12 +135,13 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
         return Ok(value);
     }
     let mut client = crate::tidal::TidalClient::from_db(db).await?;
-    if value["title"] == "Release not found" {
+    let summary_loaded = value["title"] == "Release not found";
+    if summary_loaded {
         let mut url = url::Url::parse(&format!("https://openapi.tidal.com/v2/albums/{id}"))
             .map_err(|e| e.to_string())?;
         url.query_pairs_mut()
             .append_pair("countryCode", market)
-            .append_pair("include", "artists");
+            .append_pair("include", "artists,genres,replacement");
         let raw = client.get_json(url.as_str()).await?;
         let data = raw["data"]
             .as_array()
@@ -142,8 +157,12 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
             .collect::<Vec<_>>()
             .join(", ");
         value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"original_release_date":a["originalReleaseDate"],"type":a["albumType"].as_str().unwrap_or("album"),"official":a["official"],"secondary_types":a["secondaryTypes"],"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str().or(a["copyright"]["text"].as_str()),"upc":a["barcodeId"].as_str().or(a["upc"].as_str()),"quality":a["mediaTags"].as_array().map(|values|values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),"audio_modes":a["audioModes"],"media_metadata":a["mediaMetadata"],"remote_metadata":raw});
+        let raw = value["remote_metadata"].clone();
+        apply_release_discovery(&mut value, &raw, id);
     }
-    fill_release_discovery(&mut client, &mut value, id, market).await;
+    if value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || (force && !summary_loaded) {
+        fill_release_discovery(&mut client, &mut value, id, market).await;
+    }
     let tracks = client.get_release_details(id, market).await?;
     value["tracks"] = serde_json::to_value(&tracks).map_err(|e| e.to_string())?;
     value["tracks_loaded"] = json!(true);
@@ -156,15 +175,23 @@ async fn fill_release_discovery(client: &mut crate::tidal::TidalClient, value: &
     let now = chrono::Utc::now().timestamp();
     value["discovery_checked_at"] = json!(now - 29 * 86_400); // Retry failures in one day.
     let Ok(mut url) = url::Url::parse(&format!("https://openapi.tidal.com/v2/albums/{id}")) else { return };
-    url.query_pairs_mut().append_pair("countryCode",market).append_pair("include","genres,replacement");
+    url.query_pairs_mut().append_pair("countryCode",market).append_pair("include","artists,genres,replacement");
     if let Ok(raw) = client.get_json(url.as_str()).await {
-        let data = raw["data"].as_array().and_then(|a| a.first()).unwrap_or(&raw["data"]);
-        let included = raw["included"].as_array().cloned().unwrap_or_default();
-        if data["id"].as_str() == Some(id) {
-            value["genres"] = json!(crate::tidal::related_genres(data, &included));
-            value["replacement_id"] = json!(crate::tidal::replacement_id(data));
-            value["discovery_checked_at"] = json!(now);
-        }
+        apply_release_discovery(value, &raw, id);
+    }
+}
+
+fn apply_release_discovery(value: &mut Value, raw: &Value, id: &str) {
+    let data = raw["data"].as_array().and_then(|a| a.first()).unwrap_or(&raw["data"]);
+    if data["id"].as_str() != Some(id) { return; }
+    let included = raw["included"].as_array().cloned().unwrap_or_default();
+    value["genres"] = json!(crate::tidal::related_genres(data, &included));
+    value["replacement_id"] = json!(crate::tidal::replacement_id(data));
+    value["discovery_checked_at"] = json!(chrono::Utc::now().timestamp());
+    if let Some(artists) = data["relationships"]["artists"]["data"].as_array() {
+        value["album_artist_ids"] = json!(artists.iter().filter_map(|a| a["id"].as_str()).collect::<Vec<_>>());
+        value["album_artists"] = json!(artists.iter().filter_map(|a| included.iter().find(|v| v["type"] == "artists" && v["id"] == a["id"]).and_then(|v| v["attributes"]["name"].as_str())).collect::<Vec<_>>());
+        value["tag_checked_at"] = value["discovery_checked_at"].clone();
     }
 }
 
@@ -1417,6 +1444,32 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn same_release_waits_while_other_releases_remain_independent() {
+        let first = release_gate("test:GB:1".into());
+        let same = release_gate("test:GB:1".into());
+        let other = release_gate("test:GB:2".into());
+        let guard = first.lock().await;
+        assert!(same.try_lock().is_err());
+        assert!(other.try_lock().is_ok());
+        drop(guard);
+        assert!(same.try_lock().is_ok());
+    }
+
+    #[test]
+    fn combined_summary_retains_artist_ids_for_filter_reuse() {
+        let mut value = json!({"title":"Example","tracks_loaded":true});
+        let raw = json!({"data":{"id":"123","relationships":{"artists":{"data":[{"id":"7"},{"id":"8"}]}}},"included":[{"type":"artists","id":"8","attributes":{"name":"Guest"}},{"type":"artists","id":"7","attributes":{"name":"Lead"}}]});
+        apply_release_discovery(&mut value, &raw, "123");
+        assert_eq!(value["album_artist_ids"], json!(["7","8"]));
+        assert_eq!(value["album_artists"], json!(["Lead","Guest"]));
+        assert_eq!(value["tracks_loaded"], true);
+        assert!(value["discovery_checked_at"].as_i64().is_some());
+        let before = value.clone();
+        apply_release_discovery(&mut value, &raw, "999");
+        assert_eq!(value, before);
+    }
+
     #[tokio::test]
     async fn real_flac_prepare_workflows_are_read_only_until_confirmed() {
         let Ok(sample) = std::env::var("TIBRARY_SAMPLE_FLAC") else {
