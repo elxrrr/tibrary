@@ -47,7 +47,7 @@ import {
 } from "./api";
 import { DataTable, Column } from "./DataTable";
 import { ActivityView, streamFor } from "./ActivityView";
-import { workload, jobTitle } from "./ActivityView";
+import { workload, jobTitle, compactProgress } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import "./style.css";
 const groups = [
@@ -2178,7 +2178,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.15 · build 15</span>
+          <span className="sidebar-version">v0.9.0-beta.16 · build 16</span>
         </div>
       </aside>
       <main>
@@ -2193,7 +2193,7 @@ function App() {
                   const progress = workload(job, downloadMonitor, clock);
                   return <div className="header-workload" key={job!.id} title={job?.message}>
                     <LoaderCircle className="spin" size={13}/>
-                    <span>{jobTitle(job?.kind)} · {progress?.percent != null ? `${Math.round(progress.percent)}%` : "Working"}</span>
+                    <span>{jobTitle(job?.kind)} · {compactProgress(progress?.percent)}</span>
                     {progress?.percent != null && <span className="header-workload-bar" style={{width: `${progress.percent}%`}}/>}
                   </div>;
                 })}

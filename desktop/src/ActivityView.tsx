@@ -42,8 +42,8 @@ function formatDuration(seconds: number): string {
 export function workload(job: Job | null | undefined, monitor: Record<string, Row>, now: number) {
   if (!active(job)) return null;
   const parsed = job?.message?.match(/(?:^|\D)([\d,]+)\s*(?:\/|of)\s*([\d,]+)(?!\d)/i);
-  let done = parsed ? Number(parsed[1].replaceAll(",", "")) : 0;
-  let total = parsed ? Number(parsed[2].replaceAll(",", "")) : 0;
+  let done = job?.completed ?? (parsed ? Number(parsed[1].replaceAll(",", "")) : 0);
+  let total = job?.total ?? (parsed ? Number(parsed[2].replaceAll(",", "")) : 0);
   if (job?.kind === "download") {
     const batches = Object.values(monitor).filter(row => row.kind === "batch");
     if (batches.length) {
@@ -57,6 +57,12 @@ export function workload(job: Job | null | undefined, monitor: Record<string, Ro
   const rate = done / elapsed;
   const remaining = done && rate > 0 ? ` · ~${formatDuration((total - done) / rate)} remaining · ${rate.toFixed(1)} items/s` : "";
   return { label: `${Math.round(done / total * 100)}% · ${done.toLocaleString()}/${total.toLocaleString()}${remaining}`, percent: done / total * 100 };
+}
+
+export function compactProgress(percent: number | null | undefined): string {
+  if (percent == null || percent === 0) return "Working";
+  if (percent < 1) return "<1%";
+  return `${Math.floor(percent)}%`;
 }
 
 function LogRow({ entry }: { entry: ActivityEntry }) {

@@ -353,14 +353,6 @@ impl TursoDb {
         let conn = self.connect()?;
         let mut ids = HashSet::new();
 
-        let is_compilation = |name: &str| {
-            let lower = name.trim().to_lowercase();
-            matches!(
-                lower.as_str(),
-                "various artists" | "various artist" | "va" | "v a" | "v.a." | "v.a"
-            )
-        };
-
         let mut stmt = conn
             .query(
                 "SELECT artist, tidal_id FROM mappings WHERE status IN ('confirmed', 'auto')",
@@ -372,7 +364,7 @@ impl TursoDb {
         while let Some(row) = stmt.next().await.map_err(|e| e.to_string())? {
             let artist: String = row.get(0).unwrap_or_default();
             let tid: String = row.get(1).unwrap_or_default();
-            if !is_compilation(&artist) && !tid.trim().is_empty() {
+            if !is_compilation_artist(&artist) && !tid.trim().is_empty() {
                 ids.insert(tid.trim().to_string());
             }
         }
@@ -385,7 +377,7 @@ impl TursoDb {
         while let Some(row) = add_stmt.next().await.map_err(|e| e.to_string())? {
             let artist: String = row.get(0).unwrap_or_default();
             let tid: String = row.get(1).unwrap_or_default();
-            if !is_compilation(&artist) && !tid.trim().is_empty() {
+            if !is_compilation_artist(&artist) && !tid.trim().is_empty() {
                 ids.insert(tid.trim().to_string());
             }
         }
@@ -3107,6 +3099,7 @@ impl TursoDb {
                 if let Ok(meta) = serde_json::from_str::<Value>(&meta_str) {
                     let art =
                         extract_album_artist(&meta).unwrap_or_else(|| "Unknown artist".to_string());
+                    if is_compilation_artist(&art) { continue; }
                     let alb = extract_tag_str(&meta, &["album", "release"]).unwrap_or_default();
                     *artist_tracks.entry(art.clone()).or_insert(0) += 1;
                     artist_albums.entry(art).or_default().insert(alb);
@@ -3728,7 +3721,7 @@ fn is_compilation_artist(artist: &str) -> bool {
     let lower = artist.trim().to_lowercase();
     matches!(
         lower.as_str(),
-        "various artists" | "various artist" | "va" | "v a" | "v.a."
+        "various artists" | "various artist" | "va" | "v a" | "v.a." | "v.a"
     )
 }
 
@@ -4680,6 +4673,8 @@ with sqlite3.connect('{db}') as db:
             ("Radiohead", "OK Computer", "/music/radiohead/01.flac"),
             ("Pink Floyd", "The Wall", "/music/pinkfloyd/01.flac"),
             ("Unknown Band", "Demo", "/music/unknown/01.flac"),
+            ("Various Artists", "Compilation A", "/music/compilation/01.flac"),
+            ("V.A.", "Compilation B", "/music/compilation/02.flac"),
         ];
         for (artist, album, path) in artists {
             let meta = json!({ "artist": artist, "album": album });
@@ -4702,6 +4697,7 @@ with sqlite3.connect('{db}') as db:
             "INSERT INTO mappings (artist, tidal_id, status, evidence) VALUES ('Pink Floyd', '789', 'ambiguous', '\"Multiple candidate matches\"')",
             (),
         ).await.unwrap();
+        conn.execute("INSERT INTO mappings (artist, tidal_id, status) VALUES ('Various Artists', 'compilation-id', 'confirmed')", ()).await.unwrap();
         // Unknown Band has no mapping -> status = Unresolved
 
         // 1. All filter
@@ -4710,6 +4706,11 @@ with sqlite3.connect('{db}') as db:
             .await
             .unwrap();
         assert_eq!(all_page.total, 4);
+        // Hiding compilation placeholders must not delete indexed files or saved associations.
+        let mut kept = conn.query("SELECT tidal_id FROM mappings WHERE artist='Various Artists'", ()).await.unwrap();
+        assert_eq!(kept.next().await.unwrap().unwrap().get::<String>(0).unwrap(), "compilation-id");
+        assert!(!store.get_linked_artist_ids().await.unwrap().contains(&"compilation-id".to_string()));
+
 
         // 2. Unresolved filter
         let unresolved_page = store

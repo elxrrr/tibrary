@@ -7,6 +7,8 @@ export type Job = {
   message: string;
   started: number;
   finished?: number;
+  completed?: number;
+  total?: number;
   historical?: boolean;
   result?: any;
 };

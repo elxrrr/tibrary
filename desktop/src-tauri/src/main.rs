@@ -1844,6 +1844,7 @@ async fn handle_rpc_uncached(
             "kind": "discography",
             "status": "running",
             "message": format!("Refreshing releases · {}/{} artists · {} · {}", completed.len(), total, market, if detailed { "release and track details" } else { "release list" }),
+            "completed": completed.len(), "total": total,
             "started": started,
             "result": null
         });
@@ -1875,6 +1876,7 @@ async fn handle_rpc_uncached(
                     "kind": "discography",
                     "status": "running",
                     "message": msg.clone(),
+                    "completed": checked, "total": total,
                     "started": started,
                     "result": null
                 });
@@ -1906,6 +1908,15 @@ async fn handle_rpc_uncached(
                         } else {
                             checked += 1;
                             completed.push(artist_id.clone());
+                            let mut saved_progress = prog_job.clone();
+                            saved_progress["completed"] = json!(checked);
+                            let message = format!("Saved releases · {checked}/{total} artists complete · {name} · {} releases · {market}", catalogue.releases.len());
+                            saved_progress["message"] = json!(message);
+                            backend_prog.update_online_job_progress(&message, saved_progress.clone());
+                            if let Some(ref app) = app_clone {
+                                let _ = app.emit("backend-event", json!({"event":"progress","message":message,"online_job":saved_progress}));
+                            }
+
                             if let Err(e) = db_clone.set_preference("catalogue-refresh-checkpoint", &json!({"ids":ids,"completed":completed,"market":market,"detailed":detailed,"status":"running"})).await {
                                 failure = Some(format!("Could not save refresh progress: {e}"));
                                 break;
