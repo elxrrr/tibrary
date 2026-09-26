@@ -172,13 +172,7 @@ pub async fn refresh(
                 break;
             }
             state.progress_for("release_artists", &format!("Album artist credits · {checked}/{total} releases · {reused} reused · requesting {} release summaries", batch.len()));
-            let mut url = url::Url::parse("https://openapi.tidal.com/v2/albums")
-                .map_err(|e| e.to_string())?;
-            url.query_pairs_mut()
-                .append_pair("filter[id]", &batch.join(","))
-                .append_pair("countryCode", market)
-                .append_pair("include", "artists");
-            let payload = client.get_json(url.as_str()).await?;
+            let payload = client.albums(batch,market,true).await?;
             let values = parse(&payload, batch, now);
             for resource in payload["data"].as_array().into_iter().flatten() {
                 if let (Some(id), Some(available)) = (resource["id"].as_str(), crate::availability::available(resource)) {

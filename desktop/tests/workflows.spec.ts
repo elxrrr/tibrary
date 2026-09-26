@@ -245,7 +245,7 @@ test("dark settings fit a full window and retain defaults", async ({
     .getByRole("button", { name: "Downloads & files", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: "Download & files", exact: true }),
+    page.getByRole("heading", { name: "Downloads & files", exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Reset to default" }).click();
   await expect(page.getByRole("alert")).toHaveCount(0);
@@ -376,6 +376,8 @@ test("reviewed number corrections run through the UI and survive navigation", as
 test("account sign-in opens its prompt, rejects unrelated redirects and cancels", async ({ page }) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Connections",exact:true}).click();
+  await expect(page.getByRole("heading", {name:"Developer credentials",exact:true})).toHaveCount(0);
+  await expect(page.getByLabel("Client secret")).toHaveCount(0);
   await page.getByRole("button",{name:"Connect account",exact:true}).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByRole("button",{name:"Open sign-in page"})).toBeVisible();
@@ -463,7 +465,7 @@ test("startup always shows overview and does not replay a historical failure", a
   await page.goto("/");
   await expect(page.getByRole("heading", {name:"Overview",exact:true})).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
-  const missing = await rpc("table", {route:"missing",timeline:"All missing releases",status:"Missing release",limit:20,recommendation:"All recommendations"});
+  const missing = await rpc("table", {route:"missing",timeline:"All missing releases",status:"all",limit:20,recommendation:"My album artists"});
   await expect(page.locator(".metric").filter({hasText:"Missing releases"})).toContainText(String(missing.result.total));
 });
 

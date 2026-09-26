@@ -126,6 +126,8 @@ def main():
         conn.execute("INSERT OR REPLACE INTO mappings VALUES ('Wrong', '900001', 'confirmed', 'fixture', 1)")
 
         conn.execute("INSERT OR REPLACE INTO catalogue VALUES ('900001', 'GB', ?, '2026-09-24')", (json.dumps(cat),))
+        for release in cat['releases']:
+            conn.execute("INSERT OR REPLACE INTO app_preferences VALUES (?,?)", (f"release-artists:GB:{release['id']}", json.dumps(dict(ids=['900001'], checked_at=1790000000, source='fixture album credits'))))
 
         # Enqueue all available releases with approved=0
         for r in cat['releases']:

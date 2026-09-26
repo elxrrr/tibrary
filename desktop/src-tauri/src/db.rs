@@ -2194,14 +2194,13 @@ impl TursoDb {
             }
         }
 
-        let dev_client = crate::tidal::TidalClient::from_env_or_keychain();
         let stream_tok = crate::stream_download::load_saved_token(self).await;
         let is_connected = stream_tok.is_some();
         let user_id = stream_tok.as_ref().and_then(|s| s.user_id.clone());
         let expires_at = stream_tok.as_ref().map(|s| s.expires_at);
 
         let conn_state = json!({
-            "configured": dev_client.is_some(),
+            "configured": is_connected,
             "account": is_connected,
             "checked": false,
             "tidal": {
@@ -2281,7 +2280,7 @@ impl TursoDb {
             "api_batch_size": 20,
             "api_batch_delay_sec": 3.0,
             "aac_bitrate_cap": 320,
-            "api_url": "https://openapi.tidal.com/v2",
+            "api_url": "https://api.tidal.com/v1",
             "auth_url": "https://auth.tidal.com/v1/oauth2/token"
         });
         let provider = if let Some(saved) = self.get_preference("provider").await? {
@@ -2346,11 +2345,10 @@ impl TursoDb {
                 })
             });
 
-        let dev_client = crate::tidal::TidalClient::from_env_or_keychain();
         let stream_tok = crate::stream_download::load_saved_token(self).await;
         let is_connected = stream_tok.is_some();
         let connections = json!({
-            "configured": dev_client.is_some(),
+            "configured": is_connected,
             "account": is_connected,
             "checked": false
         });

@@ -80,7 +80,7 @@ Tibrary is designed with a local-first, dual-process desktop architecture pairin
 | `tag_writer.rs` | Safe audio metadata editor using Lofty. Preserves FLAC padding, custom DJ tags, and embedded artwork without modifying audio frames. |
 | `stream_download.rs` | Native Tidal stream decryptor (AES-256-CBC token decryption, AES-128-CTR stream decryption), MPEG-DASH / BTS manifest parser, PKCE OAuth flow, Vorbis comments tagger, and `.lrc` / `.m3u8` companion file generator. |
 | `downloads.rs` | Acquisition queue state management, quality selection, pacing delay coordinator, and atomic publishing pipeline. |
-| `tidal.rs` | Direct native Tidal API client with OAuth2 token persistence, search, artist discography pagination, and rate limiting. |
+| `tidal.rs` | Native subscriber catalogue client: search, exact ISRC lookup, paginated discographies, batched summaries and shared market-scoped evidence caches. Uses the same subscriber session as downloads. |
 | `matching.rs` | Confidence-scored artist and track candidate matching, ISRC resolution, and structural duration gating. |
 | `release_matching.rs` | Whole-release track alignment, multi-disc normalization, and candidate ranking. |
 | `linking.rs` | High-level library linking pipeline connecting local tracks to confirmed Tidal releases. |
@@ -350,3 +350,20 @@ Validation used disposable fixture libraries and an isolated copy of the product
 - The read-only live check for release 234657671 returned six tracks and no credit entries. Mock compound responses verify populated credits and pagination detection. Availability is provider-dependent. README screenshots use disposable sample data, not the live music library.
 
 Validation: 72 Rust tests passed (5 opt-in checks skipped), two focused WebKit workflows passed (including all-page rendering and sidebar/history interactions), and the opt-in live credits request passed. The macOS app bundle was rebuilt. Tests used disposable files and databases; original NVME audio files were unchanged.
+
+
+### Subscriber-only migration — build 31
+
+All active online workflows now use one subscriber account. Developer credential entry, credential mutation routes, client-credential authentication and the alternate metadata refresh option have been removed. Existing developer secrets are not read or required; existing catalogue and link data are retained.
+
+- Artist/track searches use subscriber search endpoints. Exact ISRC lookup uses `/v1/tracks?isrc=…`, verifies the returned ISRC, and narrows candidate album titles before loading whole releases. Text-searching an ISRC is not equivalent and returned unrelated results in the live probe.
+- Discography discovery combines paginated albums and EPs/singles. Compilation appearances are requested only when compilation recommendations are enabled. Main Missing releases and Overview lists default to verified local album artists; broader and unknown results remain accessible through filters.
+- Release summaries use batches of up to 20 IDs and share the raw summary cache with artwork/downloads. Fresh summaries populate artist-credit and availability evidence. Audio counts exclude videos. Cached older optional null lists are accepted without treating malformed objects as valid lists.
+- Track details/role credits, DJ metadata and artwork continue using shared subscriber caches. The newer catalogue endpoint accepts the subscriber token too: optional genres, replacement IDs, label and original date are fetched in batches of 20 and cached per market for 30 days. Optional access failures pause these lookups for one hour without blocking core workflows or repeatedly failing for every release. Empty/missing fields retain previously cached values. No database reset is needed.
+- All catalogue lookups pass the selected country and cache it separately. A failed summary batch can fall back to individual IDs, omitting only confirmed 404 responses; authentication, throttling and persistent server failures retain saved data. HTTP pacing, retry limits and host-wide throttling remain in effect. API timing varies: the bounded comparison found subscriber discovery faster for ATRIP, slower for Canopy, and unsuitable for direct timing comparison for Cassie when compilation appearances were included. It is not universally faster.
+
+Validation: 99 offline Rust tests, 3 frontend unit tests and 27 WebKit workflows passed. Read-only authenticated tests exercised artist/track search, discography pagination, batched summaries, exact ISRC lookup, GB availability, credited audio tracks, DJ metadata, cache reuse and 649 favourites. A selected Cassie track downloaded into a temporary folder, completed the queue, scanned, and linked against cached whole-release data. The 13-item Cassie release is correctly treated as 12 audio tracks. Original NVME files were not written or moved. This checks the exercised workflows, not every provider endpoint or every regional catalogue edge case.
+
+Endpoint reference: [Minim subscriber API implementation](https://minim.readthedocs.io/en/latest/_modules/minim/tidal.html). This is an implementation reference, not an installed dependency.
+
+The selected live FLAC was independently checked with ffprobe: 16-bit/44.1 kHz audio and embedded 1280×1280 JPEG artwork. The subscriber token also returned HTTP 200 from the v2 optional catalogue metadata endpoint; the final workflow test verifies this route and its cache without developer credentials.

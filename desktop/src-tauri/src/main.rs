@@ -599,7 +599,6 @@ async fn handle_rpc_call(
     } else if (method == "job.start" || method == "job.cancel")
         || method.starts_with("auth.")
         || method.starts_with("settings.")
-        || method.starts_with("credentials.")
         || method.starts_with("queue.")
         || method.starts_with("links.")
         || method.starts_with("artists.")
@@ -756,7 +755,7 @@ async fn handle_rpc_uncached(
             Some(c) => c,
             None => {
                 return Err(
-                    "No TIDAL developer credentials configured in Keychain or environment."
+                    "Connect your streaming account in Settings."
                         .to_string(),
                 )
             }
@@ -778,7 +777,7 @@ async fn handle_rpc_uncached(
             Some(c) => c,
             None => {
                 return Err(
-                    "No TIDAL developer credentials configured in Keychain or environment."
+                    "Connect your streaming account in Settings."
                         .to_string(),
                 )
             }
@@ -801,7 +800,7 @@ async fn handle_rpc_uncached(
             Some(c) => c,
             None => {
                 return Err(
-                    "No TIDAL developer credentials configured in Keychain or environment."
+                    "Connect your streaming account in Settings."
                         .to_string(),
                 )
             }
@@ -1630,22 +1629,6 @@ async fn handle_rpc_uncached(
     }
 
     // CREDENTIALS & ACCOUNT
-    if method == "credentials.save" {
-        let client = args.get("client").and_then(|v| v.as_str()).unwrap_or("");
-        let secret = args.get("secret").and_then(|v| v.as_str()).unwrap_or("");
-        crate::tidal::TidalClient::save_credentials(client, secret).map_err(|e| e.to_string())?;
-        if let Some(app) = app_handle {
-            let _ = app.emit("backend-event", json!({ "event": "changed" }));
-        }
-        return Ok(json!(true));
-    }
-    if method == "credentials.forget" {
-        crate::tidal::TidalClient::forget_credentials().map_err(|e| e.to_string())?;
-        if let Some(app) = app_handle {
-            let _ = app.emit("backend-event", json!({ "event": "changed" }));
-        }
-        return Ok(json!(true));
-    }
     if method == "account.disconnect" {
         crate::account::AccountClient::disconnect().map_err(|e| e.to_string())?;
         db.set_preference("tidal_token", &Value::Null).await?;
@@ -1813,7 +1796,7 @@ async fn handle_rpc_uncached(
             Some(c) => c,
             None => {
                 return Err(
-                    "No TIDAL developer credentials configured in Keychain or environment."
+                    "Connect your streaming account in Settings."
                         .to_string(),
                 );
             }

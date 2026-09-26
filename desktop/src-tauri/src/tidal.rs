@@ -1,10 +1,7 @@
-use base64::prelude::*;
 use chrono::Utc;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use url::Url;
+use std::time::Duration;
 
 use crate::db::TursoDb;
 
@@ -36,9 +33,12 @@ pub struct TidalTrack {
     pub key_scale: Option<String>,
     #[serde(default, deserialize_with = "copyright_from_value")]
     pub copyright: Option<String>,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub media_tags: Vec<String>,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub audio_modes: Vec<String>,
     pub media_metadata: Value,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub genres: Vec<String>,
     pub replacement_id: Option<String>,
     pub discovery_checked_at: Option<i64>,
@@ -63,22 +63,35 @@ pub struct TidalRelease {
     pub copyright: Option<String>,
     pub label: Option<String>,
     pub quality: String,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub tracks: Vec<TidalTrack>,
     pub tracks_loaded: bool,
     pub upc: Option<String>,
     pub release_group_id: Option<String>,
     pub primary_type: Option<String>,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub secondary_types: Vec<String>,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub artist_credits: Vec<String>,
     pub primary_artist_verified: bool,
     #[serde(default, deserialize_with = "optional_bool_from_value")]
     pub official: Option<bool>,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub genres: Vec<String>,
     pub replacement_id: Option<String>,
     pub discovery_checked_at: Option<i64>,
     pub original_release_date: Option<String>,
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub audio_modes: Vec<String>,
     pub media_metadata: Value,
+}
+
+fn nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn artist_name_from_value<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -136,12 +149,18 @@ mod release_payload_tests {
     fn discovery_relationships_do_not_leak_between_resources() {
         use super::{related_genres, replacement_id};
         use serde_json::json;
-        let included = vec![json!({"type":"genres","id":"g","attributes":{"name":"Electronic"}}),json!({"type":"genres","id":"other","attributes":{"name":"Rock"}})];
+        let included = vec![
+            json!({"type":"genres","id":"g","attributes":{"name":"Electronic"}}),
+            json!({"type":"genres","id":"other","attributes":{"name":"Rock"}}),
+        ];
         let resource = json!({"id":"1","relationships":{"genres":{"data":[{"type":"genres","id":"g"}]},"replacement":{"data":{"type":"albums","id":"2"}}}});
-        assert_eq!(related_genres(&resource,&included), vec!["Electronic"]);
+        assert_eq!(related_genres(&resource, &included), vec!["Electronic"]);
         assert_eq!(replacement_id(&resource).as_deref(), Some("2"));
-        assert!(related_genres(&json!({}),&included).is_empty());
-        assert!(replacement_id(&json!({"id":"1","relationships":{"replacement":{"data":{"id":"1"}}}})).is_none());
+        assert!(related_genres(&json!({}), &included).is_empty());
+        assert!(replacement_id(
+            &json!({"id":"1","relationships":{"replacement":{"data":{"id":"1"}}}})
+        )
+        .is_none());
     }
 
     #[test]
@@ -226,38 +245,6 @@ pub struct TidalCatalogue {
     pub releases: Vec<TidalRelease>,
 }
 
-type CachedToken = (String, String, String, f64);
-type CachedCredentials = (std::time::Instant, Option<(String, String)>);
-static CREDENTIAL_CACHE: std::sync::Mutex<Option<CachedCredentials>> = std::sync::Mutex::new(None);
-static TOKEN_CACHE: std::sync::Mutex<Option<CachedToken>> = std::sync::Mutex::new(None);
-
-pub fn catalogue_next(current: &str, next: &str) -> Result<String, String> {
-    let current = Url::parse(current).map_err(|e| e.to_string())?;
-    let mut target = current.join(next).map_err(|e| e.to_string())?;
-    if target.scheme() != "https"
-        || target.host_str() != Some("openapi.tidal.com")
-        || target.port().is_some_and(|p| p != 443)
-        || !target.username().is_empty()
-        || target.password().is_some()
-    {
-        return Err("Rejected unexpected catalogue pagination destination".into());
-    }
-    if !target.path().starts_with("/v2/") {
-        target.set_path(&format!("/v2{}", target.path()));
-    }
-    if !target.query_pairs().any(|(k, _)| k == "countryCode") {
-        if let Some((_, market)) = current.query_pairs().find(|(k, _)| k == "countryCode") {
-            target.query_pairs_mut().append_pair("countryCode", &market);
-        }
-    }
-    if !target.query_pairs().any(|(key, _)| key == "include") {
-        if let Some((_, include)) = current.query_pairs().find(|(key, _)| key == "include") {
-            target.query_pairs_mut().append_pair("include", &include);
-        }
-    }
-    Ok(target.to_string())
-}
-
 #[cfg(test)]
 #[test]
 fn retry_delay_accepts_seconds_dates_and_fallback() {
@@ -268,7 +255,9 @@ fn retry_delay_accepts_seconds_dates_and_fallback() {
 }
 
 #[cfg(test)]
-fn retry_delay(header: Option<&str>, attempt: usize) -> Duration { crate::network::retry_after(header,attempt) }
+fn retry_delay(header: Option<&str>, attempt: usize) -> Duration {
+    crate::network::retry_after(header, attempt)
+}
 
 // Reuse connection pools across short-lived workflow clients. Authentication is
 // attached per request, never stored in default headers on the shared client.
@@ -276,350 +265,337 @@ fn catalogue_http(timeout: u64) -> Result<reqwest::Client, String> {
     type Clients = std::collections::HashMap<u64, reqwest::Client>;
     static CLIENTS: std::sync::OnceLock<std::sync::Mutex<Clients>> = std::sync::OnceLock::new();
     let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
-    if let Some(client) = clients.get(&timeout) { return Ok(client.clone()); }
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(timeout)).build().map_err(|e|e.to_string())?;
+    if let Some(client) = clients.get(&timeout) {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout))
+        .build()
+        .map_err(|e| e.to_string())?;
     clients.insert(timeout, client.clone());
     Ok(client)
 }
 
 pub struct TidalClient {
-    pub client_id: String,
-    pub client_secret: String,
+    db: TursoDb,
     http: reqwest::Client,
-    token: Option<String>,
-    expires_at: f64,
     request_spacing: Duration,
     attempts: usize,
 }
 
 impl TidalClient {
-    pub fn new(client_id: impl Into<String>, client_secret: impl Into<String>) -> Self {
-        let http = catalogue_http(30).unwrap_or_default();
-
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            http,
-            token: None,
-            expires_at: 0.0,
-            request_spacing: Duration::from_millis(350),
-            attempts: 3,
-        }
-    }
-
     pub async fn from_db(db: &TursoDb) -> Result<Self, String> {
-        let mut client =
-            Self::from_env_or_keychain().ok_or("Configure catalogue credentials in Settings")?;
         let settings = db.get_preference("provider").await?.unwrap_or(Value::Null);
-        client.request_spacing = Duration::from_millis(
-            settings["request_interval_ms"]
+        Ok(Self {
+            db: db.clone(),
+            http: catalogue_http(
+                settings["request_timeout_sec"]
+                    .as_u64()
+                    .unwrap_or(20)
+                    .clamp(5, 120),
+            )?,
+            request_spacing: Duration::from_millis(
+                settings["request_interval_ms"]
+                    .as_u64()
+                    .unwrap_or(350)
+                    .clamp(100, 10000),
+            ),
+            attempts: settings["request_attempts"]
                 .as_u64()
-                .unwrap_or(750)
-                .clamp(100, 10000),
-        );
-        client.attempts = settings["request_attempts"]
-            .as_u64()
-            .unwrap_or(2)
-            .clamp(1, 5) as usize;
-        let timeout = settings["request_timeout_sec"]
-            .as_u64()
-            .unwrap_or(20)
-            .clamp(5, 120);
-        client.http = catalogue_http(timeout)?;
-        Ok(client)
-    }
-
-    pub fn from_env_or_keychain() -> Option<Self> {
-        // 1. Environment variables
-        if let (Ok(id), Ok(sec)) = (
-            std::env::var("TIDAL_CLIENT_ID"),
-            std::env::var("TIDAL_CLIENT_SECRET"),
-        ) {
-            let id = id.trim().to_string();
-            let sec = sec.trim().to_string();
-            if !id.is_empty() && !sec.is_empty() {
-                return Some(Self::new(id, sec));
-            }
-        }
-
-        if std::env::var_os("TIBRARY_TEST_MODE").is_some() {
-            return None;
-        }
-
-        {
-            let cache = CREDENTIAL_CACHE.lock().unwrap();
-            if let Some((checked, credentials)) = cache.as_ref() {
-                if checked.elapsed() < Duration::from_secs(30) {
-                    return credentials
-                        .as_ref()
-                        .map(|(id, secret)| Self::new(id, secret));
-                }
-            }
-        }
-        let result = Self::read_keychain();
-        *CREDENTIAL_CACHE.lock().unwrap() = Some((
-            std::time::Instant::now(),
-            result
-                .as_ref()
-                .map(|c| (c.client_id.clone(), c.client_secret.clone())),
-        ));
-        result
-    }
-
-    fn read_keychain() -> Option<Self> {
-        // 2. macOS Keychain
-        #[cfg(target_os = "macos")]
-        {
-            if let Ok(output) = std::process::Command::new("security")
-                .args([
-                    "find-generic-password",
-                    "-s",
-                    "Tibrary",
-                    "-a",
-                    "catalogue-client",
-                    "-w",
-                ])
-                .output()
-            {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if let Ok(val) = serde_json::from_str::<Value>(stdout.trim()) {
-                        if let (Some(id), Some(sec)) = (
-                            val.get("id").and_then(|v| v.as_str()),
-                            val.get("secret").and_then(|v| v.as_str()),
-                        ) {
-                            let id = id.trim().to_string();
-                            let sec = sec.trim().to_string();
-                            if !id.is_empty() && !sec.is_empty() {
-                                return Some(Self::new(id, sec));
-                            }
-                        }
-                    }
-                    // Migrate the split credential format written by the early Rust UI.
-                    if !stdout.trim().is_empty() && !stdout.trim().starts_with('{') {
-                        if let Ok(secret) = std::process::Command::new("security")
-                            .args([
-                                "find-generic-password",
-                                "-s",
-                                "Tibrary",
-                                "-a",
-                                "catalogue-secret",
-                                "-w",
-                            ])
-                            .output()
-                        {
-                            if secret.status.success() {
-                                return Some(Self::new(
-                                    stdout.trim(),
-                                    String::from_utf8_lossy(&secret.stdout).trim(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    pub fn save_credentials(client: &str, secret: &str) -> std::io::Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            if client.trim().is_empty() || secret.trim().is_empty() {
-                return Err(std::io::Error::other("Client ID and secret are required"));
-            }
-            let payload =
-                serde_json::json!({"id":client.trim(),"secret":secret.trim()}).to_string();
-            let output = std::process::Command::new("security")
-                .args([
-                    "add-generic-password",
-                    "-U",
-                    "-s",
-                    "Tibrary",
-                    "-a",
-                    "catalogue-client",
-                    "-w",
-                    &payload,
-                ])
-                .output()?;
-            if !output.status.success() {
-                return Err(std::io::Error::other(
-                    "macOS Keychain could not save the credentials",
-                ));
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (client, secret);
-        }
-        *CREDENTIAL_CACHE.lock().unwrap() = None;
-        *TOKEN_CACHE.lock().unwrap() = None;
-        Ok(())
-    }
-
-    pub fn forget_credentials() -> std::io::Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("security")
-                .args([
-                    "delete-generic-password",
-                    "-s",
-                    "Tibrary",
-                    "-a",
-                    "catalogue-client",
-                ])
-                .output();
-            let _ = std::process::Command::new("security")
-                .args([
-                    "delete-generic-password",
-                    "-s",
-                    "Tibrary",
-                    "-a",
-                    "catalogue-secret",
-                ])
-                .output();
-        }
-        *CREDENTIAL_CACHE.lock().unwrap() = None;
-        *TOKEN_CACHE.lock().unwrap() = None;
-        Ok(())
+                .unwrap_or(2)
+                .clamp(1, 5) as usize,
+        })
     }
 
     pub async fn authenticate(&mut self) -> Result<String, String> {
-        let auth_val = format!("{}:{}", self.client_id, self.client_secret);
-        let encoded = BASE64_STANDARD.encode(auth_val.as_bytes());
+        crate::stream_download::get_valid_token(&self.db, &self.http).await
+    }
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {}", encoded))
-                .map_err(|e| format!("Invalid auth header: {}", e))?,
-        );
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/x-www-form-urlencoded"),
-        );
-
-        let res = self
-            .http
-            .post("https://auth.tidal.com/v1/oauth2/token")
-            .headers(headers)
-            .form(&[("grant_type", "client_credentials")])
-            .send()
-            .await
-            .map_err(|e| format!("Authentication request failed: {}", e))?;
-
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
+    /// All network requests use the single subscriber session. Paths are internal,
+    /// never taken from response links, so bearer tokens cannot leave the API host.
+    async fn request(
+        &mut self,
+        path: &str,
+        market: &str,
+        params: &[(&str, String)],
+    ) -> Result<Value, String> {
+        if market.len() != 2 || !market.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return Err("Choose a two-letter country code in Settings".into());
+        }
+        if path.contains('?') || path.contains('#') || path.contains("..") {
+            return Err("Invalid catalogue path".into());
+        }
+        let token = self.authenticate().await?;
+        let response = crate::network::get(
+            self.http
+                .get(format!("https://api.tidal.com/v1/{path}"))
+                .query(&[("countryCode", market)])
+                .query(params)
+                .bearer_auth(token),
+            self.request_spacing,
+            self.attempts,
+            None,
+        )
+        .await?;
+        let status = response.status();
+        if !status.is_success() {
             return Err(format!(
-                "TIDAL authentication rejected (HTTP {}): {}",
-                status, body
+                "Subscriber catalogue {path} failed (HTTP {})",
+                status.as_u16()
             ));
         }
-
-        let val: Value = res
+        response
             .json()
             .await
-            .map_err(|e| format!("Invalid auth JSON response: {}", e))?;
-
-        let token = val
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing access_token in response".to_string())?
-            .to_string();
-
-        let expires_in = val
-            .get("expires_in")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(3600.0);
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        self.expires_at = now + expires_in - 30.0; // Refresh 30s before expiry
-        self.token = Some(token.clone());
-        *TOKEN_CACHE.lock().unwrap() = Some((
-            self.client_id.clone(),
-            self.client_secret.clone(),
-            token.clone(),
-            self.expires_at,
-        ));
-
-        Ok(token)
+            .map_err(|e| format!("Invalid subscriber catalogue response: {e}"))
     }
 
-    pub async fn get_token(&mut self) -> Result<String, String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        if let Some(ref t) = self.token {
-            if now < self.expires_at {
-                return Ok(t.clone());
+    async fn pages(
+        &mut self,
+        path: &str,
+        market: &str,
+        params: &[(&str, String)],
+    ) -> Result<Vec<Value>, String> {
+        let mut result = Vec::new();
+        let mut offset = 0;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let mut query = params.to_vec();
+            query.extend([("limit", "100".into()), ("offset", offset.to_string())]);
+            let payload = self.request(path, market, &query).await?;
+            let page = payload["items"]
+                .as_array()
+                .ok_or("Catalogue response has no items")?;
+            let total = payload["totalNumberOfItems"].as_u64();
+            if page.is_empty() {
+                if total.is_some_and(|n| n > offset as u64) {
+                    return Err("Incomplete catalogue page; saved data retained".into());
+                }
+                break;
+            }
+            let signature = serde_json::to_string(page).map_err(|e| e.to_string())?;
+            if !seen.insert(signature) {
+                return Err("Catalogue repeated a page; saved data retained".into());
+            }
+            offset += page.len();
+            result.extend(page.clone());
+            if total.is_some_and(|n| offset as u64 >= n) || (total.is_none() && page.len() < 100) {
+                break;
+            }
+            if offset > 100_000 {
+                return Err("Catalogue pagination exceeded safety limit".into());
             }
         }
-
-        static AUTH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = AUTH_GATE.lock().await;
-        // Another workflow may have renewed the shared token while we waited.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-        if let Some((id, secret, token, expiry)) = TOKEN_CACHE.lock().unwrap().as_ref() {
-            if id == &self.client_id && secret == &self.client_secret && now < *expiry {
-                self.token = Some(token.clone());
-                self.expires_at = *expiry;
-                return Ok(token.clone());
-            }
-        }
-        self.authenticate().await
+        Ok(result)
     }
 
-    pub async fn get_json(&mut self, url: &str) -> Result<Value, String> {
-        let parsed = Url::parse(url).map_err(|e| e.to_string())?;
-        if parsed.scheme() != "https"
-            || parsed.host_str() != Some("openapi.tidal.com")
-            || !parsed.path().starts_with("/v2/")
-        {
-            return Err("Rejected unexpected catalogue URL".into());
-        }
-        for attempt in 0..2 {
-            let token = self.get_token().await?;
-            let res = crate::network::get(self.http.get(url).bearer_auth(token).header(ACCEPT, "application/vnd.api+json"),self.request_spacing,self.attempts,None).await?;
-            let status = res.status();
-            if status.is_success() {
-                return res
-                    .json()
-                    .await
-                    .map_err(|e| format!("Invalid catalogue response: {e}"));
+    /// Batch release summaries feed the existing normalized resource contract.
+    /// This avoids reimplementing availability, artist-credit and recommendation
+    /// rules while keeping all HTTP traffic on the subscriber API.
+    pub async fn albums(
+        &mut self,
+        ids: &[String],
+        market: &str,
+        force: bool,
+    ) -> Result<Value, String> {
+        let mut raw = Vec::new();
+        let mut pending = Vec::new();
+        let now = Utc::now().timestamp();
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("Invalid release ID".into());
             }
-            if status.as_u16() == 401 && attempt == 0 {
-                self.token = None;
-                *TOKEN_CACHE.lock().unwrap() = None;
+            if !seen.insert(id.clone()) {
                 continue;
             }
-            let body: Value = res.json().await.unwrap_or(Value::Null);
-            let detail = body["errors"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e["detail"].as_str().or(e["title"].as_str()))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(format!(
-                "Catalogue {} failed (HTTP {}){}",
-                parsed.path(),
-                status.as_u16(),
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", detail.chars().take(400).collect::<String>())
-                }
-            ));
+            let cached = self
+                .db
+                .get_preference(&format!("subscriber-summary:{market}:{id}"))
+                .await?;
+            if let Some(value) = cached.filter(|v| {
+                !force
+                    && (v["artist"].is_object() || v["artists"].is_array())
+                    && v["title"].is_string()
+                    && v["checked_at"]
+                        .as_i64()
+                        .is_some_and(|at| (0..30 * 86400).contains(&(now - at)))
+            }) {
+                raw.push(value);
+            } else {
+                pending.push(id.clone());
+            }
         }
-        Err("Catalogue retry limit reached".into())
+        for batch in pending.chunks(20) {
+            let payload = match self
+                .request("albums", market, &[("ids", batch.join(","))])
+                .await
+            {
+                Ok(payload) => payload,
+                Err(error)
+                    if ["(HTTP 400)", "(HTTP 404)", "(HTTP 500)"]
+                        .iter()
+                        .any(|code| error.ends_with(code)) =>
+                {
+                    // A stale ID can poison the subscriber batch. Isolate it,
+                    // but never reinterpret authentication/throttling as absence.
+                    // On a genuine outage the first failed single stops the job.
+                    let mut items = Vec::new();
+                    for id in batch {
+                        match self.request(&format!("albums/{id}"), market, &[]).await {
+                            Ok(item) => items.push(item),
+                            Err(error) if error.ends_with("(HTTP 404)") => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    json!(items)
+                }
+                Err(error) => return Err(error),
+            };
+            let items = payload
+                .as_array()
+                .or_else(|| payload["items"].as_array())
+                .ok_or("Invalid release summaries")?;
+            for item in items {
+                let id = resource_id(&item["id"]);
+                if !batch.contains(&id) {
+                    continue;
+                }
+                let mut item = item.clone();
+                item["checked_at"] = json!(now);
+                self.cache_summary(&item, market).await?;
+                raw.push(item);
+            }
+        }
+        Ok(album_resources(&raw))
+    }
+
+    async fn cache_summary(&self, raw: &Value, market: &str) -> Result<(), String> {
+        let id = resource_id(&raw["id"]);
+        self.db
+            .set_preference(&format!("subscriber-summary:{market}:{id}"), raw)
+            .await?;
+        let ids: Vec<_> = album_artists(raw)
+            .iter()
+            .map(|a| resource_id(&a["id"]))
+            .collect();
+        if !ids.is_empty() {
+            self.db.set_preference(&format!("release-artists:{market}:{id}"),&json!({"ids":ids,"checked_at":raw["checked_at"],"source":"subscriber album credits"})).await?;
+        }
+        if let Some(available) = subscriber_available(raw) {
+            self.db
+                .set_preference(
+                    &format!("release-live:{market}:{id}"),
+                    &json!({"available":available,"checked_at":raw["checked_at"]}),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Optional catalogue fields are accessible with the same subscriber token.
+    /// Empty successful results are cached; rejected/failed optional access backs
+    /// off globally so a library run cannot repeat a failure for every album.
+    pub async fn discovery(
+        &mut self,
+        ids: &[String],
+        market: &str,
+        force: bool,
+    ) -> Result<std::collections::HashMap<String, Value>, String> {
+        let mut result = std::collections::HashMap::new();
+        let mut pending = Vec::new();
+        let now = Utc::now().timestamp();
+        for id in ids {
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("Invalid release ID".into());
+            }
+            let saved = self
+                .db
+                .get_preference(&format!("subscriber-discovery:{market}:{id}"))
+                .await?;
+            if let Some(value) = saved.filter(|v| {
+                !force
+                    && v["checked_at"]
+                        .as_i64()
+                        .is_some_and(|at| (0..30 * 86400).contains(&(now - at)))
+            }) {
+                result.insert(id.clone(), value);
+            } else if !pending.contains(id) {
+                pending.push(id.clone());
+            }
+        }
+        let pause_key = format!("subscriber-discovery-paused:{market}");
+        if !force
+            && self
+                .db
+                .get_preference(&pause_key)
+                .await?
+                .is_some_and(|v| v["until"].as_i64().is_some_and(|at| at > now))
+        {
+            return Ok(result);
+        }
+        for batch in pending.chunks(20) {
+            let response = async {
+                let token = self.authenticate().await?;
+                let response = crate::network::get(
+                    self.http
+                        .get("https://openapi.tidal.com/v2/albums")
+                        .query(&[
+                            ("countryCode", market),
+                            ("filter[id]", batch.join(",").as_str()),
+                            ("include", "genres,replacement"),
+                        ])
+                        .bearer_auth(token)
+                        .header("Accept", "application/vnd.api+json"),
+                    self.request_spacing,
+                    self.attempts,
+                    None,
+                )
+                .await?;
+                if !response.status().is_success() {
+                    return Err(format!(
+                        "Optional catalogue fields: HTTP {}",
+                        response.status().as_u16()
+                    ));
+                }
+                let payload: Value = response.json().await.map_err(|e| e.to_string())?;
+                if !payload["data"].is_array() {
+                    return Err("Invalid optional catalogue metadata".to_string());
+                }
+                Ok(payload)
+            }
+            .await;
+            let payload = match response {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.db
+                        .set_preference(&pause_key, &json!({"until":now+3600,"message":error}))
+                        .await?;
+                    break;
+                }
+            };
+            let included = payload["included"].as_array().cloned().unwrap_or_default();
+            for id in batch {
+                let resource = payload["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["id"].as_str() == Some(id));
+                let value = if let Some(resource) = resource {
+                    let attrs = &resource["attributes"];
+                    json!({"checked_at":now,"genres":related_genres(resource,&included),"replacement_id":replacement_id(resource),
+                        "label":attrs["recordLabel"].as_str().or(attrs["recordLabel"]["name"].as_str()),
+                        "official":attrs["official"],"original_release_date":attrs["originalReleaseDate"],"source":"subscriber"})
+                } else {
+                    json!({"checked_at":now,"source":"subscriber","not_returned":true})
+                };
+                self.db
+                    .set_preference(&format!("subscriber-discovery:{market}:{id}"), &value)
+                    .await?;
+                result.insert(id.clone(), value);
+            }
+        }
+        Ok(result)
     }
 
     pub async fn search_artists(
@@ -627,79 +603,27 @@ impl TidalClient {
         query: &str,
         market: &str,
     ) -> Result<Vec<TidalArtist>, String> {
-        let mut url =
-            Url::parse("https://openapi.tidal.com/v2/searchResults").map_err(|e| e.to_string())?;
-        url.query_pairs_mut()
-            .append_pair("filter[query]", query)
-            .append_pair("countryCode", market);
-
-        let payload = self.get_json(url.as_str()).await?;
-        let data = match payload.get("data") {
-            Some(Value::Array(arr)) => arr.clone(),
-            Some(Value::Object(_)) => vec![payload["data"].clone()],
-            _ => return Ok(Vec::new()),
-        };
-
-        let mut artists = Vec::new();
-        for item in data {
-            let search_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if search_id.is_empty() {
-                continue;
-            }
-
-            let rel_url = format!(
-                "https://openapi.tidal.com/v2/searchResults/{}/relationships/artists?countryCode={}&include=artists",
-                urlencoding_encode(search_id),
-                market
-            );
-
-            {
-                let rel_payload = self.get_json(&rel_url).await?;
-                if let Some(included) = rel_payload.get("included").and_then(|v| v.as_array()) {
-                    for inc in included {
-                        if inc.get("type").and_then(|v| v.as_str()) == Some("artists") {
-                            let id = inc
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let name = inc
-                                .get("attributes")
-                                .and_then(|a| a.get("name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if !id.is_empty() && !name.is_empty() {
-                                artists.push(TidalArtist { id, name });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(artists)
-    }
-
-    pub async fn releases_for_isrc(&mut self, isrc: &str, market: &str) -> Result<Vec<String>, String> {
-        let mut url = Url::parse("https://openapi.tidal.com/v2/tracks").map_err(|e|e.to_string())?;
-        url.query_pairs_mut().append_pair("filter[isrc]", isrc).append_pair("countryCode", market).append_pair("include", "albums");
-        let mut next = Some(url.to_string());
-        let mut visited = std::collections::HashSet::new();
-        let mut ids = Vec::new();
-        while let Some(url) = next {
-            if !visited.insert(url.clone()) { return Err("Recording lookup repeated a page".into()); }
-            let payload = self.get_json(&url).await?;
-            for track in payload["data"].as_array().into_iter().flatten() {
-                if !track["attributes"]["isrc"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(isrc)) { continue; }
-                for album in track["relationships"]["albums"]["data"].as_array().into_iter().flatten() {
-                    if let Some(id) = album["id"].as_str() { ids.push(id.to_owned()); }
-                }
-            }
-            next = payload["links"]["next"].as_str().or_else(||payload["links"]["next"]["href"].as_str())
-                .map(|n| catalogue_next(&url,n)).transpose()?;
-        }
-        ids.sort(); ids.dedup(); Ok(ids)
+        let payload = self
+            .request(
+                "search/artists",
+                market,
+                &[("query", query.into()), ("limit", "50".into())],
+            )
+            .await?;
+        let items = payload["items"]
+            .as_array()
+            .ok_or("Invalid artist search response")?;
+        Ok(items
+            .iter()
+            .filter_map(|v| {
+                let id = resource_id(&v["id"]);
+                let name = v["name"].as_str()?;
+                (!id.is_empty()).then(|| TidalArtist {
+                    id,
+                    name: name.into(),
+                })
+            })
+            .collect())
     }
 
     pub async fn search_tracks(
@@ -707,81 +631,65 @@ impl TidalClient {
         query: &str,
         market: &str,
     ) -> Result<Vec<TidalTrackSearchResult>, String> {
-        let mut url =
-            Url::parse("https://openapi.tidal.com/v2/searchResults").map_err(|e| e.to_string())?;
-        url.query_pairs_mut()
-            .append_pair("filter[query]", query)
-            .append_pair("countryCode", market);
+        let payload = self
+            .request(
+                "search/tracks",
+                market,
+                &[("query", query.into()), ("limit", "100".into())],
+            )
+            .await?;
+        let items = payload["items"]
+            .as_array()
+            .ok_or("Invalid track search response")?;
+        Ok(items
+            .iter()
+            .filter_map(|v| {
+                let id = resource_id(&v["id"]);
+                let album = resource_id(&v["album"]["id"]);
+                (!id.is_empty() && !album.is_empty()).then(|| TidalTrackSearchResult {
+                    id,
+                    title: format_title(v["title"].as_str().unwrap_or(""), v["version"].as_str()),
+                    isrc: v["isrc"].as_str().map(str::to_owned),
+                    album_ids: vec![album],
+                })
+            })
+            .collect())
+    }
 
-        let payload = self.get_json(url.as_str()).await?;
-        let data = match payload.get("data") {
-            Some(Value::Array(arr)) => arr.clone(),
-            Some(Value::Object(_)) => vec![payload["data"].clone()],
-            _ => return Ok(Vec::new()),
-        };
-
-        let mut results = Vec::new();
-        for item in data {
-            let search_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if search_id.is_empty() {
-                continue;
-            }
-
-            let rel_url = format!(
-                "https://openapi.tidal.com/v2/searchResults/{}/relationships/tracks?countryCode={}&include=tracks",
-                urlencoding_encode(search_id),
-                market
-            );
-
-            {
-                let rel_payload = self.get_json(&rel_url).await?;
-                if let Some(included) = rel_payload.get("included").and_then(|v| v.as_array()) {
-                    for inc in included {
-                        if inc.get("type").and_then(|v| v.as_str()) == Some("tracks") {
-                            let id = inc
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let title_val = inc
-                                .get("attributes")
-                                .and_then(|a| a.get("title"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let isrc = inc
-                                .get("attributes")
-                                .and_then(|a| a.get("isrc"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let mut album_ids = Vec::new();
-                            if let Some(albums) = inc
-                                .get("relationships")
-                                .and_then(|r| r.get("albums"))
-                                .and_then(|a| a.get("data"))
-                                .and_then(|d| d.as_array())
-                            {
-                                for alb in albums {
-                                    if let Some(aid) = alb.get("id").and_then(|v| v.as_str()) {
-                                        album_ids.push(aid.to_string());
-                                    }
-                                }
-                            }
-                            if !id.is_empty() {
-                                results.push(TidalTrackSearchResult {
-                                    id,
-                                    title: title_val,
-                                    isrc,
-                                    album_ids,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(results)
+    pub async fn releases_for_isrc(
+        &mut self,
+        isrc: &str,
+        market: &str,
+        release_title: &str,
+    ) -> Result<Vec<String>, String> {
+        // ISRC is a filter on /tracks; text search treats it as words and can
+        // return unrelated recordings. Always verify the returned identifier.
+        let items = self
+            .pages("tracks", market, &[("isrc", isrc.into())])
+            .await?;
+        let mut ids: Vec<_> = items
+            .iter()
+            .filter(|v| {
+                v["isrc"]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(isrc))
+            })
+            .filter(|v| {
+                let candidate =
+                    crate::matching::title_key(v["album"]["title"].as_str().unwrap_or(""));
+                let local = crate::matching::title_key(release_title);
+                // Nested album summaries can omit the edition suffix. Retain
+                // these candidates; full release structure still decides links.
+                candidate.is_empty()
+                    || candidate == local
+                    || (candidate.len() >= 3 && local.starts_with(&format!("{candidate} ")))
+            })
+            .map(|v| resource_id(&v["album"]["id"]))
+            .filter(|s| !s.is_empty())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     pub async fn get_artist_catalogue(
@@ -790,327 +698,82 @@ impl TidalClient {
         market: &str,
         detailed: bool,
     ) -> Result<TidalCatalogue, String> {
-        let artist_url = format!(
-            "https://openapi.tidal.com/v2/artists/{}?countryCode={}",
-            artist_id, market
-        );
-        let artist_payload = self.get_json(&artist_url).await?;
-        let artist_name = artist_payload
-            .get("data")
-            .and_then(|d| d.get("attributes"))
-            .and_then(|a| a.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let mut next_url = Some(format!(
-            "https://openapi.tidal.com/v2/artists/{}/relationships/albums?countryCode={}&include=albums,albums.genres,albums.replacement",
-            artist_id, market
-        ));
-
-        let mut releases = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        while let Some(current_url) = next_url.take() {
-            if !visited.insert(current_url.clone()) {
-                return Err("Catalogue pagination repeated a page".into());
-            }
-            let payload = self.get_json(&current_url).await?;
-
-            if let Some(included) = payload.get("included").and_then(|v| v.as_array()) {
-                for item in included {
-                    if item.get("type").and_then(|v| v.as_str()) != Some("albums") {
-                        continue;
-                    }
-
-                    if !payload["data"].as_array().is_some_and(|refs| refs.iter().any(|r| r["id"] == item["id"] && r["type"] == "albums")) { continue; }
-                    let rel_id = item
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let attrs = item.get("attributes").cloned().unwrap_or(Value::Null);
-
-                    let title_raw = attrs.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    let version_raw = attrs.get("version").and_then(|v| v.as_str());
-                    let title = format_title(title_raw, version_raw);
-
-                    let date = attrs
-                        .get("releaseDate")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let rel_type = attrs
-                        .get("albumType")
-                        .or_else(|| attrs.get("type"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("ALBUM")
-                        .to_string();
-
-                    let track_count = attrs
-                        .get("numberOfItems")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize;
-
-                    let availability = attrs.get("availability").and_then(|v| v.as_array());
-                    let is_available = availability.map(|arr| {
-                        arr.iter()
-                            .any(|s| s.as_str() == Some("STREAM") || s.as_str() == Some("DJ"))
-                    });
-
-                    let explicit = attrs
-                        .get("explicit")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let copyright = attrs
-                        .get("copyright")
-                        .and_then(|v| v.as_str().or_else(|| v.get("text").and_then(Value::as_str)))
-                        .map(|s| s.to_string());
-                    let label = attrs
-                        .get("recordLabel")
-                        .or_else(|| attrs.get("label"))
-                        .and_then(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str)))
-                        .map(|s| s.to_string());
-                    let upc = attrs
-                        .get("barcodeId")
-                        .or_else(|| attrs.get("upc"))
-                        .or_else(|| attrs.get("barcode"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    let release_group_id = attrs
-                        .get("releaseGroupId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    let primary_type = attrs
-                        .get("primaryType")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    let secondary_types = attrs
-                        .get("secondaryTypes")
-                        .and_then(Value::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let artist_refs = item["relationships"]["artists"]["data"].as_array();
-                    let artist_credits: Vec<String> = artist_refs
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|reference| {
-                            let id = reference["id"].as_str()?;
-                            let artist = payload["included"]
-                                .as_array()?
-                                .iter()
-                                .find(|artist| artist["type"] == "artists" && artist["id"] == id)?;
-                            artist["attributes"]["name"].as_str().map(str::to_owned)
-                        })
-                        .collect();
-                    // The first album credit is the catalogue's primary credit. Do not
-                    // manufacture an album artist by joining every collaborator name.
-                    let primary_artist_verified = artist_refs
-                        .and_then(|refs| refs.first())
-                        .and_then(|reference| reference["id"].as_str())
-                        == Some(artist_id);
-
-                    let quality = attrs
-                        .get("mediaTags")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_default();
-
-                    let mut release = TidalRelease {
-                        id: rel_id.clone(),
-                        artist: artist_name.clone(),
-                        title,
-                        date,
-                        r#type: rel_type,
-                        available: is_available,
-                        track_count,
-                        explicit,
-                        copyright,
-                        label,
-                        quality,
-                        tracks: Vec::new(),
-                        tracks_loaded: false,
-                        upc,
-                        release_group_id,
-                        primary_type,
-                        secondary_types,
-                        artist_credits,
-                        primary_artist_verified,
-                        official: attrs.get("official").and_then(Value::as_bool),
-                        genres: related_genres(item, included),
-                        replacement_id: replacement_id(item),
-                        discovery_checked_at: Some(Utc::now().timestamp()),
-                        original_release_date: attrs
-                            .get("originalReleaseDate")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        audio_modes: string_list(attrs.get("audioModes")),
-                        media_metadata: attrs.get("mediaMetadata").cloned().unwrap_or(Value::Null),
-                    };
-
-                    if detailed {
-                        {
-                            let tracks = self.get_release_details(&rel_id, market).await?;
-                            release.track_count = tracks.len();
-                            release.tracks = tracks;
-                            release.tracks_loaded = true;
-                        }
-                    }
-
-                    releases.push(release);
-                }
-            }
-
-            next_url = payload["links"]["next"]
-                .as_str()
-                .or_else(|| payload["links"]["next"]["href"].as_str())
-                .map(|next| catalogue_next(&current_url, next))
-                .transpose()
-                .map_err(|e| e.to_string())?;
+        if artist_id.is_empty() || !artist_id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("Invalid artist ID".into());
         }
-
+        let artist = self
+            .request(&format!("artists/{artist_id}"), market, &[])
+            .await?;
+        let name = artist["name"]
+            .as_str()
+            .ok_or("Artist name missing")?
+            .to_owned();
+        // Main catalogue excludes guest compilation appearances by default.
+        // Users can explicitly include them in Release matching & recommendations.
+        let settings = self.db.get_settings().await?;
+        let filters = if settings["general"]["recommend_compilations"] == true {
+            vec!["", "EPSANDSINGLES", "COMPILATIONS"]
+        } else {
+            vec!["", "EPSANDSINGLES"]
+        };
+        let mut releases = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for filter in filters {
+            let params = if filter.is_empty() {
+                vec![]
+            } else {
+                vec![("filter", filter.to_owned())]
+            };
+            let items = self
+                .pages(&format!("artists/{artist_id}/albums"), market, &params)
+                .await?;
+            for mut raw in items {
+                let id = resource_id(&raw["id"]);
+                if id.is_empty() || !seen.insert(id.clone()) {
+                    continue;
+                }
+                raw["checked_at"] = json!(Utc::now().timestamp());
+                self.cache_summary(&raw, market).await?;
+                let mut release = release_from_subscriber(&raw, artist_id);
+                if detailed {
+                    release.tracks = self.get_release_details(&id, market).await?;
+                    release.tracks_loaded = true;
+                    release.track_count = release.tracks.len();
+                }
+                releases.push(release);
+            }
+        }
+        let ids = releases.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let extra = self.discovery(&ids, market, false).await?;
+        for release in &mut releases {
+            if let Some(fields) = extra.get(&release.id) {
+                let mut value = serde_json::to_value(&*release).map_err(|e| e.to_string())?;
+                merge_discovery(&mut value, fields);
+                *release = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            }
+        }
         Ok(TidalCatalogue {
-            id: artist_id.to_string(),
-            name: artist_name,
+            id: artist_id.into(),
+            name,
             releases,
         })
     }
 
     pub async fn get_release_details(
         &mut self,
-        release_id: &str,
+        id: &str,
         market: &str,
     ) -> Result<Vec<TidalTrack>, String> {
-        let mut next=Some(format!("https://openapi.tidal.com/v2/albums/{release_id}/relationships/items?countryCode={market}&include=items,items.credits,items.genres,items.replacement"));
-        let mut tracks = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        while let Some(url) = next {
-            if !visited.insert(url.clone()) {
-                return Err("Catalogue pagination repeated a page".into());
-            }
-            let payload = self.get_json(&url).await?;
-            tracks.extend(parse_release_tracks(&payload)?);
-            next = payload["links"]["next"]
-                .as_str()
-                .or_else(|| payload["links"]["next"]["href"].as_str())
-                .map(|n| catalogue_next(&url, n))
-                .transpose()
-                .map_err(|e| e.to_string())?;
-        }
-        tracks.sort_by_key(|t| (t.disc_number, t.track_number));
-        tracks.dedup_by(|a, b| {
-            a.id == b.id && a.disc_number == b.disc_number && a.track_number == b.track_number
-        });
-        self.fill_track_credits(&mut tracks, market).await;
-        Ok(tracks)
-    }
-
-    /// Upgrade older cached track lists without fetching the release again. Empty
-    /// credit lists are valid results; failed optional lookups wait a day to retry.
-    pub async fn fill_track_credits(&mut self, tracks: &mut [TidalTrack], market: &str) {
-        let now = Utc::now().timestamp();
-        let pending: Vec<usize> = tracks
-            .iter()
-            .enumerate()
-            .filter(|(_, track)| {
-                (!track.credits_complete && track.credits_checked_at.is_none_or(|at| now - at >= 86_400))
-                    || track.discovery_checked_at.is_none_or(|at| now - at >= 30 * 86_400)
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for batch in pending.chunks(20) {
-            let ids = batch
-                .iter()
-                .map(|&index| tracks[index].id.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut url = Url::parse("https://openapi.tidal.com/v2/tracks").unwrap();
-            url.query_pairs_mut()
-                .append_pair("countryCode", market)
-                .append_pair("filter[id]", &ids)
-                .append_pair("include", "credits,genres,replacement");
-            // Stamp the attempt even on failure, preventing a broken optional
-            // endpoint from creating a request loop during ordinary linking.
-            for &index in batch {
-                tracks[index].credits_checked_at = Some(now);
-                tracks[index].discovery_checked_at = Some(now - 29 * 86_400);
-            }
-            let Ok(payload) = self.get_json(url.as_str()).await else {
-                for &index in &pending {
-                    tracks[index].credits_checked_at = Some(now);
-                tracks[index].discovery_checked_at = Some(now - 29 * 86_400);
-                }
-                break;
-            };
-            let resources = payload["data"].as_array().cloned().unwrap_or_default();
-            let included = payload["included"].as_array().cloned().unwrap_or_default();
-            for &index in batch {
-                let track = &mut tracks[index];
-                let Some(resource) = resources.iter().find(|r| r["id"] == track.id) else {
-                    continue;
-                };
-                track.discovery_checked_at = Some(now);
-                if resource["relationships"].get("genres").is_some() { track.genres = related_genres(resource, &included); }
-                if resource["relationships"].get("replacement").is_some() { track.replacement_id = replacement_id(resource); }
-                let (credits, complete) = included_credits(resource, &included);
-                let mut values = credits.as_array().cloned().unwrap_or_default();
-                if !complete {
-                    values.extend(track.credits.as_array().into_iter().flatten().cloned());
-                }
-                let mut next = relationship_next(&resource["relationships"]["credits"]);
-                let mut complete = complete;
-                let mut visited = std::collections::HashSet::new();
-                while let Some(link) = next.take() {
-                    let Ok(mut next_url) = catalogue_next(url.as_str(), &link)
-                        .and_then(|s| Url::parse(&s).map_err(|e| e.to_string()))
-                    else {
-                        break;
-                    };
-                    if !next_url.query_pairs().any(|(key, _)| key == "include") {
-                        next_url.query_pairs_mut().append_pair("include", "credits");
-                    }
-                    if !visited.insert(next_url.to_string()) {
-                        break;
-                    }
-                    let Ok(page) = self.get_json(next_url.as_str()).await else {
-                        break;
-                    };
-                    let page_items = page["included"].as_array().cloned().unwrap_or_default();
-                    let references = page["data"].as_array().cloned().unwrap_or_default();
-                    let found: Vec<_> = references
-                        .iter()
-                        .filter_map(|r| {
-                            page_items
-                                .iter()
-                                .find(|item| item["type"] == "credits" && item["id"] == r["id"])
-                        })
-                        .map(normalized_credit)
-                        .collect();
-                    if found.len() != references.len() {
-                        break;
-                    }
-                    values.extend(found);
-                    next = relationship_next(&page);
-                    complete = next.is_none();
-                }
-                let mut seen = std::collections::HashSet::new();
-                values.retain(|value| seen.insert(value.to_string()));
-                if credits.is_array() {
-                    track.credits = json!(values);
-                }
-                track.credits_complete = complete;
-            }
-        }
+        let raw = crate::subscriber_metadata::load(
+            &self.db,
+            &self.http,
+            id,
+            market,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
+        )
+        .await?;
+        crate::subscriber_metadata::tracks(&raw)
     }
 
     pub async fn save_catalogue_to_db(
@@ -1150,6 +813,8 @@ impl TidalClient {
                                 "primary_type",
                                 "secondary_types",
                                 "artist_credits",
+                                "genres",
+                                "replacement_id",
                             ] {
                                 let absent = release[field].is_null()
                                     || release[field].as_str().is_some_and(str::is_empty)
@@ -1159,7 +824,8 @@ impl TidalClient {
                                 }
                             }
                             if release["discovery_checked_at"].is_null() {
-                                for field in ["genres","replacement_id","discovery_checked_at"] { release[field] = cached[field].clone(); }
+                                release["discovery_checked_at"] =
+                                    cached["discovery_checked_at"].clone();
                             }
                             if release["tracks_loaded"] != true && cached["tracks_loaded"] == true {
                                 release["tracks"] = cached["tracks"].clone();
@@ -1289,7 +955,9 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
             media_metadata: a.get("mediaMetadata").cloned().unwrap_or(Value::Null),
             genres: related_genres(item, included),
             replacement_id: replacement_id(item),
-            discovery_checked_at: item["relationships"].get("genres").map(|_| Utc::now().timestamp()),
+            discovery_checked_at: item["relationships"]
+                .get("genres")
+                .map(|_| Utc::now().timestamp()),
             credits,
             credits_complete,
             credits_checked_at: credits_complete.then(|| Utc::now().timestamp()),
@@ -1301,15 +969,31 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
 pub fn replacement_id(resource: &Value) -> Option<String> {
     let data = &resource["relationships"]["replacement"]["data"];
     let reference = data.as_array().and_then(|a| a.first()).unwrap_or(data);
-    reference["id"].as_str().filter(|id| !id.is_empty() && Some(*id) != resource["id"].as_str()).map(str::to_owned)
+    reference["id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && Some(*id) != resource["id"].as_str())
+        .map(str::to_owned)
 }
 
 pub fn related_genres(resource: &Value, included: &[Value]) -> Vec<String> {
     let mut values = Vec::new();
-    for reference in resource["relationships"]["genres"]["data"].as_array().into_iter().flatten() {
-        if let Some(name) = included.iter().find(|v| v["type"] == "genres" && v["id"] == reference["id"])
-            .and_then(|v| v["attributes"]["name"].as_str()) {
-            if !name.trim().is_empty() && !values.iter().any(|v: &String| v.eq_ignore_ascii_case(name.trim())) { values.push(name.trim().to_string()); }
+    for reference in resource["relationships"]["genres"]["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = included
+            .iter()
+            .find(|v| v["type"] == "genres" && v["id"] == reference["id"])
+            .and_then(|v| v["attributes"]["name"].as_str())
+        {
+            if !name.trim().is_empty()
+                && !values
+                    .iter()
+                    .any(|v: &String| v.eq_ignore_ascii_case(name.trim()))
+            {
+                values.push(name.trim().to_string());
+            }
         }
     }
     values
@@ -1363,24 +1047,8 @@ pub fn parse_iso8601_duration(value: &str) -> Option<f64> {
     Some(total_secs)
 }
 
-fn urlencoding_encode(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn pagination_preserves_api_prefix_and_market() {
-        let current =
-            "https://openapi.tidal.com/v2/artists/123/relationships/albums?countryCode=GB";
-        assert_eq!(
-            super::catalogue_next(current, "/artists/123/relationships/albums?page=2").unwrap(),
-            "https://openapi.tidal.com/v2/artists/123/relationships/albums?page=2&countryCode=GB"
-        );
-        assert!(super::catalogue_next(current, "https://example.com/page").is_err());
-        assert!(super::catalogue_next(current, "http://openapi.tidal.com/page").is_err());
-    }
-
     #[test]
     fn release_relationship_positions_exclude_video() {
         let payload = serde_json::json!({"data":[{"id":"t","type":"tracks","meta":{"trackNumber":5,"volumeNumber":2}},{"id":"v","type":"videos"}],"included":[{"id":"t","type":"tracks","attributes":{"title":"Song","duration":"PT3M","trackNumber":1}}]});
@@ -1413,66 +1081,364 @@ mod tests {
         assert_eq!(parse_iso8601_duration("PT3M45.5S"), Some(225.5));
         assert_eq!(parse_iso8601_duration("INVALID"), None);
     }
+}
 
-    #[test]
-    #[ignore = "Explicit credential-store integration check"]
-    fn test_from_env_or_keychain() {
-        // Test loading client from Keychain / env
-        let client = TidalClient::from_env_or_keychain();
-        if let Some(c) = client {
-            assert!(!c.client_id.is_empty());
-            assert!(!c.client_secret.is_empty());
+fn resource_id(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_u64().map(|v| v.to_string()))
+        .unwrap_or_default()
+}
+
+fn album_artists(raw: &Value) -> Vec<Value> {
+    let mut artists = Vec::new();
+    // Preserve the explicit album-level primary artist first, never a track guest.
+    for artist in
+        std::iter::once(&raw["artist"]).chain(raw["artists"].as_array().into_iter().flatten())
+    {
+        let id = resource_id(&artist["id"]);
+        if !id.is_empty() && !artists.iter().any(|a: &Value| resource_id(&a["id"]) == id) {
+            artists.push(artist.clone());
         }
     }
+    artists
+}
 
-    #[tokio::test]
-    #[ignore = "Explicit read-only live credits check using saved credentials"]
-    async fn live_release_credits() {
-        let mut client =
-            TidalClient::from_env_or_keychain().expect("Saved catalogue credentials required");
-        let tracks = client.get_release_details("234657671", "GB").await.unwrap();
-        assert!(!tracks.is_empty());
-        assert!(tracks.iter().all(|track| track.credits_complete));
-        let album = client.get_json("https://openapi.tidal.com/v2/albums/234657671?countryCode=GB&include=genres,replacement,artists").await.unwrap();
-        let resource = album["data"].as_array().and_then(|a| a.first()).unwrap_or(&album["data"]);
-        assert_eq!(resource["id"], "234657671");
-        if let Some(artist) = resource["relationships"]["artists"]["data"].as_array().and_then(|a| a.first()).and_then(|a| a["id"].as_str()) {
-            let page = client.get_json(&format!("https://openapi.tidal.com/v2/artists/{artist}/relationships/albums?countryCode=GB&include=albums,albums.genres,albums.replacement")).await.unwrap();
-            assert!(page["data"].is_array());
-        }
-        println!("Album genres: {:?}; replacement: {:?}", related_genres(resource, album["included"].as_array().unwrap_or(&Vec::new())), replacement_id(resource));
-        println!(
-            "{} tracks checked; {} credit entries returned (empty lists are cached too)",
-            tracks.len(),
-            tracks
+fn subscriber_available(raw: &Value) -> Option<bool> {
+    match (
+        raw["allowStreaming"].as_bool(),
+        raw["streamReady"].as_bool(),
+    ) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+/// Existing cache consumers share a JSON resource envelope. Missing optional
+/// subscriber fields remain unknown; absence must not erase richer saved data.
+fn album_resources(items: &[Value]) -> Value {
+    let mut data = Vec::new();
+    let mut included = Vec::new();
+    for raw in items {
+        let id = resource_id(&raw["id"]);
+        let artists = album_artists(raw);
+        let refs: Vec<_> = artists
+            .iter()
+            .map(|a| json!({"type":"artists","id":resource_id(&a["id"])}))
+            .collect();
+        for a in artists {
+            let aid = resource_id(&a["id"]);
+            if !included
                 .iter()
-                .map(|track| track.credits.as_array().map_or(0, Vec::len))
-                .sum::<usize>()
+                .any(|v: &Value| v["id"] == aid && v["type"] == "artists")
+            {
+                included.push(json!({"type":"artists","id":aid,"attributes":{"name":a["name"]}}));
+            }
+        }
+        let mut attrs = raw.clone();
+        attrs["albumType"] = raw["type"].clone();
+        attrs["numberOfItems"] = raw["numberOfTracks"].clone(); // Audio only, never video count.
+        attrs["barcodeId"] = raw["upc"].clone();
+        attrs["recordLabel"] = raw
+            .get("label")
+            .or_else(|| raw.get("recordLabel"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        attrs["mediaTags"] = raw["mediaMetadata"]["tags"].clone();
+        if let Some(available) = subscriber_available(raw) {
+            attrs["availability"] = if available {
+                json!(["STREAM"])
+            } else {
+                json!([])
+            };
+        }
+        let mut relationships = json!({"artists":{"data":refs}});
+        if let Some(replacement) = raw
+            .get("replacementId")
+            .or_else(|| raw.get("replacement").and_then(|v| v.get("id")))
+        {
+            let rid = resource_id(replacement);
+            if !rid.is_empty() && rid != id {
+                relationships["replacement"] = json!({"data":{"type":"albums","id":rid}});
+            }
+        }
+        if let Some(genres) = raw["genres"].as_array() {
+            let mut refs = Vec::new();
+            for (index, g) in genres.iter().enumerate() {
+                if let Some(name) = g.as_str().or_else(|| g["name"].as_str()) {
+                    let gid = format!("{id}:genre:{index}");
+                    refs.push(json!({"type":"genres","id":gid}));
+                    included.push(json!({"type":"genres","id":gid,"attributes":{"name":name}}));
+                }
+            }
+            relationships["genres"] = json!({"data":refs});
+        }
+        data.push(
+            json!({"type":"albums","id":id,"attributes":attrs,"relationships":relationships}),
+        );
+    }
+    json!({"data":data,"included":included,"source":"subscriber"})
+}
+
+fn release_from_subscriber(raw: &Value, artist_id: &str) -> TidalRelease {
+    let artists = album_artists(raw);
+    let resources = album_resources(&[raw.clone()]);
+    let data = &resources["data"][0];
+    let included = resources["included"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    TidalRelease {
+        id: resource_id(&raw["id"]),
+        artist: artists
+            .first()
+            .and_then(|a| a["name"].as_str())
+            .unwrap_or("")
+            .into(),
+        title: format_title(raw["title"].as_str().unwrap_or(""), raw["version"].as_str()),
+        date: raw["releaseDate"].as_str().unwrap_or("").into(),
+        r#type: raw["type"].as_str().unwrap_or("ALBUM").into(),
+        available: subscriber_available(raw),
+        track_count: raw["numberOfTracks"].as_u64().unwrap_or(0) as usize,
+        explicit: raw["explicit"].as_bool().unwrap_or(false),
+        copyright: raw["copyright"].as_str().map(str::to_owned),
+        label: raw["label"]
+            .as_str()
+            .or_else(|| raw["label"]["name"].as_str())
+            .map(str::to_owned),
+        quality: raw["audioQuality"].as_str().unwrap_or("").into(),
+        upc: raw["upc"].as_str().map(str::to_owned),
+        artist_credits: artists
+            .iter()
+            .filter_map(|a| a["name"].as_str().map(str::to_owned))
+            .collect(),
+        primary_artist_verified: artists
+            .first()
+            .is_some_and(|a| resource_id(&a["id"]) == artist_id),
+        original_release_date: raw["originalReleaseDate"].as_str().map(str::to_owned),
+        audio_modes: string_list(raw.get("audioModes")),
+        media_metadata: raw["mediaMetadata"].clone(),
+        genres: related_genres(data, &included),
+        replacement_id: replacement_id(data),
+        official: raw["official"].as_bool(),
+        secondary_types: string_list(raw.get("secondaryTypes")),
+        release_group_id: raw["releaseGroupId"].as_str().map(str::to_owned),
+        // No claim about genres/replacements/official status when not supplied.
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod subscriber_tests {
+    use super::*;
+    #[test]
+    fn missing_optional_lists_accept_cached_nulls_but_not_objects() {
+        let release: TidalRelease = serde_json::from_value(
+            json!({"id":"1","secondary_types":null,"audio_modes":null,"tracks":null}),
+        )
+        .unwrap();
+        assert!(release.secondary_types.is_empty());
+        assert!(release.tracks.is_empty());
+        assert!(
+            serde_json::from_value::<TidalRelease>(json!({"secondary_types":{"wrong":true}}))
+                .is_err()
         );
     }
 
+    #[test]
+    fn album_adapter_preserves_primary_credit_audio_counts_and_unknowns() {
+        let raw = json!({"id":12,"artist":{"id":4,"name":"Main"},"artists":[{"id":5,"name":"Guest"},{"id":4,"name":"Main"}],"numberOfTracks":12,"numberOfVideos":1,"allowStreaming":true,"streamReady":true,"upc":"0012","type":"ALBUM","title":"Release","audioQuality":"LOSSLESS"});
+        let rel = release_from_subscriber(&raw, "4");
+        assert_eq!(rel.track_count, 12);
+        assert!(rel.primary_artist_verified);
+        assert_eq!(rel.artist, "Main");
+        let resources = album_resources(&[raw]);
+        assert_eq!(
+            resources["data"][0]["relationships"]["artists"]["data"][0]["id"],
+            "4"
+        );
+        assert_eq!(
+            crate::availability::available(&resources["data"][0]),
+            Some(true)
+        );
+        assert!(!resources["data"][0]["relationships"]["genres"].is_object());
+        assert_eq!(subscriber_available(&json!({"allowStreaming":true})), None);
+        assert_eq!(
+            subscriber_available(&json!({"allowStreaming":true,"streamReady":false})),
+            Some(false)
+        );
+        let mut saved = json!({"genres":["Electronic"],"replacement_id":"42"});
+        merge_discovery(
+            &mut saved,
+            &json!({"checked_at":10,"genres":[],"replacement_id":null}),
+        );
+        assert_eq!(saved["genres"], json!(["Electronic"]));
+        assert_eq!(saved["replacement_id"], "42");
+        merge_discovery(
+            &mut saved,
+            &json!({"checked_at":11,"genres":["House"],"replacement_id":"43"}),
+        );
+        assert_eq!(saved["genres"], json!(["House"]));
+        assert_eq!(saved["replacement_id"], "43");
+    }
+
     #[tokio::test]
-    #[ignore = "Explicit live catalogue check; uses saved credentials and API quota"]
-    async fn test_online_search_artists() {
-        if let Some(mut client) = TidalClient::from_env_or_keychain() {
-            let artists = client.search_artists("100 gecs", "GB").await.unwrap();
-            assert!(!artists.is_empty(), "Should find artists for '100 gecs'");
-            println!("Found {} artists: {:?}", artists.len(), artists);
-            let gecs = artists.iter().find(|a| a.name.to_lowercase() == "100 gecs");
-            assert!(gecs.is_some(), "Should find 100 gecs artist");
-            let artist = gecs.unwrap();
-            let cat = client
-                .get_artist_catalogue(&artist.id, "GB", false)
+    async fn subscriber_summary_cache_works_without_credentials_and_retains_rich_old_metadata() {
+        let dir = std::env::temp_dir().join(format!("subscriber-cache-{}", uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let mut client = TidalClient::from_db(&db).await.unwrap();
+        let raw = json!({"id":12,"title":"Release","artist":{"id":4,"name":"Main"},"checked_at":Utc::now().timestamp(),"allowStreaming":true,"streamReady":true});
+        client.cache_summary(&raw, "GB").await.unwrap();
+        let payload = client.albums(&["12".into()], "GB", false).await.unwrap();
+        assert_eq!(payload["data"][0]["id"], "12");
+        assert!(db
+            .get_preference("release-artists:US:12")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.get_preference("release-artists:GB:12")
                 .await
-                .unwrap();
-            assert!(
-                !cat.releases.is_empty(),
-                "Should find releases for 100 gecs"
-            );
-            println!("Found {} releases for {}:", cat.releases.len(), cat.name);
-            for r in &cat.releases {
-                println!("  - [{}] {} ({})", r.id, r.title, r.date);
-            }
+                .unwrap()
+                .unwrap()["ids"],
+            json!(["4"])
+        );
+        let mut old = release_from_subscriber(&raw, "4");
+        old.genres = vec!["Electronic".into()];
+        old.replacement_id = Some("13".into());
+        client
+            .save_catalogue_to_db(
+                &db,
+                "GB",
+                &TidalCatalogue {
+                    id: "4".into(),
+                    name: "Main".into(),
+                    releases: vec![old],
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .save_catalogue_to_db(
+                &db,
+                "GB",
+                &TidalCatalogue {
+                    id: "4".into(),
+                    name: "Main".into(),
+                    releases: vec![release_from_subscriber(&raw, "4")],
+                },
+            )
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT payload FROM catalogue", ())
+            .await
+            .unwrap();
+        let text: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        let cached: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(cached["releases"][0]["genres"], json!(["Electronic"]));
+        assert_eq!(cached["releases"][0]["replacement_id"], "13");
+    }
+
+    #[tokio::test]
+    #[ignore = "Read-only subscriber workflow verification; disposable DB, saved account"]
+    async fn live_subscriber_workflows() {
+        let dir =
+            std::env::temp_dir().join(format!("subscriber-workflows-{}", uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let mut client = TidalClient::from_db(&db).await.unwrap();
+        let artists = client.search_artists("Canopy", "GB").await.unwrap();
+        assert!(artists.iter().any(|a| a.id == "3870503"));
+        println!("Artist search passed");
+        let results = client.search_tracks("Cassie Me & U", "GB").await.unwrap();
+        assert!(!results.is_empty());
+        println!("Track search passed");
+        let catalogue = client
+            .get_artist_catalogue("3870503", "GB", false)
+            .await
+            .unwrap();
+        assert!(catalogue.releases.iter().any(|r| r.id == "234657671"));
+        client
+            .save_catalogue_to_db(&db, "GB", &catalogue)
+            .await
+            .unwrap();
+        println!("Discovery passed: {} releases", catalogue.releases.len());
+        let summaries = client
+            .albums(
+                &["140303440".into(), "285803".into(), "999999999".into()],
+                "GB",
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summaries["data"].as_array().unwrap().len(), 2);
+        println!("Batch summaries passed");
+        let optional = client
+            .discovery(&["140303440".into()], "GB", false)
+            .await
+            .unwrap();
+        assert!(optional.contains_key("140303440"));
+        assert_eq!(optional["140303440"]["source"], "subscriber");
+        println!("Optional v2 catalogue metadata with subscriber account passed");
+        let value = crate::actions::release(&db, "140303440", "GB", false)
+            .await
+            .unwrap();
+        assert_eq!(value["track_count"], 12);
+        assert_eq!(value["artist"], "Cassie");
+        let tracks: Vec<TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap();
+        assert!(tracks.iter().any(|t| t.bpm.is_some()));
+        assert!(tracks
+            .iter()
+            .any(|t| !t.credits.as_array().unwrap().is_empty()));
+        let repeat = crate::actions::release(&db, "140303440", "GB", false)
+            .await
+            .unwrap();
+        assert_eq!(repeat["tracks"], value["tracks"]);
+        println!("Audio-only tracks, credits, BPM/key and shared cache passed");
+        let ids = client
+            .releases_for_isrc(tracks[0].isrc.as_deref().unwrap(), "GB", "Cassie")
+            .await
+            .unwrap();
+        assert!(ids.contains(&"140303440".into()));
+        println!(
+            "Exact ISRC lookup passed: {} matching album editions",
+            ids.len()
+        );
+        let live = crate::availability::check(&db, &["140303440".into(), "285803".into()], "GB")
+            .await
+            .unwrap();
+        assert_eq!(live["140303440"], Some(true));
+        println!("Market availability passed");
+        let state = std::sync::Arc::new(crate::Backend::new());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let favourites = crate::actions::execute(&db, &state, "favourites", &json!({}), cancel)
+            .await
+            .unwrap();
+        println!("Favourites passed: {}", favourites["artists"]);
+        println!("Temporary test data: {}", dir.display());
+    }
+}
+
+/// Preserve known metadata when optional fields are absent or empty upstream.
+pub fn merge_discovery(value: &mut Value, fields: &Value) {
+    for field in [
+        "genres",
+        "replacement_id",
+        "label",
+        "official",
+        "original_release_date",
+    ] {
+        let incoming = &fields[field];
+        if !incoming.is_null()
+            && !incoming.as_array().is_some_and(Vec::is_empty)
+            && !incoming.as_str().is_some_and(str::is_empty)
+        {
+            value[field] = incoming.clone();
         }
     }
+    value["discovery_checked_at"] = fields["checked_at"].clone();
+    value["subscriber_discovery_checked_at"] = fields["checked_at"].clone();
 }

@@ -217,47 +217,23 @@ pub fn tracks(value: &Value) -> Result<Vec<TidalTrack>, String> {
 
 pub async fn album_info(
     db: &TursoDb,
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     album: &str,
-    token: &str,
+    _token: &str,
     market: &str,
 ) -> Result<crate::stream_download::TidalAlbumInfo, String> {
-    let key = format!("subscriber-summary:{market}:{album}");
-    let now = chrono::Utc::now().timestamp();
-    let saved = db.get_preference(&key).await?;
-    let migrate_legacy = saved.is_none();
-    if let Some(value) = saved {
-        if value["checked_at"]
-            .as_i64()
-            .is_some_and(|at| (0..MAX_AGE).contains(&(now - at)))
-        {
-            if let Ok(info) =
-                serde_json::from_value::<crate::stream_download::TidalAlbumInfo>(value)
-            {
-                if info.id == album {
-                    return Ok(info);
-                }
-            }
+    if let Some(value)=db.get_preference(&format!("subscriber-summary:{market}:{album}")).await? {
+        if value["checked_at"].as_i64().is_some_and(|at|(0..MAX_AGE).contains(&(chrono::Utc::now().timestamp()-at))) {
+            let info=if value["numberOfTracks"].is_number() || value["artist"].is_object() {
+                crate::stream_download::album_info_from_value(&value)
+            } else {serde_json::from_value(value).map_err(|e|e.to_string())};
+            if let Ok(info)=info {if info.id==album {return Ok(info);}}
         }
     }
-    let legacy = if migrate_legacy {
-        db.get_preference(&format!("subscriber-album:{market}:{album}"))
-            .await?
-    } else {
-        None
-    };
-    let info = if let Some(info) = legacy
-        .and_then(|v| serde_json::from_value::<crate::stream_download::TidalAlbumInfo>(v).ok())
-        .filter(|info| info.id == album)
-    {
-        info
-    } else {
-        crate::stream_download::fetch_album_info(http, album, token, market).await?
-    };
-    let mut value = json!(info);
-    value["checked_at"] = json!(now);
-    db.set_preference(&key, &value).await?;
-    Ok(info)
+    let mut client=crate::tidal::TidalClient::from_db(db).await?;
+    let payload=client.albums(&[album.to_owned()],market,false).await?;
+    let item=payload["data"].as_array().and_then(|items|items.first()).ok_or("Release unavailable in this market")?;
+    crate::stream_download::album_info_from_value(&item["attributes"])
 }
 
 pub async fn cached(db: &TursoDb, album: &str, market: &str) -> Result<Option<Value>, String> {

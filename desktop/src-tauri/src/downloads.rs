@@ -869,3 +869,39 @@ mod live_tests {
         fs::remove_dir_all(temp).unwrap();
     }
 }
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore="Live one-track download into a disposable directory; saved subscriber account"]
+async fn live_subscriber_download_pipeline() {
+    let dir=std::env::temp_dir().join(format!("subscriber-download-{}",uuid::Uuid::new_v4()));
+    let db=TursoDb::open(dir.join("db")).await.unwrap();
+    let output=dir.join("music");
+    db.set_preference("downloads",&json!({"output":output,"quality":"LOSSLESS","cover_size":1280,"skip_existing":true})).await.unwrap();
+    let release=crate::actions::release(&db,"140303440","GB",false).await.unwrap();
+    let track=release["tracks"].as_array().unwrap().iter().min_by(|a,b|a["duration"].as_f64().unwrap_or(9999.).total_cmp(&b["duration"].as_f64().unwrap_or(9999.))).unwrap();
+    let mut payload=release.clone();payload["selected_tracks"]=json!([{"id":track["id"]}]);
+    let conn=db.connect().unwrap();
+    conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES(?,?,1,'queued')",("140303440",payload.to_string())).await.unwrap();
+    let count=DownloadManager::run_downloads(&db,None,Arc::new(AtomicBool::new(false)),"test",|line|println!("{line}"),|_|{}).await.unwrap();
+    assert_eq!(count,1);
+    fn collect(path:&Path,files:&mut Vec<PathBuf>) { for entry in fs::read_dir(path).unwrap().flatten() {let path=entry.path();if path.is_dir(){collect(&path,files)}else if path.extension().is_some_and(|x|x=="flac"){files.push(path);}} }
+    let mut files=Vec::new();collect(&output,&mut files);
+    assert_eq!(files.len(),1);
+    let metadata=crate::scanner::read_audio_metadata(&files[0]).unwrap();
+    println!("Downloaded audio/tag validation: {}",serde_json::to_string(&metadata).unwrap().chars().take(700).collect::<String>());
+    assert!(files[0].metadata().unwrap().len()>10000);
+    let mut rows=conn.query("SELECT decision FROM queue WHERE id='140303440'",()).await.unwrap();
+    let decision:String=rows.next().await.unwrap().unwrap().get(0).unwrap();assert_eq!(decision,"downloaded");
+    assert_eq!(metadata.tracktotal.as_deref(),Some("12"));
+    assert!(metadata.bpm.is_some());
+    let cancel=Arc::new(AtomicBool::new(false));
+    crate::scanner::scan_library(&db,&output,cancel.clone(),|_|{}).await.unwrap();
+    db.choose_artist("Cassie",&["3924".into()]).await.unwrap();
+    let client=crate::tidal::TidalClient::from_db(&db).await.unwrap();
+    let album:crate::tidal::TidalRelease=serde_json::from_value(release).unwrap();
+    client.save_catalogue_to_db(&db,"GB",&crate::tidal::TidalCatalogue{id:"3924".into(),name:"Cassie".into(),releases:vec![album]}).await.unwrap();
+    let links=crate::linking::link_library_mode(&db,"GB",&output.to_string_lossy(),cancel,|line|println!("{line}"),None,false,true).await.unwrap();
+    assert_eq!(links.linked,1);
+    println!("Download, metadata, queue completion, scan and cached linking passed in {}",dir.display());
+}

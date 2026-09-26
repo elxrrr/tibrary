@@ -1256,26 +1256,7 @@ pub struct TidalAlbumTrack {
 }
 
 /// Fetches album details from Tidal API.
-pub async fn fetch_album_info(
-    http: &reqwest::Client,
-    album_id: &str,
-    token: &str,
-    market: &str,
-) -> Result<TidalAlbumInfo, String> {
-    let url = format!("{}/albums/{}", API_V1_BASE, album_id);
-    let res = crate::network::get(http
-        .get(&url)
-        .query(&[("countryCode", market)])
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        , Duration::from_millis(350), 3, None)
-        .await
-        .map_err(|e| format!("Album info request failed: {}", e))?;
-
-    if !res.status().is_success() {
-        return Err(format!("Album info failed with HTTP {}", res.status()));
-    }
-
-    let val: Value = res.json().await.map_err(|e| e.to_string())?;
+pub fn album_info_from_value(val: &Value) -> Result<TidalAlbumInfo, String> {
     let id = val
         .get("id")
         .map(|v| v.to_string())

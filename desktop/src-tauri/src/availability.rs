@@ -57,13 +57,7 @@ pub async fn check_refresh(
     }
     let mut client = TidalClient::from_db(db).await?;
     for batch in pending.chunks(20) {
-        let mut url =
-            url::Url::parse("https://openapi.tidal.com/v2/albums").map_err(|e| e.to_string())?;
-        url.query_pairs_mut()
-            .append_pair("countryCode", market)
-            .append_pair("filter[id]", &batch.join(","))
-            .append_pair("include", "artists");
-        let raw = client.get_json(url.as_str()).await?;
+        let raw = client.albums(batch,market,true).await?;
         let resources = raw["data"]
             .as_array()
             .ok_or("Invalid release availability response")?;

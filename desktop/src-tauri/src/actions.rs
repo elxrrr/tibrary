@@ -100,10 +100,10 @@ pub(crate) fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
-    release_from(db,id,market,force,false).await
+    release_from(db,id,market,force).await
 }
 
-async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool, developer: bool) -> Result<Value, String> {
+async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
         return Err("Select a release with a valid online ID".into());
     }
@@ -118,38 +118,31 @@ async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool, develop
                 .await?
         }
     };
-    if !force && !developer && value["tracks_loaded"] == true && value["track_metadata_source"] == "subscriber"
+    if !force && value["subscriber_discovery_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at))) && value["tracks_loaded"] == true && value["track_metadata_source"] == "subscriber"
         && value["track_metadata_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at))) {
         return Ok(value);
     }
     let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
-    let mut tracks = if developer {
-        crate::tidal::TidalClient::from_db(db).await?.get_release_details(id,market).await?
-    } else {
+    let mut tracks = {
         let http=reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().map_err(|e|e.to_string())?;
         match crate::subscriber_metadata::load(db,&http,id,market,Arc::new(AtomicBool::new(false)),force).await {
             Ok(raw)=>crate::subscriber_metadata::tracks(&raw)?,
             Err(error) if value["tracks_loaded"] == true && !force => {
-                value["metadata_note"]=json!(format!("Saved metadata retained: {error}. Use the alternate metadata refresh if needed."));
+                value["metadata_note"]=json!(format!("Saved metadata retained: {error}. Reconnect your account and retry if needed."));
                 return Ok(value);
             }
-            Err(error)=>return Err(format!("Subscriber metadata unavailable: {error}. Connect your account or choose Refresh with alternate metadata source.")),
+            Err(error)=>return Err(format!("Subscriber metadata unavailable: {error}. Connect your account and retry.")),
         }
     };
     crate::subscriber_metadata::supplement(&mut tracks,&old_tracks);
     let summary_loaded = value["title"] == "Release not found";
     if summary_loaded {
         let mut client = crate::tidal::TidalClient::from_db(db).await?;
-        let mut url = url::Url::parse(&format!("https://openapi.tidal.com/v2/albums/{id}"))
-            .map_err(|e| e.to_string())?;
-        url.query_pairs_mut()
-            .append_pair("countryCode", market)
-            .append_pair("include", "artists,genres,replacement");
-        let raw = client.get_json(url.as_str()).await?;
+        let raw = client.albums(&[id.to_owned()],market,force).await?;
         let data = raw["data"]
             .as_array()
-            .and_then(|a| a.first())
-            .unwrap_or(&raw["data"]);
+            .and_then(|items| items.iter().find(|item| item["id"].as_str() == Some(id)))
+            .ok_or("This release is unavailable in the selected market; saved data retained")?;
         let a = &data["attributes"];
         let artists = raw["included"]
             .as_array()
@@ -157,33 +150,33 @@ async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool, develop
             .flatten()
             .filter(|v| v["type"] == "artists")
             .filter_map(|v| v["attributes"]["name"].as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"original_release_date":a["originalReleaseDate"],"type":a["albumType"].as_str().unwrap_or("album"),"official":a["official"],"secondary_types":a["secondaryTypes"],"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str().or(a["copyright"]["text"].as_str()),"upc":a["barcodeId"].as_str().or(a["upc"].as_str()),"quality":a["mediaTags"].as_array().map(|values|values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),"audio_modes":a["audioModes"],"media_metadata":a["mediaMetadata"],"remote_metadata":raw});
+            .next().unwrap_or_default().to_owned();
+        value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"original_release_date":a["originalReleaseDate"],"type":a["albumType"].as_str().unwrap_or("album"),"official":a["official"],"secondary_types":a["secondaryTypes"].as_array().cloned().unwrap_or_default(),"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str().or(a["copyright"]["text"].as_str()),"upc":a["barcodeId"].as_str().or(a["upc"].as_str()),"quality":a["mediaTags"].as_array().map(|values|values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),"audio_modes":a["audioModes"].as_array().cloned().unwrap_or_default(),"media_metadata":a["mediaMetadata"],"remote_metadata":raw});
         let raw = value["remote_metadata"].clone();
         apply_release_discovery(&mut value, &raw, id);
     }
     if value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || (force && !summary_loaded) {
         if let Ok(mut client)=crate::tidal::TidalClient::from_db(db).await {
-            fill_release_discovery(&mut client, &mut value, id, market).await;
+            fill_release_discovery(&mut client, &mut value, id, market, force).await;
         }
     }
-    value["track_metadata_source"]=json!(if developer {"developer"} else {"subscriber"});
+    let mut client=crate::tidal::TidalClient::from_db(db).await?;
+    let optional=client.discovery(&[id.to_owned()],market,force).await?;
+    if let Some(fields)=optional.get(id) { crate::tidal::merge_discovery(&mut value,fields); }
+    value["track_metadata_source"]=json!("subscriber");
     value["track_metadata_checked_at"]=json!(chrono::Utc::now().timestamp());
-    value["metadata_note"]=Value::Null;
+    value["metadata_note"]=if optional.contains_key(id) {Value::Null} else {json!("Track details saved; optional catalogue fields unavailable, saved values retained.")};
     value["tracks"] = serde_json::to_value(&tracks).map_err(|e| e.to_string())?;
     value["tracks_loaded"] = json!(true);
     value["track_count"] = json!(tracks.len());
     publish_release(db, id, market, value).await
 }
 
-async fn fill_release_discovery(client: &mut crate::tidal::TidalClient, value: &mut Value, id: &str, market: &str) {
+async fn fill_release_discovery(client: &mut crate::tidal::TidalClient, value: &mut Value, id: &str, market: &str, force: bool) {
     // Optional metadata never invalidates a cached release or fails a linking job.
     let now = chrono::Utc::now().timestamp();
     value["discovery_checked_at"] = json!(now - 29 * 86_400); // Retry failures in one day.
-    let Ok(mut url) = url::Url::parse(&format!("https://openapi.tidal.com/v2/albums/{id}")) else { return };
-    url.query_pairs_mut().append_pair("countryCode",market).append_pair("include","artists,genres,replacement");
-    if let Ok(raw) = client.get_json(url.as_str()).await {
+    if let Ok(raw) = client.albums(&[id.to_owned()],market,force).await {
         apply_release_discovery(value, &raw, id);
     }
 }
@@ -192,8 +185,8 @@ fn apply_release_discovery(value: &mut Value, raw: &Value, id: &str) {
     let data = raw["data"].as_array().and_then(|a| a.first()).unwrap_or(&raw["data"]);
     if data["id"].as_str() != Some(id) { return; }
     let included = raw["included"].as_array().cloned().unwrap_or_default();
-    value["genres"] = json!(crate::tidal::related_genres(data, &included));
-    value["replacement_id"] = json!(crate::tidal::replacement_id(data));
+    if data["relationships"]["genres"].is_object() { value["genres"] = json!(crate::tidal::related_genres(data, &included)); }
+    if data["relationships"]["replacement"].is_object() { value["replacement_id"] = json!(crate::tidal::replacement_id(data)); }
     value["discovery_checked_at"] = json!(chrono::Utc::now().timestamp());
     if let Some(available) = crate::availability::available(data) {
         value["available"] = json!(available);
@@ -292,9 +285,8 @@ pub async fn execute(
     }
     if kind == "release_details" {
         let id = args["id"].as_str().ok_or("Select a release")?;
-        let developer=args["source"]=="developer";
-        state.progress_for(kind,&format!("Refreshing release {id} · {}",if developer {"alternate metadata source"} else {"subscriber track details and credits"}));
-        let value=release_from(db, id, market, args["force"].as_bool().unwrap_or(false),developer).await?;
+        state.progress_for(kind,&format!("Refreshing release {id} · subscriber track details and credits"));
+        let value=release_from(db, id, market, args["force"].as_bool().unwrap_or(false)).await?;
         state.progress_for(kind,&format!("Release {id} · {} tracks cached · {}",value["track_count"],value["metadata_note"].as_str().unwrap_or("complete")));
         return Ok(json!({"release_id":id}));
     }
@@ -302,7 +294,7 @@ pub async fn execute(
         let mut metrics = json!({});
         if let Ok(mut client) = crate::tidal::TidalClient::from_db(db).await {
             let start = std::time::Instant::now();
-            let result = client.authenticate().await;
+            let result = client.search_artists("Cassie", market).await;
             let connected_on = if result.is_ok() {
                 match db.get_preference("catalogue_connected_at").await? {
                     Some(saved) if saved.as_str().is_some_and(|date| !date.is_empty()) => saved,
@@ -323,7 +315,7 @@ pub async fn execute(
                 "connected_on": connected_on
             });
         } else {
-            metrics["catalogue"] = json!({"ok":false,"message":"Application credentials required"});
+            metrics["catalogue"] = json!({"ok":false,"message":"Connect your streaming account"});
         }
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))

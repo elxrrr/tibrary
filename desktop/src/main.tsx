@@ -248,7 +248,7 @@ function App() {
   const [action, setAction] = useState("dates"),
     [preview, setPreview] = useState<string | undefined>(),
     [timeline, setTimeline] = useState("Newer than newest owned"),
-    [recommendation, setRecommendation] = useState("All recommendations"),
+    [recommendation, setRecommendation] = useState("My album artists"),
     [copyright, setCopyright] = useState("All copyrights"),
     [releaseType, setReleaseType] = useState("All types");
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
@@ -264,7 +264,7 @@ function App() {
     if (route !== "overview" || !state) return;
     let alive = true;
     call("table", {route: "missing", timeline: "All missing releases", status: "all",
-      sort: "date", direction: "desc", limit: 20, recommendation: "All recommendations"})
+      sort: "date", direction: "desc", limit: 20, recommendation: "My album artists"})
       .then((result) => { if (alive) { setLatestMissing(result.rows); setMissingReleaseCount(result.total); } })
       .catch((e) => { if (alive) notifyError(e); });
     return () => { alive = false; };
@@ -278,8 +278,7 @@ function App() {
     } | null>(null),
     [menu, setMenu] = useState<{ row: Row; x: number; y: number } | null>(null),
     [settings, setSettings] = useState<any>(null),
-    [auth, setAuth] = useState(""),
-    [credentials, setCredentials] = useState({ client: "", secret: "" });
+    [auth, setAuth] = useState("");
   const [manual, setManual] = useState(""),
     [deepQuery, setDeepQuery] = useState(""),
     [deep, setDeep] = useState<any>(null);
@@ -731,7 +730,7 @@ function App() {
     Icon: any = Music2,
   ) {
     return (
-      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
+      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setRecommendation("My album artists"); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
         <span className="metric-title">
           <Icon size={18} />
           {title}
@@ -766,7 +765,7 @@ function App() {
               {card(
                 "Missing releases",
                 missingReleaseCount?.toLocaleString(),
-                "Missing, incomplete and queued releases",
+                "From your linked album artists",
                 "missing",
                 Disc,
               )}
@@ -872,7 +871,7 @@ function App() {
           <section className="card latest-missing-card">
             <div className="section-heading">
               <h2>Latest missing releases</h2>
-              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
+              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setRecommendation("My album artists"); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
                 View missing releases
               </button>
             </div>
@@ -905,7 +904,7 @@ function App() {
                 </div>
               ))
             ) : (
-              <p>{latestMissing === null ? "Loading cached missing releases…" : "No missing releases in the cached catalogue. Scan for new releases to update it."}</p>
+              <p>{latestMissing === null ? "Loading cached missing releases…" : "No missing releases with verified album artists. Check release artists or view all recommendations in Missing releases."}</p>
             )}
             </div>
           </section>
@@ -1677,7 +1676,8 @@ function App() {
             )}
           </div>
           <section className="card">
-            <h2>User account</h2>
+            <h2>Streaming account</h2>
+            <p className="muted">One sign-in for catalogue searches, favourites, track credits, artwork and downloads.</p>
             <div className="toolbar">
               <button
                 className={state?.connections.account ? "" : "primary"}
@@ -1694,69 +1694,7 @@ function App() {
               </button>
             </div>
           </section>
-          <section className="card">
-            <h2>Developer credentials</h2>
-            <label className="setting-row">
-              <span>Client ID</span>
-              <input
-                type={state?.connections.configured ? "password" : "text"}
-                autoComplete="off"
-                disabled={state?.connections.configured}
-                value={
-                  state?.connections.configured
-                    ? "••••••••••••••••"
-                    : credentials.client
-                }
-                onChange={(e) =>
-                  setCredentials({ ...credentials, client: e.target.value })
-                }
-              />
-            </label>
-            <label className="setting-row">
-              <span>Client secret</span>
-              <input
-                type="password"
-                autoComplete="off"
-                disabled={state?.connections.configured}
-                value={
-                  state?.connections.configured
-                    ? "••••••••••••••••"
-                    : credentials.secret
-                }
-                onChange={(e) =>
-                  setCredentials({ ...credentials, secret: e.target.value })
-                }
-              />
-            </label>
-            <div className="toolbar">
-              <button
-                className={state?.connections.configured ? "" : "primary"}
-                disabled={
-                  busy ||
-                  state?.connections.configured ||
-                  !credentials.client ||
-                  !credentials.secret
-                }
-                onClick={async () => {
-                  if (
-                    await mutate("credentials.save", {
-                      ...credentials,
-                      remember: true,
-                    })
-                  )
-                    setCredentials({ client: "", secret: "" });
-                }}
-              >
-                Save credentials
-              </button>
-              <button
-                disabled={busy || !state?.connections.configured}
-                onClick={() => mutate("credentials.forget")}
-              >
-                Forget credentials
-              </button>
-            </div>
-          </section>
+
           <button className="connection-test" disabled={busy || active(state?.online_job) && state?.online_job?.kind === "connections"} onClick={() => run("connections")}
             title={state?.online_job?.kind === "connections" && !active(state.online_job)
               ? Object.values(state?.diagnostics?.metrics || {}).map((metric: any) => metric.ok ? "Connected" : metric.message || "Needs attention").join(" · ") || state.online_job.message
@@ -1770,10 +1708,7 @@ function App() {
     return (
       <>
         <section className="card">
-          <h2>Downloads & files</h2>
-          <p>
-
-          </p>
+          <h2>Download folder & layout</h2>
           <label className="setting-row">
             <span>Download folder</span>
             <input
@@ -1985,9 +1920,9 @@ function App() {
           )}
           {["missing", "queue", "downloaded"].includes(route) && (
             <button role="menuitem" disabled={busy}
-              title="Explicitly fetch track metadata and credits with the developer connection. Existing subscriber credits are retained."
-              onClick={() => {run("release_details", {id:r.parent || r.id, force:true, source:"developer"}); setMenu(null);}}>
-              Refresh with alternate metadata source
+              title="Refresh track metadata and credits using your streaming account. Saved metadata is retained if the request fails."
+              onClick={() => {run("release_details", {id:r.parent || r.id, force:true}); setMenu(null);}}>
+              Refresh track details and credits
             </button>
           )}
           {route === "downloaded" && (
@@ -2143,7 +2078,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.30 · build 30</span>
+          <span className="sidebar-version">v0.9.0-beta.31 · build 31</span>
         </div>
       </aside>
       <main>
@@ -2377,9 +2312,9 @@ function App() {
                     Recheck this track
                   </button>
                   {detail.linked_ids?.album_id && <button disabled={busy}
-                    title="Use the developer connection to refresh this release. Existing subscriber credits are retained."
-                    onClick={() => run("release_details", {id:detail.linked_ids.album_id, force:true, source:"developer"})}>
-                    Refresh with alternate metadata source
+                    title="Refresh this release using your streaming account."
+                    onClick={() => run("release_details", {id:detail.linked_ids.album_id, force:true})}>
+                    Refresh track details and credits
                   </button>}
                 </div>
                 </>}

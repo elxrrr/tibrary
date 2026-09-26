@@ -329,7 +329,7 @@ pub async fn link_library_mode(
                 } else {
                     progress(format!("Searching exact recording · {} — {} · checking ISRC before considering another artist", anchor.artist, anchor.title));
                     let mut client = crate::tidal::TidalClient::from_db(db).await?;
-                    let ids = client.releases_for_isrc(anchor.isrc.as_deref().unwrap(), market).await?;
+                    let ids = client.releases_for_isrc(anchor.isrc.as_deref().unwrap(), market, &anchor.album).await?;
                     db.set_preference(&key, &json!({"ids":ids,"checked_at":chrono::Utc::now().timestamp()})).await?;
                     ids
                 };
