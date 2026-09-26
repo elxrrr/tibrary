@@ -806,7 +806,13 @@ async fn handle_rpc_uncached(
                 )
             }
         };
-        let catalogue = client.get_artist_catalogue(id, market, detailed).await?;
+        let mut catalogue = client.get_artist_catalogue(id, market, false).await?;
+        if detailed {
+            client.save_catalogue_to_db(db,market,&catalogue).await?;
+            for release in &mut catalogue.releases {
+                *release=serde_json::from_value(actions::release(db,&release.id,market,false).await?).map_err(|e|e.to_string())?;
+            }
+        }
         return Ok(serde_json::to_value(catalogue).unwrap_or_default());
     }
     if method == "turso.tags.write" {
@@ -1931,6 +1937,11 @@ async fn handle_rpc_uncached(
                             break;
                         } else {
                             if detailed {
+                                if let Ok(http)=reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build() {
+                                    if let Err(error)=subscriber_metadata::prefetch(&db_clone,&http,catalogue.releases.iter().map(|r|r.id.clone()).collect(),&market,cancel_flag.clone(),|message|backend_task.progress_for("discography",&format!("{name} · {message}"))).await {
+                                        backend_task.log(&format!("Subscriber metadata cache: {error}"));
+                                    }
+                                }
                                 // Read this artist's merged snapshot once instead of searching
                                 // every cached artist again for each release.
                                 let stored: Vec<Value> = async {

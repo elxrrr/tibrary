@@ -88,7 +88,7 @@ pub async fn cached_mqa_rows(
     Ok(rows)
 }
 // Serialize only identical releases; unrelated releases and local work stay independent.
-fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
     type Gates = std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>;
     static GATES: std::sync::OnceLock<std::sync::Mutex<Gates>> = std::sync::OnceLock::new();
     let mut gates = GATES.get_or_init(Default::default).lock().unwrap();
@@ -100,6 +100,10 @@ fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
+    release_from(db,id,market,force,false).await
+}
+
+async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool, developer: bool) -> Result<Value, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
         return Err("Select a release with a valid online ID".into());
     }
@@ -114,29 +118,28 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
                 .await?
         }
     };
-    if !force && value["tracks_loaded"] == true {
-        let mut tracks: Vec<crate::tidal::TidalTrack> =
-            serde_json::from_value(value["tracks"].clone()).map_err(|e| e.to_string())?;
-        let due = tracks.iter().any(|track| {
-            track.discovery_checked_at.is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || !track.credits_complete
-                && track
-                    .credits_checked_at
-                    .is_none_or(|at| chrono::Utc::now().timestamp() - at >= 86_400)
-        });
-        let release_due = value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400);
-        if due || release_due {
-            if let Ok(mut client) = crate::tidal::TidalClient::from_db(db).await {
-                if release_due { fill_release_discovery(&mut client, &mut value, id, market).await; }
-                client.fill_track_credits(&mut tracks, market).await;
-                value["tracks"] = serde_json::to_value(tracks).map_err(|e| e.to_string())?;
-                return publish_release(db, id, market, value).await;
-            }
-        }
+    if !force && !developer && value["tracks_loaded"] == true && value["track_metadata_source"] == "subscriber"
+        && value["track_metadata_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at))) {
         return Ok(value);
     }
-    let mut client = crate::tidal::TidalClient::from_db(db).await?;
+    let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
+    let mut tracks = if developer {
+        crate::tidal::TidalClient::from_db(db).await?.get_release_details(id,market).await?
+    } else {
+        let http=reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().map_err(|e|e.to_string())?;
+        match crate::subscriber_metadata::load(db,&http,id,market,Arc::new(AtomicBool::new(false)),force).await {
+            Ok(raw)=>crate::subscriber_metadata::tracks(&raw)?,
+            Err(error) if value["tracks_loaded"] == true && !force => {
+                value["metadata_note"]=json!(format!("Saved metadata retained: {error}. Use the alternate metadata refresh if needed."));
+                return Ok(value);
+            }
+            Err(error)=>return Err(format!("Subscriber metadata unavailable: {error}. Connect your account or choose Refresh with alternate metadata source.")),
+        }
+    };
+    crate::subscriber_metadata::supplement(&mut tracks,&old_tracks);
     let summary_loaded = value["title"] == "Release not found";
     if summary_loaded {
+        let mut client = crate::tidal::TidalClient::from_db(db).await?;
         let mut url = url::Url::parse(&format!("https://openapi.tidal.com/v2/albums/{id}"))
             .map_err(|e| e.to_string())?;
         url.query_pairs_mut()
@@ -161,9 +164,13 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
         apply_release_discovery(&mut value, &raw, id);
     }
     if value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || (force && !summary_loaded) {
-        fill_release_discovery(&mut client, &mut value, id, market).await;
+        if let Ok(mut client)=crate::tidal::TidalClient::from_db(db).await {
+            fill_release_discovery(&mut client, &mut value, id, market).await;
+        }
     }
-    let tracks = client.get_release_details(id, market).await?;
+    value["track_metadata_source"]=json!(if developer {"developer"} else {"subscriber"});
+    value["track_metadata_checked_at"]=json!(chrono::Utc::now().timestamp());
+    value["metadata_note"]=Value::Null;
     value["tracks"] = serde_json::to_value(&tracks).map_err(|e| e.to_string())?;
     value["tracks_loaded"] = json!(true);
     value["track_count"] = json!(tracks.len());
@@ -285,7 +292,10 @@ pub async fn execute(
     }
     if kind == "release_details" {
         let id = args["id"].as_str().ok_or("Select a release")?;
-        release(db, id, market, args["force"].as_bool().unwrap_or(false)).await?;
+        let developer=args["source"]=="developer";
+        state.progress_for(kind,&format!("Refreshing release {id} · {}",if developer {"alternate metadata source"} else {"subscriber track details and credits"}));
+        let value=release_from(db, id, market, args["force"].as_bool().unwrap_or(false),developer).await?;
+        state.progress_for(kind,&format!("Release {id} · {} tracks cached · {}",value["track_count"],value["metadata_note"].as_str().unwrap_or("complete")));
         return Ok(json!({"release_id":id}));
     }
     if kind == "connections" {
@@ -975,21 +985,7 @@ pub async fn execute(
                 if token.is_none() {
                     token = Some(crate::stream_download::get_valid_token(db, &http).await?);
                 }
-                let album_key = format!("subscriber-album:{market}:{album}");
-                let info = if let Some(info) = db.get_preference(&album_key).await? {
-                    serde_json::from_value::<crate::stream_download::TidalAlbumInfo>(info)
-                        .map_err(|e| e.to_string())?
-                } else {
-                    let info = crate::stream_download::fetch_album_info(
-                        &http,
-                        album,
-                        token.as_ref().unwrap(),
-                        market,
-                    )
-                    .await?;
-                    db.set_preference(&album_key, &json!(info)).await?;
-                    info
-                };
+                let info=crate::subscriber_metadata::album_info(db,&http,album,token.as_ref().unwrap(),market).await?;
                 let Some(cover) = info.cover else { continue };
                 let Some(bytes) =
                     crate::stream_download::fetch_cover_art(&http, &cover, 1280).await
@@ -1199,7 +1195,7 @@ pub async fn execute(
             if let Some(album) = args["album_id"].as_str().or(detail["linked_ids"]["album_id"].as_str()).or_else(||tags.get("tidal_album_id").map(String::as_str)) {
                 if !complete_dj.contains_key(album) {
                     let cached = db.get_preference(&format!("tag-review:{market}:{album}")).await?;
-                    let complete = cached.as_ref().and_then(|v|v["tracks"].as_array()).into_iter().flatten()
+                    let complete = cached.as_ref().filter(|v|v["track_metadata_source"]=="subscriber" && v["track_metadata_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at)))).and_then(|v|v["tracks"].as_array()).into_iter().flatten()
                         .filter(|t|t["bpm"].as_f64().is_some_and(|n|n>0.) && t["key"].as_str().is_some_and(|s|!s.is_empty()))
                         .filter_map(|t|t["id"].as_str().map(str::to_owned)).collect();
                     complete_dj.insert(album.to_owned(),complete);
@@ -1225,7 +1221,7 @@ pub async fn execute(
             state.progress_for(kind, &format!("Checking missing metadata · {} — {} · {} · release ID {album}", tags.get("albumartist").or(tags.get("artist")).map(String::as_str).unwrap_or("Unknown artist"), tags.get("title").map(String::as_str).unwrap_or("Untitled track"), tags.get("album").map(String::as_str).unwrap_or("Unknown release")));
             let value = release(db, album, market, false).await?;
             let mut rel: crate::tidal::TidalRelease =
-                serde_json::from_value(value).map_err(|e| e.to_string())?;
+                serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
             let track_id = detail["linked_ids"]["track_id"]
                 .as_str()
                 .or_else(|| tags.get("tidal_track_id").map(String::as_str));
@@ -1305,8 +1301,9 @@ pub async fn execute(
                 crate::subscriber_metadata::merge(&mut track, &extra);
             }
             rel.tracks[index] = track.clone();
-            db.set_preference(&format!("tag-review:{market}:{}", rel.id), &json!(rel))
-                .await?;
+            let mut stored = value;
+            stored["tracks"]=json!(rel.tracks);
+            db.set_preference(&format!("tag-review:{market}:{}", rel.id), &stored).await?;
             let mut changes = crate::enrichment::compute_missing_tags(&tags, &rel, &track);
             // Page ownership is not a reliable performer or album-artist credit.
             changes.remove("artist");
@@ -1626,7 +1623,7 @@ mod tests {
             .await
             .unwrap();
         db.set_preference("tag-review:GB:123", &json!({"id":"123","title":"Release","artist":"Wrong Featured Credit","tracks_loaded":true,"track_count":1,"tracks":[{"id":"456","title":"Example","isrc":"TEST123","track_number":1,"disc_number":1}]})).await.unwrap();
-        db.set_preference("subscriber-album:GB:123", &json!({"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":456,"isrc":"TEST123","bpm":124.0,"key":"G","keyScale":"major"}]})).await.unwrap();
+        db.set_preference("subscriber-items:GB:123", &json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":456,"title":"Example","trackNumber":1,"volumeNumber":1,"credits":[],"isrc":"TEST123","bpm":124.0,"key":"G","keyScale":"major"}]})).await.unwrap();
         let backend = Arc::new(Backend::new());
         let before = std::fs::read(&path).unwrap();
         let result = execute(

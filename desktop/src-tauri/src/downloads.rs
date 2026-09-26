@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::db::TursoDb;
 use crate::stream_download::{
-    self, apply_audio_tags, download_stream, fetch_album_info, fetch_album_tracks, fetch_cover_art,
+    self, apply_audio_tags, download_stream, fetch_album_tracks, fetch_cover_art,
     fetch_lyrics, format_download_path, get_playback_info, get_valid_token, publish_staged_files,
     TidalAlbumTrack, TrackDownloadMeta,
 };
@@ -32,6 +32,7 @@ fn preliminary_meta(track: &TidalAlbumTrack, album_id: &str, album: &str, album_
         bpm: track.bpm, musical_key: track.key.clone(), release_type: None, explicit: track.explicit,
         lyrics: None, unsynced_lyrics: None, album_replay_gain: None, album_peak_amplitude: None,
         track_replay_gain: None, track_peak_amplitude: None,
+        credit_tags: crate::enrichment::credit_tags(&track.credits),
     }
 }
 
@@ -272,7 +273,7 @@ impl DownloadManager {
 
             let token = get_valid_token(db, &http).await?;
             // Fetch album info and tracks
-            let album_info = match fetch_album_info(&http, ident, &token, market).await {
+            let album_info = match crate::subscriber_metadata::album_info(db,&http, ident, &token, market).await {
                 Ok(info) => info,
                 Err(e) => {
                     failed_count += 1;
@@ -284,11 +285,6 @@ impl DownloadManager {
                 }
             };
 
-            db.set_preference(
-                &format!("subscriber-album:{market}:{ident}"),
-                &json!(album_info),
-            )
-            .await?;
 
             if album_artist_name.is_empty() {
                 if let Some(ref a) = album_info.artist_name {
@@ -297,7 +293,7 @@ impl DownloadManager {
             }
 
             let all_tracks =
-                match fetch_album_tracks(&http, ident, &token, &cancel_flag, market).await {
+                match fetch_album_tracks(db, &http, ident, &token, &cancel_flag, market).await {
                     Ok(t) => t,
                     Err(e) => {
                         if cancel_flag.load(Ordering::Relaxed) {
@@ -320,6 +316,11 @@ impl DownloadManager {
                     &json!({"id":track.id,"isrc":track.isrc,"bpm":track.bpm,"key":track.key}),
                 )
                 .await?;
+            }
+
+            // Publish the shared credited track list for linking and recommendations too.
+            if let Err(error)=crate::actions::release(db,ident,market,false).await {
+                progress_cb(format!("Release metadata cached for download; catalogue publication deferred: {error}"));
             }
 
             let selected = release.get("selected_tracks").and_then(|v| v.as_array());
@@ -567,6 +568,7 @@ impl DownloadManager {
                     date: album_info.release_date.clone(),
                     isrc: track.isrc.clone(),
                     copyright: track.copyright.clone(),
+                    credit_tags: crate::enrichment::credit_tags(&track.credits),
                     bpm: track.bpm,
                     musical_key: track.key.clone(),
                     release_type: None,

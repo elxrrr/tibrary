@@ -975,6 +975,7 @@ pub struct TrackDownloadMeta {
     pub album_peak_amplitude: Option<f64>,
     pub track_replay_gain: Option<f64>,
     pub track_peak_amplitude: Option<f64>,
+    pub credit_tags: std::collections::HashMap<String,String>,
 }
 
 /// Applies tags and embeds front cover art into the downloaded audio file.
@@ -1037,6 +1038,8 @@ pub fn apply_audio_tags(
         if let Some(ref rt) = meta.release_type {
             comments.insert("RELEASETYPE".to_string(), rt.clone());
         }
+
+        for (key,value) in &meta.credit_tags { comments.insert(key.to_uppercase(),value.clone()); }
 
         // Tidal IDs
         comments.insert("TIDAL_TRACK_ID".to_string(), meta.track_id.clone());
@@ -1102,6 +1105,10 @@ pub fn apply_audio_tags(
     } else {
         meta.album_artist.clone()
     });
+
+    for (key,value) in &meta.credit_tags {
+        if let Some(key)=ItemKey::from_key(tag_type,key) { tag.insert_text(key,value.clone()); }
+    }
 
     // CRITICAL: ALBUMARTIST must be set strictly to the album artist!
     tag.insert_text(ItemKey::AlbumArtist, meta.album_artist.clone());
@@ -1244,6 +1251,8 @@ pub struct TidalAlbumTrack {
     pub bpm: Option<f64>,
     pub key: Option<String>,
     pub audio_modes: Vec<String>,
+    #[serde(default)]
+    pub credits: Value,
 }
 
 /// Fetches album details from Tidal API.
@@ -1327,136 +1336,25 @@ pub async fn fetch_album_info(
 
 /// Fetches all tracks of an album from Tidal API, handling pagination.
 pub async fn fetch_album_tracks(
+    db: &TursoDb,
     http: &reqwest::Client,
     album_id: &str,
-    token: &str,
+    _token: &str,
     cancel_flag: &Arc<AtomicBool>,
     market: &str,
 ) -> Result<Vec<TidalAlbumTrack>, String> {
-    let mut tracks = Vec::new();
-    let mut offset = 0usize;
-    let limit = 100usize;
-
-    loop {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err("Cancelled".to_string());
+    let value=crate::subscriber_metadata::load(db,http,album_id,market,cancel_flag.clone(),false).await?;
+    let tracks=crate::subscriber_metadata::tracks(&value)?;
+    Ok(tracks.into_iter().map(|track| {
+        let raw=value["items"].as_array().unwrap().iter().find(|v|v["id"].as_str().map(str::to_owned).unwrap_or_else(||v["id"].to_string())==track.id).unwrap();
+        TidalAlbumTrack {
+            id:track.id,title:track.title,track_number:track.track_number,volume_number:track.disc_number,
+            duration:track.duration,isrc:track.isrc,copyright:track.copyright,explicit:raw["explicit"].as_bool().unwrap_or(false),
+            artists:raw["artists"].as_array().into_iter().flatten().filter_map(|a|a["name"].as_str().map(str::to_owned)).collect(),
+            bpm:track.bpm,key:track.key.map(|key|track.key_scale.map_or_else(||key.clone(),|scale|format!("{key} {scale}"))),
+            audio_modes:track.audio_modes,credits:track.credits,
         }
-
-        let url = format!(
-            "{}/albums/{}/tracks?limit={}&offset={}",
-            API_V1_BASE, album_id, limit, offset
-        );
-        let res = crate::network::get(http
-            .get(&url)
-            .query(&[("countryCode", market)])
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            , Duration::from_millis(350), 3, Some(cancel_flag.as_ref()))
-            .await
-            .map_err(|e| format!("Tracks request failed: {}", e))?;
-
-        if !res.status().is_success() {
-            return Err(format!("Tracks request failed with HTTP {}", res.status()));
-        }
-
-        let val: Value = res.json().await.map_err(|e| e.to_string())?;
-        let items = val.get("items").and_then(|v| v.as_array());
-
-        let Some(items) = items else { break };
-        if items.is_empty() {
-            break;
-        }
-
-        for item in items {
-            let id = item
-                .get("id")
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-                .trim_matches('"')
-                .to_string();
-            let title = crate::tidal::format_title(
-                item.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                item.get("version").and_then(|v| v.as_str()),
-            );
-            let track_number = item
-                .get("trackNumber")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let volume_number = item
-                .get("volumeNumber")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-            let duration = item.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let isrc = item
-                .get("isrc")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let copyright = item
-                .get("copyright")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let explicit = item
-                .get("explicit")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let bpm = item.get("bpm").and_then(|v| v.as_f64());
-            let key = item.get("key").and_then(|v| v.as_str()).map(|key| {
-                match item["keyScale"].as_str() {
-                    Some(scale) => format!("{key} {scale}"),
-                    None => key.to_string(),
-                }
-            });
-
-            let mut artists = Vec::new();
-            if let Some(arr) = item.get("artists").and_then(|v| v.as_array()) {
-                for a in arr {
-                    if let Some(name) = a.get("name").and_then(|v| v.as_str()) {
-                        artists.push(name.to_string());
-                    }
-                }
-            } else if let Some(a) = item
-                .get("artist")
-                .and_then(|a| a.get("name"))
-                .and_then(|v| v.as_str())
-            {
-                artists.push(a.to_string());
-            }
-
-            let mut audio_modes = Vec::new();
-            if let Some(arr) = item.get("audioModes").and_then(|v| v.as_array()) {
-                for m in arr {
-                    if let Some(ms) = m.as_str() {
-                        audio_modes.push(ms.to_string());
-                    }
-                }
-            }
-
-            tracks.push(TidalAlbumTrack {
-                id,
-                title,
-                track_number,
-                volume_number,
-                duration,
-                isrc,
-                copyright,
-                explicit,
-                artists,
-                bpm,
-                key,
-                audio_modes,
-            });
-        }
-
-        let total = val
-            .get("totalNumberOfItems")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        offset += items.len();
-        if offset >= total || items.len() < limit {
-            break;
-        }
-    }
-
-    Ok(tracks)
+    }).collect())
 }
 
 // ============================================================================
@@ -1922,6 +1820,7 @@ mod tests {
             disc_number: 1,
             disc_total: 1,
             date: Some("2013-05-17".to_string()),
+            credit_tags: std::collections::HashMap::from([("composer".into(),"Example Composer".into()),("producer".into(),"Example Producer".into())]),
             bpm: Some(116.0),
             musical_key: Some("8A".to_string()),
             lyrics: Some("[00:01.00] Like the legend of the phoenix".to_string()),
@@ -1958,6 +1857,11 @@ mod tests {
         assert_eq!(parsed.tidal_album_id.as_deref(), Some("112233"));
         assert_eq!(parsed.track.as_deref(), Some("08"));
         assert_eq!(parsed.tracktotal.as_deref(), Some("13"));
+        use lofty::file::AudioFile;
+        let saved=lofty::flac::FlacFile::read_from(&mut std::fs::File::open(&flac_file).unwrap(),lofty::config::ParseOptions::new()).unwrap();
+        assert_eq!(saved.vorbis_comments().unwrap().get("COMPOSER"),Some("Example Composer"));
+        assert_eq!(saved.vorbis_comments().unwrap().get("PRODUCER"),Some("Example Producer"));
+
 
         // Verify playback validity with claxon after tagging
         let mut reader_after =

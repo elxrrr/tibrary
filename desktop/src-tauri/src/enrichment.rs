@@ -26,12 +26,32 @@ pub fn has_any_tag(tags: &HashMap<String, String>, key: &str) -> bool {
     }
 }
 
+/// Preserve every role in the cache; export recognised personal-credit tag names only.
+pub fn credit_tags(credits: &serde_json::Value) -> HashMap<String,String> {
+    let mut tags: std::collections::BTreeMap<&str,std::collections::BTreeSet<String>>=Default::default();
+    for credit in credits.as_array().into_iter().flatten() {
+        let role=credit["role"].as_str().or(credit["roleId"].as_str()).unwrap_or("").to_lowercase();
+        let tag=match role.as_str() {
+            "composer"=>"composer", "writer"|"songwriter"=>"songwriter", "lyricist"=>"lyricist",
+            "producer"|"co-producer"|"associate producer"|"executive producer"=>"producer",
+            "engineer"|"recording engineer"|"assistant engineer"=>"engineer",
+            "mixer"|"mixing engineer"=>"mixer", "masterer"|"mastering engineer"=>"masteringengineer",
+            "remixer"=>"remixer", "arranger"=>"arranger", "conductor"=>"conductor", _=>continue,
+        };
+        if let Some(name)=credit["name"].as_str().filter(|name|!name.trim().is_empty()) {tags.entry(tag).or_default().insert(name.into());}
+    }
+    tags.into_iter().map(|(key,values)|(key.into(),values.into_iter().collect::<Vec<_>>().join("; "))).collect()
+}
+
 pub fn compute_missing_tags(
     local_tags: &HashMap<String, String>,
     release: &TidalRelease,
     track: &TidalTrack,
 ) -> HashMap<String, String> {
     let mut missing = HashMap::new();
+    for (key,value) in credit_tags(&track.credits) {
+        if !has_any_tag(local_tags,&key) {missing.insert(key,value);}
+    }
 
     // Title & Artist
     if !has_any_tag(local_tags, "title") && !track.title.trim().is_empty() {

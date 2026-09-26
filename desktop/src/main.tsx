@@ -1983,6 +1983,13 @@ function App() {
               </button>
             </>
           )}
+          {["missing", "queue", "downloaded"].includes(route) && (
+            <button role="menuitem" disabled={busy}
+              title="Explicitly fetch track metadata and credits with the developer connection. Existing subscriber credits are retained."
+              onClick={() => {run("release_details", {id:r.parent || r.id, force:true, source:"developer"}); setMenu(null);}}>
+              Refresh with alternate metadata source
+            </button>
+          )}
           {route === "downloaded" && (
             <>
               <hr />
@@ -2136,7 +2143,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.29 · build 29</span>
+          <span className="sidebar-version">v0.9.0-beta.30 · build 30</span>
         </div>
       </aside>
       <main>
@@ -2369,6 +2376,11 @@ function App() {
                   >
                     Recheck this track
                   </button>
+                  {detail.linked_ids?.album_id && <button disabled={busy}
+                    title="Use the developer connection to refresh this release. Existing subscriber credits are retained."
+                    onClick={() => run("release_details", {id:detail.linked_ids.album_id, force:true, source:"developer"})}>
+                    Refresh with alternate metadata source
+                  </button>}
                 </div>
                 </>}
                 <details>
