@@ -1226,6 +1226,37 @@ pub async fn execute(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn real_flac_prepare_workflows_are_read_only_until_confirmed() {
+        let Ok(sample) = std::env::var("TIBRARY_SAMPLE_FLAC") else { return };
+        let source = std::path::Path::new(&sample);
+        let before = std::fs::read(source).unwrap();
+        let temp = std::env::temp_dir().join(format!("tibrary-real-prep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let copied = temp.join("sample.flac");
+        std::fs::copy(source, &copied).unwrap();
+        crate::tag_writer::write_tags(&copied, &std::collections::HashMap::from([
+            ("tracknumber".into(), "1".into()),
+            ("discnumber".into(), "1".into()),
+        ])).unwrap();
+        let db = TursoDb::open(&temp.join("db")).await.unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {}).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        for action in ["dates", "numbers", "keys", "lyrics", "organise"] {
+            execute(&db, &backend, "preview", &json!({"root":temp,"action":action}), cancel.clone()).await.unwrap();
+        }
+        let preview = execute(&db, &backend, "preview", &json!({"root":temp,"action":"numbers"}), cancel.clone()).await.unwrap();
+        let applied = execute(&db, &backend, "apply", &json!({"root":temp,"preview_id":preview["preview_id"],"ids":[copied],"confirmed":true}), cancel.clone()).await.unwrap();
+        assert_eq!(applied["applied"], 1);
+        let copied_tags = workflows::extract_tags_map(&Some(serde_json::to_value(crate::scanner::read_audio_metadata(&copied).unwrap()).unwrap()));
+        assert_eq!(copied_tags.get("tracknumber").map(String::as_str), Some("01"));
+        let audited = execute(&db, &backend, "mqa", &json!({"root":temp}), cancel.clone()).await.unwrap();
+        assert_eq!(audited["files"], 1);
+        assert_eq!(std::fs::read(source).unwrap(), before);
+        drop(db);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+    #[tokio::test]
     async fn preview_apply_roundtrip_preserves_audio_and_requires_review() {
         let temp = std::env::temp_dir().join(format!("tibrary-action-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp).unwrap();

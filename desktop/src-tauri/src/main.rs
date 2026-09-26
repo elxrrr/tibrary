@@ -37,6 +37,8 @@ pub struct Backend {
     pub db: Mutex<Option<Arc<TursoDb>>>,
     pub active_job_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub active_job: Mutex<Option<Value>>,
+    pub download_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    pub download_job: Mutex<Option<Value>>,
     pub logs: Mutex<Vec<Value>>,
     pub previews: Mutex<HashMap<String, Value>>,
     pub dispatch_gate: tokio::sync::Mutex<()>,
@@ -52,6 +54,8 @@ impl Default for Backend {
             db: Mutex::new(None),
             active_job_cancel: Mutex::new(None),
             active_job: Mutex::new(None),
+            download_cancel: Mutex::new(None),
+            download_job: Mutex::new(None),
             logs: Mutex::new(Vec::new()),
             previews: Mutex::new(HashMap::new()),
             dispatch_gate: tokio::sync::Mutex::new(()),
@@ -173,6 +177,38 @@ impl Backend {
         *self.active_job.lock().unwrap() = Some(job);
     }
 
+    pub fn start_download_job(&self, job: Value, cancel_flag: Arc<AtomicBool>) {
+        self.log_with_category("Download started", "info", Some("download"));
+        *self.download_cancel.lock().unwrap() = Some(cancel_flag);
+        *self.download_job.lock().unwrap() = Some(job);
+    }
+
+    pub fn update_download_job(&self, mut job: Value) {
+        if self.download_cancel.lock().unwrap().as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            job["status"] = json!("cancelling");
+        }
+        *self.download_job.lock().unwrap() = Some(job);
+    }
+
+    pub fn finish_download_job(&self, job: Value) {
+        if let Some(message) = job["message"].as_str() {
+            self.log_with_category(message, if job["status"] == "failed" { "error" } else { "info" }, Some("download"));
+        }
+        *self.download_job.lock().unwrap() = Some(job);
+        *self.download_cancel.lock().unwrap() = None;
+        self.view_cache.lock().unwrap().clear();
+    }
+
+    pub fn cancel_download_job(&self) -> Option<Value> {
+        let flag = self.download_cancel.lock().unwrap().clone()?;
+        flag.store(true, Ordering::Relaxed);
+        let mut job = self.download_job.lock().unwrap();
+        let current = job.as_mut()?;
+        current["status"] = json!("cancelling");
+        current["message"] = json!("Cancelling after the current safe file boundary");
+        Some(current.clone())
+    }
+
     pub fn update_job_progress(&self, msg: &str, mut job: Value) {
         if self
             .active_job_cancel
@@ -289,6 +325,7 @@ async fn handle_rpc_call(
                     if let Some(job) = state.active_job.lock().unwrap().clone() {
                         value["job"] = job;
                     }
+                    value["download_job"] = json!(state.download_job.lock().unwrap().clone());
                     value["logs"] = json!(state.logs.lock().unwrap().clone());
                     value["auth_url"] = state
                         .pending_pkce
@@ -336,7 +373,7 @@ async fn handle_rpc_uncached(
 ) -> Result<Value, String> {
     if method == "job.status" {
         return Ok(
-            json!({"job":state.active_job.lock().unwrap().clone(),"logs":state.logs.lock().unwrap().clone(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
+            json!({"job":state.active_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.lock().unwrap().clone(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
         );
     }
     if method == "table" || method == "detail" || method == "job.start" {
@@ -361,7 +398,7 @@ async fn handle_rpc_uncached(
     } else {
         None
     };
-    if method == "job.start" && state.active_job_cancel.lock().unwrap().is_some() {
+    if method == "job.start" && args["kind"] != "download" && state.active_job_cancel.lock().unwrap().is_some() {
         return Err("A job is already running. Wait for completion or cancel it first.".into());
     }
     if method == "job.start" && actions::handles(args["kind"].as_str().unwrap_or("")) {
@@ -652,6 +689,7 @@ async fn handle_rpc_uncached(
         }
         let root = args.get("root").and_then(|v| v.as_str());
         let mut snapshot = db.get_state(active, &logs, root).await?;
+        snapshot["download_job"] = json!(state.download_job.lock().unwrap().clone());
         snapshot["auth_url"] = state
             .pending_pkce
             .lock()
@@ -1064,6 +1102,14 @@ async fn handle_rpc_uncached(
         }
         return Ok(json!(true));
     }
+    if method == "queue.redownload" {
+        let release_id = args["release_id"].as_str().ok_or("Choose a release")?;
+        db.queue_redownload(release_id, args["track_id"].as_str()).await?;
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({"event":"changed"}));
+        }
+        return Ok(json!(true));
+    }
     if method == "queue.add" {
         let sel_val = args.get("selection").cloned().unwrap_or(json!({}));
         let selection: HashMap<String, Option<Vec<String>>> =
@@ -1203,7 +1249,7 @@ async fn handle_rpc_uncached(
         return Ok(json!(true));
     }
     if method == "shutdown" {
-        return Ok(json!({ "safe": state.active_job_cancel.lock().unwrap().is_none() }));
+        return Ok(json!({ "safe": state.active_job_cancel.lock().unwrap().is_none() && state.download_cancel.lock().unwrap().is_none() }));
     }
 
     // JOBS
@@ -1754,8 +1800,8 @@ async fn handle_rpc_uncached(
         return Ok(job);
     }
     if method == "job.start" && args.get("kind").and_then(|v| v.as_str()) == Some("download") {
-        if state.active_job_cancel.lock().unwrap().is_some() {
-            return Err("A job is already running".to_string());
+        if state.download_cancel.lock().unwrap().is_some() {
+            return Err("A download is already running".to_string());
         }
 
         let job_id = uuid::Uuid::new_v4().to_string();
@@ -1770,7 +1816,7 @@ async fn handle_rpc_uncached(
         });
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        state.start_job(initial_job.clone(), cancel_flag.clone());
+        state.start_download_job(initial_job.clone(), cancel_flag.clone());
 
         let db_clone = db.clone();
         let app_clone = app_handle.cloned();
@@ -1781,6 +1827,7 @@ async fn handle_rpc_uncached(
             let app_prog = app_clone.clone();
             let backend_prog = backend_task.clone();
             let j_id_prog = j_id.clone();
+            let app_monitor = app_clone.clone();
 
             let dl_res = downloads::DownloadManager::run_downloads(
                 &db_clone,
@@ -1788,6 +1835,10 @@ async fn handle_rpc_uncached(
                 cancel_flag.clone(),
                 &j_id,
                 move |msg| {
+                    let lower = msg.to_lowercase();
+                    if lower.contains("failed") || lower.contains("error") || lower.contains("unavailable") {
+                        backend_prog.log_with_category(&msg, "error", Some("download"));
+                    }
                     let prog_job = json!({
                         "id": j_id_prog.clone(),
                         "kind": "download",
@@ -1796,16 +1847,21 @@ async fn handle_rpc_uncached(
                         "started": started,
                         "result": null
                     });
-                    backend_prog.update_job_progress(&msg, prog_job.clone());
+                    backend_prog.update_download_job(prog_job.clone());
                     if let Some(ref a) = app_prog {
                         let _ = a.emit(
                             "backend-event",
                             json!({
                                 "event": "progress",
                                 "message": msg,
-                                "job": prog_job
+                                "download_job": prog_job
                             }),
                         );
+                    }
+                },
+                move |item| {
+                    if let Some(ref a) = app_monitor {
+                        let _ = a.emit("backend-event", json!({"event":"download-monitor","item":item}));
                     }
                 },
             )
@@ -1840,7 +1896,7 @@ async fn handle_rpc_uncached(
                 "result": json!({ "completed": count })
             });
 
-            backend_task.finish_job(final_job.clone());
+            backend_task.finish_download_job(final_job.clone());
             let _ = db_clone
                 .set_preference("desktop-last-job", &final_job)
                 .await;
@@ -1850,7 +1906,7 @@ async fn handle_rpc_uncached(
                     "backend-event",
                     json!({
                         "event": "job",
-                        "job": final_job
+                        "download_job": final_job
                     }),
                 );
                 let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -1879,6 +1935,14 @@ async fn handle_rpc_uncached(
     }
     if method == "job.cancel" {
         state.pending_pkce.lock().unwrap().take();
+        if args["kind"] == "download" || state.active_job_cancel.lock().unwrap().is_none() {
+            if let Some(job) = state.cancel_download_job() {
+                if let Some(app) = app_handle {
+                    let _ = app.emit("backend-event", json!({"event":"job","download_job":job}));
+                }
+            }
+            return Ok(json!(true));
+        }
         let cancel_msg = "Cancellation requested · finishing the current safe file boundary";
         if let Some(active) = state.cancel_active_job(cancel_msg) {
             if let Some(app) = app_handle {
@@ -2108,6 +2172,19 @@ fn main() {
 #[cfg(test)]
 mod activity_tests {
     use super::*;
+    #[test]
+    fn download_and_local_jobs_have_independent_cancellation() {
+        let backend = Backend::new();
+        let download_cancel = Arc::new(AtomicBool::new(false));
+        let local_cancel = Arc::new(AtomicBool::new(false));
+        backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}), download_cancel.clone());
+        backend.start_job(json!({"id":"scan","kind":"scan","status":"running"}), local_cancel.clone());
+        backend.cancel_download_job().unwrap();
+        assert!(download_cancel.load(Ordering::Relaxed));
+        assert!(!local_cancel.load(Ordering::Relaxed));
+        backend.finish_download_job(json!({"id":"download","status":"cancelled"}));
+        assert_eq!(backend.active_job.lock().unwrap().as_ref().unwrap()["id"], "scan");
+    }
     #[test]
     fn progress_replaces_one_row_and_preserves_errors() {
         let backend = Backend::new();

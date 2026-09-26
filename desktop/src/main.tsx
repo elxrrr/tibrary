@@ -241,6 +241,7 @@ function App() {
     [releaseType, setReleaseType] = useState("All types");
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
+  const [downloadMonitor, setDownloadMonitor] = useState<Record<string, Row>>({});
   useEffect(() => {
     if (route !== "overview" || !state) return;
     let alive = true;
@@ -401,7 +402,15 @@ function App() {
   useEffect(() => {
     let dispose: (() => void) | undefined;
     listen<any>("backend-event", ({ payload: p }) => {
-      if (p.event === "progress")
+      if (p.event === "download-monitor" && p.item) {
+        const item = p.item as Row;
+        const key = item.kind === "batch" ? `batch:${item.release_id}` : `track:${item.release_id}:${item.id}`;
+        setDownloadMonitor((old) => ({ ...old, [key]: { ...old[key], ...item } }));
+      }
+      if (p.event === "progress" && p.download_job) {
+        setState((s) => s ? { ...s, download_job: p.download_job } : s);
+      }
+      if (p.event === "progress" && !p.download_job)
         setState((s) =>
           s
             ? {
@@ -504,9 +513,10 @@ function App() {
   async function run(kind: string, args: any = {}) {
     setError("");
     setSubmitting(true);
+    if (kind === "download") setDownloadMonitor({});
     try {
       const j = await call<Job>("job.start", { kind, args: { root, ...args } });
-      setState((s) => (s ? { ...s, job: j } : s));
+      setState((s) => (s ? kind === "download" ? { ...s, download_job: j } : { ...s, job: j } : s));
       if (kind === "preview") setSelected(new Set());
       if (!active(j)) await refresh();
     } catch (e) {
@@ -1133,7 +1143,7 @@ function App() {
           <>
             <button
               className="primary"
-              disabled={busy || !state?.stats.approved_queue}
+              disabled={busy || active(state?.download_job) || !state?.stats.approved_queue}
               onClick={async () => {
                 setSubmitting(true);
                 try { setReview({ operation: "download", rows: await call("queue.preview") }); }
@@ -1967,7 +1977,16 @@ function App() {
               </button>
             </>
           )}
-          {!r.parent && ["queue", "downloaded", "missing"].includes(route) && (
+          {route === "downloaded" && (
+            <>
+              <hr />
+              <button role="menuitem" disabled={busy} onClick={() => {
+                mutate("queue.redownload", { release_id: r.parent || r.id, ...(r.parent ? { track_id: r.id } : {}) });
+                setMenu(null);
+              }}>{r.parent ? "Redownload track" : "Redownload release"}</button>
+            </>
+          )}
+          {!r.parent && ["queue", "missing"].includes(route) && (
             <>
               <hr />
               <button
@@ -2097,7 +2116,7 @@ function App() {
                 >
                   <Icon size={16} />
                   {name}
-                  {id === "activity" && active(state?.job) && (
+                  {id === "activity" && (active(state?.job) || active(state?.download_job)) && (
                     <span className="live-dot" />
                   )}
                 </button>
@@ -2105,7 +2124,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.7 · build 7</span>
+          <span className="sidebar-version">v0.9.0-beta.9 · build 9</span>
         </div>
       </aside>
       <main>
@@ -2129,17 +2148,17 @@ function App() {
             {route !== "activity" && (
               <button
                 className={
-                  active(state?.job) ? "activity-pill running" : "activity-pill"
+                  active(state?.job) || active(state?.download_job) ? "activity-pill running" : "activity-pill"
                 }
                 onClick={() => setRoute("activity")}
               >
-                {active(state?.job) ? (
+                {active(state?.job) || active(state?.download_job) ? (
                   <LoaderCircle className="spin" size={16} />
                 ) : (
                   <Activity size={16} />
                 )}{" "}
-                {active(state?.job)
-                  ? state?.job?.status === "cancelling"
+                {active(state?.job) || active(state?.download_job)
+                  ? state?.job?.status === "cancelling" || state?.download_job?.status === "cancelling"
                     ? "Cancelling…"
                     : "Working"
                   : "Activity"}
@@ -2187,7 +2206,7 @@ function App() {
           ) : route === "activity" ? (
             <>
               {(() => {
-                const job = state?.job;
+                const job = active(state?.job) ? state?.job : state?.download_job || state?.job;
                 const isJobActive = active(job);
                 if (!isJobActive) {
                   return (
@@ -2258,7 +2277,7 @@ function App() {
                     </div>
                     <button
                       disabled={job?.status === "cancelling"}
-                      onClick={() => call("job.cancel").catch(notifyError)}
+                      onClick={() => call("job.cancel", { kind: job?.kind }).catch(notifyError)}
                     >
                       Cancel
                     </button>
@@ -2350,11 +2369,15 @@ function App() {
                   </button>
                 </div>
               </div>
+              <div className="activity-split">
+              <section className="activity-panel" aria-label="General activity">
+              <h2>General activity</h2>
               <div className="activity-log">
                 {(() => {
                   const allLogs = (state?.logs || []).slice().reverse();
                   const filtered = allLogs.filter((l) => {
                     const cat = l.category || getLogCategory(l);
+                    if (cat === "download") return false;
                     if (logCategory !== "all" && cat !== logCategory) return false;
                     if (logSearch.trim()) {
                       const q = logSearch.trim().toLowerCase();
@@ -2384,6 +2407,21 @@ function App() {
                     );
                   });
                 })()}
+              </div>
+              </section>
+              <section className="activity-panel" aria-label="Downloads">
+                <h2>Downloads</h2>
+                {active(state?.download_job) && <div className="download-row"><strong>{state?.download_job?.message}</strong><button onClick={() => call("job.cancel", {kind:"download"}).catch(notifyError)}>Cancel download</button></div>}
+                <div className="activity-log">
+                  {Object.values(downloadMonitor).length === 0 && !(state?.logs || []).some(l => (l.category || getLogCategory(l)) === "download") && <div className="activity-empty">Download progress will appear here.</div>}
+                  {Object.values(downloadMonitor).map((item) => <div className="download-row" key={item.kind === "batch" ? `batch:${item.release_id}` : `track:${item.release_id}:${item.id}`}>
+                    <strong>{item.kind === "batch" ? `${item.artist || "Release"} — ${item.release}` : item.title}</strong>
+                    <span>{item.kind === "batch" ? (() => {const tracks=Object.values(downloadMonitor).filter(row => row.kind === "track" && row.release_id === item.release_id); const bytes=tracks.reduce((n,row)=>n+(row.bytes||0),0); const total=tracks.reduce((n,row)=>n+(row.estimated_total_bytes||row.bytes||0),0); return `${item.completed_tracks || 0} of ${item.total_tracks} tracks · ${(bytes/1048576).toFixed(1)} MB downloaded${total>bytes?` · ~${((total-bytes)/1048576).toFixed(1)} MB remaining`:""}`;})() : `${item.index} of ${item.total_tracks} · ${item.percent || 0}% · ${((item.bytes || 0) / 1048576).toFixed(1)} MB${item.estimated_total_bytes ? ` / ~${(item.estimated_total_bytes / 1048576).toFixed(1)} MB` : ""} · ${item.bytes_per_second ? `${(item.bytes_per_second / 1048576).toFixed(1)} MB/s` : "—"} · ${item.eta_seconds != null ? `${item.eta_seconds}s remaining` : "ETA —"}`}</span>
+                    <span className={`status-badge status-${item.status === "failed" ? "failed" : "running"}`}>{item.status}{item.error ? ` · ${item.error}` : ""}</span>
+                  </div>)}
+                  {(state?.logs || []).filter(l => (l.category || getLogCategory(l)) === "download" && (l.level === "error" || !l.progress_id)).slice(-30).reverse().map((l,i) => <div className="log-row log-download" key={i}><time>{new Date(l.at).toLocaleTimeString()}</time><span className="log-message">{l.message}</span></div>)}
+                </div>
+              </section>
               </div>
             </>
           ) : (

@@ -292,6 +292,9 @@ pub async fn scan_library_with_options(
 
             let path = entry.path();
             if file_type.is_dir() {
+                if entry.file_name().to_string_lossy().starts_with(".tibrary-") {
+                    continue;
+                }
                 pending_dirs.push(path);
                 continue;
             }

@@ -1,6 +1,6 @@
 [package]
 name = "tibrary"
-version = "0.9.0-beta.8"
+version = "0.9.0-beta.9"
 edition = "2021"
 
 [build-dependencies]
@@ -27,4 +27,3 @@ cipher = "0.4"
 sha2 = "0.10"
 rand = "0.8"
 quick-xml = "0.37"
-

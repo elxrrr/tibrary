@@ -1854,8 +1854,8 @@ impl TursoDb {
             "token_refresh_margin_sec": 30,
             "sign_in_timeout_sec": 180,
             "request_attempts": 2,
-            "download_concurrency": 1,
-            "segment_concurrency": 1,
+            "download_concurrency": 2,
+            "segment_concurrency": 2,
             "download_delay": true,
             "download_delay_min_sec": 3.0,
             "download_delay_max_sec": 5.0,
@@ -1991,8 +1991,8 @@ impl TursoDb {
                 obj.insert("download_delay_min_sec".to_string(), json!(3.0));
                 obj.insert("download_delay_max_sec".to_string(), json!(5.0));
                 obj.insert("aac_bitrate_cap".to_string(), json!(320));
-                obj.insert("download_concurrency".to_string(), json!(1));
-                obj.insert("segment_concurrency".to_string(), json!(1));
+                obj.insert("download_concurrency".to_string(), json!(2));
+                obj.insert("segment_concurrency".to_string(), json!(2));
             }
             self.set_preference("provider", &current_provider).await?;
         } else if group == "metadata" {
@@ -2384,6 +2384,33 @@ impl TursoDb {
                 .map_err(|e| e.to_string())?;
             }
         }
+        self.bump_revision();
+        Ok(())
+    }
+
+    pub async fn queue_redownload(&self, release_id: &str, track_id: Option<&str>) -> Result<(), String> {
+        let conn = self.connect()?;
+        let mut rows = conn.query(
+            "SELECT payload FROM queue WHERE id = ? AND decision = 'downloaded'",
+            (release_id,),
+        ).await.map_err(|e| e.to_string())?;
+        let row = rows.next().await.map_err(|e| e.to_string())?
+            .ok_or("Choose a completed download to redownload")?;
+        let raw: String = row.get(0).map_err(|e| e.to_string())?;
+        let mut release: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if let Some(track_id) = track_id {
+            let tracks = release["tracks"].as_array().ok_or("Load cached track details first")?;
+            let selected: Vec<Value> = tracks.iter().filter(|track| track["id"].as_str() == Some(track_id)).cloned().collect();
+            if selected.len() != 1 { return Err("Selected track is absent from the cached release".into()); }
+            release["selected_tracks"] = json!(selected);
+        } else {
+            release["selected_tracks"] = Value::Null;
+        }
+        release["redownload"] = json!(true);
+        let payload = serde_json::to_string(&release).map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute("UPDATE queue SET payload = ?, approved = 1, decision = 'queued', updated = ? WHERE id = ?",
+            (payload.as_str(), now.as_str(), release_id)).await.map_err(|e| e.to_string())?;
         self.bump_revision();
         Ok(())
     }
@@ -3894,6 +3921,11 @@ with sqlite3.connect('{db}') as db:
             .queue_decision(&["album_100".to_string()], "downloaded")
             .await
             .unwrap();
+        store.queue_redownload("album_100", Some("t2")).await.unwrap();
+        let requeued = store.get_queue_rows("queue", None, None, None, None, 0, 10).await.unwrap();
+        assert_eq!(requeued.total, 1);
+        assert_eq!(requeued.rows[0].selected, Some(vec!["t2".to_string()]));
+        store.queue_decision(&["album_100".to_string()], "downloaded").await.unwrap();
         let queue_after = store
             .get_queue_rows("queue", None, None, None, None, 0, 10)
             .await

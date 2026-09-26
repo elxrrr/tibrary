@@ -347,9 +347,33 @@ test("download without an account fails and retains the approved queue", async (
   const before = await rpc("table", {route: "queue"});
   expect(before.result.rows.some((r: any) => r.approved)).toBe(true);
   await rpc("job.start", {kind: "download"});
-  await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("failed");
+  await expect.poll(async () => (await rpc("job.status")).result?.download_job?.status).toBe("failed");
   const after = await rpc("table", {route: "queue"});
   expect(after.result.rows).toEqual(before.result.rows);
+});
+
+test("downloaded release and track menus requeue the original record", async ({page}) => {
+  await rpc("queue.decision", {ids:["910001"],decision:"downloaded"});
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"Downloaded releases",exact:true}).click();
+  await page.getByRole("button", {name:"Actions for Blue Hours"}).click();
+  await page.getByRole("menuitem", {name:"Redownload release"}).click();
+  await expect.poll(async () => (await rpc("table", {route:"queue"})).result.rows.some((row:any) => row.id === "910001")).toBe(true);
+  await rpc("queue.decision", {ids:["910001"],decision:"downloaded"});
+  await page.reload();
+  await page.locator("aside").getByRole("button", {name:"Downloaded releases",exact:true}).click();
+  await page.getByRole("button", {name:"Expand Blue Hours"}).click();
+  await page.getByRole("button", {name:"Actions for track Drift"}).click();
+  await page.getByRole("menuitem", {name:"Redownload track"}).click();
+  const queued = await rpc("table", {route:"queue"});
+  expect(queued.result.rows.find((row:any) => row.id === "910001")?.selected).toEqual(["91000101"]);
+});
+
+test("activity separates general events from download progress", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"Activity",exact:true}).click();
+  await expect(page.getByRole("region", {name:"General activity"})).toBeVisible();
+  await expect(page.getByRole("region", {name:"Downloads"})).toBeVisible();
 });
 
 test("startup always shows overview and does not replay a historical failure", async ({ page }) => {
@@ -422,6 +446,32 @@ test("automatic correction previews can be applied and all-files view remains av
   await expect(page.locator("tbody tr")).toHaveCount(0);
   await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
   await expect(page.locator("tbody tr")).toHaveCount(2);
+});
+
+test("organise files previews and applies only to the disposable library", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Organise files",exact:true}).click();
+  await page.getByRole("button",{name:"Preview moves"}).click();
+  await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+  await expect(page.locator("tbody tr").first()).toBeVisible();
+  await page.getByRole("checkbox",{name:"Select visible rows"}).check();
+  await page.getByRole("button",{name:/Review & apply/}).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.getByRole("button",{name:"Confirm & continue"}).click();
+  await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+  const indexed = await rpc("table", {route:"files",root:join(folder,"music"),limit:20});
+  expect(indexed.result.rows.every((row:any) => row.path.includes("/North Assembly/Blue Hours"))).toBe(true);
+});
+
+test("MQA and local duplicate scan controls complete without blocking navigation", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"MQA audit",exact:true}).click();
+  await page.getByRole("button",{name:/Recheck|Audit/}).first().click();
+  await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+  await page.locator("aside").getByRole("button",{name:"Local duplicates",exact:true}).click();
+  await page.getByRole("button",{name:"Scan for duplicates"}).click();
+  await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+  await expect(page.getByRole("heading",{name:"Local duplicates",exact:true})).toBeVisible();
 });
 
 test("table reloads when saved page size arrives after the initial table", async ({page}) => {

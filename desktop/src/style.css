@@ -1097,8 +1097,17 @@ dialog footer {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  background: var(--surface);
+  background: linear-gradient(180deg, var(--card), color-mix(in srgb, var(--card) 82%, var(--bg)));
 }
+.activity-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; min-height: 360px; }
+.activity-panel { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--card); overflow: hidden; }
+.activity-panel h2 { margin: 0; padding: 14px 16px; font-size: 14px; border-bottom: 1px solid var(--line); }
+.activity-panel .activity-log { border: 0; border-radius: 0; max-height: min(54vh, 680px); overflow: auto; }
+.download-row { display: grid; gap: 4px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.download-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download-row > span:nth-child(2) { color: var(--muted); font-variant-numeric: tabular-nums; }
+.download-row .status-badge { width: fit-content; }
+@media (max-width: 850px) { .activity-split { grid-template-columns: 1fr; } }
 dialog p {
   margin: 9px 0 14px;
 }

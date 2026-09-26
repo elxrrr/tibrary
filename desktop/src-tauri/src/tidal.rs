@@ -34,6 +34,7 @@ pub struct TidalTrack {
     pub bpm: Option<f64>,
     pub key: Option<String>,
     pub key_scale: Option<String>,
+    #[serde(default, deserialize_with = "copyright_from_value")]
     pub copyright: Option<String>,
 }
 
@@ -41,6 +42,7 @@ pub struct TidalTrack {
 #[serde(default)]
 pub struct TidalRelease {
     pub id: String,
+    #[serde(deserialize_with = "artist_name_from_value")]
     pub artist: String,
     pub title: String,
     pub date: String,
@@ -48,11 +50,75 @@ pub struct TidalRelease {
     pub available: Option<bool>,
     pub track_count: usize,
     pub explicit: bool,
+    #[serde(default, deserialize_with = "copyright_from_value")]
     pub copyright: Option<String>,
     pub label: Option<String>,
     pub quality: String,
     pub tracks: Vec<TidalTrack>,
     pub tracks_loaded: bool,
+}
+
+fn artist_name_from_value<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::String(name) => name,
+        Value::Object(artist) => artist
+            .get("name")
+            .or_else(|| artist.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        Value::Null => String::new(),
+        _ => String::new(),
+    })
+}
+
+fn copyright_from_value<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) => Ok(Some(text)),
+        Value::Object(fields) => Ok(fields.get("text").and_then(Value::as_str).map(str::to_owned)),
+        _ => Err(serde::de::Error::custom("copyright must be text or an object with a text field")),
+    }
+}
+
+#[cfg(test)]
+mod release_payload_tests {
+    #[test]
+    fn release_artist_accepts_cached_object_or_string() {
+        let object: super::TidalRelease = serde_json::from_value(serde_json::json!({
+            "id":"123", "artist":{"id":"42","name":"Album Artist"}, "title":"Example"
+        })).unwrap();
+        assert_eq!(object.artist, "Album Artist");
+        let string: super::TidalRelease = serde_json::from_value(serde_json::json!({
+            "id":"123", "artist":"Album Artist", "title":"Example"
+        })).unwrap();
+        assert_eq!(string.artist, "Album Artist");
+    }
+    #[test]
+    fn cached_catalogue_copyright_accepts_provider_text_object() {
+        let release: super::TidalRelease = serde_json::from_value(serde_json::json!({
+            "id":"378495652", "artist":"Example", "title":"Example release",
+            "copyright":{"text":"Armada Music B.V."},
+            "tracks":[{"id":"378495656","title":"Example track","copyright":{"text":"Armada Music B.V."}}]
+        })).unwrap();
+        assert_eq!(release.copyright.as_deref(), Some("Armada Music B.V."));
+        assert_eq!(release.tracks[0].copyright.as_deref(), Some("Armada Music B.V."));
+    }
+    #[test]
+    fn saved_catalogue_fixture_deserializes() {
+        let Ok(path) = std::env::var("TIBRARY_CATALOGUE_JSON") else { return };
+        let raw = std::fs::read_to_string(path).unwrap();
+        let catalogue: super::TidalCatalogue = serde_json::from_str(&raw).unwrap();
+        assert!(!catalogue.releases.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

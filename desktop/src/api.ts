@@ -15,6 +15,7 @@ export type AppState = {
   roots: Row[];
   stats: Record<string, number>;
   job: Job | null;
+  download_job?: Job | null;
   logs: { at: string; message: string; level?: string; category?: string; progress_id?: string }[];
   settings: { market: string; theme: string };
   connections: any;
@@ -116,5 +117,4 @@ export const tursoMatchingScore = (args: {
   candidate_name: string;
   candidate_albums: string[];
 }) => call("turso.matching.score", args);
-
 

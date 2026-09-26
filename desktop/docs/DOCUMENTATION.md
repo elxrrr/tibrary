@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.8 (build 8)  
+> **Version:** 0.9.0-beta.9 (build 9)
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
 
@@ -20,7 +20,7 @@
 
 ---
 
-## Verification status — 25 September 2026
+## Verification status — 26 September 2026
 
 This remains a beta, not a certified public release. The Rust migration audit restored previously unhandled desktop actions and removed silent-success fallbacks. Linking and extended review write database associations only; filesystem edits require a current, explicit preview. File changes invalidate reviewed writes. Jobs run independently of navigation, with lightweight progress polling and revision-based table caches.
 
@@ -28,7 +28,7 @@ Connections now consist of application credentials for the official catalogue AP
 
 Verification uses disposable files/databases, mocked catalogue data, and WebKit against the actual Rust RPC backend. Routine Rust tests do not consume live API quota; credential-store/live catalogue tests are explicitly ignored unless requested. A read-only snapshot of the production library was used to exercise all table routes, without modifying library files. On that 19,243-track snapshot, cold link-table construction took about 7.5 seconds; cached filtering took 16–17 ms. Cold-start query optimization remains useful future work.
 
-Live official catalogue authentication, artist search and audio-only release pagination were checked. Cassie release `140303440` returns 12 audio tracks, excluding its video. Successful subscriber OAuth completion, favourites retrieval and a real authenticated audio download still require an available subscriber session and are **not verified by the automated checks**. Native decoding, tagging, staging, queue selection and missing-account failure paths are tested separately. Non-macOS packaging and notarized public distribution are not validated by this audit.
+Live official catalogue authentication, artist search and audio-only release pagination were checked. Cassie release `140303440` returns 12 audio tracks, excluding its video. An isolated authenticated one-track download and two-track parallel download passed using the saved account; both wrote only to temporary folders. A copied real FLAC passed local preview, tag application, MQA audit, and source-integrity checks. Segmented transfers and recoverable redownload publishing have focused tests. The cached-catalogue copyright-object format that caused the Online replacements and Optimizations deserialization failure now parses correctly. Non-macOS packaging and notarized public distribution are not validated by this audit.
 
 ## 1. Architecture Overview
 

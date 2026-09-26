@@ -784,7 +784,8 @@ pub async fn download_stream(
     stream_info: &PlaybackStreamInfo,
     dest_path: &Path,
     cancel_flag: &Arc<AtomicBool>,
-    progress_cb: &(dyn Fn(u8) + Send + Sync),
+    progress_cb: &(dyn Fn(u8, u64, Option<u64>) + Send + Sync),
+    segment_concurrency: usize,
 ) -> Result<(), String> {
     if dest_path.exists() {
         let _ = fs::remove_file(dest_path);
@@ -808,7 +809,48 @@ pub async fn download_stream(
         None
     };
 
-    let mut _downloaded_bytes_total = 0usize;
+    let mut downloaded_bytes_total = 0u64;
+    if total_urls > 1 && segment_concurrency > 1 {
+        let parallel = segment_concurrency.clamp(1, 4).min(total_urls);
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut next = 0usize;
+        let mut write_index = 0usize;
+        let mut ready = std::collections::BTreeMap::<usize, Vec<u8>>::new();
+        while next < parallel {
+            spawn_audio_segment(&mut tasks, http, &stream_info.urls[next], cancel_flag, next);
+            next += 1;
+        }
+        while write_index < total_urls {
+            let segment = tasks.join_next().await.ok_or("Audio segment worker stopped")?
+                .map_err(|e| e.to_string())?;
+            let (index, bytes) = match segment {
+                Ok(result) => result,
+                Err(error) => {
+                    tasks.abort_all();
+                    drop(dest_file);
+                    let _ = fs::remove_file(dest_path);
+                    return Err(error);
+                }
+            };
+            ready.insert(index, bytes);
+            while let Some(bytes) = ready.remove(&write_index) {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    tasks.abort_all();
+                    drop(dest_file);
+                    let _ = fs::remove_file(dest_path);
+                    return Err("Download cancelled".into());
+                }
+                dest_file.write_all(&bytes).map_err(|e| e.to_string())?;
+                downloaded_bytes_total += bytes.len() as u64;
+                write_index += 1;
+                progress_cb(((write_index * 100) / total_urls) as u8, downloaded_bytes_total, None);
+                if next < total_urls {
+                    spawn_audio_segment(&mut tasks, http, &stream_info.urls[next], cancel_flag, next);
+                    next += 1;
+                }
+            }
+        }
+    } else {
     for (idx, url) in stream_info.urls.iter().enumerate() {
         if cancel_flag.load(Ordering::Relaxed) {
             let _ = fs::remove_file(dest_path);
@@ -829,6 +871,7 @@ pub async fn download_stream(
             ));
         }
 
+        let segment_length = res.content_length();
         let mut seg_bytes = Vec::new();
         while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
             if cancel_flag.load(Ordering::Relaxed) {
@@ -836,7 +879,13 @@ pub async fn download_stream(
                 return Err("Download cancelled".to_string());
             }
             seg_bytes.extend_from_slice(&chunk);
-            _downloaded_bytes_total += chunk.len();
+            downloaded_bytes_total += chunk.len() as u64;
+            let segment_fraction = segment_length
+                .filter(|length| *length > 0)
+                .map(|length| (seg_bytes.len() as f64 / length as f64).min(1.0))
+                .unwrap_or(0.0);
+            let pct = (((idx as f64 + segment_fraction) / total_urls.max(1) as f64) * 100.0) as u8;
+            progress_cb(pct, downloaded_bytes_total, if total_urls == 1 { segment_length } else { None });
         }
 
         dest_file
@@ -844,7 +893,8 @@ pub async fn download_stream(
             .map_err(|e| format!("Failed writing segment to file: {}", e))?;
 
         let pct = (((idx + 1) as f64 / total_urls as f64) * 100.0).min(100.0) as u8;
-        progress_cb(pct);
+        progress_cb(pct, downloaded_bytes_total, if total_urls == 1 { segment_length } else { None });
+    }
     }
 
     dest_file.flush().map_err(|e| e.to_string())?;
@@ -858,6 +908,30 @@ pub async fn download_stream(
     }
 
     Ok(())
+}
+
+fn spawn_audio_segment(
+    tasks: &mut tokio::task::JoinSet<Result<(usize, Vec<u8>), String>>,
+    http: &reqwest::Client,
+    url: &str,
+    cancel: &Arc<AtomicBool>,
+    index: usize,
+) {
+    let http = http.clone();
+    let url = url.to_string();
+    let cancel = cancel.clone();
+    tasks.spawn(async move {
+        if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
+        let response = http.get(&url).send().await.map_err(|e| format!("Segment {index}: {e}"))?;
+        if !response.status().is_success() { return Err(format!("Segment {index}: HTTP {}", response.status())); }
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((index, bytes))
+    });
 }
 
 // ============================================================================
@@ -1532,6 +1606,60 @@ pub fn publish_staged_files(stage_dir: &Path, target_root: &Path) -> Result<Vec<
     Ok(published)
 }
 
+/// Replace only the requested staged files. Previous copies remain recoverable beside the
+/// destination until the caller moves them to Trash after a successful publish.
+pub fn publish_redownloaded_files(stage_dir: &Path, target_root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() { collect(&path, out)?; } else if path.is_file() { out.push(path); }
+        }
+        Ok(())
+    }
+    let mut sources = Vec::new();
+    collect(stage_dir, &mut sources).map_err(|e| e.to_string())?;
+    let backup_dir = target_root.join(format!(".tibrary-redownload-backup-{}", uuid::Uuid::new_v4()));
+    let mut published = Vec::new();
+    let mut backups = Vec::new();
+    for src in sources {
+        let relative = src.strip_prefix(stage_dir).map_err(|e| e.to_string())?;
+        let destination = target_root.join(relative);
+        let backup = backup_dir.join(relative);
+        let result = (|| -> Result<(), String> {
+            if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+            if destination.exists() {
+                if let Some(parent) = backup.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+                fs::rename(&destination, &backup).map_err(|e| e.to_string())?;
+                backups.push(backup.clone());
+            }
+            let alternate = match destination.extension().and_then(|value| value.to_str()) {
+                Some("flac") => Some(destination.with_extension("m4a")),
+                Some("m4a") => Some(destination.with_extension("flac")),
+                _ => None,
+            };
+            if let Some(alternate) = alternate.filter(|path| path.exists()) {
+                let old = backup_dir.join(alternate.strip_prefix(target_root).map_err(|e| e.to_string())?);
+                if let Some(parent) = old.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+                fs::rename(&alternate, &old).map_err(|e| e.to_string())?;
+                backups.push(old);
+            }
+            fs::rename(&src, &destination).map_err(|e| e.to_string())?;
+            published.push(destination);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for path in published.iter().rev() { let _ = fs::remove_file(path); }
+            for old in backups.iter().rev() {
+                if let Ok(relative) = old.strip_prefix(&backup_dir) {
+                    let _ = fs::rename(old, target_root.join(relative));
+                }
+            }
+            return Err(format!("Redownload could not be published; previous copies restored: {error}"));
+        }
+    }
+    Ok((published, backups))
+}
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -1862,6 +1990,67 @@ mod tests {
         assert!(err.contains("Destination already exists with different contents"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn redownload_publish_keeps_previous_copy_recoverable() {
+        let root = std::env::temp_dir().join(format!("tibrary-redownload-{}", uuid::Uuid::new_v4()));
+        let stage = root.join(".stage");
+        let library = root.join("library");
+        fs::create_dir_all(stage.join("Artist/Release")).unwrap();
+        fs::create_dir_all(library.join("Artist/Release")).unwrap();
+        let relative = "Artist/Release/01 - Track.flac";
+        fs::write(stage.join(relative), b"new audio").unwrap();
+        fs::write(library.join(relative), b"old audio").unwrap();
+        fs::write(library.join("Artist/Release/01 - Track.m4a"), b"older alternate").unwrap();
+        let (published, backups) = publish_redownloaded_files(&stage, &library).unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(fs::read(&published[0]).unwrap(), b"new audio");
+        assert_eq!(fs::read(&backups[0]).unwrap(), b"old audio");
+        assert_eq!(fs::read(&backups[1]).unwrap(), b"older alternate");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn segmented_audio_fetches_in_parallel_and_writes_in_order() {
+        use std::io::Read;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_active = active.clone();
+        let server_maximum = maximum.clone();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..3 {
+                let (mut connection, _) = listener.accept().unwrap();
+                let active = server_active.clone();
+                let maximum = server_maximum.clone();
+                handlers.push(std::thread::spawn(move || {
+                    let mut request = [0u8; 1024];
+                    let size = connection.read(&mut request).unwrap();
+                    let route = String::from_utf8_lossy(&request[..size]);
+                    let payload = if route.contains("/a ") { b"A" } else if route.contains("/b ") { b"B" } else { b"C" };
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    if payload == b"A" { std::thread::sleep(Duration::from_millis(75)); }
+                    connection.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{}", String::from_utf8_lossy(payload)).as_bytes()).unwrap();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for handler in handlers { handler.join().unwrap(); }
+        });
+        let temp = std::env::temp_dir().join(format!("tibrary-segments-{}", uuid::Uuid::new_v4()));
+        let stream = PlaybackStreamInfo { urls: ["a","b","c"].map(|part| format!("http://{address}/{part}")).to_vec(),
+            codec:"FLAC".into(), mime_type:"audio/flac".into(), is_encrypted:false, security_token:None,
+            bit_depth:Some(16), sample_rate:Some(44100), album_replay_gain:None, album_peak_amplitude:None,
+            track_replay_gain:None, track_peak_amplitude:None };
+        download_stream(&reqwest::Client::new(), &stream, &temp, &Arc::new(AtomicBool::new(false)), &|_,_,_| {}, 2).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read(&temp).unwrap(), b"ABC");
+        assert!(maximum.load(Ordering::SeqCst) >= 2);
+        fs::remove_file(temp).unwrap();
     }
 
     #[test]

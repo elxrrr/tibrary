@@ -12,7 +12,7 @@ use crate::db::TursoDb;
 use crate::stream_download::{
     self, apply_audio_tags, download_stream, fetch_album_info, fetch_album_tracks, fetch_cover_art,
     fetch_lyrics, format_download_path, get_playback_info, get_valid_token, publish_staged_files,
-    TrackDownloadMeta,
+    TidalAlbumTrack, TrackDownloadMeta,
 };
 
 struct StagingDirectory(PathBuf);
@@ -20,6 +20,33 @@ impl Drop for StagingDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn preliminary_meta(track: &TidalAlbumTrack, album_id: &str, album: &str, album_artist: &str, track_total: u32, disc_total: u32, date: &Option<String>) -> TrackDownloadMeta {
+    TrackDownloadMeta {
+        track_id: track.id.clone(), album_id: album_id.to_string(), title: track.title.clone(),
+        album: album.to_string(), album_artist: album_artist.to_string(),
+        track_artists: if track.artists.is_empty() { vec![album_artist.to_string()] } else { track.artists.clone() },
+        track_number: track.track_number, track_total, disc_number: track.volume_number, disc_total,
+        date: date.clone(), isrc: track.isrc.clone(), copyright: track.copyright.clone(),
+        bpm: track.bpm, musical_key: track.key.clone(), release_type: None, explicit: track.explicit,
+        lyrics: None, unsynced_lyrics: None, album_replay_gain: None, album_peak_amplitude: None,
+        track_replay_gain: None, track_peak_amplitude: None,
+    }
+}
+
+fn existing_audio_path(output: &Path, destination: Option<&Value>, template: &str, meta: &TrackDownloadMeta) -> PathBuf {
+    let relative = if let Some(dest) = destination {
+        let mut path = PathBuf::from(dest.get("album_relative").and_then(Value::as_str).unwrap_or(""));
+        if meta.disc_total > 1 { path.push(format!("Disc {}", meta.disc_number)); }
+        path.push(format_download_path("{tracknumber} - {title}", meta, ".flac"));
+        path
+    } else { format_download_path(template, meta, ".flac") };
+    output.join(relative)
+}
+
+fn nonempty_file(path: &Path) -> bool {
+    path.is_file() && path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false)
 }
 
 pub struct DownloadManager;
@@ -31,8 +58,10 @@ impl DownloadManager {
         cancel_flag: Arc<AtomicBool>,
         _job_id: &str,
         progress_cb: impl Fn(String) + Send + Sync + 'static,
+        monitor_cb: impl Fn(Value) + Send + Sync + 'static,
     ) -> Result<usize, String> {
         let progress_cb = Arc::new(progress_cb);
+        let monitor_cb = Arc::new(monitor_cb);
         let conn = db.connect()?;
         let mut queue_stmt = conn
             .query(
@@ -180,9 +209,7 @@ impl DownloadManager {
             }
         };
 
-        progress_cb(
-            "Tidal account connected · lossless audio · sequential track downloads".to_string(),
-        );
+        progress_cb("Download account connected · preparing selected releases".to_string());
 
         let configuration = db.get_settings().await?;
         let market = configuration["general"]["market"].as_str().unwrap_or("GB");
@@ -348,9 +375,66 @@ impl DownloadManager {
 
             let mut all_tracks_ok = true;
             let total_tracks = tracks.len();
+            monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":0,"status":"running"}));
             let mut relative_track_filenames = Vec::new();
             let mut existing_published_files = Vec::new();
             let mut album_dir_opt: Option<PathBuf> = None;
+
+            // Fetch audio concurrently, then publish the complete release only after every
+            // selected file has passed tagging and path checks. The semaphore bounds network
+            // pressure and each track writes to its own staging file.
+            let parallel = provider.get("download_concurrency").and_then(Value::as_u64).unwrap_or(2).clamp(1, 3) as usize;
+            let provider_segment_concurrency = provider.get("segment_concurrency").and_then(Value::as_u64).unwrap_or(2).clamp(1, 4) as usize;
+            let permits = Arc::new(tokio::sync::Semaphore::new(parallel));
+            let mut prefetch = Vec::with_capacity(total_tracks);
+            for (idx, track) in tracks.iter().enumerate() {
+                let track_total = all_tracks.iter().filter(|other| other.volume_number == track.volume_number).count() as u32;
+                let disc_total = album_info.number_of_volumes.unwrap_or(1) as u32;
+                let album_title = if let Some(version) = album_info.version.as_ref().filter(|version| !version.is_empty() && !album_info.title.to_lowercase().contains(&version.to_lowercase())) {
+                    format!("{} ({version})", album_info.title)
+                } else { album_info.title.clone() };
+                let meta = preliminary_meta(track, ident, &album_title, &album_artist_name, track_total, disc_total, &album_info.release_date);
+                let existing = existing_audio_path(&item_output, destination, template, &meta);
+                if skip_existing && release["redownload"] != true && (nonempty_file(&existing) || nonempty_file(&existing.with_extension("m4a"))) {
+                    prefetch.push(None);
+                    continue;
+                }
+                let http = http.clone();
+                let track = track.clone();
+                let token = token.clone();
+                let market = market.to_string();
+                let stage = stage_dir.clone();
+                let cancel = cancel_flag.clone();
+                let monitor = monitor_cb.clone();
+                let log = progress_cb.clone();
+                let permits = permits.clone();
+                let release_id = ident.clone();
+                prefetch.push(Some(tokio::spawn(async move {
+                    let _permit = permits.acquire_owned().await.map_err(|e| e.to_string())?;
+                    if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
+                    if idx > 0 { tokio::time::sleep(Duration::from_millis(350 * (idx % parallel) as u64)).await; }
+                    monitor(json!({"kind":"track","id":track.id,"release_id":release_id,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"preparing","percent":0,"bytes":0}));
+                    let stream = get_playback_info(&http, &track.id, &token, item_quality, &market).await?;
+                    let extension = if stream.mime_type.contains("mp4") || stream.codec.to_lowercase().contains("mp4") || stream.codec.to_lowercase().contains("aac") { ".m4a" } else { ".flac" };
+                    let source = stage.join(format!(".source-{}{}", track.id, extension));
+                    let started = std::time::Instant::now();
+                    let last = std::sync::Mutex::new((std::time::Instant::now() - Duration::from_secs(1), 255u8));
+                    let progress = |pct: u8, bytes: u64, total_bytes: Option<u64>| {
+                        let mut latest = last.lock().unwrap();
+                        if pct == latest.1 && latest.0.elapsed() < Duration::from_millis(250) { return; }
+                        if latest.0.elapsed() < Duration::from_millis(250) && pct < 100 { return; }
+                        *latest = (std::time::Instant::now(), pct);
+                        let speed = bytes as f64 / started.elapsed().as_secs_f64().max(0.001);
+                        let estimated_total = total_bytes.or_else(|| if pct > 0 { Some(bytes.saturating_mul(100) / pct as u64) } else { None });
+                        let remaining = estimated_total.and_then(|total| if speed > 0.0 { Some((total.saturating_sub(bytes) as f64 / speed).ceil() as u64) } else { None });
+                        monitor(json!({"kind":"track","id":track.id,"release_id":release_id,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"downloading","percent":pct,"bytes":bytes,"total_bytes":total_bytes,"estimated_total_bytes":estimated_total,"bytes_per_second":speed,"eta_seconds":remaining}));
+                        if pct == 100 { log(format!("Downloaded audio · {}", track.title)); }
+                    };
+                    let segment_concurrency = provider_segment_concurrency;
+                    download_stream(&http, &stream, &source, &cancel, &progress, segment_concurrency).await?;
+                    Ok::<_, String>((stream, source))
+                })));
+            }
 
             for (idx, track) in tracks.iter().enumerate() {
                 if cancel_flag.load(Ordering::Relaxed) {
@@ -380,59 +464,10 @@ impl DownloadManager {
                     album_info.title.clone()
                 };
 
-                let prelim_meta = TrackDownloadMeta {
-                    track_id: track.id.clone(),
-                    album_id: ident.clone(),
-                    title: track.title.clone(),
-                    album: full_album_title.clone(),
-                    album_artist: album_artist_name.clone(),
-                    track_artists: if !track.artists.is_empty() {
-                        track.artists.clone()
-                    } else {
-                        vec![album_artist_name.clone()]
-                    },
-                    track_number: track.track_number,
-                    track_total: track_total_on_vol,
-                    disc_number: track.volume_number,
-                    disc_total,
-                    date: album_info.release_date.clone(),
-                    isrc: track.isrc.clone(),
-                    copyright: track.copyright.clone(),
-                    bpm: track.bpm,
-                    musical_key: track.key.clone(),
-                    release_type: None,
-                    explicit: track.explicit,
-                    lyrics: None,
-                    unsynced_lyrics: None,
-                    album_replay_gain: None,
-                    album_peak_amplitude: None,
-                    track_replay_gain: None,
-                    track_peak_amplitude: None,
-                };
+                let prelim_meta = preliminary_meta(track, ident, &full_album_title, &album_artist_name, track_total_on_vol, disc_total, &album_info.release_date);
 
-                if skip_existing {
-                    let rel_flac = if let Some(dest) = destination {
-                        let rel_album = dest
-                            .get("album_relative")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let disc_dir_name = if disc_total > 1 {
-                            format!("Disc {}", track.volume_number)
-                        } else {
-                            String::new()
-                        };
-                        let filename =
-                            format_download_path("{tracknumber} - {title}", &prelim_meta, ".flac");
-                        let mut p = PathBuf::from(rel_album);
-                        if !disc_dir_name.is_empty() {
-                            p.push(disc_dir_name);
-                        }
-                        p.push(filename);
-                        p
-                    } else {
-                        format_download_path(template, &prelim_meta, ".flac")
-                    };
-                    let dst_flac = item_output.join(&rel_flac);
+                if skip_existing && release["redownload"] != true {
+                    let dst_flac = existing_audio_path(&item_output, destination, template, &prelim_meta);
                     let dst_m4a = dst_flac.with_extension("m4a");
 
                     let exists_flac = dst_flac.is_file()
@@ -452,55 +487,28 @@ impl DownloadManager {
                             relative_track_filenames.push(fname.to_string());
                         }
                         existing_published_files.push(actual_dst);
+                        monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"already downloaded","percent":100}));
+                        monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":idx+1,"status":"running"}));
                         continue;
                     }
                 }
 
-                progress_cb(format!(
-                    "Track {}/{} · {}",
-                    idx + 1,
-                    total_tracks,
-                    track.title
-                ));
-
-                let stream_info =
-                    match get_playback_info(&http, &track.id, &token, item_quality, market).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            progress_cb(format!("Playback unavailable for {}: {}", track.title, e));
-                            all_tracks_ok = false;
-                            break;
-                        }
-                    };
-
-                let ext = if stream_info.mime_type.contains("mp4")
-                    || stream_info.codec.to_lowercase().contains("mp4")
-                    || stream_info.codec.to_lowercase().contains("aac")
-                {
-                    ".m4a"
-                } else {
-                    ".flac"
-                };
-
-                let mut staged_source = stage_dir.join(format!(".source-{}{}", track.id, ext));
-
-                // Download stream with progress reporting
-                let cb_clone = progress_cb.clone();
-                let p_cb = move |pct: u8| {
-                    cb_clone(format!("Download progress · {}%", pct));
-                };
-
-                if let Err(e) =
-                    download_stream(&http, &stream_info, &staged_source, &cancel_flag, &p_cb).await
-                {
-                    if cancel_flag.load(Ordering::Relaxed) {
+                let result = prefetch[idx].take().expect("active track has a download task").await;
+                let (stream_info, mut staged_source) = match result {
+                    Ok(Ok(audio)) => audio,
+                    Ok(Err(error)) => {
+                        progress_cb(format!("Download failed for {}: {error}", track.title));
+                        monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"failed","error":error}));
                         all_tracks_ok = false;
                         break;
                     }
-                    progress_cb(format!("Download failed for track {}: {}", track.title, e));
-                    all_tracks_ok = false;
-                    break;
-                }
+                    Err(error) => {
+                        progress_cb(format!("Download task stopped for {}: {error}", track.title));
+                        all_tracks_ok = false;
+                        break;
+                    }
+                };
+                let ext = if staged_source.extension().and_then(|s| s.to_str()) == Some("m4a") { ".m4a" } else { ".flac" };
 
                 let mut bytes = [0u8; 32];
                 {
@@ -595,8 +603,14 @@ impl DownloadManager {
                     },
                 };
 
-                if let Err(e) = apply_audio_tags(&staged_source, &meta, cover_data.as_deref()) {
+                let tag_path = staged_source.clone();
+                let tag_meta = meta.clone();
+                let tag_cover = cover_data.clone();
+                let tag_result = tokio::task::spawn_blocking(move || apply_audio_tags(&tag_path, &tag_meta, tag_cover.as_deref()))
+                    .await.map_err(|e| format!("Tag worker stopped: {e}"))?;
+                if let Err(e) = tag_result {
                     progress_cb(format!("Tagging failed for {}: {}", track.title, e));
+                    monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"failed","error":e}));
                     all_tracks_ok = false;
                     break;
                 }
@@ -652,9 +666,11 @@ impl DownloadManager {
                 if let Some(fname) = target_path_in_stage.file_name().and_then(|f| f.to_str()) {
                     relative_track_filenames.push(fname.to_string());
                 }
+                monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"staged","percent":100}));
+                monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":idx+1,"status":"running"}));
 
                 // Delay pacing between tracks if enabled
-                if download_delay && delay_min > 0.0 {
+                if download_delay && parallel == 1 && delay_min > 0.0 {
                     let wait_secs = {
                         let mut rng = rand::thread_rng();
                         rng.gen_range(delay_min..=delay_max.max(delay_min))
@@ -663,8 +679,13 @@ impl DownloadManager {
                 }
             }
 
+            for task in prefetch.into_iter().flatten() {
+                task.abort();
+                let _ = task.await;
+            }
             if !all_tracks_ok {
                 failed_count += 1;
+                monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"status":"failed"}));
                 let _ = fs::remove_dir_all(&stage_dir);
                 if cancel_flag.load(Ordering::Relaxed) {
                     break;
@@ -696,15 +717,41 @@ impl DownloadManager {
             }
 
             // Atomically publish staged files to destination library
-            let mut published = match publish_staged_files(&stage_dir, &item_output) {
+            let publish_stage = stage_dir.clone();
+            let publish_output = item_output.clone();
+            let is_redownload = release["redownload"] == true;
+            let publish_result = tokio::task::spawn_blocking(move || {
+                if is_redownload {
+                    stream_download::publish_redownloaded_files(&publish_stage, &publish_output)
+                } else {
+                    publish_staged_files(&publish_stage, &publish_output).map(|files| (files, Vec::new()))
+                }
+            }).await.map_err(|e| format!("Publish worker stopped: {e}"))?;
+            let (mut published, previous_files) = match publish_result {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = fs::remove_dir_all(&stage_dir);
                     failed_count += 1;
                     progress_cb(format!("Publishing failed for {}: {}", release_title, e));
+                    monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"status":"failed","error":e}));
                     continue;
                 }
             };
+            let backup_root = previous_files.first().and_then(|path| {
+                let folder = path.strip_prefix(&item_output).ok()?.components().next()?;
+                let name = folder.as_os_str().to_string_lossy();
+                if name.starts_with(".tibrary-redownload-backup-") { Some(item_output.join(folder.as_os_str())) } else { None }
+            });
+            let mut retained_previous = false;
+            for old in previous_files {
+                if let Err(error) = crate::duplicates::trash_file_or_directory(&old.to_string_lossy()).await {
+                    retained_previous = true;
+                    progress_cb(format!("Previous copy retained for review · {} ({error})", old.display()));
+                }
+            }
+            if !retained_previous {
+                if let Some(folder) = backup_root { let _ = fs::remove_dir_all(folder); }
+            }
             published.extend(existing_published_files);
 
             let _ = fs::remove_dir_all(&stage_dir);
@@ -747,6 +794,10 @@ impl DownloadManager {
             }
 
             completed_count += 1;
+            for (idx, track) in tracks.iter().enumerate() {
+                monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"complete","percent":100}));
+            }
+            monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":total_tracks,"status":"complete"}));
         }
 
         db.bump_revision();
@@ -754,5 +805,65 @@ impl DownloadManager {
             return Err(format!("Downloaded {completed_count} releases; {failed_count} failed and remain queued. See Activity for details."));
         }
         Ok(completed_count)
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "Uses the saved account and downloads one release to a temporary folder"]
+    async fn isolated_one_track_download() {
+        let temp = std::env::temp_dir().join(format!("tibrary-live-download-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let db = TursoDb::open(&temp.join("db.sqlite3")).await.unwrap();
+        db.set_preference("downloads", &json!({"output":temp.join("music"),"quality":"LOSSLESS","cover_size":0,"skip_existing":false,"parallel_downloads":2})).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO queue (id,payload,approved,decision,updated) VALUES (?, ?, 1, 'queued', ?)",
+            ("561743899", json!({"id":"561743899","title":"Sex","artist":"2hollis","track_count":1}).to_string().as_str(), chrono::Utc::now().to_rfc3339().as_str())).await.unwrap();
+        let completed = DownloadManager::run_downloads(&db, None, Arc::new(AtomicBool::new(false)), "isolated-test", |_| {}, |_| {}).await.unwrap();
+        assert_eq!(completed, 1);
+        let rows = db.get_queue_rows("downloaded", None, None, None, None, 0, 10).await.unwrap();
+        assert_eq!(rows.total, 1);
+        assert!(temp.join("music").exists());
+        drop(db);
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "Uses the saved account and downloads two tracks to a temporary folder"]
+    async fn isolated_parallel_tracks_download() {
+        let temp = std::env::temp_dir().join(format!("tibrary-parallel-download-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let db = TursoDb::open(&temp.join("db.sqlite3")).await.unwrap();
+        db.set_preference("downloads", &json!({"output":temp.join("music"),"quality":"LOSSLESS","cover_size":0,"skip_existing":false,"parallel_downloads":2})).await.unwrap();
+        let selected = json!({"id":"482348849","title":"Sunk Cost Fallacy Deluxe","artist":"Fox Stevenson","track_count":20,
+            "selected_tracks":[{"id":"482348850"},{"id":"482348851"}]});
+        let conn = db.connect().unwrap();
+        let payload = selected.to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO queue (id,payload,approved,decision,updated) VALUES (?, ?, 1, 'queued', ?)",
+            ("482348849", payload.as_str(), now.as_str())).await.unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let observed = events.clone();
+        let download = DownloadManager::run_downloads(&db, None, Arc::new(AtomicBool::new(false)), "parallel-test", |_| {}, move |item| observed.lock().unwrap().push(item));
+        let reads = async {
+            for _ in 0..200 {
+                if events.lock().unwrap().iter().any(|event| event["status"] == "downloading") { break; }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let started = std::time::Instant::now();
+            db.get_state(None, &[], None).await.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(2), "Local state query stalled during download");
+        };
+        let (downloaded, ()) = tokio::join!(download, reads);
+        let completed = downloaded.unwrap();
+        assert_eq!(completed, 1);
+        let events = events.lock().unwrap();
+        let active_ids: std::collections::HashSet<_> = events.iter().filter(|event| event["status"] == "downloading")
+            .filter_map(|event| event["id"].as_str()).collect();
+        assert_eq!(active_ids.len(), 2);
+        drop(events);
+        drop(db);
+        fs::remove_dir_all(temp).unwrap();
     }
 }
