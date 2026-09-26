@@ -404,3 +404,95 @@ async fn live_metadata_concurrency() {
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "Explicit live album-credit comparison; temporary DB, no music writes"]
+async fn live_album_credits_comparison() {
+    let dir = std::env::temp_dir().join(format!("tibrary-credit-probe-{}", uuid::Uuid::new_v4()));
+    let db = crate::db::TursoDb::open(dir.join("db")).await.unwrap();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let token = crate::stream_download::get_valid_token(&db, &http)
+        .await
+        .unwrap();
+    let mut client = crate::tidal::TidalClient::from_env_or_keychain().unwrap();
+    client.get_token().await.unwrap();
+    for id in ["234657671", "140303440"] {
+        let start = Instant::now();
+        let response = get(
+            http.get(format!(
+                "https://api.tidal.com/v1/albums/{id}/items/credits"
+            ))
+            .query(&[("countryCode", "GB"), ("limit", "100"), ("offset", "0")])
+            .bearer_auth(&token),
+            Duration::from_millis(350),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        if !status.is_success() {
+            println!("album={id} subscriber HTTP {status}");
+            continue;
+        }
+        let payload: serde_json::Value = response.json().await.unwrap();
+        let items = payload["items"].as_array().unwrap();
+        let audio: Vec<_> = items.iter().filter(|v| v["type"] == "track").collect();
+        let mut roles = std::collections::BTreeSet::new();
+        let mut count = 0;
+        let mut credited = 0;
+        for row in &audio {
+            if let Some(groups) = row["credits"].as_array() {
+                if !groups.is_empty() {
+                    credited += 1;
+                }
+                for group in groups {
+                    if let Some(role) = group["type"].as_str() {
+                        roles.insert(role.to_string());
+                    }
+                    count += group["contributors"].as_array().map_or(0, Vec::len);
+                }
+            }
+        }
+        println!("album={id} subscriber_ms={} items={} total={} audio={} credited_tracks={credited} contributor_role_entries={count} roles={roles:?} first_item_keys={:?}",start.elapsed().as_millis(),items.len(),payload["totalNumberOfItems"],audio.len(),items.first().and_then(|v|v.as_object()).map(|v|v.keys().collect::<Vec<_>>()));
+        let start = Instant::now();
+        let tracks = client.get_release_details(id, "GB").await.unwrap();
+        println!(
+            "album={id} developer_ms={} audio={} credited_tracks={} credit_entries={}",
+            start.elapsed().as_millis(),
+            tracks.len(),
+            tracks
+                .iter()
+                .filter(|t| t.credits.as_array().is_some_and(|a| !a.is_empty()))
+                .count(),
+            tracks
+                .iter()
+                .map(|t| t.credits.as_array().map_or(0, Vec::len))
+                .sum::<usize>()
+        );
+        let raw = client
+            .get_json(&format!(
+                "https://openapi.tidal.com/v2/tracks/{}?countryCode=GB&include=credits",
+                tracks[0].id
+            ))
+            .await
+            .unwrap();
+        println!(
+            "developer raw first-track credit relationship={} included_types={:?}",
+            raw["data"]
+                .as_array()
+                .and_then(|a| a.first())
+                .unwrap_or(&raw["data"])["relationships"]["credits"],
+            raw["included"].as_array().map(|a| a
+                .iter()
+                .filter_map(|v| v["type"].as_str())
+                .collect::<Vec<_>>())
+        );
+    }
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
