@@ -6,16 +6,19 @@
   color-scheme: light;
   --shadow: 0 6px 28px #0001;
   --danger: #ad3d39;
+  --online-log: #973b68;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --danger: #ed9c96;
+    --online-log: #f3b8d2;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --danger: #ed9c96;
+  --online-log: #f3b8d2;
 }
 :root {
   /* WebKit resolves semantic colours against the selected macOS appearance. */
@@ -1047,6 +1050,11 @@ summary {
   background: rgba(16, 185, 129, 0.15);
   color: #10b981;
   border: 1px solid rgba(16, 185, 129, 0.3);
+}
+.log-badge-online {
+  color: var(--online-log);
+  background: color-mix(in srgb, #f3b8d2 20%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--online-log) 35%, transparent);
 }
 .log-badge-linking {
   background: rgba(168, 85, 247, 0.15);
