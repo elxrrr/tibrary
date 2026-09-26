@@ -322,10 +322,10 @@ pub async fn execute(
         let token = crate::stream_download::get_valid_token(db, &http).await;
         let mut user_detail = String::new();
         let result = match token {
-            Ok(token) => match http
+            Ok(token) => match crate::network::get(http
                 .get("https://api.tidal.com/v1/sessions")
                 .bearer_auth(token)
-                .send()
+                , std::time::Duration::from_millis(350), 3, Some(cancel.as_ref()))
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
@@ -389,7 +389,7 @@ pub async fn execute(
             if cancel.load(Ordering::Relaxed) {
                 return Err("Cancelled; previous favourites retained".into());
             }
-            let response: Value = http
+            let response: Value = crate::network::get(http
                 .get(format!(
                     "https://api.tidal.com/v1/users/{user}/favorites/artists"
                 ))
@@ -399,7 +399,7 @@ pub async fn execute(
                     ("offset", &offset.to_string()),
                 ])
                 .bearer_auth(&token)
-                .send()
+                , std::time::Duration::from_millis(350), 3, Some(cancel.as_ref()))
                 .await
                 .map_err(|e| e.to_string())?
                 .error_for_status()
@@ -1263,11 +1263,11 @@ pub async fn execute(
                             .ok();
                     }
                     if let Some(ref token) = subscriber_token {
-                        let response = http
+                        let response = crate::network::get(http
                             .get(format!("https://api.tidal.com/v1/tracks/{}", track.id))
                             .query(&[("countryCode", market)])
                             .bearer_auth(token)
-                            .send()
+                            , std::time::Duration::from_millis(350), 3, Some(cancel.as_ref()))
                             .await
                             .map_err(|e| e.to_string())?
                             .error_for_status()

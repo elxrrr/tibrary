@@ -2,6 +2,7 @@
 mod release_artists;
 mod release_anchor;
 mod availability;
+mod network;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,

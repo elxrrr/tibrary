@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit, StreamCipher};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -470,6 +470,9 @@ async fn record_first_connected(db: &TursoDb) -> Result<(), String> {
 
 /// Retrieves a valid access token, auto-refreshing if necessary.
 pub async fn get_valid_token(db: &TursoDb, http: &reqwest::Client) -> Result<String, String> {
+    // Reload under the gate: another task may have renewed the same saved session.
+    static RENEWAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _renewal = RENEWAL.lock().await;
     let mut token = load_saved_token(db)
         .await
         .ok_or_else(|| "No Tidal login token found. Authentication required.".to_string())?;
@@ -547,11 +550,11 @@ pub async fn get_playback_info(
         API_V1_BASE, track_id, norm_quality
     );
 
-    let res = http
+    let res = crate::network::get(http
         .get(&url)
         .query(&[("countryCode", market)])
         .header(AUTHORIZATION, format!("Bearer {}", token))
-        .send()
+        , Duration::from_millis(350), 3, None)
         .await
         .map_err(|e| format!("Playback info request failed: {}", e))?;
 
@@ -866,9 +869,9 @@ pub async fn download_stream(
             return Err("Download cancelled".to_string());
         }
 
-        let mut res = http
+        let mut res = crate::network::get(http
             .get(url)
-            .send()
+            , Duration::ZERO, 3, Some(cancel_flag.as_ref()))
             .await
             .map_err(|e| format!("Segment download error (url {}): {}", idx, e))?;
 
@@ -931,7 +934,7 @@ fn spawn_audio_segment(
     let cancel = cancel.clone();
     tasks.spawn(async move {
         if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
-        let response = http.get(&url).send().await.map_err(|e| format!("Segment {index}: {e}"))?;
+        let response = crate::network::get(http.get(&url), Duration::ZERO, 3, Some(cancel.as_ref())).await.map_err(|e| format!("Segment {index}: {e}"))?;
         if !response.status().is_success() { return Err(format!("Segment {index}: HTTP {}", response.status())); }
         let mut response = response;
         let mut bytes = Vec::new();
@@ -1159,11 +1162,11 @@ pub async fn fetch_lyrics(
     market: &str,
 ) -> (Option<String>, Option<String>) {
     let url = format!("{}/tracks/{}/lyrics", API_V1_BASE, track_id);
-    if let Ok(res) = http
+    if let Ok(res) = crate::network::get(http
         .get(&url)
         .query(&[("countryCode", market)])
         .header(AUTHORIZATION, format!("Bearer {}", token))
-        .send()
+        , Duration::from_millis(350), 3, None)
         .await
     {
         if res.status().is_success() {
@@ -1198,7 +1201,7 @@ pub async fn fetch_cover_art(
         format!("{}/images/{}/320x320.jpg", RESOURCES_BASE, uuid_formatted)
     };
 
-    if let Ok(res) = http.get(&url).send().await {
+    if let Ok(res) = crate::network::get(http.get(&url), Duration::from_millis(350), 3, None).await {
         if res.status().is_success() {
             return res.bytes().await.ok().map(|b| b.to_vec());
         }
@@ -1206,7 +1209,7 @@ pub async fn fetch_cover_art(
 
     // Fallback to origin.jpg
     let origin_url = format!("{}/images/{}/origin.jpg", RESOURCES_BASE, uuid_formatted);
-    if let Ok(res) = http.get(&origin_url).send().await {
+    if let Ok(res) = crate::network::get(http.get(&origin_url), Duration::from_millis(350), 3, None).await {
         if res.status().is_success() {
             return res.bytes().await.ok().map(|b| b.to_vec());
         }
@@ -1251,11 +1254,11 @@ pub async fn fetch_album_info(
     market: &str,
 ) -> Result<TidalAlbumInfo, String> {
     let url = format!("{}/albums/{}", API_V1_BASE, album_id);
-    let res = http
+    let res = crate::network::get(http
         .get(&url)
         .query(&[("countryCode", market)])
         .header(AUTHORIZATION, format!("Bearer {}", token))
-        .send()
+        , Duration::from_millis(350), 3, None)
         .await
         .map_err(|e| format!("Album info request failed: {}", e))?;
 
@@ -1343,11 +1346,11 @@ pub async fn fetch_album_tracks(
             "{}/albums/{}/tracks?limit={}&offset={}",
             API_V1_BASE, album_id, limit, offset
         );
-        let res = http
+        let res = crate::network::get(http
             .get(&url)
             .query(&[("countryCode", market)])
             .header(AUTHORIZATION, format!("Bearer {}", token))
-            .send()
+            , Duration::from_millis(350), 3, Some(cancel_flag.as_ref()))
             .await
             .map_err(|e| format!("Tracks request failed: {}", e))?;
 

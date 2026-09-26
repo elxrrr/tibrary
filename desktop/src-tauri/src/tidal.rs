@@ -262,17 +262,13 @@ pub fn catalogue_next(current: &str, next: &str) -> Result<String, String> {
 #[test]
 fn retry_delay_accepts_seconds_dates_and_fallback() {
     assert_eq!(retry_delay(Some("12"), 0), Duration::from_secs(12));
-    assert_eq!(retry_delay(Some("invalid"), 1), Duration::from_secs(8));
+    assert_eq!(retry_delay(Some("invalid"), 1), Duration::from_secs(4));
     let future = (Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
     assert!((29..=30).contains(&retry_delay(Some(&future), 0).as_secs()));
 }
 
-fn retry_delay(header: Option<&str>, attempt: usize) -> Duration {
-    let seconds = header.and_then(|v| v.trim().parse::<u64>().ok().or_else(|| {
-        chrono::DateTime::parse_from_rfc2822(v).ok().map(|date| (date.timestamp() - Utc::now().timestamp()).max(0) as u64)
-    })).unwrap_or(4 * (attempt as u64 + 1));
-    Duration::from_secs(seconds)
-}
+#[cfg(test)]
+fn retry_delay(header: Option<&str>, attempt: usize) -> Duration { crate::network::retry_after(header,attempt) }
 
 // Reuse connection pools across short-lived workflow clients. Authentication is
 // attached per request, never stored in default headers on the shared client.
@@ -589,31 +585,9 @@ impl TidalClient {
         {
             return Err("Rejected unexpected catalogue URL".into());
         }
-        static PACER: std::sync::OnceLock<tokio::sync::Mutex<std::time::Instant>> =
-            std::sync::OnceLock::new();
-        for attempt in 0..self.attempts {
-            let mut last = PACER
-                .get_or_init(|| {
-                    tokio::sync::Mutex::new(std::time::Instant::now())
-                })
-                .lock()
-                .await;
-            let wait = last.saturating_duration_since(std::time::Instant::now());
-            if wait > Duration::from_secs(60) {
-                return Err(format!("Service rate limit: retry after {} seconds", wait.as_secs()));
-            }
-            tokio::time::sleep(wait).await;
-            *last = std::time::Instant::now() + self.request_spacing;
-            drop(last);
+        for attempt in 0..2 {
             let token = self.get_token().await?;
-            let res = self
-                .http
-                .get(url)
-                .bearer_auth(token)
-                .header(ACCEPT, "application/vnd.api+json")
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
+            let res = crate::network::get(self.http.get(url).bearer_auth(token).header(ACCEPT, "application/vnd.api+json"),self.request_spacing,self.attempts,None).await?;
             let status = res.status();
             if status.is_success() {
                 return res
@@ -625,22 +599,6 @@ impl TidalClient {
                 self.token = None;
                 *TOKEN_CACHE.lock().unwrap() = None;
                 continue;
-            }
-            if status.as_u16() == 429 || status.is_server_error() {
-                let wait = retry_delay(res.headers().get("retry-after").and_then(|v| v.to_str().ok()), attempt);
-                // Apply cooldown even on the final attempt, so another workflow cannot
-                // immediately repeat requests against a throttled catalogue service.
-                if status.as_u16() == 429 {
-                    let mut next = PACER.get().unwrap().lock().await;
-                    *next = (*next).max(std::time::Instant::now() + wait);
-                }
-                if wait > Duration::from_secs(60) {
-                    return Err(format!("Service rate limit: retry after {} seconds", wait.as_secs()));
-                }
-                if attempt + 1 < self.attempts {
-                    if status.as_u16() != 429 { tokio::time::sleep(wait).await; }
-                    continue;
-                }
             }
             let body: Value = res.json().await.unwrap_or(Value::Null);
             let detail = body["errors"]
