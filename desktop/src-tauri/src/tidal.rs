@@ -36,6 +36,10 @@ pub struct TidalTrack {
     pub key_scale: Option<String>,
     #[serde(default, deserialize_with = "copyright_from_value")]
     pub copyright: Option<String>,
+    pub media_tags: Vec<String>,
+    pub audio_modes: Vec<String>,
+    pub media_metadata: Value,
+    pub credits: Value,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -62,6 +66,11 @@ pub struct TidalRelease {
     pub secondary_types: Vec<String>,
     pub artist_credits: Vec<String>,
     pub primary_artist_verified: bool,
+    #[serde(default, deserialize_with = "optional_bool_from_value")]
+    pub official: Option<bool>,
+    pub original_release_date: Option<String>,
+    pub audio_modes: Vec<String>,
+    pub media_metadata: Value,
 }
 
 fn artist_name_from_value<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -90,9 +99,27 @@ where
     match value {
         Value::Null => Ok(None),
         Value::String(text) => Ok(Some(text)),
-        Value::Object(fields) => Ok(fields.get("text").and_then(Value::as_str).map(str::to_owned)),
-        _ => Err(serde::de::Error::custom("copyright must be text or an object with a text field")),
+        Value::Object(fields) => Ok(fields
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)),
+        _ => Err(serde::de::Error::custom(
+            "copyright must be text or an object with a text field",
+        )),
     }
+}
+
+fn optional_bool_from_value<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Bool(flag) => Some(flag),
+        Value::String(text) if text.eq_ignore_ascii_case("true") => Some(true),
+        Value::String(text) if text.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -101,11 +128,13 @@ mod release_payload_tests {
     fn release_artist_accepts_cached_object_or_string() {
         let object: super::TidalRelease = serde_json::from_value(serde_json::json!({
             "id":"123", "artist":{"id":"42","name":"Album Artist"}, "title":"Example"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(object.artist, "Album Artist");
         let string: super::TidalRelease = serde_json::from_value(serde_json::json!({
             "id":"123", "artist":"Album Artist", "title":"Example"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(string.artist, "Album Artist");
     }
     #[test]
@@ -116,11 +145,36 @@ mod release_payload_tests {
             "tracks":[{"id":"378495656","title":"Example track","copyright":{"text":"Armada Music B.V."}}]
         })).unwrap();
         assert_eq!(release.copyright.as_deref(), Some("Armada Music B.V."));
-        assert_eq!(release.tracks[0].copyright.as_deref(), Some("Armada Music B.V."));
+        assert_eq!(
+            release.tracks[0].copyright.as_deref(),
+            Some("Armada Music B.V.")
+        );
+    }
+    #[test]
+    fn release_tracks_keep_optional_audio_and_credit_metadata() {
+        let payload = serde_json::json!({
+            "data":[{"id":"track-1","type":"tracks","meta":{"trackNumber":1,"volumeNumber":1}}],
+            "included":[{"id":"track-1","type":"tracks","attributes":{
+                "title":"Example", "duration":"PT3M10S", "isrc":"GBABC1234567",
+                "mediaTags":["HIRES_LOSSLESS"], "audioModes":["STEREO"],
+                "mediaMetadata":{"sampleRate":96000,"bitDepth":24},
+                "credits":[{"roleId":"producer","name":"Example Producer"}]
+            }}]
+        });
+        let tracks = super::parse_release_tracks(&payload).unwrap();
+        assert_eq!(tracks[0].isrc.as_deref(), Some("GBABC1234567"));
+        assert_eq!(tracks[0].media_tags, vec!["HIRES_LOSSLESS"]);
+        assert_eq!(tracks[0].media_metadata["bitDepth"], 24);
+        assert_eq!(tracks[0].credits[0]["roleId"], "producer");
+        let cached: super::TidalTrack =
+            serde_json::from_value(serde_json::json!({"id":"legacy","title":"Legacy"})).unwrap();
+        assert!(cached.audio_modes.is_empty());
     }
     #[test]
     fn saved_catalogue_fixture_deserializes() {
-        let Ok(path) = std::env::var("TIBRARY_CATALOGUE_JSON") else { return };
+        let Ok(path) = std::env::var("TIBRARY_CATALOGUE_JSON") else {
+            return;
+        };
         let raw = std::fs::read_to_string(path).unwrap();
         let catalogue: super::TidalCatalogue = serde_json::from_str(&raw).unwrap();
         assert!(!catalogue.releases.is_empty());
@@ -762,23 +816,50 @@ impl TidalClient {
                         .or_else(|| attrs.get("label"))
                         .and_then(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str)))
                         .map(|s| s.to_string());
-                    let upc = attrs.get("barcodeId").or_else(|| attrs.get("upc")).or_else(|| attrs.get("barcode"))
-                        .and_then(Value::as_str).map(str::to_owned);
-                    let release_group_id = attrs.get("releaseGroupId").and_then(Value::as_str).map(str::to_owned);
-                    let primary_type = attrs.get("primaryType").and_then(Value::as_str).map(str::to_owned);
-                    let secondary_types = attrs.get("secondaryTypes").and_then(Value::as_array)
-                        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    let upc = attrs
+                        .get("barcodeId")
+                        .or_else(|| attrs.get("upc"))
+                        .or_else(|| attrs.get("barcode"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let release_group_id = attrs
+                        .get("releaseGroupId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let primary_type = attrs
+                        .get("primaryType")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let secondary_types = attrs
+                        .get("secondaryTypes")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let artist_refs = item["relationships"]["artists"]["data"].as_array();
-                    let artist_credits: Vec<String> = artist_refs.into_iter().flatten().filter_map(|reference| {
-                        let id = reference["id"].as_str()?;
-                        let artist = payload["included"].as_array()?.iter().find(|artist| artist["type"] == "artists" && artist["id"] == id)?;
-                        artist["attributes"]["name"].as_str().map(str::to_owned)
-                    }).collect();
+                    let artist_credits: Vec<String> = artist_refs
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|reference| {
+                            let id = reference["id"].as_str()?;
+                            let artist = payload["included"]
+                                .as_array()?
+                                .iter()
+                                .find(|artist| artist["type"] == "artists" && artist["id"] == id)?;
+                            artist["attributes"]["name"].as_str().map(str::to_owned)
+                        })
+                        .collect();
                     // The first album credit is the catalogue's primary credit. Do not
                     // manufacture an album artist by joining every collaborator name.
-                    let primary_artist_verified = artist_refs.and_then(|refs| refs.first())
-                        .and_then(|reference| reference["id"].as_str()) == Some(artist_id);
+                    let primary_artist_verified = artist_refs
+                        .and_then(|refs| refs.first())
+                        .and_then(|reference| reference["id"].as_str())
+                        == Some(artist_id);
 
                     let quality = attrs
                         .get("mediaTags")
@@ -811,6 +892,13 @@ impl TidalClient {
                         secondary_types,
                         artist_credits,
                         primary_artist_verified,
+                        official: attrs.get("official").and_then(Value::as_bool),
+                        original_release_date: attrs
+                            .get("originalReleaseDate")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        audio_modes: string_list(attrs.get("audioModes")),
+                        media_metadata: attrs.get("mediaMetadata").cloned().unwrap_or(Value::Null),
                     };
 
                     if detailed {
@@ -893,6 +981,27 @@ impl TidalClient {
                 ) {
                     for release in fresh {
                         if let Some(cached) = prior.iter().find(|r| r["id"] == release["id"]) {
+                            for field in [
+                                "upc",
+                                "original_release_date",
+                                "audio_modes",
+                                "media_metadata",
+                                "quality",
+                                "copyright",
+                                "label",
+                                "official",
+                                "release_group_id",
+                                "primary_type",
+                                "secondary_types",
+                                "artist_credits",
+                            ] {
+                                let absent = release[field].is_null()
+                                    || release[field].as_str().is_some_and(str::is_empty)
+                                    || release[field].as_array().is_some_and(Vec::is_empty);
+                                if absent && !cached[field].is_null() {
+                                    release[field] = cached[field].clone();
+                                }
+                            }
                             if release["tracks_loaded"] != true && cached["tracks_loaded"] == true {
                                 release["tracks"] = cached["tracks"].clone();
                                 release["tracks_loaded"] = json!(true);
@@ -960,9 +1069,33 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
                 .as_str()
                 .or_else(|| a["copyright"]["text"].as_str())
                 .map(str::to_owned),
+            media_tags: string_list(a.get("mediaTags")),
+            audio_modes: string_list(a.get("audioModes")),
+            media_metadata: a.get("mediaMetadata").cloned().unwrap_or(Value::Null),
+            credits: a
+                .get("credits")
+                .or_else(|| {
+                    item.get("relationships")
+                        .and_then(|r| r.get("contributors"))
+                })
+                .cloned()
+                .unwrap_or(Value::Null),
         });
     }
     Ok(tracks)
+}
+
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn format_title(title: &str, version: Option<&str>) -> String {

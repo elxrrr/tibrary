@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.10 (build 10)
+> **Version:** 0.9.0-beta.11 (build 11)
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
 
@@ -21,6 +21,8 @@
 ---
 
 ## Verification status — 26 September 2026
+
+Build 11 makes Activity status describe the current task and clears completion after three seconds. Connection checks show progress and results on their button rather than in the window header. Local duplicate work now uses the local worker lane, with scan progress visible in Activity. Release matching settings separate unofficial, compilation and fuzzy-title review choices. Unofficial and compilation releases remain visible for manual inspection; automatic linking requires the corresponding permission. The local duplicate scan compares every recording with a distinct retained track and verifies FLAC sample rate and bit depth before suggesting removal. Cached duplicate results are reused until the indexed file manifest changes. MQA audit rows load from the index and keep valid per-file audit evidence; new or changed files are marked for recheck. File mutations signal view refreshes and clear stale previews. Catalogue cache entries retain optional original release dates, audio modes, media metadata and contributor credits when supplied; recommendation scoring only uses contributor overlap when it is anchored to local tagged music. Similar-artist, radio and playlist relationships are not fetched during routine scans because they are weak evidence for release ownership and would add requests for every artist.
 
 This remains a beta, not a certified public release. The Rust migration audit restored previously unhandled desktop actions and removed silent-success fallbacks. Linking and extended review write database associations only; filesystem edits require a current, explicit preview. File changes invalidate reviewed writes. Jobs run independently of navigation, with lightweight progress polling and revision-based table caches.
 

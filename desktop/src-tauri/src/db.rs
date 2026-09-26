@@ -257,7 +257,8 @@ impl TursoDb {
             _ => return Err("Unknown activity stream".into()),
         };
         conn.execute(&format!("DELETE FROM activity_logs WHERE {condition}"), ())
-            .await.map_err(|e| e.to_string())?;
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -687,7 +688,9 @@ impl TursoDb {
                     }
 
                     if !has_correction {
-                        for (number, total) in [("tracknumber", "tracktotal"), ("discnumber", "disctotal")] {
+                        for (number, total) in
+                            [("tracknumber", "tracktotal"), ("discnumber", "disctotal")]
+                        {
                             if let Some(value) = tags.get(number) {
                                 let parts: Vec<_> = value.split('/').collect();
                                 if let Ok(n) = parts[0].trim().parse::<u32>() {
@@ -707,7 +710,9 @@ impl TursoDb {
                         }
                     }
 
-                    if !has_correction && (tags.contains_key("unsyncedlyrics") || tags.contains_key("lyrics")) {
+                    if !has_correction
+                        && (tags.contains_key("unsyncedlyrics") || tags.contains_key("lyrics"))
+                    {
                         has_correction = true;
                     }
 
@@ -784,7 +789,18 @@ impl TursoDb {
         }
 
         let missing_releases = match self
-            .get_missing_rows(market, Some("All missing releases"), None, Some("Missing release"), None, None, None, None, 0, 0)
+            .get_missing_rows(
+                market,
+                Some("All missing releases"),
+                None,
+                Some("Missing release"),
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+            )
             .await
         {
             Ok(page) => page.total,
@@ -962,8 +978,8 @@ impl TursoDb {
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(Value::Null);
 
-                let artist = extract_album_artist(&meta)
-                    .unwrap_or_else(|| "Unknown artist".to_string());
+                let artist =
+                    extract_album_artist(&meta).unwrap_or_else(|| "Unknown artist".to_string());
                 let release = extract_tag_str(&meta, &["album", "release"])
                     .unwrap_or_else(|| "Unknown release".to_string());
                 let title = extract_tag_str(&meta, &["title"]).unwrap_or_else(|| {
@@ -1247,7 +1263,12 @@ impl TursoDb {
     }
 
     fn recommendation_priority(badge: &str) -> i32 {
-        match badge { "Recommended" => 3, "Potential" => 2, "Suspect" => 1, _ => 0 }
+        match badge {
+            "Recommended" => 3,
+            "Potential" => 2,
+            "Suspect" => 1,
+            _ => 0,
+        }
     }
 
     fn audio_quality_priority(q: &str) -> i32 {
@@ -1281,43 +1302,122 @@ impl TursoDb {
         let mut local_isrcs: HashMap<String, HashSet<String>> = HashMap::new();
         let mut local_labels: HashMap<String, HashSet<String>> = HashMap::new();
         let mut local_rights: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut local_files = conn.query("SELECT path, metadata FROM local_files WHERE present = 1 AND metadata IS NOT NULL", ())
-            .await.map_err(|e| e.to_string())?;
+        let mut local_contributors: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut local_files = conn
+            .query(
+                "SELECT path, metadata FROM local_files WHERE present = 1 AND metadata IS NOT NULL",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         while let Some(row) = local_files.next().await.map_err(|e| e.to_string())? {
             let path: String = row.get(0).unwrap_or_default();
             let metadata: String = row.get(1).unwrap_or_default();
-            let Some(meta) = serde_json::from_str::<Value>(&metadata).ok() else { continue; };
-            let Some(artist) = extract_album_artist(&meta) else { continue; };
-            if is_compilation_artist(&artist) { continue; }
+            let Some(meta) = serde_json::from_str::<Value>(&metadata).ok() else {
+                continue;
+            };
+            let Some(artist) = extract_album_artist(&meta) else {
+                continue;
+            };
+            if is_compilation_artist(&artist) {
+                continue;
+            }
             let artist_key = crate::matching::name_key(&artist);
-            let Some(album) = extract_tag_str(&meta, &["album", "release"]) else { continue; };
+            let Some(album) = extract_tag_str(&meta, &["album", "release"]) else {
+                continue;
+            };
             let title_key = Self::normalize_release_title(&album);
-            if title_key.is_empty() { continue; }
-            let date = extract_tag_str(&meta, &["date", "release_date", "releasedate", "year"]).unwrap_or_default();
-            if let Some(isrc) = extract_tag_str(&meta, &["isrc"]) { local_isrcs.entry(artist_key.clone()).or_default().insert(isrc.trim().to_uppercase()); }
-            if let Some(label) = extract_tag_str(&meta, &["label", "record_label", "recordlabel"]) { local_labels.entry(artist_key.clone()).or_default().insert(crate::matching::name_key(&label)); }
-            if let Some(rights) = extract_tag_str(&meta, &["copyright"]) { local_rights.entry(artist_key.clone()).or_default().insert(crate::matching::name_key(&rights)); }
+            if title_key.is_empty() {
+                continue;
+            }
+            let date = extract_tag_str(&meta, &["date", "release_date", "releasedate", "year"])
+                .unwrap_or_default();
+            if let Some(isrc) = extract_tag_str(&meta, &["isrc"]) {
+                local_isrcs
+                    .entry(artist_key.clone())
+                    .or_default()
+                    .insert(isrc.trim().to_uppercase());
+            }
+            if let Some(label) = extract_tag_str(&meta, &["label", "record_label", "recordlabel"]) {
+                local_labels
+                    .entry(artist_key.clone())
+                    .or_default()
+                    .insert(crate::matching::name_key(&label));
+            }
+            if let Some(rights) = extract_tag_str(&meta, &["copyright"]) {
+                local_rights
+                    .entry(artist_key.clone())
+                    .or_default()
+                    .insert(crate::matching::name_key(&rights));
+            }
+            for role in [
+                "composer",
+                "lyricist",
+                "songwriter",
+                "producer",
+                "engineer",
+                "mixer",
+            ] {
+                let names: Vec<String> = meta["tags"][role].as_array()
+                    .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .unwrap_or_else(|| extract_tag_str(&meta, &[role]).into_iter().collect());
+                for names in names {
+                    for name in names.split(';') {
+                        let key = crate::matching::name_key(name);
+                        if !key.is_empty() {
+                            local_contributors
+                                .entry(artist_key.clone())
+                                .or_default()
+                                .insert(key);
+                        }
+                    }
+                }
+            }
             let folder = crate::duplicates::extract_release_folder(&path);
-            let edition = local_by_folder.entry((artist_key, title_key, folder)).or_default();
-            if edition.year.is_empty() { edition.year = date.chars().take(4).collect(); }
-            if date.len() > edition.date.len() { edition.date = date; }
+            let edition = local_by_folder
+                .entry((artist_key, title_key, folder))
+                .or_default();
+            if edition.year.is_empty() {
+                edition.year = date.chars().take(4).collect();
+            }
+            if date.len() > edition.date.len() {
+                edition.date = date;
+            }
             let disc = extract_tag_num(&meta, &["disc_number", "discnumber", "disc"]).unwrap_or(1);
-            let track = extract_tag_num(&meta, &["track_number", "tracknumber", "track"]).unwrap_or(0);
-            edition.positions.insert(if track > 0 { format!("{disc}:{track}") } else { path });
-            edition.declared_total = edition.declared_total.max(extract_tag_num(&meta, &["track_total", "tracktotal", "totaltracks"]).unwrap_or(0) as usize);
-            if edition.upc.is_none() { edition.upc = extract_tag_str(&meta, &["upc", "barcode"]); }
+            let track =
+                extract_tag_num(&meta, &["track_number", "tracknumber", "track"]).unwrap_or(0);
+            edition.positions.insert(if track > 0 {
+                format!("{disc}:{track}")
+            } else {
+                path
+            });
+            edition.declared_total = edition.declared_total.max(
+                extract_tag_num(&meta, &["track_total", "tracktotal", "totaltracks"]).unwrap_or(0)
+                    as usize,
+            );
+            if edition.upc.is_none() {
+                edition.upc = extract_tag_str(&meta, &["upc", "barcode"]);
+            }
         }
         drop(local_files);
         let mut local_editions: HashMap<(String, String), Vec<LocalEdition>> = HashMap::new();
         let mut complete_local_upcs: HashSet<String> = HashSet::new();
         for ((artist, title, _), edition) in local_by_folder {
             if !edition.date.is_empty() {
-                local_dates.entry(artist.clone()).or_default().push(edition.date.clone());
+                local_dates
+                    .entry(artist.clone())
+                    .or_default()
+                    .push(edition.date.clone());
             }
             if edition.declared_total > 0 && edition.positions.len() >= edition.declared_total {
-                if let Some(upc) = &edition.upc { complete_local_upcs.insert(upc.clone()); }
+                if let Some(upc) = &edition.upc {
+                    complete_local_upcs.insert(upc.clone());
+                }
             }
-            local_editions.entry((artist, title)).or_default().push(edition);
+            local_editions
+                .entry((artist, title))
+                .or_default()
+                .push(edition);
         }
         for dates in local_dates.values_mut() {
             dates.sort();
@@ -1328,6 +1428,7 @@ impl TursoDb {
         let treat_editions_as_owned = general["treat_editions_as_owned"].as_bool().unwrap_or(true);
         let recommend_live = general["recommend_live"].as_bool().unwrap_or(false);
         let recommend_bootlegs = general["recommend_bootlegs"].as_bool().unwrap_or(false);
+        let recommend_compilations = general["recommend_compilations"].as_bool().unwrap_or(false);
 
         // 1. Load queue decisions
         let mut queue_stmt = conn
@@ -1531,10 +1632,17 @@ impl TursoDb {
                 let artist_key = crate::matching::name_key(&rel_artist);
                 let title_key = Self::normalize_release_title(&title);
                 let year = date.chars().take(4).collect::<String>().parse::<i32>().ok();
-                let owned_edition = local_editions.get(&(artist_key.clone(), title_key.clone()))
-                    .and_then(|editions| editions.iter().filter(|edition| {
-                        year.zip(edition.year.parse::<i32>().ok()).is_none_or(|(remote, local)| (remote - local).abs() <= 3)
-                    }).max_by_key(|edition| edition.positions.len()));
+                let owned_edition = local_editions
+                    .get(&(artist_key.clone(), title_key.clone()))
+                    .and_then(|editions| {
+                        editions
+                            .iter()
+                            .filter(|edition| {
+                                year.zip(edition.year.parse::<i32>().ok())
+                                    .is_none_or(|(remote, local)| (remote - local).abs() <= 3)
+                            })
+                            .max_by_key(|edition| edition.positions.len())
+                    });
                 let (status, approved) = if let Some((decision, app)) = queue_decisions.get(&id) {
                     let st = match decision.as_str() {
                         "ignored" => "Ignored",
@@ -1544,7 +1652,11 @@ impl TursoDb {
                     (st.to_string(), *app)
                 } else if available == Some(false) {
                     ("Unavailable".to_string(), false)
-                } else if rel.get("upc").and_then(Value::as_str).is_some_and(|upc| complete_local_upcs.contains(upc)) {
+                } else if rel
+                    .get("upc")
+                    .and_then(Value::as_str)
+                    .is_some_and(|upc| complete_local_upcs.contains(upc))
+                {
                     ("Owned complete".to_string(), false)
                 } else if let Some(&linked_count) = linked_album_tracks.get(&id) {
                     if linked_count >= track_count && track_count > 0 {
@@ -1556,7 +1668,8 @@ impl TursoDb {
                     }
                 } else if let Some(edition) = owned_edition {
                     let owned = edition.positions.len();
-                    let complete_local = edition.declared_total > 0 && owned >= edition.declared_total;
+                    let complete_local =
+                        edition.declared_total > 0 && owned >= edition.declared_total;
                     if track_count > 0 && owned >= track_count {
                         ("Owned complete".to_string(), false)
                     } else if treat_editions_as_owned && complete_local && owned > 0 {
@@ -1575,23 +1688,66 @@ impl TursoDb {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                 let is_bootleg = rel.get("official").and_then(Value::as_bool) == Some(false)
-                    || rel["secondary_types"].as_array().is_some_and(|types| types.iter().any(|value| value.as_str().is_some_and(|name| name.eq_ignore_ascii_case("bootleg"))))
+                    || rel["secondary_types"].as_array().is_some_and(|types| {
+                        types.iter().any(|value| {
+                            value.as_str().is_some_and(|name| {
+                                ["bootleg", "promo", "unofficial"]
+                                    .iter()
+                                    .any(|flag| name.eq_ignore_ascii_case(flag))
+                            })
+                        })
+                    })
                     || title.to_lowercase().contains("bootleg");
                 let is_unofficial = is_bootleg && !recommend_bootlegs;
                 let is_official = rel
                     .get("official")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let primary_verified = rel.get("primary_artist_verified").and_then(Value::as_bool).unwrap_or(false);
+                let primary_verified = rel
+                    .get("primary_artist_verified")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let primary = primary_verified;
-                let conflict = rel["artist_credits"].as_array().and_then(|credits| credits.first())
+                let conflict = rel["artist_credits"]
+                    .as_array()
+                    .and_then(|credits| credits.first())
                     .and_then(Value::as_str)
-                    .is_some_and(|first| crate::matching::name_key(first) != crate::matching::name_key(&artist_name));
-                let label = rel.get("label").and_then(Value::as_str).map(crate::matching::name_key).unwrap_or_default();
-                let rights = rel.get("copyright").and_then(Value::as_str).or_else(|| rel["copyright"]["text"].as_str()).map(crate::matching::name_key).unwrap_or_default();
-                let label_match = !label.is_empty() && local_labels.get(&artist_key).is_some_and(|values| values.contains(&label));
-                let rights_match = !rights.is_empty() && local_rights.get(&artist_key).is_some_and(|values| values.contains(&rights));
-                let recordings = children.iter().filter(|track| !track.isrc.is_empty() && local_isrcs.get(&artist_key).is_some_and(|values| values.contains(&track.isrc.to_uppercase()))).count();
+                    .is_some_and(|first| {
+                        crate::matching::name_key(first) != crate::matching::name_key(&artist_name)
+                    });
+                let label = rel
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(crate::matching::name_key)
+                    .unwrap_or_default();
+                let rights = rel
+                    .get("copyright")
+                    .and_then(Value::as_str)
+                    .or_else(|| rel["copyright"]["text"].as_str())
+                    .map(crate::matching::name_key)
+                    .unwrap_or_default();
+                let label_match = !label.is_empty()
+                    && local_labels
+                        .get(&artist_key)
+                        .is_some_and(|values| values.contains(&label));
+                let rights_match = !rights.is_empty()
+                    && local_rights
+                        .get(&artist_key)
+                        .is_some_and(|values| values.contains(&rights));
+                let recordings = children
+                    .iter()
+                    .filter(|track| {
+                        !track.isrc.is_empty()
+                            && local_isrcs
+                                .get(&artist_key)
+                                .is_some_and(|values| values.contains(&track.isrc.to_uppercase()))
+                    })
+                    .count();
+                let (contributor_tracks, contributors) =
+                    crate::recommendations::shared_contributor_evidence(
+                        local_contributors.get(&artist_key),
+                        rel["tracks"].as_array(),
+                    );
                 let (_score, mut badge, mut reasons) = crate::recommendations::recommendation_score(
                     primary,
                     conflict,
@@ -1600,20 +1756,45 @@ impl TursoDb {
                     !label.is_empty(),
                     rights_match,
                     recordings,
-                    0,
-                    0,
-                    is_compilation,
+                    contributor_tracks,
+                    contributors,
+                    is_compilation && !recommend_compilations,
                     is_unofficial,
                     is_official,
                 );
-                let is_live = rel["secondary_types"].as_array().is_some_and(|types| types.iter().any(|value| value.as_str().is_some_and(|name| name.eq_ignore_ascii_case("live"))))
-                    || title.to_lowercase().contains("(live") || title.to_lowercase().contains(" live at ");
-                if is_live && !recommend_live { badge = "Suspect".into(); reasons.push("Live release; show live items in recommendations to consider it".into()); }
-                if is_bootleg && !recommend_bootlegs { reasons.push("Bootleg or unofficial release; still visible for manual review".into()); }
-                if status == "Owned alternate edition" { reasons.push("A complete local edition with the same album artist and release title is already indexed".into()); }
+                let is_live = rel["secondary_types"].as_array().is_some_and(|types| {
+                    types.iter().any(|value| {
+                        value
+                            .as_str()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("live"))
+                    })
+                }) || title.to_lowercase().contains("(live")
+                    || title.to_lowercase().contains(" live at ");
+                if is_live && !recommend_live {
+                    badge = "Suspect".into();
+                    reasons.push(
+                        "Live release; show live items in recommendations to consider it".into(),
+                    );
+                }
+                if is_bootleg && !recommend_bootlegs {
+                    reasons.push(
+                        "Bootleg or unofficial release; still visible for manual review".into(),
+                    );
+                }
+                if is_compilation && !recommend_compilations {
+                    reasons.push("Compilation; still visible for manual review".into());
+                }
+                if status == "Owned alternate edition" {
+                    reasons.push("A complete local edition with the same album artist and release title is already indexed".into());
+                }
 
                 let norm_title = Self::normalize_release_title(&title);
-                let group_key = rel.get("release_group_id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(|id| format!("group:{id}")).unwrap_or_else(|| norm_title.clone());
+                let group_key = rel
+                    .get("release_group_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| format!("group:{id}"))
+                    .unwrap_or_else(|| norm_title.clone());
 
                 match by_id.entry(id.clone()) {
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -1653,11 +1834,15 @@ impl TursoDb {
                         if new_q > existing_q {
                             existing.quality = quality;
                         }
-                        if Self::coverage_priority(&status) > Self::coverage_priority(&existing.status) {
+                        if Self::coverage_priority(&status)
+                            > Self::coverage_priority(&existing.status)
+                        {
                             existing.status = status;
                             existing.approved = approved;
                         }
-                        if Self::recommendation_priority(&badge) > Self::recommendation_priority(&existing.recommendation) {
+                        if Self::recommendation_priority(&badge)
+                            > Self::recommendation_priority(&existing.recommendation)
+                        {
                             existing.recommendation = badge;
                             existing.evidence = reasons;
                         }
@@ -1705,7 +1890,9 @@ impl TursoDb {
 
                     let should_replace = cand_pri > existing_pri
                         || (cand_pri == existing_pri && cand_rec > existing_rec)
-                        || (cand_pri == existing_pri && cand_rec == existing_rec && cand_q > existing_q)
+                        || (cand_pri == existing_pri
+                            && cand_rec == existing_rec
+                            && cand_q > existing_q)
                         || (cand_pri == existing_pri
                             && cand_rec == existing_rec
                             && cand_q == existing_q
@@ -1735,7 +1922,10 @@ impl TursoDb {
                     2 => format!("{} & {}", rel.artists[0], rel.artists[1]),
                     _ => rel.artists.join(", "),
                 };
-                let dates = rel.artists.first().and_then(|artist| local_dates.get(&crate::matching::name_key(artist)));
+                let dates = rel
+                    .artists
+                    .first()
+                    .and_then(|artist| local_dates.get(&crate::matching::name_key(artist)));
                 MissingRow {
                     id: rel.id.clone(),
                     downloaded_files: Vec::new(),
@@ -1777,11 +1967,21 @@ impl TursoDb {
     ) -> Result<TablePage<MissingRow>, String> {
         let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
         let key = format!("{market}:{}", chrono::Utc::now().format("%Y-%m-%d"));
-        let cached = self.missing_rows_cache.lock().unwrap().get(&key).filter(|(rev,_)|*rev==revision).map(|(_,rows)|rows.clone());
-        let mut rows = if let Some(rows)=cached { rows } else {
+        let cached = self
+            .missing_rows_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|(rev, _)| *rev == revision)
+            .map(|(_, rows)| rows.clone());
+        let mut rows = if let Some(rows) = cached {
+            rows
+        } else {
             let rows = self.build_missing_rows(market).await?;
-            let mut cache=self.missing_rows_cache.lock().unwrap();
-            cache.clear(); cache.insert(key,(revision,rows.clone())); rows
+            let mut cache = self.missing_rows_cache.lock().unwrap();
+            cache.clear();
+            cache.insert(key, (revision, rows.clone()));
+            rows
         };
 
         // Apply filters
@@ -1826,13 +2026,19 @@ impl TursoDb {
             if tl == "Newer than newest owned" {
                 rows.retain(|r| {
                     ["Missing release", "Owned partial", "Queued"].contains(&r.status.as_str())
-                        && r.newest_local_date.as_deref().is_none_or(|newest| compare_release_dates(&r.date, newest).is_gt())
+                        && r.newest_local_date
+                            .as_deref()
+                            .is_none_or(|newest| compare_release_dates(&r.date, newest).is_gt())
                 });
             } else if tl == "Between newest two owned" {
                 rows.retain(|r| {
                     ["Missing release", "Owned partial", "Queued"].contains(&r.status.as_str())
-                        && r.newest_local_date.as_deref().is_some_and(|newest| !compare_release_dates(&r.date, newest).is_gt())
-                        && r.previous_local_date.as_deref().is_some_and(|previous| compare_release_dates(&r.date, previous).is_gt())
+                        && r.newest_local_date
+                            .as_deref()
+                            .is_some_and(|newest| !compare_release_dates(&r.date, newest).is_gt())
+                        && r.previous_local_date.as_deref().is_some_and(|previous| {
+                            compare_release_dates(&r.date, previous).is_gt()
+                        })
                 });
             } else if tl == "All missing releases" {
                 rows.retain(|r| {
@@ -1914,7 +2120,10 @@ impl TursoDb {
             obj.insert("files".to_string(), json!(stats_record.track_count));
             obj.insert("linked".to_string(), json!(stats_record.linked_tracks));
             obj.insert("missing".to_string(), json!(stats_record.missing_releases));
-            obj.insert("missing_releases".to_string(), json!(stats_record.missing_releases));
+            obj.insert(
+                "missing_releases".to_string(),
+                json!(stats_record.missing_releases),
+            );
             obj.insert("correct".to_string(), json!(stats_record.correct));
         }
 
@@ -2544,20 +2753,38 @@ impl TursoDb {
         Ok(())
     }
 
-    pub async fn queue_redownload(&self, release_id: &str, track_id: Option<&str>) -> Result<(), String> {
+    pub async fn queue_redownload(
+        &self,
+        release_id: &str,
+        track_id: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.connect()?;
-        let mut rows = conn.query(
-            "SELECT payload FROM queue WHERE id = ? AND decision = 'downloaded'",
-            (release_id,),
-        ).await.map_err(|e| e.to_string())?;
-        let row = rows.next().await.map_err(|e| e.to_string())?
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM queue WHERE id = ? AND decision = 'downloaded'",
+                (release_id,),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| e.to_string())?
             .ok_or("Choose a completed download to redownload")?;
         let raw: String = row.get(0).map_err(|e| e.to_string())?;
         let mut release: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         if let Some(track_id) = track_id {
-            let tracks = release["tracks"].as_array().ok_or("Load cached track details first")?;
-            let selected: Vec<Value> = tracks.iter().filter(|track| track["id"].as_str() == Some(track_id)).cloned().collect();
-            if selected.len() != 1 { return Err("Selected track is absent from the cached release".into()); }
+            let tracks = release["tracks"]
+                .as_array()
+                .ok_or("Load cached track details first")?;
+            let selected: Vec<Value> = tracks
+                .iter()
+                .filter(|track| track["id"].as_str() == Some(track_id))
+                .cloned()
+                .collect();
+            if selected.len() != 1 {
+                return Err("Selected track is absent from the cached release".into());
+            }
             release["selected_tracks"] = json!(selected);
         } else {
             release["selected_tracks"] = Value::Null;
@@ -2660,7 +2887,11 @@ impl TursoDb {
         Ok(())
     }
 
-    pub async fn queue_export(&self, format: &str, decision: Option<&str>) -> Result<String, String> {
+    pub async fn queue_export(
+        &self,
+        format: &str,
+        decision: Option<&str>,
+    ) -> Result<String, String> {
         let dec = decision.unwrap_or("queued");
         let conn = self.connect()?;
         let mut stmt = conn
@@ -2811,8 +3042,8 @@ impl TursoDb {
         while let Some(row) = file_stmt.next().await.map_err(|e| e.to_string())? {
             if let Ok(Some(meta_str)) = row.get::<Option<String>>(0) {
                 if let Ok(meta) = serde_json::from_str::<Value>(&meta_str) {
-                    let art = extract_album_artist(&meta)
-                        .unwrap_or_else(|| "Unknown artist".to_string());
+                    let art =
+                        extract_album_artist(&meta).unwrap_or_else(|| "Unknown artist".to_string());
                     let alb = extract_tag_str(&meta, &["album", "release"]).unwrap_or_default();
                     *artist_tracks.entry(art.clone()).or_insert(0) += 1;
                     artist_albums.entry(art).or_default().insert(alb);
@@ -2991,84 +3222,128 @@ impl TursoDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn get_favourite_rows(&self, root: Option<&str>, filter: &str, search: &str, sort: &str, direction: &str, offset: usize, limit: usize) -> Result<TablePage<Value>, String> {
+    pub async fn get_favourite_rows(
+        &self,
+        root: Option<&str>,
+        filter: &str,
+        search: &str,
+        sort: &str,
+        direction: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<TablePage<Value>, String> {
         let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
         let cache_key = root.unwrap_or("").to_string();
-        let cached = self.favourite_rows_cache.lock().unwrap().get(&cache_key).filter(|(rev, _)| *rev == revision).map(|(_, rows)| rows.clone());
-        let mut rows = if let Some(base) = cached { base } else {
-        let conn = self.connect()?;
-        let mut local_counts: HashMap<String, (String, usize)> = HashMap::new();
-        let mut files = conn.query(
-            "SELECT metadata FROM local_files WHERE present = 1 AND (? = '' OR root = ?)",
-            (root.unwrap_or(""), root.unwrap_or("")),
-        ).await.map_err(|e| e.to_string())?;
-        while let Some(file) = files.next().await.map_err(|e| e.to_string())? {
-            let metadata: Option<String> = file.get(0).ok().flatten();
-            if let Some(meta) = metadata.as_deref().and_then(|text| serde_json::from_str::<Value>(text).ok()) {
-                if let Some(artist) = extract_album_artist(&meta) {
-                    if !is_compilation_artist(&artist) {
-                        let key = artist.to_lowercase();
-                        let item = local_counts.entry(key).or_insert((artist, 0));
-                        item.1 += 1;
+        let cached = self
+            .favourite_rows_cache
+            .lock()
+            .unwrap()
+            .get(&cache_key)
+            .filter(|(rev, _)| *rev == revision)
+            .map(|(_, rows)| rows.clone());
+        let mut rows = if let Some(base) = cached {
+            base
+        } else {
+            let conn = self.connect()?;
+            let mut local_counts: HashMap<String, (String, usize)> = HashMap::new();
+            let mut files = conn
+                .query(
+                    "SELECT metadata FROM local_files WHERE present = 1 AND (? = '' OR root = ?)",
+                    (root.unwrap_or(""), root.unwrap_or("")),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            while let Some(file) = files.next().await.map_err(|e| e.to_string())? {
+                let metadata: Option<String> = file.get(0).ok().flatten();
+                if let Some(meta) = metadata
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                {
+                    if let Some(artist) = extract_album_artist(&meta) {
+                        if !is_compilation_artist(&artist) {
+                            let key = artist.to_lowercase();
+                            let item = local_counts.entry(key).or_insert((artist, 0));
+                            item.1 += 1;
+                        }
                     }
                 }
             }
-        }
-        drop(files);
-        let mut stmt = conn
-            .query("SELECT payload FROM favourite_artists", ())
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut rows = Vec::new();
-        let mut favourited = HashSet::new();
-        while let Some(row) = stmt.next().await.map_err(|e| e.to_string())? {
-            if let Ok(Some(payload_str)) = row.get::<Option<String>>(0) {
-                if let Ok(items) = serde_json::from_str::<Vec<Value>>(&payload_str) {
-                    for item in items {
-                        let name = item
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let id = item
-                            .get("id")
-                            .map(|v| v.to_string().trim_matches('"').to_string())
-                            .unwrap_or_default();
-                        let key = name.to_lowercase();
-                        if name.is_empty() || !favourited.insert(key.clone()) { continue; }
-                        let tracks = local_counts.get(&key).map(|(_, count)| *count).unwrap_or(0);
-                        rows.push(json!({
-                            "id": format!("favourite:{id}"),
-                            "artist": name,
-                            "status": if tracks > 0 { "In library" } else { "Missing locally" },
-                            "tracks": tracks,
-                            "online_id": id
-                        }));
+            drop(files);
+            let mut stmt = conn
+                .query("SELECT payload FROM favourite_artists", ())
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut rows = Vec::new();
+            let mut favourited = HashSet::new();
+            while let Some(row) = stmt.next().await.map_err(|e| e.to_string())? {
+                if let Ok(Some(payload_str)) = row.get::<Option<String>>(0) {
+                    if let Ok(items) = serde_json::from_str::<Vec<Value>>(&payload_str) {
+                        for item in items {
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let id = item
+                                .get("id")
+                                .map(|v| v.to_string().trim_matches('"').to_string())
+                                .unwrap_or_default();
+                            let key = name.to_lowercase();
+                            if name.is_empty() || !favourited.insert(key.clone()) {
+                                continue;
+                            }
+                            let tracks =
+                                local_counts.get(&key).map(|(_, count)| *count).unwrap_or(0);
+                            rows.push(json!({
+                                "id": format!("favourite:{id}"),
+                                "artist": name,
+                                "status": if tracks > 0 { "In library" } else { "Missing locally" },
+                                "tracks": tracks,
+                                "online_id": id
+                            }));
+                        }
                     }
                 }
             }
-        }
-        for (key, (name, count)) in local_counts {
-            if !favourited.contains(&key) {
-                rows.push(json!({"id":format!("local:{key}"),"artist":name,"status":"Local only","tracks":count,"online_id":""}));
+            for (key, (name, count)) in local_counts {
+                if !favourited.contains(&key) {
+                    rows.push(json!({"id":format!("local:{key}"),"artist":name,"status":"Local only","tracks":count,"online_id":""}));
+                }
             }
-        }
-        let mut cache = self.favourite_rows_cache.lock().unwrap();
-        cache.clear();
-        cache.insert(cache_key, (revision, rows.clone()));
-        rows
+            let mut cache = self.favourite_rows_cache.lock().unwrap();
+            cache.clear();
+            cache.insert(cache_key, (revision, rows.clone()));
+            rows
         };
-        if filter != "all" && !filter.is_empty() { rows.retain(|row| row["status"].as_str() == Some(filter)); }
+        if filter != "all" && !filter.is_empty() {
+            rows.retain(|row| row["status"].as_str() == Some(filter));
+        }
         let query = search.trim().to_lowercase();
-        if !query.is_empty() { rows.retain(|row| row["artist"].as_str().unwrap_or("").to_lowercase().contains(&query)); }
+        if !query.is_empty() {
+            rows.retain(|row| {
+                row["artist"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&query)
+            });
+        }
         rows.sort_by(|a, b| {
             let cmp = match sort {
                 "tracks" => a["tracks"].as_u64().cmp(&b["tracks"].as_u64()),
                 "status" => a["status"].as_str().cmp(&b["status"].as_str()),
                 "online_id" => a["online_id"].as_str().cmp(&b["online_id"].as_str()),
-                _ => a["artist"].as_str().unwrap_or("").to_lowercase().cmp(&b["artist"].as_str().unwrap_or("").to_lowercase()),
+                _ => a["artist"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .cmp(&b["artist"].as_str().unwrap_or("").to_lowercase()),
             };
-            let cmp = if direction == "desc" { cmp.reverse() } else { cmp };
+            let cmp = if direction == "desc" {
+                cmp.reverse()
+            } else {
+                cmp
+            };
             cmp.then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
         });
         let total = rows.len();
@@ -3197,14 +3472,30 @@ impl TursoDb {
                 let mut sources = Vec::new();
                 let mut seen_sources = std::collections::HashSet::new();
                 let placements = link["placements"].as_array().cloned().unwrap_or_default();
-                for source in std::iter::once(&link["ids"]).chain(placements.iter()).chain(options.iter()) {
+                for source in std::iter::once(&link["ids"])
+                    .chain(placements.iter())
+                    .chain(options.iter())
+                {
                     let album = source["album_id"].as_str().or(source["id"].as_str());
                     let track = source["track_id"].as_str();
-                    let (Some(album), Some(track)) = (album, track) else { continue };
-                    if !seen_sources.insert((album.to_string(), track.to_string())) { continue }
-                    let dj = self.get_preference(&format!("dj-check:{market}:{track}")).await?;
-                    let cached = self.get_preference(&format!("tag-review:{market}:{album}")).await?.unwrap_or(Value::Null);
-                    let recording = cached["tracks"].as_array().and_then(|tracks| tracks.iter().find(|t| t["id"].as_str() == Some(track))).cloned().unwrap_or(Value::Null);
+                    let (Some(album), Some(track)) = (album, track) else {
+                        continue;
+                    };
+                    if !seen_sources.insert((album.to_string(), track.to_string())) {
+                        continue;
+                    }
+                    let dj = self
+                        .get_preference(&format!("dj-check:{market}:{track}"))
+                        .await?;
+                    let cached = self
+                        .get_preference(&format!("tag-review:{market}:{album}"))
+                        .await?
+                        .unwrap_or(Value::Null);
+                    let recording = cached["tracks"]
+                        .as_array()
+                        .and_then(|tracks| tracks.iter().find(|t| t["id"].as_str() == Some(track)))
+                        .cloned()
+                        .unwrap_or(Value::Null);
                     sources.push(json!({"album_id":album,"track_id":track,
                         "release":cached["title"].as_str().or(source["album"].as_str()),
                         "artist":cached["artist"],"date":cached["date"],"label":cached["label"],"upc":cached["barcode"],
@@ -3275,9 +3566,13 @@ fn compare_release_dates(left: &str, right: &str) -> std::cmp::Ordering {
     let left_year = left.chars().take(4).collect::<String>();
     let right_year = right.chars().take(4).collect::<String>();
     let year_order = left_year.cmp(&right_year);
-    if !year_order.is_eq() { return year_order; }
+    if !year_order.is_eq() {
+        return year_order;
+    }
     // A year-only tag cannot prove that another release in that year is newer.
-    if left.len() <= 4 || right.len() <= 4 { return std::cmp::Ordering::Equal; }
+    if left.len() <= 4 || right.len() <= 4 {
+        return std::cmp::Ordering::Equal;
+    }
     left.cmp(right)
 }
 
@@ -3370,11 +3665,33 @@ fn is_compilation_artist(artist: &str) -> bool {
 mod tests {
     #[tokio::test]
     async fn clearing_one_activity_stream_preserves_the_others() {
-        let path = std::env::temp_dir().join(format!("tibrary_log_streams_{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("tibrary_log_streams_{}.db", uuid::Uuid::new_v4()));
         let db = super::TursoDb::open(&path).await.unwrap();
-        db.log_activity("2026-09-26T12:00:00Z", "Scanning download folder", "info", "scan").await.unwrap();
-        db.log_activity("2026-09-26T12:00:01Z", "Fetching catalogue", "info", "online").await.unwrap();
-        db.log_activity("2026-09-26T12:00:02Z", "Downloading track", "info", "download").await.unwrap();
+        db.log_activity(
+            "2026-09-26T12:00:00Z",
+            "Scanning download folder",
+            "info",
+            "scan",
+        )
+        .await
+        .unwrap();
+        db.log_activity(
+            "2026-09-26T12:00:01Z",
+            "Fetching catalogue",
+            "info",
+            "online",
+        )
+        .await
+        .unwrap();
+        db.log_activity(
+            "2026-09-26T12:00:02Z",
+            "Downloading track",
+            "info",
+            "download",
+        )
+        .await
+        .unwrap();
         db.clear_log_stream("local").await.unwrap();
         let remaining = db.load_recent_logs(10).await.unwrap();
         assert_eq!(remaining.len(), 2);
@@ -3385,8 +3702,12 @@ mod tests {
     }
     #[test]
     fn album_artist_precedes_performer_even_when_nested_and_year_is_not_a_full_date() {
-        let metadata = serde_json::json!({"artist":"Guest singer","tags":{"albumartist":["Main artist"]}});
-        assert_eq!(super::extract_album_artist(&metadata).as_deref(), Some("Main artist"));
+        let metadata =
+            serde_json::json!({"artist":"Guest singer","tags":{"albumartist":["Main artist"]}});
+        assert_eq!(
+            super::extract_album_artist(&metadata).as_deref(),
+            Some("Main artist")
+        );
         assert!(super::compare_release_dates("2025-09-15", "2025").is_eq());
         assert!(super::compare_release_dates("2026-01-01", "2025").is_gt());
     }
@@ -4165,11 +4486,20 @@ with sqlite3.connect('{db}') as db:
             .queue_decision(&["album_100".to_string()], "downloaded")
             .await
             .unwrap();
-        store.queue_redownload("album_100", Some("t2")).await.unwrap();
-        let requeued = store.get_queue_rows("queue", None, None, None, None, 0, 10).await.unwrap();
+        store
+            .queue_redownload("album_100", Some("t2"))
+            .await
+            .unwrap();
+        let requeued = store
+            .get_queue_rows("queue", None, None, None, None, 0, 10)
+            .await
+            .unwrap();
         assert_eq!(requeued.total, 1);
         assert_eq!(requeued.rows[0].selected, Some(vec!["t2".to_string()]));
-        store.queue_decision(&["album_100".to_string()], "downloaded").await.unwrap();
+        store
+            .queue_decision(&["album_100".to_string()], "downloaded")
+            .await
+            .unwrap();
         let queue_after = store
             .get_queue_rows("queue", None, None, None, None, 0, 10)
             .await
@@ -4377,40 +4707,130 @@ with sqlite3.connect('{db}') as db:
 
     #[tokio::test]
     async fn complete_local_standard_is_not_recommended_as_missing_deluxe() {
-        let temp_dir = std::env::temp_dir().join(format!("tibrary_editions_{}", uuid::Uuid::new_v4()));
-        let store = TursoDb::open(temp_dir.join("library.sqlite3")).await.unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("tibrary_editions_{}", uuid::Uuid::new_v4()));
+        let store = TursoDb::open(temp_dir.join("library.sqlite3"))
+            .await
+            .unwrap();
         let conn = store.connect().unwrap();
         for (number, title) in [(1, "Unbound"), (2, "Sequoia")] {
             let path = format!("/music/Klur/Unbound (2025)/0{number} - {title}.flac");
             let meta = json!({"album_artist":"Klur","artist":"Klur","album":"Unbound","title":title,"tracknumber":format!("{number}/2"),"tracktotal":"2","date":"2025-01-01"});
-            conn.execute("INSERT INTO local_files (path,root,metadata,present) VALUES (?, '/music', ?, 1)", (path, meta.to_string())).await.unwrap();
+            conn.execute(
+                "INSERT INTO local_files (path,root,metadata,present) VALUES (?, '/music', ?, 1)",
+                (path, meta.to_string()),
+            )
+            .await
+            .unwrap();
         }
         let catalogue = json!({"name":"Klur","releases":[{"id":"deluxe","artist":"Klur","title":"Unbound (Deluxe)","date":"2025-01-01","type":"ALBUM","track_count":3,"tracks":[]}]});
-        conn.execute("INSERT INTO catalogue (artist_id,market,payload) VALUES ('klur','GB',?)", (catalogue.to_string(),)).await.unwrap();
-        let all = store.get_missing_rows("GB", Some("All releases"), None, None, None, None, None, None, 0, 10).await.unwrap();
+        conn.execute(
+            "INSERT INTO catalogue (artist_id,market,payload) VALUES ('klur','GB',?)",
+            (catalogue.to_string(),),
+        )
+        .await
+        .unwrap();
+        let all = store
+            .get_missing_rows(
+                "GB",
+                Some("All releases"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(all.rows[0].status, "Owned alternate edition");
-        let missing = store.get_missing_rows("GB", Some("All missing releases"), None, None, None, None, None, None, 0, 10).await.unwrap();
+        let missing = store
+            .get_missing_rows(
+                "GB",
+                Some("All missing releases"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(missing.total, 0);
-        store.set_preference("desktop", &json!({"treat_editions_as_owned":false})).await.unwrap();
+        store
+            .set_preference("desktop", &json!({"treat_editions_as_owned":false}))
+            .await
+            .unwrap();
         store.invalidate_missing_rows();
-        let reconsidered = store.get_missing_rows("GB", Some("All releases"), None, None, None, None, None, None, 0, 10).await.unwrap();
+        let reconsidered = store
+            .get_missing_rows(
+                "GB",
+                Some("All releases"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(reconsidered.rows[0].status, "Owned partial");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]
     async fn favourites_use_album_artist_and_filter_pagination() {
-        let temp_dir = std::env::temp_dir().join(format!("tibrary_favourites_{}", uuid::Uuid::new_v4()));
-        let store = TursoDb::open(temp_dir.join("library.sqlite3")).await.unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("tibrary_favourites_{}", uuid::Uuid::new_v4()));
+        let store = TursoDb::open(temp_dir.join("library.sqlite3"))
+            .await
+            .unwrap();
         let conn = store.connect().unwrap();
-        let meta = json!({"album_artist":"North Assembly","artist":"Guest Artist","album":"Blue Hours"});
+        let meta =
+            json!({"album_artist":"North Assembly","artist":"Guest Artist","album":"Blue Hours"});
         conn.execute("INSERT INTO local_files (path,root,metadata,present) VALUES ('/music/song.flac','/music',?,1)", (meta.to_string(),)).await.unwrap();
-        let cached = json!([{"id":"101","name":"North Assembly"},{"id":"102","name":"Away Artist"}]);
-        conn.execute("INSERT INTO favourite_artists (cache_id,payload) VALUES ('user',?)", (cached.to_string(),)).await.unwrap();
-        let local = store.get_favourite_rows(Some("/music"), "In library", "North", "tracks", "desc", 0, 10).await.unwrap();
+        let cached =
+            json!([{"id":"101","name":"North Assembly"},{"id":"102","name":"Away Artist"}]);
+        conn.execute(
+            "INSERT INTO favourite_artists (cache_id,payload) VALUES ('user',?)",
+            (cached.to_string(),),
+        )
+        .await
+        .unwrap();
+        let local = store
+            .get_favourite_rows(
+                Some("/music"),
+                "In library",
+                "North",
+                "tracks",
+                "desc",
+                0,
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(local.total, 1);
         assert_eq!(local.rows[0]["tracks"], 1);
-        let missing = store.get_favourite_rows(Some("/music"), "Missing locally", "", "artist", "asc", 0, 10).await.unwrap();
+        let missing = store
+            .get_favourite_rows(
+                Some("/music"),
+                "Missing locally",
+                "",
+                "artist",
+                "asc",
+                0,
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(missing.total, 1);
         assert_eq!(missing.rows[0]["artist"], "Away Artist");
         let _ = std::fs::remove_dir_all(temp_dir);

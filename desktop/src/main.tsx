@@ -219,7 +219,7 @@ function App() {
     [toast, setToast] = useState(""),
     [closing, setClosing] = useState(false),
     [stopped, setStopped] = useState(false);
-  const [data, setData] = useState<{ rows: Row[]; total: number }>({
+  const [data, setData] = useState<{ rows: Row[]; total: number; scanned?: boolean }>({
       rows: [],
       total: 0,
     }),
@@ -445,7 +445,8 @@ function App() {
               }
             : s,
         );
-      if (["changed", "job", "ready"].includes(p.event)) refresh();
+      if (p.event === "library-mutated") { setPreview(undefined); setReview(null); setDeep(null); }
+      if (["changed", "library-mutated", "job", "ready"].includes(p.event)) refresh();
       if (p.event === "authentication") {
         setAuth("");
         refresh();
@@ -1068,12 +1069,12 @@ function App() {
               className="primary"
               disabled={busy || !root}
               onClick={() =>
-                run("optimizations", {
+                run(route === "local" ? "local_duplicates" : "optimizations", {
                   scope: route === "local" ? "local" : "remote",
                 })
               }
             >
-              {route === "local" ? "Scan for duplicates" : "Find cached replacements"}
+              {route === "local" ? (data.scanned ? "Rescan tags" : "Scan tags") : "Find cached replacements"}
             </button>
             {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
               <button
@@ -1329,12 +1330,12 @@ function App() {
               : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}`}
           </span>
         </div>
-        {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
+        {route === "local" && data.rows.length > 0 && (
           <div className="cluster-callout">
             <div className="cluster-callout-text">
               <Layers size={16} />
               <span>
-                <strong>Chained duplicates detected:</strong> Multiple smaller releases are completely absorbed into one comprehensive master album (e.g. Single → EP → Album). You can select all and safely trash them in a single clean operation.
+                <strong>Absorbable Duplicates Found:</strong> Older releases, singles, and EPs are fully contained within larger albums. You can safely trash redundant tracks while keeping complete versions.
               </span>
             </div>
             <button
@@ -1554,17 +1555,6 @@ function App() {
             )}
             {field("Catalogue market", "general", "market")}
             <label className="setting-row">
-              <span>Treat a complete standard or deluxe edition as owned</span>
-              <input type="checkbox" checked={settings.general?.treat_editions_as_owned !== false}
-                onChange={(event) => updateSetting("general", "treat_editions_as_owned", event.target.checked)}/>
-            </label>
-            <label className="setting-row"><span>Include live releases in recommendations</span>
-              <input type="checkbox" checked={settings.general?.recommend_live === true}
-                onChange={(event) => updateSetting("general", "recommend_live", event.target.checked)}/></label>
-            <label className="setting-row"><span>Include bootlegs in recommendations</span>
-              <input type="checkbox" checked={settings.general?.recommend_bootlegs === true}
-                onChange={(event) => updateSetting("general", "recommend_bootlegs", event.target.checked)}/></label>
-            <label className="setting-row">
               <span>Save activity logs</span>
               <input
                 type="checkbox"
@@ -1574,6 +1564,20 @@ function App() {
                 }
               />
             </label>
+          </section>
+          <section className="card">
+            <h2>Release matching &amp; recommendations</h2>
+            <label className="setting-row"><span>Treat a complete standard or deluxe edition as owned</span>
+              <input type="checkbox" checked={settings.general?.treat_editions_as_owned !== false}
+                onChange={(event) => updateSetting("general", "treat_editions_as_owned", event.target.checked)}/></label>
+            {toggle("Include live releases", "general", "recommend_live")}
+            <label className="setting-row" title="Include bootlegs/unofficial live recordings in match candidates and artist recommendations">
+              <span>Include bootlegs and unofficial recordings</span>
+              <input type="checkbox" checked={settings.general?.recommend_bootlegs === true}
+                onChange={(event) => updateSetting("general", "recommend_bootlegs", event.target.checked)}/>
+            </label>
+            {toggle("Include compilations in matching and recommendations", "general", "recommend_compilations")}
+            {toggle("Allow fuzzy title matches for review", "general", "fuzzy_release_matching")}
           </section>
           <section className="card">
             <h2>Artist matching</h2>
@@ -1758,9 +1762,13 @@ function App() {
               </button>
             </div>
           </section>
-          <button disabled={busy} onClick={() => run("connections")}>
-            <RefreshCw size={16} />
-            Test connections
+          <button className="connection-test" disabled={busy || active(state?.online_job) && state?.online_job?.kind === "connections"} onClick={() => run("connections")}
+            title={state?.online_job?.kind === "connections" && !active(state.online_job)
+              ? Object.values(state?.diagnostics?.metrics || {}).map((metric: any) => metric.ok ? "Connected" : metric.message || "Needs attention").join(" · ") || state.online_job.message
+              : "Test configured connections"}>
+            <RefreshCw className={state?.online_job?.kind === "connections" && active(state.online_job) ? "spin" : ""} size={16} />
+            {state?.online_job?.kind === "connections" && active(state.online_job) ? "Testing connections…" : "Test connections"}
+            {state?.online_job?.kind === "connections" && !active(state.online_job) && <span className={state.online_job.status === "complete" && Object.values(state?.diagnostics?.metrics || {}).length > 0 && Object.values(state?.diagnostics?.metrics || {}).every((metric: any) => metric.ok) ? "connection-result ok" : "connection-result warning"} aria-label={state.online_job.status === "complete" && Object.values(state?.diagnostics?.metrics || {}).every((metric: any) => metric.ok) ? "Connection test passed" : "Connection test needs attention"}/>}
           </button>
         </>
       );
@@ -2147,7 +2155,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.10 · build 10</span>
+          <span className="sidebar-version">v0.9.0-beta.11 · build 11</span>
         </div>
       </aside>
       <main>
@@ -2156,9 +2164,9 @@ function App() {
             <h1>{titles[route] || "Overview"}</h1>
           </div>
           <div className="header-actions">
-            {(active(state?.job) || active(state?.online_job) || active(state?.download_job)) && (
+            {[state?.job, state?.online_job, state?.download_job].some(job => active(job) && job?.kind !== "connections") && (
               <div className="header-workloads" role="status" aria-live="off">
-                {[state?.job, state?.online_job, state?.download_job].filter(active).map((job) => {
+                {[state?.job, state?.online_job, state?.download_job].filter(job => active(job) && job?.kind !== "connections").map((job) => {
                   const progress = workload(job, downloadMonitor, clock);
                   return <div className="header-workload" key={job!.id} title={job?.message}>
                     <LoaderCircle className="spin" size={13}/>

@@ -26,6 +26,7 @@ pub fn handles(kind: &str) -> bool {
             | "manual_candidate"
             | "artwork"
             | "optimizations"
+            | "local_duplicates"
             | "check_replacements"
             | "queue_replacements"
             | "queue_mqa"
@@ -49,6 +50,32 @@ pub async fn files(db: &TursoDb, root: &str) -> Result<Vec<LocalFileRecord>, Str
         }
     }
     Ok(out)
+}
+
+/// Rebuild the visible audit list from indexed files and prior per-file results.
+/// Changed files become "Not audited" until the user runs the audio inspection.
+pub async fn cached_mqa_rows(db: &TursoDb, indexed: &[LocalFileRecord]) -> Result<Vec<Value>, String> {
+    let conn = db.connect()?;
+    let mut query = conn.query("SELECT key,payload FROM app_preferences WHERE key LIKE 'mqa-audit:%'", ())
+        .await.map_err(|e| e.to_string())?;
+    let mut saved = std::collections::HashMap::new();
+    while let Some(row) = query.next().await.map_err(|e| e.to_string())? {
+        let key: String = row.get(0).map_err(|e| e.to_string())?;
+        let payload: String = row.get(1).map_err(|e| e.to_string())?;
+        if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+            saved.insert(key.trim_start_matches("mqa-audit:").to_owned(), value);
+        }
+    }
+    let rows = indexed.iter().filter(|file| file.present).map(|file| {
+        let tags = workflows::extract_tags_map(&file.metadata);
+        let prior = saved.get(&file.path).filter(|value| value["size"] == json!(file.size) && value["mtime"] == json!(file.mtime));
+        let result = prior.map(|value| &value["result"]);
+        json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),
+            "status":result.and_then(|value| value["status"].as_str()).unwrap_or("Not audited"),
+            "evidence":result.and_then(|value| value["evidence"].as_str()).unwrap_or("New or changed audio; run the MQA audit"),
+            "affected":result.is_some_and(|value| value["detected"] == true),"target":"Queue lossless replacement"})
+    }).collect();
+    Ok(rows)
 }
 pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
@@ -88,7 +115,7 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
             .filter_map(|v| v["attributes"]["name"].as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"type":a["albumType"].as_str().unwrap_or("album"),"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str(),"remote_metadata":raw});
+        value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"original_release_date":a["originalReleaseDate"],"type":a["albumType"].as_str().unwrap_or("album"),"official":a["official"],"secondary_types":a["secondaryTypes"],"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str().or(a["copyright"]["text"].as_str()),"upc":a["barcodeId"].as_str().or(a["upc"].as_str()),"quality":a["mediaTags"].as_array().map(|values|values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),"audio_modes":a["audioModes"],"media_metadata":a["mediaMetadata"],"remote_metadata":raw});
     }
     let tracks = client.get_release_details(id, market).await?;
     value["tracks"] = serde_json::to_value(&tracks).map_err(|e| e.to_string())?;
@@ -176,11 +203,14 @@ pub async fn execute(
                     Some(saved) if saved.as_str().is_some_and(|date| !date.is_empty()) => saved,
                     _ => {
                         let first_seen = json!(chrono::Local::now().format("%Y-%m-%d").to_string());
-                        db.set_preference("catalogue_connected_at", &first_seen).await?;
+                        db.set_preference("catalogue_connected_at", &first_seen)
+                            .await?;
                         first_seen
                     }
                 }
-            } else { Value::Null };
+            } else {
+                Value::Null
+            };
             metrics["catalogue"] = json!({
                 "ok": result.is_ok(),
                 "message": result.err().unwrap_or_default(),
@@ -228,7 +258,9 @@ pub async fn execute(
                 saved_date.as_str().unwrap_or("").to_string()
             } else {
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let _ = db.set_preference("account_connected_at", &json!(today)).await;
+                let _ = db
+                    .set_preference("account_connected_at", &json!(today))
+                    .await;
                 today
             }
         } else {
@@ -430,13 +462,16 @@ pub async fn execute(
             crate::duplicates::trash_file_or_directory(&path).await?;
             db.remove_local_file(&path).await?;
             completed += 1;
-            state.progress_for(kind, &format!(
-                "Moved duplicate to Trash · {}",
-                std::path::Path::new(&path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ));
+            state.progress_for(
+                kind,
+                &format!(
+                    "Moved duplicate to Trash · {}",
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ),
+            );
         }
         state.previews.lock().unwrap().remove(id);
         db.set_preference(&format!("desktop-local:{root}"), &json!([]))
@@ -689,14 +724,22 @@ pub async fn execute(
         db.queue_add(&selection).await?;
         return Ok(json!({"releases":selection.len()}));
     }
-    if kind == "optimizations" || kind == "check_replacements" {
-        if args["scope"] != "remote" && kind != "check_replacements" {
+    if kind == "optimizations" || kind == "local_duplicates" || kind == "check_replacements" {
+        if kind == "local_duplicates" || args["scope"] != "remote" && kind != "check_replacements" {
+            state.progress_for(kind, &format!("Checking {} indexed files for absorbable releases", indexed.len()));
             let clusters = crate::duplicates::find_duplicate_clusters(&indexed);
             let rows = crate::duplicates::clusters_to_group_rows(&clusters);
             db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
                 .await?;
+            db.set_preference(
+                &format!("desktop-local-manifest:{root}"),
+                &json!(crate::duplicates::manifest_fingerprint(&indexed)),
+            )
+            .await?;
+            state.progress_for(kind, &format!("Found {} absorbable release groups", rows.len()));
             return Ok(json!({"opportunities":rows.len()}));
         }
+        state.progress_for(kind, "Comparing cached online releases with indexed albums");
         let locals = crate::duplicates::parse_local_releases(&indexed);
         let conn = db.connect()?;
         let mut query = conn
@@ -713,10 +756,12 @@ pub async fn execute(
         drop(query);
         let mut rows = vec![];
         let mut seen = HashSet::new();
-        for mut target in remote {
+        let remote_total = remote.len();
+        for (position, mut target) in remote.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
+            if position % 100 == 0 { state.progress_for(kind, &format!("Checking cached releases · {}/{}", position + 1, remote_total)); }
             if target.available != Some(true)
                 || target.date.as_str() > chrono::Utc::now().format("%Y-%m-%d").to_string().as_str()
             {
@@ -863,10 +908,13 @@ pub async fn execute(
                 }
             }
             output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"affected":true,"status":"Artwork available","changes":"Embed verified 1280 × 1280 front cover","size":file.size,"mtime":file.mtime,"item":{"path":file.path,"artwork":target,"tags":{}}}));
-            state.progress_for(kind, &format!(
-                "Artwork ready · {}",
-                tags.get("title").unwrap_or(&file.path)
-            ));
+            state.progress_for(
+                kind,
+                &format!(
+                    "Artwork ready · {}",
+                    tags.get("title").unwrap_or(&file.path)
+                ),
+            );
         }
         let id = uuid::Uuid::new_v4().to_string();
         state.previews.lock().unwrap().insert(id.clone(),json!({"id":id,"created":chrono::Utc::now().timestamp_millis(),"operation":"artwork","root":root,"rows":output,"count":output.len()}));
@@ -946,6 +994,23 @@ pub async fn execute(
                 let albums = cat
                     .releases
                     .iter()
+                    .filter(|release| {
+                        let unofficial = release.official == Some(false)
+                            || release.secondary_types.iter().any(|kind| {
+                                ["bootleg", "promo", "unofficial"]
+                                    .iter()
+                                    .any(|flag| kind.eq_ignore_ascii_case(flag))
+                            })
+                            || release.title.to_ascii_lowercase().contains("bootleg");
+                        let compilation = release.r#type.eq_ignore_ascii_case("compilation")
+                            || release
+                                .secondary_types
+                                .iter()
+                                .any(|kind| kind.eq_ignore_ascii_case("compilation"));
+                        (!unofficial || settings["general"]["recommend_bootlegs"] == true)
+                            && (!compilation
+                                || settings["general"]["recommend_compilations"] == true)
+                    })
                     .map(|r| r.title.clone())
                     .collect::<Vec<_>>();
                 let score = crate::matching::score_artist_candidate(
@@ -974,10 +1039,13 @@ pub async fn execute(
                 db.choose_artist(name, &accepted).await?;
             }
             checked += 1;
-            state.progress_for(kind, &format!(
-                "Artist checked · {name} · {} supported matches",
-                accepted.len()
-            ));
+            state.progress_for(
+                kind,
+                &format!(
+                    "Artist checked · {name} · {} supported matches",
+                    accepted.len()
+                ),
+            );
         }
         return Ok(json!({"checked":checked}));
     }
@@ -1161,13 +1229,16 @@ pub async fn execute(
                 Ok(()) => count += 1,
                 Err(e) => errors.push(format!("{path}: {e}")),
             }
-            state.progress_for(kind, &format!(
-                "Applied {count} files · {}",
-                std::path::Path::new(path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ));
+            state.progress_for(
+                kind,
+                &format!(
+                    "Applied {count} files · {}",
+                    std::path::Path::new(path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ),
+            );
         }
         state.previews.lock().unwrap().remove(id);
         if !errors.is_empty() {
@@ -1201,7 +1272,7 @@ pub async fn execute(
     }
     if kind == "mqa" {
         let mut rows = vec![];
-        for file in indexed {
+        for file in &indexed {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -1226,6 +1297,7 @@ pub async fn execute(
         }
         db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows))
             .await?;
+        db.set_preference(&format!("desktop-mqa-manifest:{root}"), &json!(crate::duplicates::manifest_fingerprint(&indexed))).await?;
         return Ok(json!({"files":rows.len()}));
     }
     Err(format!(
@@ -1238,30 +1310,61 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn real_flac_prepare_workflows_are_read_only_until_confirmed() {
-        let Ok(sample) = std::env::var("TIBRARY_SAMPLE_FLAC") else { return };
+        let Ok(sample) = std::env::var("TIBRARY_SAMPLE_FLAC") else {
+            return;
+        };
         let source = std::path::Path::new(&sample);
         let before = std::fs::read(source).unwrap();
         let temp = std::env::temp_dir().join(format!("tibrary-real-prep-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp).unwrap();
         let copied = temp.join("sample.flac");
         std::fs::copy(source, &copied).unwrap();
-        crate::tag_writer::write_tags(&copied, &std::collections::HashMap::from([
-            ("tracknumber".into(), "1".into()),
-            ("discnumber".into(), "1".into()),
-        ])).unwrap();
+        crate::tag_writer::write_tags(
+            &copied,
+            &std::collections::HashMap::from([
+                ("tracknumber".into(), "1".into()),
+                ("discnumber".into(), "1".into()),
+            ]),
+        )
+        .unwrap();
         let db = TursoDb::open(&temp.join("db")).await.unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {}).await.unwrap();
+        crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {})
+            .await
+            .unwrap();
         let backend = Arc::new(Backend::new());
         for action in ["dates", "numbers", "keys", "lyrics", "organise"] {
-            execute(&db, &backend, "preview", &json!({"root":temp,"action":action}), cancel.clone()).await.unwrap();
+            execute(
+                &db,
+                &backend,
+                "preview",
+                &json!({"root":temp,"action":action}),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
         }
-        let preview = execute(&db, &backend, "preview", &json!({"root":temp,"action":"numbers"}), cancel.clone()).await.unwrap();
+        let preview = execute(
+            &db,
+            &backend,
+            "preview",
+            &json!({"root":temp,"action":"numbers"}),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
         let applied = execute(&db, &backend, "apply", &json!({"root":temp,"preview_id":preview["preview_id"],"ids":[copied],"confirmed":true}), cancel.clone()).await.unwrap();
         assert_eq!(applied["applied"], 1);
-        let copied_tags = workflows::extract_tags_map(&Some(serde_json::to_value(crate::scanner::read_audio_metadata(&copied).unwrap()).unwrap()));
-        assert_eq!(copied_tags.get("tracknumber").map(String::as_str), Some("01"));
-        let audited = execute(&db, &backend, "mqa", &json!({"root":temp}), cancel.clone()).await.unwrap();
+        let copied_tags = workflows::extract_tags_map(&Some(
+            serde_json::to_value(crate::scanner::read_audio_metadata(&copied).unwrap()).unwrap(),
+        ));
+        assert_eq!(
+            copied_tags.get("tracknumber").map(String::as_str),
+            Some("01")
+        );
+        let audited = execute(&db, &backend, "mqa", &json!({"root":temp}), cancel.clone())
+            .await
+            .unwrap();
         assert_eq!(audited["files"], 1);
         assert_eq!(std::fs::read(source).unwrap(), before);
         drop(db);

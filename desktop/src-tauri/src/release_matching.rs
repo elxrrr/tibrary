@@ -27,11 +27,19 @@ pub fn clean_isrc(isrc_opt: Option<&str>) -> Option<String> {
 pub fn has_mix_keyword(title: &str) -> bool {
     let lower = title.to_lowercase();
     let keywords = [
-        "remix", "mix", "extended", "instrumental", "radio", "club", "live", "edit", "acoustic",
+        "remix",
+        "mix",
+        "extended",
+        "instrumental",
+        "radio",
+        "club",
+        "live",
+        "edit",
+        "acoustic",
     ];
-    keywords.iter().any(|&kw| {
-        lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == kw)
-    })
+    keywords
+        .iter()
+        .any(|&kw| lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == kw))
 }
 
 pub fn recording_matches(
@@ -44,7 +52,10 @@ pub fn recording_matches(
     strict: bool,
 ) -> bool {
     // 1. Duration check (tolerance: 3 seconds)
-    if local_duration > 0.0 && remote_duration > 0.0 && (local_duration - remote_duration).abs() > 3.0 {
+    if local_duration > 0.0
+        && remote_duration > 0.0
+        && (local_duration - remote_duration).abs() > 3.0
+    {
         return false;
     }
 
@@ -65,7 +76,11 @@ pub fn recording_matches(
     }
 
     if strict {
-        if local_duration <= 0.0 || remote_duration <= 0.0 || local_title.is_empty() || remote_title.is_empty() {
+        if local_duration <= 0.0
+            || remote_duration <= 0.0
+            || local_title.is_empty()
+            || remote_title.is_empty()
+        {
             return false;
         }
         if lt_key != rt_key {
@@ -299,6 +314,7 @@ mod tests {
                     key: None,
                     key_scale: None,
                     copyright: None,
+                    ..Default::default()
                 },
                 TidalTrack {
                     id: "t2".to_string(),
@@ -311,6 +327,7 @@ mod tests {
                     key: None,
                     key_scale: None,
                     copyright: None,
+                    ..Default::default()
                 },
             ],
             tracks_loaded: true,
@@ -322,6 +339,13 @@ mod tests {
         assert!(!result.incomplete);
         assert_eq!(result.matched_count, 2);
         assert!(result.missing_remote_track_ids.is_empty());
-        assert_eq!(result.alignments.get("/music/01.flac").unwrap().remote_track_id, "t1");
+        assert_eq!(
+            result
+                .alignments
+                .get("/music/01.flac")
+                .unwrap()
+                .remote_track_id,
+            "t1"
+        );
     }
 }

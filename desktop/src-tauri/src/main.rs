@@ -34,15 +34,42 @@ pub mod workflows;
 use db::TursoDb;
 
 fn is_online_job(kind: &str) -> bool {
-    matches!(kind, "link" | "discography" | "release_details" | "connections" | "favourites" | "match_artists" | "metadata" | "manual_candidate" | "artwork" | "check_replacements" | "optimizations" | "deep_review" | "deep_preview" | "connect_account" | "connect_download")
+    matches!(
+        kind,
+        "link"
+            | "discography"
+            | "release_details"
+            | "connections"
+            | "favourites"
+            | "match_artists"
+            | "metadata"
+            | "manual_candidate"
+            | "artwork"
+            | "check_replacements"
+            | "optimizations"
+            | "deep_review"
+            | "deep_preview"
+            | "connect_account"
+            | "connect_download"
+    )
 }
 
 fn compare_table_cell(a: &Value, b: &Value, key: &str) -> std::cmp::Ordering {
     match (a[key].as_f64(), b[key].as_f64()) {
         (Some(left), Some(right)) => left.total_cmp(&right),
         _ => {
-            let display = |value: &Value| value.as_str().map(str::to_owned).unwrap_or_else(|| if value.is_null() { String::new() } else { value.to_string() });
-            display(&a[key]).to_lowercase().cmp(&display(&b[key]).to_lowercase())
+            let display = |value: &Value| {
+                value.as_str().map(str::to_owned).unwrap_or_else(|| {
+                    if value.is_null() {
+                        String::new()
+                    } else {
+                        value.to_string()
+                    }
+                })
+            };
+            display(&a[key])
+                .to_lowercase()
+                .cmp(&display(&b[key]).to_lowercase())
         }
     }
 }
@@ -56,13 +83,34 @@ fn activity_stream(entry: &Value) -> &'static str {
         _ => {}
     }
     let message = entry["message"].as_str().unwrap_or("").to_lowercase();
-    if ["download", "fetching track", "saving track"].iter().any(|word| message.contains(word)) { "downloads" }
-    else if ["catalogue", "api", "remote", "artist search", "releases", "metadata source"].iter().any(|word| message.contains(word)) { "online" }
-    else { "local" }
+    if ["download", "fetching track", "saving track"]
+        .iter()
+        .any(|word| message.contains(word))
+    {
+        "downloads"
+    } else if [
+        "catalogue",
+        "api",
+        "remote",
+        "artist search",
+        "releases",
+        "metadata source",
+    ]
+    .iter()
+    .any(|word| message.contains(word))
+    {
+        "online"
+    } else {
+        "local"
+    }
 }
 
 fn activity_stream_index(stream: &str) -> usize {
-    match stream { "online" => 0, "downloads" => 2, _ => 1 }
+    match stream {
+        "online" => 0,
+        "downloads" => 2,
+        _ => 1,
+    }
 }
 
 #[derive(Default)]
@@ -74,19 +122,31 @@ pub struct ActivityBuffers {
 
 impl ActivityBuffers {
     fn buffer(&self, stream: &str) -> &Mutex<Vec<Value>> {
-        match stream { "online" => &self.online, "downloads" => &self.downloads, _ => &self.local }
+        match stream {
+            "online" => &self.online,
+            "downloads" => &self.downloads,
+            _ => &self.local,
+        }
     }
 
     fn push(&self, entry: Value) {
         let mut entries = self.buffer(activity_stream(&entry)).lock().unwrap();
         entries.push(entry);
-        if entries.len() > 1000 { entries.remove(0); }
+        if entries.len() > 1000 {
+            entries.remove(0);
+        }
     }
 
     fn replace_progress(&self, id: &str, entry: Value) {
         let mut entries = self.buffer(activity_stream(&entry)).lock().unwrap();
-        if let Some(existing) = entries.iter_mut().find(|item| item["progress_id"].as_str() == Some(id)) { *existing = entry; }
-        else { entries.push(entry); }
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|item| item["progress_id"].as_str() == Some(id))
+        {
+            *existing = entry;
+        } else {
+            entries.push(entry);
+        }
     }
 
     fn retain(&self, mut keep: impl FnMut(&Value) -> bool) {
@@ -100,12 +160,16 @@ impl ActivityBuffers {
             self.online.lock().unwrap().clear();
             self.local.lock().unwrap().clear();
             self.downloads.lock().unwrap().clear();
-        } else { self.buffer(stream).lock().unwrap().clear(); }
+        } else {
+            self.buffer(stream).lock().unwrap().clear();
+        }
     }
 
     fn load(&self, entries: Vec<Value>) {
         self.clear("all");
-        for entry in entries { self.push(entry); }
+        for entry in entries {
+            self.push(entry);
+        }
     }
 
     fn snapshot(&self) -> Vec<Value> {
@@ -258,12 +322,18 @@ impl Backend {
             if let Some(mut job) = job {
                 job["message"] = json!(message);
                 self.update_online_job_progress(message, job);
-            } else { self.log_with_category(message, "info", Some("online")); }
-        } else { self.progress(message); }
+            } else {
+                self.log_with_category(message, "info", Some("online"));
+            }
+        } else {
+            self.progress(message);
+        }
     }
 
     pub fn start_online_job(&self, job: Value, cancel: Arc<AtomicBool>) {
-        if let Some(message) = job["message"].as_str() { self.log_with_category(message, "info", Some("online")); }
+        if let Some(message) = job["message"].as_str() {
+            self.log_with_category(message, "info", Some("online"));
+        }
         *self.online_cancel.lock().unwrap() = Some(cancel);
         *self.online_job.lock().unwrap() = Some(job);
     }
@@ -278,13 +348,27 @@ impl Backend {
     pub fn finish_online_job(&self, job: Value) {
         self.view_cache.lock().unwrap().clear();
         self.logs.retain(|entry| entry["progress_id"] != job["id"]);
-        if let Some(message) = job["message"].as_str() { self.log_with_category(message, if job["status"] == "failed" { "error" } else { "info" }, Some("online")); }
+        if let Some(message) = job["message"].as_str() {
+            self.log_with_category(
+                message,
+                if job["status"] == "failed" {
+                    "error"
+                } else {
+                    "info"
+                },
+                Some("online"),
+            );
+        }
         *self.online_job.lock().unwrap() = Some(job);
         *self.online_cancel.lock().unwrap() = None;
     }
 
     pub fn cancel_online_job(&self) -> Option<Value> {
-        self.online_cancel.lock().unwrap().as_ref()?.store(true, Ordering::Relaxed);
+        self.online_cancel
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .store(true, Ordering::Relaxed);
         let mut lock = self.online_job.lock().unwrap();
         let job = lock.as_mut()?;
         job["status"] = json!("cancelling");
@@ -321,7 +405,13 @@ impl Backend {
     }
 
     pub fn update_download_job(&self, mut job: Value) {
-        if self.download_cancel.lock().unwrap().as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        if self
+            .download_cancel
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
             job["status"] = json!("cancelling");
         }
         *self.download_job.lock().unwrap() = Some(job);
@@ -329,7 +419,15 @@ impl Backend {
 
     pub fn finish_download_job(&self, job: Value) {
         if let Some(message) = job["message"].as_str() {
-            self.log_with_category(message, if job["status"] == "failed" { "error" } else { "info" }, Some("download"));
+            self.log_with_category(
+                message,
+                if job["status"] == "failed" {
+                    "error"
+                } else {
+                    "info"
+                },
+                Some("download"),
+            );
         }
         *self.download_job.lock().unwrap() = Some(job);
         *self.download_cancel.lock().unwrap() = None;
@@ -380,7 +478,8 @@ impl Backend {
 
     pub fn finish_job(&self, final_job: Value) {
         self.view_cache.lock().unwrap().clear();
-        self.logs.retain(|entry| entry["progress_id"] != final_job["id"]);
+        self.logs
+            .retain(|entry| entry["progress_id"] != final_job["id"]);
         if let Some(msg) = final_job.get("message").and_then(|v| v.as_str()) {
             let kind = final_job.get("kind").and_then(|v| v.as_str());
             let status = final_job.get("status").and_then(|v| v.as_str());
@@ -525,8 +624,14 @@ async fn handle_rpc_uncached(
     };
     if method == "job.start" && args["kind"] != "download" {
         let kind = args["kind"].as_str().unwrap_or("");
-        let occupied = if is_online_job(kind) { state.online_cancel.lock().unwrap().is_some() } else { state.active_job_cancel.lock().unwrap().is_some() };
-        if occupied { return Err("A task in this section is already running. Wait for completion or cancel it first.".into()); }
+        let occupied = if is_online_job(kind) {
+            state.online_cancel.lock().unwrap().is_some()
+        } else {
+            state.active_job_cancel.lock().unwrap().is_some()
+        };
+        if occupied {
+            return Err("A task in this section is already running. Wait for completion or cancel it first.".into());
+        }
     }
     if method == "job.start" && actions::handles(args["kind"].as_str().unwrap_or("")) {
         let kind = args["kind"].as_str().unwrap().to_string();
@@ -535,8 +640,11 @@ async fn handle_rpc_uncached(
         let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.;
         let cancel = Arc::new(AtomicBool::new(false));
         let initial = json!({"id":id,"kind":kind,"status":"running","message":format!("Started · {kind}"),"started":started});
-        if is_online_job(&kind) { state.start_online_job(initial.clone(), cancel.clone()); }
-        else { state.start_job(initial.clone(), cancel.clone()); }
+        if is_online_job(&kind) {
+            state.start_online_job(initial.clone(), cancel.clone());
+        } else {
+            state.start_job(initial.clone(), cancel.clone());
+        }
         let backend = state.clone();
         let database = db.clone();
         let app = app_handle.cloned();
@@ -571,14 +679,25 @@ async fn handle_rpc_uncached(
                     Value::Null,
                 ),
             };
+            let library_mutated = status == "complete" && matches!(kind.as_str(), "apply" | "deep_apply" | "consolidate");
             let finished = json!({"id":id,"kind":kind,"status":status,"message":message,"started":started,"finished":chrono::Utc::now().timestamp_millis() as f64/1000.,"result":value});
-            if is_online_job(&kind) { backend.finish_online_job(finished.clone()); }
-            else { backend.finish_job(finished.clone()); }
+            if is_online_job(&kind) {
+                backend.finish_online_job(finished.clone());
+            } else {
+                backend.finish_job(finished.clone());
+            }
             database.bump_revision();
             let _ = database.set_preference("desktop-last-job", &finished).await;
             if let Some(app) = app {
-                let _ = app.emit("backend-event", if is_online_job(&kind) { json!({"event":"job","online_job":finished}) } else { json!({"event":"job","job":finished}) });
-                let _ = app.emit("backend-event", json!({"event":"changed"}));
+                let _ = app.emit(
+                    "backend-event",
+                    if is_online_job(&kind) {
+                        json!({"event":"job","online_job":finished})
+                    } else {
+                        json!({"event":"job","job":finished})
+                    },
+                );
+                let _ = app.emit("backend-event", json!({"event":if library_mutated {"library-mutated"} else {"changed"}}));
             }
         });
         return Ok(initial);
@@ -870,11 +989,15 @@ async fn handle_rpc_uncached(
         let stream = args.get("stream").and_then(Value::as_str).unwrap_or("all");
         let _guard = state.log_persist_gate.lock().await;
         if stream == "all" {
-            for epoch in state.log_epochs.iter() { epoch.fetch_add(1, Ordering::SeqCst); }
+            for epoch in state.log_epochs.iter() {
+                epoch.fetch_add(1, Ordering::SeqCst);
+            }
             state.logs.clear("all");
             db.clear_logs().await?;
         } else {
-            if !["online", "local", "downloads"].contains(&stream) { return Err("Unknown activity stream".into()); }
+            if !["online", "local", "downloads"].contains(&stream) {
+                return Err("Unknown activity stream".into());
+            }
             state.log_epochs[activity_stream_index(stream)].fetch_add(1, Ordering::SeqCst);
             state.logs.clear(stream);
             db.clear_log_stream(stream).await?;
@@ -884,7 +1007,9 @@ async fn handle_rpc_uncached(
     if method == "missing.rebuild" {
         db.invalidate_missing_rows();
         state.view_cache.lock().unwrap().clear();
-        if let Some(app) = app_handle { let _ = app.emit("backend-event", json!({"event":"changed"})); }
+        if let Some(app) = app_handle {
+            let _ = app.emit("backend-event", json!({"event":"changed"}));
+        }
         return Ok(json!({"rebuilt":true}));
     }
 
@@ -1005,26 +1130,92 @@ async fn handle_rpc_uncached(
         } else {
             None
         };
-        if route == "local" && cached_rows.as_ref().is_some_and(|rows| rows.iter().any(|row| row.get("date").is_none() || row.get("children").is_none())) {
+        let local_manifest_saved = if route == "local" {
+            db.get_preference(&format!(
+                "desktop-local-manifest:{}",
+                args["root"].as_str().unwrap_or("")
+            ))
+            .await?
+        } else {
+            None
+        };
+        if route == "local"
+            && (local_manifest_saved.is_some()
+                || cached_rows.as_ref().is_some_and(|rows| !rows.is_empty()))
+        {
+            let root = args["root"].as_str().unwrap_or("");
+            let current = duplicates::indexed_manifest_fingerprint(db, root).await?;
+            let saved = local_manifest_saved
+                .as_ref()
+                .and_then(|value| value.as_str());
+            if saved != Some(current.as_str()) {
+                let indexed = actions::files(db, root).await?;
+                let rows = duplicates::clusters_to_group_rows(
+                    &duplicates::find_duplicate_clusters(&indexed),
+                );
+                db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
+                    .await?;
+                db.set_preference(&format!("desktop-local-manifest:{root}"), &json!(current))
+                    .await?;
+                cached_rows = Some(rows);
+            }
+        }
+        if route == "mqa" {
+            let root = args["root"].as_str().unwrap_or("");
+            let current = duplicates::indexed_manifest_fingerprint(db, root).await?;
+            let saved = db.get_preference(&format!("desktop-mqa-manifest:{root}")).await?;
+            if saved.as_ref().and_then(Value::as_str) != Some(current.as_str()) {
+                let indexed = actions::files(db, root).await?;
+                let rows = actions::cached_mqa_rows(db, &indexed).await?;
+                db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows)).await?;
+                db.set_preference(&format!("desktop-mqa-manifest:{root}"), &json!(current)).await?;
+                cached_rows = Some(rows);
+            }
+        }
+        if route == "local"
+            && cached_rows.as_ref().is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.get("date").is_none() || row.get("children").is_none())
+            })
+        {
             let root = args["root"].as_str().unwrap_or("");
             let indexed = actions::files(db, root).await?;
             let mut rows = cached_rows.take().unwrap_or_default();
             if rows.iter().any(|row| row.get("children").is_none()) {
-                rows = duplicates::clusters_to_group_rows(&duplicates::find_duplicate_clusters(&indexed));
+                rows = duplicates::clusters_to_group_rows(&duplicates::find_duplicate_clusters(
+                    &indexed,
+                ));
             } else {
-                let dates: HashMap<String,String> = indexed.iter().filter_map(|file| {
-                    let tags = workflows::extract_tags_map(&file.metadata);
-                    Some((duplicates::extract_release_folder(&file.path),tags.get("date")?.clone()))
-                }).collect();
+                let dates: HashMap<String, String> = indexed
+                    .iter()
+                    .filter_map(|file| {
+                        let tags = workflows::extract_tags_map(&file.metadata);
+                        Some((
+                            duplicates::extract_release_folder(&file.path),
+                            tags.get("date")?.clone(),
+                        ))
+                    })
+                    .collect();
                 for row in &mut rows {
-                    row["date"] = json!(row["path"].as_str().and_then(|path|dates.get(path)).cloned().unwrap_or_default());
-                    if let Some(children)=row["children"].as_array_mut() {
-                        for child in children { child["date"]=json!(child["path"].as_str().and_then(|path|dates.get(path)).cloned().unwrap_or_default()); }
+                    row["date"] = json!(row["path"]
+                        .as_str()
+                        .and_then(|path| dates.get(path))
+                        .cloned()
+                        .unwrap_or_default());
+                    if let Some(children) = row["children"].as_array_mut() {
+                        for child in children {
+                            child["date"] = json!(child["path"]
+                                .as_str()
+                                .and_then(|path| dates.get(path))
+                                .cloned()
+                                .unwrap_or_default());
+                        }
                     }
                 }
             }
-            db.set_preference(&format!("desktop-local:{root}"), &json!(rows)).await?;
-            cached_rows=Some(rows);
+            db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
+                .await?;
+            cached_rows = Some(rows);
         }
         if let Some(mut rows) = cached_rows {
             if filter == Some("affected") {
@@ -1041,7 +1232,7 @@ async fn handle_rpc_uncached(
             }
             let total = rows.len();
             return Ok(
-                json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,"offset":offset,"revision":db.revision.load(Ordering::SeqCst),"preview_id":preview.as_ref().map(|p|p["id"].clone())}),
+                json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,"offset":offset,"revision":db.revision.load(Ordering::SeqCst),"preview_id":preview.as_ref().map(|p|p["id"].clone()),"scanned":route == "local" && (local_manifest_saved.is_some() || total > 0)}),
             );
         }
         if route == "queue" || route == "downloaded" {
@@ -1058,7 +1249,17 @@ async fn handle_rpc_uncached(
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "favourites" {
-            let page = db.get_favourite_rows(args.get("root").and_then(Value::as_str), filter.unwrap_or("all"), search.unwrap_or(""), sort.unwrap_or("artist"), direction.unwrap_or("asc"), offset, limit).await?;
+            let page = db
+                .get_favourite_rows(
+                    args.get("root").and_then(Value::as_str),
+                    filter.unwrap_or("all"),
+                    search.unwrap_or(""),
+                    sort.unwrap_or("artist"),
+                    direction.unwrap_or("asc"),
+                    offset,
+                    limit,
+                )
+                .await?;
             return serde_json::to_value(page).map_err(|e| e.to_string());
         }
         if route == "correct" || route == "organise" {
@@ -1085,7 +1286,10 @@ async fn handle_rpc_uncached(
                 .and_then(|v| v.get("template"))
                 .and_then(|v| v.as_str());
             let plans = workflows::plan_workflow(&files, action, template_str);
-            let file_index: HashMap<_, _> = files.iter().map(|file| (file.path.as_str(), file)).collect();
+            let file_index: HashMap<_, _> = files
+                .iter()
+                .map(|file| (file.path.as_str(), file))
+                .collect();
             let preview_id = uuid::Uuid::new_v4().to_string();
             let mut rows: Vec<Value> = plans.iter().filter_map(|plan| {
                 let file = file_index.get(plan.path.as_str())?;
@@ -1095,9 +1299,12 @@ async fn handle_rpc_uncached(
                     "affected":true,"status":"Needs update","size":file.size,"mtime":file.mtime,
                     "item":{"path":plan.path,"target":plan.target,"tags":plan.changes}}))
             }).collect();
-            let affected_paths: std::collections::HashSet<String> = plans.iter().map(|plan|plan.path.clone()).collect();
+            let affected_paths: std::collections::HashSet<String> =
+                plans.iter().map(|plan| plan.path.clone()).collect();
             for file in &files {
-                if affected_paths.contains(&file.path) { continue }
+                if affected_paths.contains(&file.path) {
+                    continue;
+                }
                 let tags = workflows::extract_tags_map(&file.metadata);
                 rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),
                     "release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":{},"target":null,
@@ -1105,16 +1312,23 @@ async fn handle_rpc_uncached(
             }
             state.previews.lock().unwrap().insert(preview_id.clone(), json!({"id":preview_id,
                 "created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":plans.len()}));
-            if filter == Some("affected") { rows.retain(|row| row["affected"] == true); }
+            if filter == Some("affected") {
+                rows.retain(|row| row["affected"] == true);
+            }
             if let Some(q) = search.filter(|q| !q.is_empty()) {
-                let query=q.to_lowercase(); rows.retain(|row|row.to_string().to_lowercase().contains(&query));
+                let query = q.to_lowercase();
+                rows.retain(|row| row.to_string().to_lowercase().contains(&query));
             }
             let key = sort.unwrap_or("artist");
             rows.sort_by(|a, b| compare_table_cell(a, b, key));
-            if direction == Some("desc") { rows.reverse(); }
-            let total=rows.len();
-            return Ok(json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,
-                "offset":offset,"revision":db.revision.load(Ordering::SeqCst),"preview_id":preview_id}));
+            if direction == Some("desc") {
+                rows.reverse();
+            }
+            let total = rows.len();
+            return Ok(
+                json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,
+                "offset":offset,"revision":db.revision.load(Ordering::SeqCst),"preview_id":preview_id}),
+            );
         }
 
         if route == "metadata" || route == "artwork" || route == "mqa" {
@@ -1180,7 +1394,11 @@ async fn handle_rpc_uncached(
                     let left = serde_json::to_value(a).unwrap_or(Value::Null);
                     let right = serde_json::to_value(b).unwrap_or(Value::Null);
                     let order = compare_table_cell(&left, &right, key);
-                    if direction == Some("desc") { order.reverse() } else { order }
+                    if direction == Some("desc") {
+                        order.reverse()
+                    } else {
+                        order
+                    }
                 });
             }
             let total = rows.len();
@@ -1222,7 +1440,9 @@ async fn handle_rpc_uncached(
 
     // QUEUE ACTIONS
     if method == "queue.preview" {
-        let page = db.get_queue_rows("queue", None, None, None, None, 0, usize::MAX).await?;
+        let page = db
+            .get_queue_rows("queue", None, None, None, None, 0, usize::MAX)
+            .await?;
         let rows: Vec<_> = page.rows.into_iter().filter(|row| row.approved).collect();
         return serde_json::to_value(rows).map_err(|e| e.to_string());
     }
@@ -1251,7 +1471,8 @@ async fn handle_rpc_uncached(
     }
     if method == "queue.redownload" {
         let release_id = args["release_id"].as_str().ok_or("Choose a release")?;
-        db.queue_redownload(release_id, args["track_id"].as_str()).await?;
+        db.queue_redownload(release_id, args["track_id"].as_str())
+            .await?;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({"event":"changed"}));
         }
@@ -1396,7 +1617,9 @@ async fn handle_rpc_uncached(
         return Ok(json!(true));
     }
     if method == "shutdown" {
-        return Ok(json!({ "safe": state.active_job_cancel.lock().unwrap().is_none() && state.online_cancel.lock().unwrap().is_none() && state.download_cancel.lock().unwrap().is_none() }));
+        return Ok(
+            json!({ "safe": state.active_job_cancel.lock().unwrap().is_none() && state.online_cancel.lock().unwrap().is_none() && state.download_cancel.lock().unwrap().is_none() }),
+        );
     }
 
     // JOBS
@@ -1507,6 +1730,7 @@ async fn handle_rpc_uncached(
                 Err(e) => ("failed", format!("Scan failed: {}", e), json!(null)),
             };
 
+            let library_mutated = status == "complete" && (result_val["read"].as_u64().unwrap_or(0) > 0 || result_val["missing"].as_u64().unwrap_or(0) > 0);
             let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
             let final_job = json!({
                 "id": j_id,
@@ -1531,7 +1755,7 @@ async fn handle_rpc_uncached(
                         "job": final_job
                     }),
                 );
-                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+                let _ = app.emit("backend-event", json!({ "event": if library_mutated { "library-mutated" } else { "changed" } }));
             }
         });
 
@@ -1895,7 +2119,10 @@ async fn handle_rpc_uncached(
                 "backend-event",
                 json!({ "event": "authentication", "auth_url": auth_url }),
             );
-            let _ = app.emit("backend-event", json!({ "event": "job", "online_job": job }));
+            let _ = app.emit(
+                "backend-event",
+                json!({ "event": "job", "online_job": job }),
+            );
         }
 
         return Ok(job);
@@ -1983,7 +2210,10 @@ async fn handle_rpc_uncached(
                 &j_id,
                 move |msg| {
                     let lower = msg.to_lowercase();
-                    if lower.contains("failed") || lower.contains("error") || lower.contains("unavailable") {
+                    if lower.contains("failed")
+                        || lower.contains("error")
+                        || lower.contains("unavailable")
+                    {
                         backend_prog.log_with_category(&msg, "error", Some("download"));
                     }
                     let prog_job = json!({
@@ -2008,7 +2238,10 @@ async fn handle_rpc_uncached(
                 },
                 move |item| {
                     if let Some(ref a) = app_monitor {
-                        let _ = a.emit("backend-event", json!({"event":"download-monitor","item":item}));
+                        let _ = a.emit(
+                            "backend-event",
+                            json!({"event":"download-monitor","item":item}),
+                        );
                     }
                 },
             )
@@ -2056,7 +2289,7 @@ async fn handle_rpc_uncached(
                         "download_job": final_job
                     }),
                 );
-                let _ = app.emit("backend-event", json!({ "event": "changed" }));
+                let _ = app.emit("backend-event", json!({ "event": if count > 0 { "library-mutated" } else { "changed" } }));
             }
         });
 
@@ -2075,8 +2308,10 @@ async fn handle_rpc_uncached(
         let items: Vec<maintenance::FileApplyItem> =
             serde_json::from_value(items_val).map_err(|e| format!("Invalid apply items: {}", e))?;
         let res = maintenance::apply_batch(db, root, &items).await;
-        if let Some(app) = app_handle {
-            let _ = app.emit("backend-event", json!({ "event": "changed" }));
+        if res.applied > 0 {
+            if let Some(app) = app_handle {
+                let _ = app.emit("backend-event", json!({ "event": "library-mutated" }));
+            }
         }
         return serde_json::to_value(res).map_err(|e| e.to_string());
     }
@@ -2084,9 +2319,17 @@ async fn handle_rpc_uncached(
         let requested = args["kind"].as_str().unwrap_or("");
         let pending_sign_in = if requested.is_empty() || requested.starts_with("connect_") {
             state.pending_pkce.lock().unwrap().take().is_some()
-        } else { false };
-        if pending_sign_in && requested.is_empty() { return Ok(json!(true)); }
-        if requested == "download" || (requested.is_empty() && state.active_job_cancel.lock().unwrap().is_none() && state.online_cancel.lock().unwrap().is_none()) {
+        } else {
+            false
+        };
+        if pending_sign_in && requested.is_empty() {
+            return Ok(json!(true));
+        }
+        if requested == "download"
+            || (requested.is_empty()
+                && state.active_job_cancel.lock().unwrap().is_none()
+                && state.online_cancel.lock().unwrap().is_none())
+        {
             if let Some(job) = state.cancel_download_job() {
                 if let Some(app) = app_handle {
                     let _ = app.emit("backend-event", json!({"event":"job","download_job":job}));
@@ -2094,9 +2337,13 @@ async fn handle_rpc_uncached(
             }
             return Ok(json!(true));
         }
-        if is_online_job(requested) || (requested.is_empty() && state.online_cancel.lock().unwrap().is_some()) {
+        if is_online_job(requested)
+            || (requested.is_empty() && state.online_cancel.lock().unwrap().is_some())
+        {
             if let Some(job) = state.cancel_online_job() {
-                if let Some(app) = app_handle { let _ = app.emit("backend-event", json!({"event":"job","online_job":job})); }
+                if let Some(app) = app_handle {
+                    let _ = app.emit("backend-event", json!({"event":"job","online_job":job}));
+                }
             }
             return Ok(json!(true));
         }
@@ -2301,11 +2548,16 @@ fn main() {
                 .flatten()
                 .and_then(|v| v.get("persist_logs").and_then(|b| b.as_bool()))
                 .unwrap_or(true);
-            backend.persist_logs.store(persist, std::sync::atomic::Ordering::SeqCst);
+            backend
+                .persist_logs
+                .store(persist, std::sync::atomic::Ordering::SeqCst);
             if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
-                        &format!("Tibrary v{} ready · workspace initialized", env!("CARGO_PKG_VERSION")),
+                        &format!(
+                            "Tibrary v{} ready · workspace initialized",
+                            env!("CARGO_PKG_VERSION")
+                        ),
                         "info",
                         Some("general"),
                     );
@@ -2346,13 +2598,22 @@ mod activity_tests {
         let backend = Backend::new();
         let download_cancel = Arc::new(AtomicBool::new(false));
         let local_cancel = Arc::new(AtomicBool::new(false));
-        backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}), download_cancel.clone());
-        backend.start_job(json!({"id":"scan","kind":"scan","status":"running"}), local_cancel.clone());
+        backend.start_download_job(
+            json!({"id":"download","kind":"download","status":"running"}),
+            download_cancel.clone(),
+        );
+        backend.start_job(
+            json!({"id":"scan","kind":"scan","status":"running"}),
+            local_cancel.clone(),
+        );
         backend.cancel_download_job().unwrap();
         assert!(download_cancel.load(Ordering::Relaxed));
         assert!(!local_cancel.load(Ordering::Relaxed));
         backend.finish_download_job(json!({"id":"download","status":"cancelled"}));
-        assert_eq!(backend.active_job.lock().unwrap().as_ref().unwrap()["id"], "scan");
+        assert_eq!(
+            backend.active_job.lock().unwrap().as_ref().unwrap()["id"],
+            "scan"
+        );
     }
     #[test]
     fn online_local_and_download_jobs_keep_separate_progress_and_cancel_flags() {
@@ -2360,13 +2621,28 @@ mod activity_tests {
         let online_cancel = Arc::new(AtomicBool::new(false));
         let local_cancel = Arc::new(AtomicBool::new(false));
         let download_cancel = Arc::new(AtomicBool::new(false));
-        backend.start_online_job(json!({"id":"online","kind":"link","status":"running"}), online_cancel.clone());
-        backend.start_job(json!({"id":"local","kind":"scan","status":"running"}), local_cancel.clone());
-        backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}), download_cancel.clone());
+        backend.start_online_job(
+            json!({"id":"online","kind":"link","status":"running"}),
+            online_cancel.clone(),
+        );
+        backend.start_job(
+            json!({"id":"local","kind":"scan","status":"running"}),
+            local_cancel.clone(),
+        );
+        backend.start_download_job(
+            json!({"id":"download","kind":"download","status":"running"}),
+            download_cancel.clone(),
+        );
         backend.progress_for("link", "Checking 2/10 releases");
         backend.progress_for("scan", "Scanning 7/20 files");
-        assert_eq!(backend.online_job.lock().unwrap().as_ref().unwrap()["message"], "Checking 2/10 releases");
-        assert_eq!(backend.active_job.lock().unwrap().as_ref().unwrap()["message"], "Scanning 7/20 files");
+        assert_eq!(
+            backend.online_job.lock().unwrap().as_ref().unwrap()["message"],
+            "Checking 2/10 releases"
+        );
+        assert_eq!(
+            backend.active_job.lock().unwrap().as_ref().unwrap()["message"],
+            "Scanning 7/20 files"
+        );
         backend.cancel_online_job().unwrap();
         assert!(online_cancel.load(Ordering::Relaxed));
         assert!(!local_cancel.load(Ordering::Relaxed));

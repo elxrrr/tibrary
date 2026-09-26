@@ -36,6 +36,10 @@ pub async fn link_library_scoped(
     editions_only: bool,
 ) -> Result<LinkSummary, String> {
     let conn = db.connect()?;
+    let general = db.get_settings().await?["general"].clone();
+    let include_unofficial = general["recommend_bootlegs"].as_bool().unwrap_or(false);
+    let include_compilations = general["recommend_compilations"].as_bool().unwrap_or(false);
+    let fuzzy_review = general["fuzzy_release_matching"].as_bool().unwrap_or(false);
 
     // 1. Load mappings: artist -> Vec<tidal_id>
     let mut mappings: HashMap<String, HashSet<String>> = HashMap::new();
@@ -266,7 +270,13 @@ pub async fn link_library_scoped(
             for aid in artist_ids {
                 if let Some(rels) = catalogues_by_artist.get(aid) {
                     for r in rels {
-                        if title_key(&r.title) == alb_key {
+                        let candidate_title = title_key(&r.title);
+                        let related_title = fuzzy_review
+                            && alb_key.len() >= 8
+                            && candidate_title.len() >= 8
+                            && (candidate_title.starts_with(&format!("{alb_key} "))
+                                || alb_key.starts_with(&format!("{candidate_title} ")));
+                        if candidate_title == alb_key || related_title {
                             candidate_releases.push(r.clone());
                         }
                     }
@@ -311,6 +321,32 @@ pub async fn link_library_scoped(
         let mut scored_candidates = Vec::new();
         for rel in &candidate_releases {
             let mut res = structure_match(&group_tracks, rel);
+            let unofficial = rel.official == Some(false)
+                || rel.secondary_types.iter().any(|kind| {
+                    ["bootleg", "promo", "unofficial"]
+                        .iter()
+                        .any(|flag| kind.eq_ignore_ascii_case(flag))
+                })
+                || rel.title.to_ascii_lowercase().contains("bootleg");
+            let compilation = rel.r#type.eq_ignore_ascii_case("compilation")
+                || rel
+                    .secondary_types
+                    .iter()
+                    .any(|kind| kind.eq_ignore_ascii_case("compilation"));
+            if title_key(&rel.title) != alb_key {
+                res.compatible = false;
+                res.conflicts
+                    .push("Related title; manual review required".into());
+            }
+            if unofficial && !include_unofficial {
+                res.compatible = false;
+                res.conflicts.push("Unofficial or promotional edition; enable in settings to allow automatic matching".into());
+            }
+            if compilation && !include_compilations {
+                res.compatible = false;
+                res.conflicts
+                    .push("Compilation; enable in settings to allow automatic matching".into());
+            }
             for track in &group_tracks {
                 let (total, discs) = totals[&track.path];
                 let remote_total = rel
@@ -491,6 +527,7 @@ mod tests {
                     key: None,
                     key_scale: None,
                     copyright: None,
+                    ..Default::default()
                 }],
                 tracks_loaded: true,
                 ..Default::default()

@@ -1,5 +1,46 @@
 //! Pure recommendation policy. Evidence extraction stays at the database boundary.
 
+use serde_json::Value;
+use std::collections::HashSet;
+
+/// Count independently corroborated contributors from already indexed music.
+/// A lone shared name never makes a release "Recommended".
+pub fn shared_contributor_evidence(
+    local: Option<&HashSet<String>>,
+    tracks: Option<&Vec<Value>>,
+) -> (usize, usize) {
+    let (Some(local), Some(tracks)) = (local, tracks) else {
+        return (0, 0);
+    };
+    let mut people = HashSet::new();
+    let mut matched_tracks = 0;
+    for track in tracks {
+        let mut track_matched = false;
+        let credits = track.get("credits").and_then(Value::as_array);
+        for credit in credits.into_iter().flatten() {
+            // Only a named, explicitly credited contributor is evidence. Bare
+            // relationship IDs and main artist names are not independent proof.
+            let named = credit
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| credit.get("person").and_then(Value::as_str));
+            let role = credit.get("roleId").or_else(|| credit.get("role"));
+            let Some(name) = named.filter(|_| role.is_some()) else {
+                continue;
+            };
+            let key = crate::matching::name_key(name);
+            if !key.is_empty() && local.contains(&key) {
+                people.insert(key);
+                track_matched = true;
+            }
+        }
+        if track_matched {
+            matched_tracks += 1;
+        }
+    }
+    (matched_tracks, people.len())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn recommendation_score(
     primary: bool,
@@ -90,6 +131,23 @@ pub fn recommendation_score(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credits_need_two_local_anchors_for_strong_network() {
+        let local = HashSet::from(["writerone".to_string(), "writertwo".to_string()]);
+        let tracks = vec![
+            serde_json::json!({"credits":[{"roleId":"songwriter","name":"Writer One"}]}),
+            serde_json::json!({"credits":[{"roleId":"producer","name":"Writer Two"}]}),
+        ];
+        assert_eq!(
+            shared_contributor_evidence(Some(&local), Some(&tracks)),
+            (2, 2)
+        );
+        assert_eq!(
+            shared_contributor_evidence(Some(&local), Some(&tracks[..1].to_vec())),
+            (1, 1)
+        );
+    }
 
     #[test]
     fn contributor_network_requires_primary_and_independent_recordings() {

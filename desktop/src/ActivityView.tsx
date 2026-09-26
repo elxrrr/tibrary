@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Copy, Trash2, ChevronDown, ChevronRight } from "lucide-react";
 import { call, active, Job, Row } from "./api";
 
@@ -141,6 +141,30 @@ function DownloadTrack({ item }: { item: Row }) {
   </div>;
 }
 
+function WorkerStatus({ title, job, onCancel }: { title: string; job?: Job | null; onCancel: (kind: string) => void }) {
+  const [completedId, setCompletedId] = useState("");
+  useEffect(() => {
+    if (!job || job.historical || active(job) || job.status !== "complete") {
+      setCompletedId("");
+      return;
+    }
+    const remaining = 3000 - (Date.now() - Number(job.finished || 0) * 1000);
+    if (remaining <= 0) { setCompletedId(""); return; }
+    setCompletedId(job.id);
+    const timer = window.setTimeout(() => setCompletedId(""), remaining);
+    return () => window.clearTimeout(timer);
+  }, [job?.id, job?.status, job?.finished, job?.historical]);
+  const running = active(job);
+  const progress = running && job?.message?.match(/([\d,]+)\s*(?:\/|of)\s*([\d,]+)/i);
+  const detail = running ? (job?.message || "Working") : completedId === job?.id ? "Task complete" : "Awaiting task...";
+  return <div className="card activity-status" role="status">
+    <div><small>{title}</small><h2>{running ? "Task in progress..." : detail}</h2>
+      {running && <p>{progress ? `Processing ${progress[1]}/${progress[2]} · ` : ""}{job?.message}</p>}
+    </div>
+    {running && <button onClick={() => onCancel(job!.kind)}>Cancel task</button>}
+  </div>;
+}
+
 export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onClear, onCancel }: {
   logs: ActivityEntry[];
   monitor: Record<string, Row>;
@@ -157,9 +181,9 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
   }), [logs]);
   return <div className="activity-view">
     <div className="activity-status-grid">
-      <div className="card activity-status"><div><h2>{active(job) ? job?.message : "No local task running"}</h2><p>File and tag work has its own worker.</p></div>{active(job) && <button onClick={() => onCancel(job!.kind)}>Cancel task</button>}</div>
-      <div className="card activity-status"><div><h2>{active(onlineJob) ? onlineJob?.message : "No online task running"}</h2><p>Catalogue requests have their own worker.</p></div>{active(onlineJob) && <button onClick={() => onCancel(onlineJob!.kind)}>Cancel online task</button>}</div>
-      <div className="card activity-status"><div><h2>{active(downloadJob) ? downloadJob?.message : "No downloads running"}</h2><p>Transfers and placement run independently.</p></div>{active(downloadJob) && <button onClick={() => onCancel("download")}>Cancel download</button>}</div>
+      <WorkerStatus title="Local actions" job={job} onCancel={onCancel}/>
+      <WorkerStatus title="Online actions" job={onlineJob} onCancel={onCancel}/>
+      <WorkerStatus title="Downloads" job={downloadJob} onCancel={onCancel}/>
     </div>
     <div className="activity-split">
       <StreamPanel stream="online" title="Online actions" entries={streams.online} monitor={monitor} job={onlineJob} onClear={onClear}/>

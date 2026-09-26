@@ -20,7 +20,9 @@ pub fn has_any_tag(tags: &HashMap<String, String>, key: &str) -> bool {
     if aliases.is_empty() {
         tags.contains_key(key) && !tags[key].trim().is_empty()
     } else {
-        aliases.iter().any(|&a| tags.contains_key(a) && !tags[a].trim().is_empty())
+        aliases
+            .iter()
+            .any(|&a| tags.contains_key(a) && !tags[a].trim().is_empty())
     }
 }
 
@@ -60,20 +62,37 @@ pub fn compute_missing_tags(
         missing.insert("tidal_album_id".to_string(), release.id.clone());
     }
     if !has_any_tag(local_tags, "url") && track.id.chars().all(|c| c.is_ascii_digit()) {
-        missing.insert("url".to_string(), format!("https://tidal.com/track/{}", track.id));
+        missing.insert(
+            "url".to_string(),
+            format!("https://tidal.com/track/{}", track.id),
+        );
     }
 
     // Numbers & Totals
     if !has_any_tag(local_tags, "tracknumber") && track.track_number > 0 {
-        missing.insert("tracknumber".to_string(), format!("{:02}", track.track_number));
+        missing.insert(
+            "tracknumber".to_string(),
+            format!("{:02}", track.track_number),
+        );
     }
     if !has_any_tag(local_tags, "discnumber") && track.disc_number > 0 {
-        missing.insert("discnumber".to_string(), format!("{:02}", track.disc_number));
+        missing.insert(
+            "discnumber".to_string(),
+            format!("{:02}", track.disc_number),
+        );
     }
     if !has_any_tag(local_tags, "tracktotal") && release.track_count > 0 {
         // If single disc or known count
-        let on_disc = release.tracks.iter().filter(|t| t.disc_number == track.disc_number).count();
-        let total = if on_disc > 0 { on_disc } else { release.track_count };
+        let on_disc = release
+            .tracks
+            .iter()
+            .filter(|t| t.disc_number == track.disc_number)
+            .count();
+        let total = if on_disc > 0 {
+            on_disc
+        } else {
+            release.track_count
+        };
         missing.insert("tracktotal".to_string(), format!("{:02}", total));
     }
 
@@ -164,6 +183,7 @@ mod tests {
             key: Some("G".to_string()),
             key_scale: Some("major".to_string()),
             copyright: None,
+            ..Default::default()
         };
 
         let missing = compute_missing_tags(&local_tags, &release, &track);

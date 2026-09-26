@@ -205,6 +205,17 @@ test("dark settings fit a full window and retain defaults", async ({
   ).toBeEnabled();
 });
 
+test("release matching scope is saved and explained in settings", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"General", exact:true}).click();
+  await expect(page.getByRole("heading", {name:"Release matching & recommendations"})).toBeVisible();
+  const bootlegs = page.getByLabel("Include bootlegs and unofficial recordings");
+  await expect(bootlegs).toHaveAttribute("type", "checkbox");
+  await bootlegs.check();
+  await expect.poll(async () => (await rpc("settings")).result?.general?.recommend_bootlegs).toBe(true);
+  await expect(page.locator('label[title="Include bootlegs/unofficial live recordings in match candidates and artist recommendations"]')).toBeVisible();
+});
+
 test("missing releases queue only the selected audio tracks", async ({
   page,
 }) => {
@@ -375,6 +386,7 @@ test("activity has independent online, local and download panels", async ({page}
   await expect(page.getByRole("region", {name:"Online actions"})).toBeVisible();
   await expect(page.getByRole("region", {name:"Local actions"})).toBeVisible();
   await expect(page.getByRole("region", {name:"Downloads"})).toBeVisible();
+  await expect(page.locator(".activity-status h2")).toHaveText(["Awaiting task...", "Awaiting task...", "Awaiting task..."]);
   expect((await page.getByRole("region", {name:"Downloads"}).boundingBox())?.height).toBeGreaterThan(500);
   await page.getByRole("searchbox", {name:"Search local actions"}).fill("nothing matches");
   await expect(page.getByRole("region", {name:"Online actions"}).getByRole("searchbox")).toHaveValue("");
@@ -479,11 +491,13 @@ test("organise files previews and applies only to the disposable library", async
 test("MQA and local duplicate scan controls complete without blocking navigation", async ({page}) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"MQA audit",exact:true}).click();
+  await expect(page.locator("tbody").getByText("Not audited").first()).toBeVisible();
   await page.getByRole("button",{name:/Recheck|Audit/}).first().click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
   await page.locator("aside").getByRole("button",{name:"Local duplicates",exact:true}).click();
-  await page.getByRole("button",{name:"Scan for duplicates"}).click();
+  await page.getByRole("button",{name:/^(Scan|Rescan) tags$/}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+  await expect(page.getByRole("button",{name:"Rescan tags"})).toBeVisible();
   await expect(page.getByRole("heading",{name:"Local duplicates",exact:true})).toBeVisible();
 });
 

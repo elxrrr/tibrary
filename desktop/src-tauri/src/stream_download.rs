@@ -2053,7 +2053,9 @@ mod tests {
                     let payload = if route.contains("/a ") { b"A" } else if route.contains("/b ") { b"B" } else { b"C" };
                     let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                     maximum.fetch_max(current, Ordering::SeqCst);
-                    if payload == b"A" { std::thread::sleep(Duration::from_millis(75)); }
+                    // Keep each mocked transfer active long enough for the next
+                    // request to overlap, independent of OS thread scheduling.
+                    std::thread::sleep(Duration::from_millis(200));
                     connection.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{}", String::from_utf8_lossy(payload)).as_bytes()).unwrap();
                     active.fetch_sub(1, Ordering::SeqCst);
                 }));

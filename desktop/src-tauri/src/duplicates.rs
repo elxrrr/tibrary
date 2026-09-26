@@ -1,7 +1,12 @@
 use crate::db::{LinkRow, LocalFileRecord, TursoDb};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+static AUDIO_QUALITY_CACHE: OnceLock<Mutex<HashMap<(String, i64, i64), Option<(u32, u32)>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalTrack {
@@ -17,6 +22,10 @@ pub struct LocalTrack {
     pub mtime: i64,
     pub bpm: Option<String>,
     pub key: Option<String>,
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub bit_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +47,41 @@ pub struct DuplicateCluster {
     pub chain_summary: String,
     pub total_redundant_tracks: usize,
     pub total_recoverable_bytes: i64,
+}
+
+pub fn manifest_fingerprint(files: &[LocalFileRecord]) -> String {
+    let mut rows: Vec<_> = files.iter().filter(|file| file.present).collect();
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut hash = Sha256::new();
+    for file in rows {
+        hash.update(file.path.as_bytes());
+        hash.update([0]);
+        hash.update(file.size.to_le_bytes());
+        hash.update(file.mtime.to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+pub async fn indexed_manifest_fingerprint(db: &TursoDb, root: &str) -> Result<String, String> {
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT path, size, mtime FROM local_files WHERE root=? AND present=1 ORDER BY path",
+            (root,),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+        let path: String = row.get(0).map_err(|e| e.to_string())?;
+        let size: i64 = row.get(1).unwrap_or_default();
+        let mtime: i64 = row.get(2).unwrap_or_default();
+        hash.update(path.as_bytes());
+        hash.update([0]);
+        hash.update(size.to_le_bytes());
+        hash.update(mtime.to_le_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 pub fn normalize_text(s: &str) -> String {
@@ -65,6 +109,73 @@ pub fn track_matches(source: &LocalTrack, target: &LocalTrack) -> bool {
     )
 }
 
+// FLAC STREAMINFO is the first metadata block. Reading its fixed 42-byte header
+// avoids decoding audio or rescanning tags for an already indexed library.
+fn flac_quality(path: &str) -> Option<(u32, u32)> {
+    if !Path::new(path).extension()?.eq_ignore_ascii_case("flac") {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 42];
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != b"fLaC" || header[4] & 0x7f != 0 || header[5..8] != [0, 0, 34] {
+        return None;
+    }
+    let packed = u64::from_be_bytes(header[18..26].try_into().ok()?);
+    let sample_rate = ((packed >> 44) & 0xfffff) as u32;
+    let bit_depth = (((packed >> 36) & 0x1f) + 1) as u32;
+    (sample_rate > 0 && bit_depth >= 8).then_some((sample_rate, bit_depth))
+}
+
+fn quality(track: &LocalTrack) -> Option<(u32, u32)> {
+    if let Some(known) = track.sample_rate.zip(track.bit_depth) { return Some(known); }
+    let cache = AUDIO_QUALITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (track.path.clone(), track.mtime, track.size);
+    if let Ok(guard) = cache.lock() {
+        if let Some(saved) = guard.get(&key) { return *saved; }
+    }
+    let inspected = flac_quality(&track.path);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 100_000 { guard.clear(); }
+        guard.insert(key, inspected);
+    }
+    inspected
+}
+
+fn fidelity_at_least(source: &LocalTrack, target: &LocalTrack) -> bool {
+    let (Some((source_rate, source_depth)), Some((target_rate, target_depth))) =
+        (quality(source), quality(target))
+    else {
+        return false;
+    };
+    target_rate >= source_rate && target_depth >= source_depth
+}
+
+fn assign_source(
+    source_idx: usize,
+    source: &LocalRelease,
+    target: &LocalRelease,
+    owners: &mut [Option<usize>],
+    seen: &mut [bool],
+) -> bool {
+    for (idx, candidate) in target.tracks.iter().enumerate() {
+        if seen[idx]
+            || !track_matches(&source.tracks[source_idx], candidate)
+            || !fidelity_at_least(&source.tracks[source_idx], candidate)
+        {
+            continue;
+        }
+        seen[idx] = true;
+        if owners[idx].is_none()
+            || assign_source(owners[idx].unwrap(), source, target, owners, seen)
+        {
+            owners[idx] = Some(source_idx);
+            return true;
+        }
+    }
+    false
+}
+
 pub fn is_release_contained(source: &LocalRelease, target: &LocalRelease) -> bool {
     if source.folder == target.folder || source.tracks.is_empty() {
         return false;
@@ -87,23 +198,18 @@ pub fn is_release_contained(source: &LocalRelease, target: &LocalRelease) -> boo
         return false;
     }
 
-    // Every track in source must match a distinct track in target
-    let mut claimed_target_indices = HashSet::new();
-    for s_track in &source.tracks {
-        let mut found = false;
-        for (idx, t_track) in target.tracks.iter().enumerate() {
-            if !claimed_target_indices.contains(&idx) && track_matches(s_track, t_track) {
-                claimed_target_indices.insert(idx);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return false;
-        }
-    }
-
-    true
+    // An augmenting-path assignment handles repeated titles without letting two
+    // source recordings claim the same target track.
+    let mut owners = vec![None; target.tracks.len()];
+    (0..source.tracks.len()).all(|idx| {
+        assign_source(
+            idx,
+            source,
+            target,
+            &mut owners,
+            &mut vec![false; target.tracks.len()],
+        )
+    })
 }
 
 pub fn extract_release_folder(file_path: &str) -> String {
@@ -185,6 +291,16 @@ pub fn parse_local_releases(files: &[LocalFileRecord]) -> Vec<LocalRelease> {
             mtime: file.mtime,
             bpm: tags.get("bpm").cloned(),
             key: tags.get("initialkey").or(tags.get("key")).cloned(),
+            sample_rate: file
+                .metadata
+                .as_ref()
+                .and_then(|m| m["sample_rate"].as_u64())
+                .map(|n| n as u32),
+            bit_depth: file
+                .metadata
+                .as_ref()
+                .and_then(|m| m["bit_depth"].as_u64())
+                .map(|n| n as u32),
         });
     }
     let mut releases: Vec<_> = releases.into_values().collect();
@@ -206,10 +322,10 @@ fn md5_hash(s: &str) -> u64 {
 }
 
 fn is_better_master(a: &LocalRelease, b: &LocalRelease) -> bool {
-    let size_a: i64 = a.tracks.iter().map(|t| t.size).sum();
-    let size_b: i64 = b.tracks.iter().map(|t| t.size).sum();
-    if size_a != size_b {
-        return size_a > size_b;
+    let qa = a.tracks.iter().filter_map(quality).min();
+    let qb = b.tracks.iter().filter_map(quality).min();
+    if qa != qb {
+        return qa > qb;
     }
     // Deterministic tie breaker: prefer the alphabetically earlier folder path
     a.folder < b.folder
@@ -223,24 +339,24 @@ pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluste
 
     // Build containment map: child_idx -> Vec<parent_idx> (releases that contain child)
     let mut parents: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-
-    for i in 0..releases.len() {
-        for j in 0..releases.len() {
-            if i == j {
-                continue;
-            }
-            if is_release_contained(&releases[i], &releases[j]) {
-                // If both releases contain each other (exact duplicate releases),
-                // break symmetry so the graph is a strict DAG: only the worse release has the better release as parent
-                if is_release_contained(&releases[j], &releases[i]) {
-                    if is_better_master(&releases[j], &releases[i]) {
+    let mut artist_groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, release) in releases.iter().enumerate() {
+        artist_groups.entry(normalize_text(&release.artist)).or_default().push(index);
+    }
+    let groups: Vec<_> = artist_groups.into_iter().collect();
+    for (left_key, left) in &groups {
+        for (right_key, right) in &groups {
+            if !left_key.is_empty() && !right_key.is_empty()
+                && left_key != right_key && !left_key.contains(right_key) && !right_key.contains(left_key) { continue; }
+            for &i in left {
+                for &j in right {
+                    if i == j || !is_release_contained(&releases[i], &releases[j]) { continue; }
+                    // A complete clone has two possible parents. Keep only the
+                    // higher-quality deterministic winner so the graph is acyclic.
+                    if !is_release_contained(&releases[j], &releases[i])
+                        || is_better_master(&releases[j], &releases[i]) {
                         parents.entry(i).or_default().push(j);
-                        children.entry(j).or_default().push(i);
                     }
-                } else {
-                    parents.entry(i).or_default().push(j);
-                    children.entry(j).or_default().push(i);
                 }
             }
         }
@@ -591,7 +707,63 @@ mod tests {
             mtime: 1000,
             bpm: None,
             key: None,
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
         }
+    }
+
+    #[test]
+    fn lower_quality_or_exclusive_mix_cannot_be_absorbed() {
+        let source = LocalRelease {
+            id: "single".into(),
+            folder: "/music/single".into(),
+            artist: "Daft Punk".into(),
+            title: "Single".into(),
+            date: "2020".into(),
+            tracks: vec![make_test_track("source", "Song", "ISRC1", 200.0)],
+        };
+        let mut target = LocalRelease {
+            id: "album".into(),
+            folder: "/music/album".into(),
+            artist: "Daft Punk".into(),
+            title: "Album".into(),
+            date: "2021".into(),
+            tracks: vec![
+                make_test_track("target", "Song", "ISRC1", 200.0),
+                make_test_track("bonus", "Bonus", "ISRC2", 180.0),
+            ],
+        };
+        assert!(is_release_contained(&source, &target));
+        target.tracks[0].bit_depth = Some(16);
+        let mut higher = source.clone();
+        higher.tracks[0].bit_depth = Some(24);
+        assert!(!is_release_contained(&higher, &target));
+        let mut exclusive = source.clone();
+        exclusive.tracks.push(make_test_track(
+            "mix",
+            "Song (Extended Mix)",
+            "ISRC3",
+            270.0,
+        ));
+        assert!(!is_release_contained(&exclusive, &target));
+    }
+
+    #[test]
+    fn reads_flac_streaminfo_without_audio_decode() {
+        let path = std::env::temp_dir().join(format!(
+            "tibrary-streaminfo-{}-{}.flac",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut bytes = [0u8; 42];
+        bytes[..4].copy_from_slice(b"fLaC");
+        bytes[4] = 0x80; // final STREAMINFO block
+        bytes[7] = 34;
+        let packed = (96_000u64 << 44) | (1u64 << 41) | (23u64 << 36);
+        bytes[18..26].copy_from_slice(&packed.to_be_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(flac_quality(path.to_str().unwrap()), Some((96_000, 24)));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -729,6 +901,8 @@ mod tests {
                         "album": rel.title,
                         "isrc": t.isrc,
                         "duration": t.duration,
+                        "sample_rate": t.sample_rate,
+                        "bit_depth": t.bit_depth,
                     })),
                     error: None,
                     present: true,
@@ -831,6 +1005,8 @@ mod tests {
                         "album": rel.title,
                         "isrc": t.isrc,
                         "duration": t.duration,
+                        "sample_rate": t.sample_rate,
+                        "bit_depth": t.bit_depth,
                     })),
                     error: None,
                     present: true,
