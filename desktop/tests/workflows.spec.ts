@@ -613,7 +613,9 @@ test("artist context menu opens legacy candidates and local recordings", async (
 test("match unresolved artists skips confirmed artists without network work", async ({page}) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Link artists",exact:true}).click();
-  await page.getByRole("button",{name:"Match unresolved artists",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Refresh release list",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Download track details",exact:true})).toHaveCount(0);
+  await page.getByRole("button",{name:"Match artist",exact:true}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.online_job?.status).toBe("complete");
   const status = await rpc("job.status");
   expect(status.result.online_job.result.checked).toBe(0);

@@ -1893,7 +1893,7 @@ async fn handle_rpc_uncached(
                 }
 
                 match client
-                    .get_artist_catalogue(artist_id, &market, detailed)
+                    .get_artist_catalogue(artist_id, &market, false)
                     .await
                 {
                     Ok(catalogue) => {
@@ -1906,6 +1906,34 @@ async fn handle_rpc_uncached(
                             failure = Some(e);
                             break;
                         } else {
+                            if detailed {
+                                // Read this artist's merged snapshot once instead of searching
+                                // every cached artist again for each release.
+                                let stored: Vec<Value> = async {
+                                    let conn = db_clone.connect()?;
+                                    let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id=? AND market=?", (artist_id.as_str(), market.as_str())).await.map_err(|e|e.to_string())?;
+                                    let raw = rows.next().await.map_err(|e|e.to_string())?.and_then(|r|r.get::<String>(0).ok());
+                                    Ok::<_,String>(raw.and_then(|s|serde_json::from_str::<Value>(&s).ok()).and_then(|v|v["releases"].as_array().cloned()).unwrap_or_default())
+                                }.await.unwrap_or_default();
+                                for (index, release) in catalogue.releases.iter().enumerate() {
+                                    if cancel_flag.load(Ordering::Relaxed) { break; }
+                                    let message = format!("Updating recommendation data · {name} · {} · release {}/{} · cached details first", release.title, index + 1, catalogue.releases.len());
+                                    let mut progress = prog_job.clone();
+                                    progress["message"] = json!(message);
+                                    backend_prog.update_online_job_progress(&message, progress);
+                                    let key = format!("tag-review:{market}:{}", release.id);
+                                    if db_clone.get_preference(&key).await.ok().flatten().is_none() {
+                                        if let Some(saved) = stored.iter().find(|r| r["id"] == release.id) {
+                                            if let Err(error) = db_clone.set_preference(&key, saved).await { failure = Some(error); break; }
+                                        }
+                                    }
+                                    if let Err(error) = actions::release(&db_clone, &release.id, &market, false).await {
+                                        failure = Some(format!("{} — {}: {error}", name, release.title));
+                                        break;
+                                    }
+                                }
+                                if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
+                            }
                             checked += 1;
                             completed.push(artist_id.clone());
                             let mut saved_progress = prog_job.clone();

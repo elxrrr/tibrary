@@ -163,9 +163,17 @@ impl TursoDb {
     }
 
     pub fn connect(&self) -> Result<Connection, String> {
-        self.db
-            .connect()
-            .map_err(|e| format!("Turso connect error: {}", e))
+        let conn = self.db.connect().map_err(|e| format!("Turso connect error: {}", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
+        Ok(conn)
+    }
+
+    /// A fresh autocommit connection cannot inherit an old read snapshot from a
+    /// long-running catalogue lookup. Waiting for another writer is asynchronous.
+    pub async fn save_track_link(&self, path: &str, market: &str, stamp: &str, payload: &str) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute("INSERT OR REPLACE INTO track_links(path,market,stamp,payload) VALUES(?,?,?,?)", (path,market,stamp,payload)).await.map_err(|e|format!("Could not save track link: {e}"))?;
+        Ok(())
     }
 
     pub async fn init_schema(&self) -> Result<(), String> {
@@ -4941,6 +4949,25 @@ with sqlite3.connect('{db}') as db:
             .unwrap();
         assert_eq!(reconsidered.rows[0].status, "Owned partial");
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn track_link_save_waits_for_concurrent_writer() {
+        let dir = std::env::temp_dir().join(format!("link_lock_{}", uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let writer = db.connect().unwrap();
+        writer.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        let save = db.save_track_link("/test.flac", "GB", "[1,2]", "{\"status\":\"linked\"}");
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            writer.execute("COMMIT", ()).await.unwrap();
+        };
+        let (result, _) = tokio::join!(save, release);
+        result.unwrap();
+        let mut rows = writer.query("SELECT COUNT(*) FROM track_links", ()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 1);
+        drop(rows); drop(writer); drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

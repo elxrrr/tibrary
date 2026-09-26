@@ -993,36 +993,7 @@ function App() {
             >
               {selected.size
                 ? "Match selected artists"
-                : "Match unresolved artists"}
-            </button>
-            <button
-              disabled={busy}
-              onClick={() =>
-                run("discography", {
-                  ids: selected.size
-                    ? data.rows
-                        .filter((r) => selected.has(r.id))
-                        .map((r) => r.online_id)
-                        .filter(Boolean)
-                    : undefined,
-                })
-              }
-            >
-              Refresh release list
-            </button>
-            <button
-              disabled={busy || !selected.size}
-              onClick={() =>
-                run("discography", {
-                  ids: data.rows
-                    .filter((r) => selected.has(r.id))
-                    .map((r) => r.online_id)
-                    .filter(Boolean),
-                  detailed: true,
-                })
-              }
-            >
-              Download track details
+                : "Match artist"}
             </button>
           </>
         )}
@@ -1132,13 +1103,14 @@ function App() {
           </>
         )}
         {route === "favourites" && (
+          <><button disabled={busy || !root} onClick={() => run("match_artists")}>Match local artists</button>
           <button
             className="primary"
             disabled={busy}
             onClick={() => run("favourites")}
           >
             Refresh favourite artists
-          </button>
+          </button></>
         )}
         {route === "missing" && (
           <>
@@ -1149,6 +1121,7 @@ function App() {
             >
               Find new releases (online)
             </button>
+            <button disabled={busy} onClick={() => run("discography", { detailed: true })} title="Refresh linked artists, fill missing track lists, credits and genres, and reuse up-to-date cached details. Progress can be resumed.">Update recommendation data</button>
             {state?.catalogue_refresh && state.catalogue_refresh.status !== "complete" && state.catalogue_refresh.completed.length < state.catalogue_refresh.ids.length && !active(state.online_job) && (
               <button disabled={busy} onClick={() => run("discography", { ...state.catalogue_refresh, resume: true })}>
                 Resume refresh ({state.catalogue_refresh.completed.length}/{state.catalogue_refresh.ids.length})
@@ -2158,7 +2131,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.21 · build 21</span>
+          <span className="sidebar-version">v0.9.0-beta.22 · build 22</span>
         </div>
       </aside>
       <main>

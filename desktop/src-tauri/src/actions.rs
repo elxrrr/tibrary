@@ -92,7 +92,7 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
     }
     let key = format!("tag-review:{market}:{id}");
     let cached = db.get_preference(&key).await?;
-    let mut value = match cached.filter(|v| v["tracks_loaded"] == true) {
+    let mut value = match cached {
         Some(value) => value,
         None => {
             db.get_detail(&json!({"release_id":id, "market":market}))
@@ -1017,6 +1017,14 @@ pub async fn execute(
         if pending.is_empty() { return Ok(json!({"checked":0})); }
         let mut client = crate::tidal::TidalClient::from_db(db).await?;
         let conn = db.connect()?;
+        let mut favourites = Vec::<crate::tidal::TidalArtist>::new();
+        let mut saved = conn.query("SELECT payload FROM favourite_artists", ()).await.map_err(|e|e.to_string())?;
+        while let Some(row) = saved.next().await.map_err(|e|e.to_string())? {
+            if let Ok(raw) = row.get::<String>(0) {
+                if let Ok(items) = serde_json::from_str::<Vec<crate::tidal::TidalArtist>>(&raw) { favourites.extend(items); }
+            }
+        }
+        drop(saved);
         let mut checked = 0;
         for artist in pending {
             let name = artist["artist"].as_str().unwrap_or("");
@@ -1048,8 +1056,11 @@ pub async fn execute(
                 })
                 .collect();
             let search_key = format!("artist-search:{market}:{}", crate::matching::name_key(name));
+            let favourite_matches: Vec<_> = favourites.iter().filter(|f| crate::matching::name_key(&f.name) == crate::matching::name_key(name)).cloned().collect();
             let candidates: Vec<crate::tidal::TidalArtist> =
-                if let Some(c) = db.get_preference(&search_key).await? {
+                if !favourite_matches.is_empty() {
+                    favourite_matches
+                } else if let Some(c) = db.get_preference(&search_key).await? {
                     serde_json::from_value(c).unwrap_or_default()
                 } else {
                     let c = client.search_artists(name, market).await?;

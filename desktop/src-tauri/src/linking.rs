@@ -239,6 +239,9 @@ pub async fn link_library_mode(
         });
     }
 
+    drop(file_stmt);
+    drop(cat_stmt);
+    drop(map_stmt);
     let total = eligible.len();
     if total == 0 {
         return Ok(LinkSummary::default());
@@ -365,10 +368,7 @@ pub async fn link_library_mode(
                     .cloned()
                     .unwrap_or_else(|| "[]".to_string());
                 let payload_str = payload.to_string();
-                conn.execute(
-                    "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
-                    (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                ).await.map_err(|e| format!("Could not save track link: {e}"))?;
+                db.save_track_link(&track.path, market, &stamp, &payload_str).await?;
                 progress(format!("Unmatched · {}/{} tracks checked · {} — {} · {} · no verified release found", summary.linked + summary.review + summary.unmatched, total, track.artist, track.title, track.album));
             }
             continue;
@@ -541,10 +541,7 @@ pub async fn link_library_mode(
                     }
                     payload["catalogue_options"] = json!(scored_candidates.iter().filter_map(|(r,s)|s.alignments.get(&track.path).map(|a|json!({"id":r.id,"title":r.title,"track_id":a.remote_track_id,"tracks":r.track_count,"artist":r.artist,"album":r.title,"position_label":format!("Disc {} · Track {}/{}",a.disc_number,a.track_number,r.track_count),"evidence":({let mut reasons=s.conflicts.clone(); if credit_scores[&r.id]>0 { reasons.push(format!("{} shared local contributor credits support this release",credit_scores[&r.id])); } reasons.join("; ")}),"structure":{"compatible":s.compatible,"reasons":s.conflicts},"compatible":s.compatible}))).collect::<Vec<_>>());
                     let payload_str = payload.to_string();
-                    conn.execute(
-                        "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
-                        (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                    ).await.map_err(|e| format!("Could not save track link: {e}"))?;
+                    db.save_track_link(&track.path, market, &stamp, &payload_str).await?;
                 } else {
                     summary.review += 1;
                     let payload = json!({
@@ -554,10 +551,7 @@ pub async fn link_library_mode(
                         "checked_at": chrono::Utc::now().timestamp(),
                     });
                     let payload_str = payload.to_string();
-                    conn.execute(
-                        "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
-                        (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                    ).await.map_err(|e| format!("Could not save track link: {e}"))?;
+                    db.save_track_link(&track.path, market, &stamp, &payload_str).await?;
                 }
             }
         } else {
@@ -573,10 +567,7 @@ pub async fn link_library_mode(
                     .cloned()
                     .unwrap_or_else(|| "[]".to_string());
                 let payload_str = payload.to_string();
-                conn.execute(
-                    "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
-                    (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                ).await.map_err(|e| format!("Could not save track link: {e}"))?;
+                db.save_track_link(&track.path, market, &stamp, &payload_str).await?;
             }
         }
         for track in group_tracks.iter().filter(|t| eligible.contains(&t.path)) {

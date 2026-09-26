@@ -31,6 +31,14 @@ Folder previews clean tag whitespace before adding template separators, preserve
 
 ---
 
+## Refreshing matching and recommendation data
+
+1. **Favourite artists → Refresh favourite artists**, then **Match local artists** (or **Link artists → Match artist**). Saved favourites provide candidates; local release evidence is still required. Confirmed artists are skipped unless explicitly selected.
+2. **Missing releases → Update recommendation data** refreshes linked artists and fills missing track details, credits, genres and replacement information. Current details are reused; unavailable fields are not invented. Progress is saved per artist, with release details cached as they complete. Use **Resume refresh** after interruption.
+3. **Recheck cached releases** recalculates recommendations locally. Composer, songwriter and other contributor connections are anchored to verified local recordings, alongside artist credits, labels, rights, genres and recording overlap. Suspect releases remain inspectable through the filters.
+
+No database reset or full local rescan is needed to collect this online metadata. Update the local library only when files or tags have changed outside the app.
+
 ## ✨ Features
 
 - ⚡ **Fast Library Scanning:** Quickly scans your local music folders (FLAC, ALAC, MP3, WAV, AIFF) and checks for new or modified files.
