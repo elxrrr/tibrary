@@ -135,3 +135,9 @@ open desktop/src-tauri/target/release/bundle/macos/Tibrary.app
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
+
+### Safe number repairs and quitting
+
+Correct tags → Track & disc numbers flags impossible totals such as `04/1`. It proposes padded totals from consistent sibling tags or agreeing cached releases with matching recordings and positions. Incomplete or conflicting evidence stays for review. Applying a number repair refreshes the affected links from cache without an online scan.
+
+Closing the window or choosing Quit while downloading asks whether to keep downloading or stop and quit. The latter waits for download cancellation before exiting. Completed downloads are retained.

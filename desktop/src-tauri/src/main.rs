@@ -190,6 +190,8 @@ pub struct Backend {
     pub online_job: Mutex<Option<Value>>,
     pub download_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub download_job: Mutex<Option<Value>>,
+    quit_prompt: AtomicBool,
+    quit_approved: AtomicBool,
     pub logs: ActivityBuffers,
     pub log_epochs: Arc<[AtomicU64; 3]>,
     pub log_persist_gate: Arc<tokio::sync::Mutex<()>>,
@@ -211,6 +213,8 @@ impl Default for Backend {
             online_job: Mutex::new(None),
             download_cancel: Mutex::new(None),
             download_job: Mutex::new(None),
+            quit_prompt: AtomicBool::new(false),
+            quit_approved: AtomicBool::new(false),
             logs: ActivityBuffers::default(),
             log_epochs: Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]),
             log_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -532,6 +536,10 @@ async fn handle_rpc_call(
     method: String,
     args: Value,
 ) -> Result<Value, String> {
+    if method == "job.start" && state.quit_prompt.load(Ordering::SeqCst) {
+        return Err("Finish the quit confirmation before starting another task".into());
+    }
+
     let cacheable = method == "table" || method == "state";
     let _read = if cacheable {
         Some(state.read_gate.lock().await)
@@ -871,7 +879,7 @@ async fn handle_rpc_uncached(
         let template = args.get("template").and_then(|v| v.as_str());
 
         let (files, _) = db.get_local_files_page(Some(root), 10000, 0).await?;
-        let plans = workflows::plan_workflow(&files, action, template);
+        let plans = workflows::plan_cached(db, &files, action, template).await?;
         return serde_json::to_value(plans).map_err(|e| e.to_string());
     }
     if method == "turso.account.status" {
@@ -1285,7 +1293,7 @@ async fn handle_rpc_uncached(
                 .get("organisation")
                 .and_then(|v| v.get("template"))
                 .and_then(|v| v.as_str());
-            let plans = workflows::plan_workflow(&files, action, template_str);
+            let plans = workflows::plan_cached(db, &files, action, template_str).await?;
             let file_index: HashMap<_, _> = files
                 .iter()
                 .map(|file| (file.path.as_str(), file))
@@ -1295,8 +1303,8 @@ async fn handle_rpc_uncached(
                 let file = file_index.get(plan.path.as_str())?;
                 let description = if plan.target.is_some() { "Move or rename file to match its tags" } else { "Standardise local tags" };
                 Some(json!({"id":plan.path,"path":plan.path,"artist":plan.artist,"release":plan.album,"title":plan.title,
-                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"evidence":description,
-                    "affected":true,"status":"Needs update","size":file.size,"mtime":file.mtime,
+                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"evidence":if plan.issues.is_empty() { description.to_string() } else { plan.issues.join("; ") },
+                    "affected":!plan.changes.is_empty() || plan.target.is_some(),"status":if plan.changes.is_empty() && plan.target.is_none() { "Needs review" } else { "Needs update" },"size":file.size,"mtime":file.mtime,
                     "item":{"path":plan.path,"target":plan.target,"tags":plan.changes}}))
             }).collect();
             let affected_paths: std::collections::HashSet<String> =
@@ -2574,8 +2582,41 @@ fn main() {
             reveal_file,
             save_export
         ])
-        .run(tauri::generate_context!())
-        .expect("Could not start Tibrary");
+        .build(tauri::generate_context!())
+        .expect("Could not start Tibrary")
+        .run(|app, event| {
+            let backend = app.state::<Arc<Backend>>().inner().clone();
+            if backend.quit_approved.load(Ordering::SeqCst) { return; }
+            let active_download = backend.download_cancel.lock().unwrap().is_some();
+            if !active_download && !backend.active_job_cancel.lock().unwrap().is_some() && !backend.online_cancel.lock().unwrap().is_some() && !backend.quit_prompt.load(Ordering::SeqCst) { return; }
+            match event {
+                tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => api.prevent_close(),
+                tauri::RunEvent::ExitRequested { api, .. } => api.prevent_exit(),
+                _ => return,
+            }
+            if backend.quit_prompt.swap(true, Ordering::SeqCst) { return; }
+            use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+            let handle = app.clone();
+            app.dialog().message(if active_download { "Downloads are still running. Stop active tasks and quit? Completed tracks will be kept; unfinished tracks remain in the queue." } else { "A task is still running. Stop active tasks and quit? File changes already completed will be kept." })
+                .title("Quit Tibrary?")
+                .buttons(MessageDialogButtons::OkCancelCustom(if active_download { "Stop downloads and quit" } else { "Stop tasks and quit" }.into(), if active_download { "Keep downloading" } else { "Keep working" }.into()))
+                .show(move |confirmed| {
+                    if !confirmed { backend.quit_prompt.store(false, Ordering::SeqCst); return; }
+                    if let Some(job) = backend.cancel_download_job() {
+                        let _ = handle.emit("backend-event", json!({"event":"job", "download_job":job}));
+                    }
+                    backend.cancel_active_job("Stopping safely before quitting");
+                    backend.cancel_online_job();
+                    tauri::async_runtime::spawn(async move {
+                        // Let the worker publish completed files and clean up temporary output.
+                        while backend.download_cancel.lock().unwrap().is_some() || backend.active_job_cancel.lock().unwrap().is_some() || backend.online_cancel.lock().unwrap().is_some() {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        backend.quit_approved.store(true, Ordering::SeqCst);
+                        handle.exit(0);
+                    });
+                });
+        });
 }
 
 #[cfg(test)]

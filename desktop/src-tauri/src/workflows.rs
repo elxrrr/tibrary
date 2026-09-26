@@ -74,14 +74,98 @@ pub fn extract_tags_map(metadata: &Option<Value>) -> HashMap<String, String> {
     tags
 }
 
+fn number(tags: &HashMap<String, String>, key: &str) -> u32 {
+    tags.get(key).and_then(|s| s.split('/').next()).and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+fn total(tags: &HashMap<String, String>, key: &str, position: &str) -> u32 {
+    let separate = number(tags, key);
+    if separate > 0 { separate } else {
+        tags.get(position).and_then(|s| s.split('/').nth(1)).and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+    }
+}
+fn release_key(row: &LocalFileRecord, tags: &HashMap<String, String>) -> (String, String, String) {
+    let mut folder = Path::new(&row.path).parent().unwrap_or(Path::new(&row.root));
+    if folder.file_name().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("disc ")) {
+        folder = folder.parent().unwrap_or(folder);
+    }
+    (folder.display().to_string(), tags.get("albumartist").or(tags.get("artist")).cloned().unwrap_or_default(), tags.get("album").cloned().unwrap_or_default())
+}
+
+/// Uses the shared catalogue snapshot only: opening Correct tags never fetches online data.
+pub async fn plan_cached(db: &crate::db::TursoDb, rows: &[LocalFileRecord], action: &str, template: Option<&str>) -> Result<Vec<WorkflowRowPlan>, String> {
+    let mut plans = plan_workflow(rows, action, template);
+    if action != "numbers" { return Ok(plans); }
+    let market = db.get_settings().await?["general"]["market"].as_str().unwrap_or("GB").to_string();
+    let conn = db.connect()?;
+    let mut query = conn.query("SELECT payload FROM catalogue WHERE market=?", (market.as_str(),)).await.map_err(|e| e.to_string())?;
+    let mut releases = Vec::new();
+    while let Some(row) = query.next().await.map_err(|e| e.to_string())? {
+        if let Ok(cat) = serde_json::from_str::<crate::tidal::TidalCatalogue>(&row.get::<String>(0).unwrap_or_default()) {
+            releases.extend(cat.releases.into_iter().filter(|r| r.tracks_loaded));
+        }
+    }
+    let mut groups: HashMap<_, Vec<_>> = HashMap::new();
+    let mut keys = HashMap::new();
+    for row in rows.iter().filter(|r| r.present) {
+        let tags = extract_tags_map(&row.metadata);
+        let key = release_key(row, &tags);
+        keys.insert(row.path.as_str(), key.clone());
+        groups.entry(key).or_default().push(crate::release_matching::LocalTrackInfo {
+            path: row.path.clone(), title: tags.get("title").cloned().unwrap_or_default(),
+            artist: tags.get("albumartist").or(tags.get("artist")).cloned().unwrap_or_default(),
+            album: tags.get("album").cloned().unwrap_or_default(),
+            duration: row.metadata.as_ref().and_then(|m| m["duration"].as_f64()).unwrap_or(0.0),
+            track_number: number(&tags,"tracknumber"), disc_number: number(&tags,"discnumber").max(1), isrc: tags.get("isrc").cloned(),
+        });
+    }
+    let mut by_title: HashMap<_,Vec<_>> = HashMap::new();
+    for release in &releases { by_title.entry(crate::matching::title_key(&release.title)).or_default().push(release); }
+    for plan in plans.iter_mut().filter(|p| !p.issues.is_empty()) {
+        let Some(key) = keys.get(plan.path.as_str()) else { continue };
+        let peers = &groups[key];
+        let release_candidates = by_title.get(&crate::matching::title_key(&plan.album)).cloned().unwrap_or_default();
+        let candidates: Vec<_> = release_candidates.into_iter().filter(|r| {
+            crate::matching::title_key(&r.title) == crate::matching::title_key(&plan.album)
+                && crate::matching::name_key(&r.artist) == crate::matching::name_key(&plan.artist)
+                && peers.iter().all(|p| p.track_number > 0 && r.tracks.iter().any(|t|
+                    t.track_number == p.track_number && t.disc_number == p.disc_number
+                    && (p.duration > 0.0 || p.isrc.as_ref().is_some_and(|s| !s.trim().is_empty()))
+                    && crate::release_matching::recording_matches(&p.title, p.duration, p.isrc.as_deref(), &t.title, t.duration, t.isrc.as_deref(), true)))
+        }).collect();
+        for (position, total_key) in [("tracknumber", "tracktotal"), ("discnumber", "disctotal")] {
+            let disc = number(&plan.current_tags, "discnumber").max(1);
+            let max_position = peers.iter().filter(|p| position == "discnumber" || p.disc_number == disc)
+                .map(|p| if position == "discnumber" { p.disc_number } else { p.track_number }).max().unwrap_or(0);
+            if total(&plan.current_tags, total_key, position) >= max_position || number(&plan.changes, total_key) >= max_position { continue; }
+            let counts: std::collections::HashSet<u32> = candidates.iter().map(|r| if position == "discnumber" {
+                r.tracks.iter().map(|t| t.disc_number).max().unwrap_or(1)
+            } else { r.tracks.iter().filter(|t| t.disc_number == disc).count() as u32 }).collect();
+            if counts.len() == 1 {
+                let count = *counts.iter().next().unwrap();
+                if count >= max_position {
+                    plan.changes.insert(total_key.into(), format!("{count:02}"));
+                    plan.issues.retain(|issue| !issue.starts_with(&format!("{total_key} ")));
+                    plan.issues.push(format!("{total_key}: {count:02} confirmed by cached release(s) {} with matching recordings and positions", candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")));
+                }
+            }
+        }
+    }
+    Ok(plans)
+}
+
 pub fn plan_workflow(
     rows: &[LocalFileRecord],
     action: &str,
     template: Option<&str>,
 ) -> Vec<WorkflowRowPlan> {
     let mut plans = Vec::new();
+    let mut indexed: HashMap<_, Vec<_>> = HashMap::new();
+    for row in rows.iter().filter(|r| r.present) {
+        let tags = extract_tags_map(&row.metadata);
+        indexed.entry(release_key(row, &tags)).or_default().push(tags);
+    }
 
-    for row in rows {
+    for row in rows.iter().filter(|r| r.present) {
         let current_tags = extract_tags_map(&row.metadata);
         let mut changes = HashMap::new();
         let mut issues = Vec::new();
@@ -163,6 +247,23 @@ pub fn plan_workflow(
                         }
                     }
                 }
+                let key = release_key(row, &current_tags);
+                for (position, total_key) in [("tracknumber", "tracktotal"), ("discnumber", "disctotal")] {
+                    let disc = number(&current_tags, "discnumber").max(1);
+                    let peers: Vec<_> = indexed[&key].iter().filter(|t| position == "discnumber" || number(t,"discnumber").max(1) == disc).collect();
+                    let max_position = peers.iter().map(|t| number(t,position)).max().unwrap_or(0);
+                    let saved = total(&current_tags, total_key, position);
+                    if max_position > saved {
+                        let known: std::collections::HashSet<_> = peers.iter().map(|t| total(t,total_key,position)).filter(|n| *n >= max_position).collect();
+                        if known.len() == 1 {
+                            let count = *known.iter().next().unwrap();
+                            changes.insert(total_key.into(), format!("{count:02}"));
+                            issues.push(format!("{total_key} {saved} is below position {max_position}; sibling tags agree on {count:02}"));
+                        } else {
+                            issues.push(format!("{total_key} {saved} is below position {max_position}; a verified release total is needed (local files may be incomplete)"));
+                        }
+                    }
+                }
             }
             "lyrics" => {
                 for k in &["lyrics", "unsyncedlyrics", "syncedlyrics"] {
@@ -189,7 +290,7 @@ pub fn plan_workflow(
             _ => {}
         }
 
-        if !changes.is_empty() || target.is_some() {
+        if !changes.is_empty() || target.is_some() || !issues.is_empty() {
             plans.push(WorkflowRowPlan {
                 path: row.path.clone(),
                 root: row.root.clone(),
@@ -210,6 +311,52 @@ pub fn plan_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(n: u32, total: u32) -> LocalFileRecord {
+        LocalFileRecord { path: format!("/root/Artist/Album/{n}.flac"), root: "/root".into(), size: 1, mtime: 1,
+            metadata: Some(serde_json::json!({"albumartist":"Artist","album":"Album","title":format!("Song {n}"),"duration":180.0,"tracknumber":format!("{n:02}/{total}"),"discnumber":"01","disctotal":"01"})), error:None, present:true }
+    }
+    #[test]
+    fn impossible_totals_use_sibling_evidence_not_file_count() {
+        let plans = plan_workflow(&[sample(1,12), sample(4,1)], "numbers", None);
+        assert_eq!(plans.iter().find(|p| p.path.ends_with("4.flac")).unwrap().changes["tracktotal"], "12");
+        let plans = plan_workflow(&[sample(1,1), sample(4,1)], "numbers", None);
+        assert!(plans.iter().all(|p| !p.issues.is_empty()));
+        assert!(plans.iter().all(|p| p.changes.get("tracktotal").is_none_or(|v| v == "01")));
+        let plans = plan_workflow(&[sample(1,12), sample(2,14), sample(4,1)], "numbers", None);
+        assert_ne!(plans.iter().find(|p| p.path.ends_with("4.flac")).unwrap().changes.get("tracktotal").map(String::as_str), Some("12"));
+    }
+    #[tokio::test]
+    async fn cached_exact_recordings_repair_totals_but_conflicting_editions_do_not() {
+        let dir = std::env::temp_dir().join(format!("tibrary-numbers-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::TursoDb::open(&dir.join("test.sqlite")).await.unwrap();
+        let release = serde_json::json!({"id":"r","artist":"Artist","title":"Album","tracks_loaded":true,"tracks":(1..=12).map(|n| serde_json::json!({"id":n.to_string(),"title":format!("Song {n}"),"duration":180.0,"track_number":n,"disc_number":1})).collect::<Vec<_>>()});
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('a','GB',?)", (serde_json::json!({"releases":[release.clone()]}).to_string(),)).await.unwrap();
+        let plans = plan_cached(&db, &[sample(1,1),sample(4,1)], "numbers", None).await.unwrap();
+        assert!(plans.iter().all(|p| p.changes["tracktotal"] == "12"));
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Artist','a','confirmed')", ()).await.unwrap();
+        let local = vec![sample(1,1),sample(4,1)];
+        for file in &local {
+            db.apply_file_update(&file.path, &file.path, &file.root, file.metadata.as_ref().unwrap(), 1, 1).await.unwrap();
+        }
+        let paths: std::collections::HashSet<_> = local.iter().map(|f| f.path.clone()).collect();
+        crate::maintenance::refresh_number_links(&db, "/root", &paths).await;
+        let mut linked = conn.query("SELECT payload FROM track_links", ()).await.unwrap();
+        let mut count = 0;
+        while let Some(row) = linked.next().await.unwrap() {
+            let payload: Value = serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+            assert_eq!(payload["status"], "linked", "{payload}"); count += 1;
+        }
+        assert_eq!(count, 2);
+        drop(linked);
+        let mut other = release.clone(); other["id"] = serde_json::json!("other"); other["tracks"].as_array_mut().unwrap().pop();
+        conn.execute("UPDATE catalogue SET payload=?", (serde_json::json!({"releases":[release,other]}).to_string(),)).await.unwrap();
+        let plans = plan_cached(&db, &[sample(1,1),sample(4,1)], "numbers", None).await.unwrap();
+        assert!(plans.iter().all(|p| p.changes["tracktotal"] == "01"));
+        drop(conn); drop(db); std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn test_plan_workflow_keys_and_numbers() {

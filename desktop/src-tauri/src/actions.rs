@@ -1247,6 +1247,7 @@ pub async fn execute(
             return Err("Select only affected files from the current preview".into());
         }
         let mut count = 0;
+        let mut repaired = std::collections::HashSet::new();
         let mut errors = vec![];
         for row in preview["rows"].as_array().ok_or("Invalid preview")? {
             let path = row["path"].as_str().unwrap_or("");
@@ -1276,7 +1277,7 @@ pub async fn execute(
             }
             .await;
             match result {
-                Ok(()) => count += 1,
+                Ok(()) => { count += 1; if row["item"]["tags"].as_object().is_some_and(|tags| tags.keys().any(|k| matches!(k.as_str(), "tracknumber" | "discnumber" | "tracktotal" | "disctotal"))) { repaired.insert(path.to_string()); } },
                 Err(e) => errors.push(format!("{path}: {e}")),
             }
             state.progress_for(
@@ -1289,6 +1290,10 @@ pub async fn execute(
                         .to_string_lossy()
                 ),
             );
+        }
+        if !repaired.is_empty() {
+            state.progress_for(kind, "Updating links from cached release evidence");
+            maintenance::refresh_number_links(db, root, &repaired).await;
         }
         state.previews.lock().unwrap().remove(id);
         if !errors.is_empty() {
@@ -1311,10 +1316,10 @@ pub async fn execute(
             return Err("Unknown local operation".into());
         }
         let template = settings["organisation"]["template"].as_str();
-        let plans = workflows::plan_workflow(&indexed, action, template);
+        let plans = workflows::plan_cached(db, &indexed, action, template).await?;
         let rows:Vec<Value>=plans.into_iter().filter(|p|ids.is_empty()||ids.contains(&p.path)).map(|p| {
             let f=indexed.iter().find(|f|f.path==p.path).unwrap();
-            json!({"id":p.path,"path":p.path,"artist":p.artist,"release":p.album,"title":p.title,"tags":p.current_tags,"changes":p.changes,"target":p.target,"affected":true,"status":"Needs update","size":f.size,"mtime":f.mtime,"item":{"path":p.path,"target":p.target,"tags":p.changes}})
+            json!({"id":p.path,"path":p.path,"artist":p.artist,"release":p.album,"title":p.title,"tags":p.current_tags,"changes":p.changes,"target":p.target,"evidence":p.issues.join("; "),"affected":!p.changes.is_empty() || p.target.is_some(),"status":"Needs update","size":f.size,"mtime":f.mtime,"item":{"path":p.path,"target":p.target,"tags":p.changes}})
         }).collect();
         let id = uuid::Uuid::new_v4().to_string();
         state.previews.lock().unwrap().insert(id.clone(),json!({"id":id,"created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":rows.len()}));

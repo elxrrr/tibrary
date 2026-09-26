@@ -188,10 +188,11 @@ pub async fn apply_batch(db: &TursoDb, root: &str, items: &[FileApplyItem]) -> A
     let mut applied = 0;
     let mut failed = 0;
     let mut errors = Vec::new();
+    let mut repaired = std::collections::HashSet::new();
 
     for item in items {
         match apply_file_item(db, root, item).await {
-            Ok(_) => applied += 1,
+            Ok(path) => { applied += 1; if item.tags.keys().any(|k| matches!(k.as_str(), "tracktotal" | "disctotal" | "tracknumber" | "discnumber")) { repaired.insert(path.display().to_string()); } },
             Err(e) => {
                 failed += 1;
                 errors.push(format!("{}: {}", item.path, e));
@@ -199,10 +200,20 @@ pub async fn apply_batch(db: &TursoDb, root: &str, items: &[FileApplyItem]) -> A
         }
     }
 
+    if !repaired.is_empty() { refresh_number_links(db, root, &repaired).await; }
     ApplyResult {
         applied,
         failed,
         errors,
+    }
+}
+
+pub async fn refresh_number_links(db: &TursoDb, root: &str, paths: &std::collections::HashSet<String>) {
+    let settings = db.get_settings().await.unwrap_or_default();
+    let market = settings["general"]["market"].as_str().unwrap_or("GB");
+    if let Err(error) = crate::linking::link_library_mode(db, market, root,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| {}, Some(paths), false, true).await {
+        eprintln!("Cached link refresh after tag correction: {error}");
     }
 }
 

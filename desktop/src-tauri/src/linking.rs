@@ -35,6 +35,13 @@ pub async fn link_library_scoped(
     selected: Option<&HashSet<String>>,
     editions_only: bool,
 ) -> Result<LinkSummary, String> {
+    link_library_mode(db, market, root, cancel, progress, selected, editions_only, false).await
+}
+
+pub async fn link_library_mode(
+    db: &TursoDb, market: &str, root: &str, cancel: Arc<AtomicBool>, progress: impl Fn(String),
+    selected: Option<&HashSet<String>>, editions_only: bool, cached_only: bool,
+) -> Result<LinkSummary, String> {
     let conn = db.connect()?;
     let general = db.get_settings().await?["general"].clone();
     let include_unofficial = general["recommend_bootlegs"].as_bool().unwrap_or(false);
@@ -289,6 +296,9 @@ pub async fn link_library_scoped(
             }
         }
 
+        // A local repair must never trigger network requests or erase a prior choice
+        // when the catalogue lacks any candidate's full track list.
+        if cached_only && (candidate_releases.is_empty() || candidate_releases.iter().any(|r| !r.tracks_loaded)) { continue; }
         if candidate_releases.is_empty() {
             // Unmatched
             for track in group_tracks.iter().filter(|t| eligible.contains(&t.path)) {
@@ -371,8 +381,10 @@ pub async fn link_library_scoped(
                     .filter(|t| t.disc_number == track.disc_number)
                     .count() as u32;
                 let remote_discs = rel.tracks.iter().map(|t| t.disc_number).max().unwrap_or(1);
-                if (total >= track.track_number && total > 0 && remote_total != total)
-                    || (discs >= track.disc_number && discs > 0 && remote_discs != discs)
+                let minimum_tracks = group_tracks.iter().filter(|t| t.disc_number == track.disc_number).map(|t| t.track_number).max().unwrap_or(0);
+                let minimum_discs = group_tracks.iter().map(|t| t.disc_number).max().unwrap_or(1);
+                if (total >= minimum_tracks && total > 0 && remote_total != total)
+                    || (discs >= minimum_discs && discs > 0 && remote_discs != discs)
                 {
                     res.compatible = false;
                     res.conflicts
