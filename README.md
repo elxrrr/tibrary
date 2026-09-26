@@ -160,3 +160,5 @@ Closing the window or choosing Quit while downloading asks whether to keep downl
 Compilation placeholders such as “Various artists” stay out of the artist inbox and bulk artist matching; their individual file and release links remain intact. Refresh progress uses completed-artist counts, displays small nonzero progress as `<1%`, and shows `Working` until the first artist completes.
 
 Linking recognises both legacy and current file signatures, avoiding unnecessary rechecks of unchanged linked tracks. Activity retains each checked track’s link/review/unmatched outcome. The header task indicator opens Activity and includes the current work details; MQA audit is under Update library.
+
+Folder previews identify moves, renames, or both, with separate before/after folder and filename evidence. The default layout avoids appending a year already present at the end of the album tag. Downloads & files keeps destination, layout and audio options together. Missing releases uses linked artist IDs, excluding unrelated catalogues retained from searches.

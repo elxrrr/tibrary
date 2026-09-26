@@ -1308,7 +1308,7 @@ async fn handle_rpc_uncached(
                 let file = file_index.get(plan.path.as_str())?;
                 let description = if plan.target.is_some() { "Move or rename file to match its tags" } else { "Standardise local tags" };
                 Some(json!({"id":plan.path,"path":plan.path,"artist":plan.artist,"release":plan.album,"title":plan.title,
-                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"evidence":if plan.issues.is_empty() { description.to_string() } else { plan.issues.join("; ") },
+                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"folder_operation":crate::organisation::folder_operation(&plan.path, plan.target.as_deref()),"evidence":if plan.issues.is_empty() { description.to_string() } else { plan.issues.join("; ") },
                     "affected":!plan.changes.is_empty() || plan.target.is_some(),"status":if plan.changes.is_empty() && plan.target.is_none() { "Needs review" } else { "Needs update" },"size":file.size,"mtime":file.mtime,
                     "item":{"path":plan.path,"target":plan.target,"tags":plan.changes}}))
             }).collect();
@@ -1320,7 +1320,7 @@ async fn handle_rpc_uncached(
                 }
                 let tags = workflows::extract_tags_map(&file.metadata);
                 rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),
-                    "release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":{},"target":null,
+                    "release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":{},"target":null,"folder_operation":"No change",
                     "affected":false,"status":"No change","evidence":"No changes needed for this operation"}));
             }
             state.previews.lock().unwrap().insert(preview_id.clone(), json!({"id":preview_id,

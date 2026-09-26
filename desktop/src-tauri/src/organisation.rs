@@ -53,6 +53,18 @@ pub fn safe_component(value: &str, _final_part: bool) -> Result<String, String> 
     Ok(result)
 }
 
+pub fn folder_operation(source: &str, target: Option<&str>) -> &'static str {
+    let Some(target) = target else { return "No change"; };
+    let source = Path::new(source);
+    let target = Path::new(target);
+    match (source.parent() != target.parent(), source.file_name() != target.file_name()) {
+        (true, true) => "Move and rename file",
+        (true, false) => "Move file",
+        (false, true) => "Rename file",
+        _ => "No change",
+    }
+}
+
 pub fn format_layout(
     root: &Path,
     tags: &HashMap<String, String>,
@@ -111,6 +123,10 @@ pub fn format_layout(
     for (i, part) in parts.iter().enumerate() {
         let is_last = i == parts.len() - 1;
         let mut part_str = part.to_string();
+        // The album tag remains untouched; do not append the same year twice.
+        if !year.is_empty() && album.trim_end().ends_with(&format!("({year})")) {
+            part_str = part_str.replace("{album} ({year})", "{album}");
+        }
 
         if !disc_relevant && part_str.contains("{disc}") {
             continue;
@@ -132,6 +148,8 @@ pub fn format_layout(
 
         part_str = part_str
             .replace("{albumartist}", artist)
+            .replace("{artist}", tags.get("artist").map(String::as_str).unwrap_or(artist))
+            .replace("{discnumber}", &format!("{disc_num:02}"))
             .replace("{album}", album)
             .replace("{title}", title)
             .replace("{year}", year)
@@ -197,6 +215,23 @@ mod tests {
             path,
             PathBuf::from("/Music/Queen/A Night at the Opera (1975)/11 - Bohemian Rhapsody.flac")
         );
+    }
+
+    #[test]
+    fn folder_operations_describe_actual_changes() {
+        assert_eq!(folder_operation("/a/old.flac", Some("/b/new.flac")), "Move and rename file");
+        assert_eq!(folder_operation("/a/song.flac", Some("/b/song.flac")), "Move file");
+        assert_eq!(folder_operation("/a/old.flac", Some("/a/new.flac")), "Rename file");
+        assert_eq!(folder_operation("/a/song.flac", None), "No change");
+    }
+
+    #[test]
+    fn album_year_suffix_is_not_duplicated() {
+        let mut tags = HashMap::from([("albumartist".into(), "Elohim".into()), ("album".into(), "Elohim (2016)".into()), ("date".into(), "2016-05-20".into()), ("title".into(), "Song".into())]);
+        let path = format_layout(Path::new("/Music"), &tags, None, "flac").unwrap();
+        assert_eq!(path, PathBuf::from("/Music/Elohim/Elohim (2016)/01 - Song.flac"));
+        tags.insert("date".into(), "2020".into());
+        assert!(format_layout(Path::new("/Music"), &tags, None, "flac").unwrap().to_string_lossy().contains("Elohim (2016) (2020)"));
     }
 
     #[test]

@@ -1347,7 +1347,7 @@ pub async fn execute(
         let plans = workflows::plan_cached(db, &indexed, action, template).await?;
         let rows:Vec<Value>=plans.into_iter().filter(|p|ids.is_empty()||ids.contains(&p.path)).map(|p| {
             let f=indexed.iter().find(|f|f.path==p.path).unwrap();
-            json!({"id":p.path,"path":p.path,"artist":p.artist,"release":p.album,"title":p.title,"tags":p.current_tags,"changes":p.changes,"target":p.target,"evidence":p.issues.join("; "),"affected":!p.changes.is_empty() || p.target.is_some(),"status":"Needs update","size":f.size,"mtime":f.mtime,"item":{"path":p.path,"target":p.target,"tags":p.changes}})
+            json!({"id":p.path,"path":p.path,"artist":p.artist,"release":p.album,"title":p.title,"tags":p.current_tags,"changes":p.changes,"target":p.target,"folder_operation":crate::organisation::folder_operation(&p.path, p.target.as_deref()),"evidence":p.issues.join("; "),"affected":!p.changes.is_empty() || p.target.is_some(),"status":"Needs update","size":f.size,"mtime":f.mtime,"item":{"path":p.path,"target":p.target,"tags":p.changes}})
         }).collect();
         let id = uuid::Uuid::new_v4().to_string();
         state.previews.lock().unwrap().insert(id.clone(),json!({"id":id,"created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":rows.len()}));

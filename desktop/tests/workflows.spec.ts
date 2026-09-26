@@ -95,7 +95,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     "Settings",
     "General",
     "Connections",
-    "Downloads",
+    "Downloads & files",
     "Activity",
   ]) {
     await page
@@ -233,7 +233,7 @@ test("dark settings fit a full window and retain defaults", async ({
   await page.goto("/");
   await page
     .locator("aside")
-    .getByRole("button", { name: "Downloads", exact: true })
+    .getByRole("button", { name: "Downloads & files", exact: true })
     .click();
   await expect(
     page.getByRole("heading", { name: "Download & files", exact: true }),

@@ -99,7 +99,7 @@ const groups = [
     items: [
       ["general", "General", SlidersHorizontal],
       ["connections", "Connections", Link],
-      ["downloads", "Downloads", ArrowDownToLine],
+      ["downloads", "Downloads & files", ArrowDownToLine],
       ["activity", "Activity", Activity],
     ],
   },
@@ -578,7 +578,7 @@ function App() {
       } else if (route === "local" || route === "online") {
         setDetail({operation: row});
       } else if (row.path || route === "links") {
-        setDetail({...await call("detail", { root, path: row.path || row.id }), proposed: row.changes, folder_target: route === "organise" ? row.target : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
+        setDetail({...await call("detail", { root, path: row.path || row.id }), proposed: row.changes, folder_target: route === "organise" ? (row.target || row.path || row.id) : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
       }
     } catch (e) {
       notifyError(e);
@@ -712,7 +712,7 @@ function App() {
         : route === "organise"
           ? [
               ...fileColumns.slice(0, 3),
-              { key: "changes", label: "Folder operation" },
+              { key: "folder_operation", label: "Folder operation" },
               { key: "target", label: "Destination" },
               { key: "evidence", label: "Evidence" },
             ]
@@ -1792,7 +1792,7 @@ function App() {
     return (
       <>
         <section className="card">
-          <h2>Download folder & structure</h2>
+          <h2>Downloads & files</h2>
           <p>
 
           </p>
@@ -1828,30 +1828,10 @@ function App() {
           {field("Folder template", "organisation", "template")}
           <details>
             <summary>Template reference & tag variables</summary>
-            <div className="tokens">
-              {[
-                "albumartist",
-                "artist",
-                "album",
-                "year",
-                "disc",
-                "discnumber",
-                "disc_prefix",
-                "tracknumber",
-                "title",
-              ].map((t) => (
-                <code key={t}>{"{" + t + "}"}</code>
-              ))}
-            </div>
-            <p>
-              Default: Album artist / Release (Year) / Disc (when needed) /
-              Track number - Title. Accents and hyphens are preserved; unsafe
-              path punctuation is normalised.
-            </p>
+            <p>Default: <code>{"{albumartist}/{album} ({year})/{disc}/{disc_prefix}{tracknumber} - {title}"}</code></p>
+            <p>Extra: <code>{"{artist}"}</code> <code>{"{discnumber}"}</code></p>
           </details>
-        </section>
-        <section className="card">
-          <h2>Download & files</h2>
+          <h3>Audio and file options</h3>
           {field("Audio quality", "downloads", "quality", [
             { value: "HI_RES_LOSSLESS", label: "FLAC (24/192khz)" },
             { value: "LOSSLESS", label: "FLAC (16/44.1khz)" },
@@ -2178,7 +2158,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.17 · build 17</span>
+          <span className="sidebar-version">v0.9.0-beta.18 · build 18</span>
         </div>
       </aside>
       <main>
@@ -2305,7 +2285,7 @@ function App() {
                     Show in Finder
                   </button>
                 </div>
-                {detail.folder_target && <section className="metadata-source"><h3>Proposed folder layout</h3><p>{detail.folder_evidence}</p><dl><dt>Current path</dt><dd>{detail.path}</dd><dt>Proposed path</dt><dd>{detail.folder_target}</dd></dl><p>Only the file location changes. Tags remain unchanged.</p></section>}
+                {detail.folder_target && <section className="metadata-source"><h3>Proposed folder layout</h3><p>{detail.folder_evidence}</p><dl><dt>Current path</dt><dd>{detail.path}</dd><dt>Proposed path</dt><dd>{detail.folder_target}</dd></dl><p>{detail.folder_target === detail.path ? "This file already follows the saved folder template. No change is proposed." : "Only the file location or filename changes. Tags remain unchanged."}</p></section>}
                 {detail.proposed && Object.keys(detail.proposed).length > 0 && <section><h3>Proposed changes</h3>
                   {detail.source_release_id && <p>Online source · Release {detail.source_release_id} · Track {detail.source_track_id}</p>}
                   <TagChanges changes={detail.proposed} current={detail.tags}/></section>}

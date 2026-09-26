@@ -287,12 +287,11 @@ pub fn plan_workflow(
                     if target_str.nfc().collect::<String>().to_lowercase() != row.path.nfc().collect::<String>().to_lowercase() {
                         let source = Path::new(&row.path).strip_prefix(&row.root).unwrap_or(Path::new(&row.path));
                         let destination = target_path.strip_prefix(&row.root).unwrap_or(&target_path);
-                        let old: Vec<_> = source.components().map(|p| p.as_os_str().to_string_lossy().to_string()).collect();
-                        let new: Vec<_> = destination.components().map(|p| p.as_os_str().to_string_lossy().to_string()).collect();
-                        for i in 0..old.len().max(new.len()) {
-                            let before = old.get(i).map(String::as_str).unwrap_or("(none)");
-                            let after = new.get(i).map(String::as_str).unwrap_or("(none)");
-                            if before != after { issues.push(format!("{}: {} → {}", if i == 0 { "Album artist folder" } else if i == 1 { "Release folder" } else if i + 1 == new.len() { "Filename" } else { "Disc folder" }, before, after)); }
+                        if source.parent() != destination.parent() {
+                            issues.push(format!("Folder: {} → {}", source.parent().unwrap_or(Path::new("")).display(), destination.parent().unwrap_or(Path::new("")).display()));
+                        }
+                        if source.file_name() != destination.file_name() {
+                            issues.push(format!("Filename: {} → {}", source.file_name().unwrap_or_default().to_string_lossy(), destination.file_name().unwrap_or_default().to_string_lossy()));
                         }
                         target = Some(target_str);
                     }

@@ -1468,6 +1468,8 @@ impl TursoDb {
             }
         }
 
+        // Exploratory search caches are not subscriptions to an artist's releases.
+        let linked_artists: HashSet<String> = self.get_linked_artist_ids().await?.into_iter().collect();
         // 3. Load catalogue
         let mut cat_stmt = conn
             .query(
@@ -1501,6 +1503,9 @@ impl TursoDb {
         let mut full_releases: HashMap<String, crate::tidal::TidalRelease> = HashMap::new();
 
         while let Some(row) = cat_stmt.next().await.map_err(|e| e.to_string())? {
+            let artist_id: String = row.get(0).map_err(|e|e.to_string())?;
+            if !linked_artists.contains(&artist_id) { continue; }
+
             let payload_str: Option<String> = row.get(1).ok().flatten();
             let payload = match payload_str
                 .as_deref()
@@ -3747,6 +3752,7 @@ mod tests {
         let link =
             serde_json::json!({"status":"linked","ids":{"track_id":"anchor","album_id":"owned"}});
         conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES('/music/song.flac','GB','[0,0,10,20]',?)", (link.to_string(),)).await.unwrap();
+        conn.execute("INSERT OR IGNORE INTO mappings(artist,tidal_id,status) SELECT artist_id,artist_id,'confirmed' FROM catalogue", ()).await.unwrap();
         let rows = store.build_missing_rows("GB").await.unwrap();
         let row = rows.iter().find(|row| row.id == "new").unwrap();
         assert_eq!(row.recommendation, "Recommended");
@@ -4299,6 +4305,10 @@ with sqlite3.connect('{db}') as db:
         ).await.expect("Insert queue failed");
 
         // Query missing rows
+        conn.execute("INSERT OR IGNORE INTO mappings(artist,tidal_id,status) SELECT artist_id,artist_id,'confirmed' FROM catalogue", ()).await.unwrap();
+        // Cached search candidates must not become artists in Missing releases.
+        let unrelated = json!({"name":"Alabama","releases":[{"id":"unrelated","title":"Unrelated album","artist":"Alabama","date":"2020-01-01","type":"ALBUM","track_count":1}]});
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES ('unmapped-search','GB',?)", (unrelated.to_string(),)).await.unwrap();
         let page = store
             .get_missing_rows("GB", None, None, None, None, None, None, None, 0, 10)
             .await
@@ -4817,6 +4827,7 @@ with sqlite3.connect('{db}') as db:
         .await
         .unwrap();
 
+        conn.execute("INSERT OR IGNORE INTO mappings(artist,tidal_id,status) SELECT artist_id,artist_id,'confirmed' FROM catalogue", ()).await.unwrap();
         let page = store
             .get_missing_rows("GB", None, None, None, None, None, None, None, 0, 10)
             .await
@@ -4855,6 +4866,7 @@ with sqlite3.connect('{db}') as db:
         )
         .await
         .unwrap();
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES ('Klur','klur','confirmed')", ()).await.unwrap();
         let all = store
             .get_missing_rows(
                 "GB",
