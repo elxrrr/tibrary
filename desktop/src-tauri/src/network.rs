@@ -496,3 +496,59 @@ async fn live_album_credits_comparison() {
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "Read-only subscriber catalogue capability probe; four bounded GETs"]
+async fn live_subscriber_catalogue_capabilities() {
+    let dir =
+        std::env::temp_dir().join(format!("subscriber-capabilities-{}", uuid::Uuid::new_v4()));
+    let db = crate::db::TursoDb::open(dir.join("db")).await.unwrap();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let token = crate::stream_download::get_valid_token(&db, &http)
+        .await
+        .unwrap();
+    let mut artist = None;
+    for id in ["234657671", "140303440"] {
+        let response = get(
+            http.get(format!("https://api.tidal.com/v1/albums/{id}"))
+                .query(&[("countryCode", "GB")])
+                .bearer_auth(&token),
+            Duration::from_millis(350),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        let data: serde_json::Value = response.json().await.unwrap();
+        println!(
+            "album={id} {}",
+            serde_json::json!({"title":data["title"],"allowStreaming":data["allowStreaming"],"streamReady":data["streamReady"],"djReady":data["djReady"],"numberOfTracks":data["numberOfTracks"],"numberOfVideos":data["numberOfVideos"],"genre":data["genre"],"genres":data["genres"],"replacement":data["replacement"],"replacementId":data["replacementId"],"keys":data.as_object().unwrap().keys().collect::<Vec<_>>()})
+        );
+        if artist.is_none() {
+            artist = data["artist"]["id"].as_u64();
+        }
+    }
+    let artist = artist.unwrap();
+    for filter in ["", "EPSANDSINGLES"] {
+        let mut request = http
+            .get(format!("https://api.tidal.com/v1/artists/{artist}/albums"))
+            .query(&[("countryCode", "GB"), ("limit", "100"), ("offset", "0")])
+            .bearer_auth(&token);
+        if !filter.is_empty() {
+            request = request.query(&[("filter", filter)]);
+        }
+        let response = get(request, Duration::from_millis(350), 2, None)
+            .await
+            .unwrap();
+        let status = response.status();
+        let data: serde_json::Value = response.json().await.unwrap();
+        println!("artist={artist} filter={filter:?} HTTP={status} total={} returned={} availability_fields={}",data["totalNumberOfItems"],data["items"].as_array().map_or(0,Vec::len),data["items"].as_array().into_iter().flatten().filter(|r|r["allowStreaming"].is_boolean()).count());
+    }
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
