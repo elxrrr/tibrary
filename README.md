@@ -23,7 +23,7 @@
 
 By pairing your local albums and tracks with their streaming counterparts, Tibrary can fill available metadata—including release dates, artwork, disc numbers, Camelot keys and BPM. It also caches track credits, with contributor names and roles, to support release matching and recommendations. Availability depends on what the provider returns; missing credits never become invented metadata.
 
-Artist match details show local recordings and support targeted recording checks when Album Artist is incorrect. These checks use the provider's [ISRC lookup](https://tidal-music.github.io/tidal-api-reference/) and cached results, then require matching titles, durations, release totals and positions. Recording links never rewrite artist identities or file tags. Folder previews explain invisible whitespace changes explicitly.
+Artist match details show local recordings and support targeted recording checks when Album Artist is incorrect. These checks use the provider's [ISRC lookup](https://tidal-music.github.io/tidal-api-reference/) and cached results, then require matching titles, durations, release totals and positions. Recording links never rewrite artist identities or file tags. Folder previews explain invisible whitespace changes explicitly and show current/proposed paths in the final confirmation. Matching unresolved artists skips confirmed and automatically matched identities; each checked artist records a link or review outcome in Activity.
 
 Folder previews clean tag whitespace before adding template separators, preserve literal title parentheses, and flag conflicting release years for review instead of splitting an album between folders.
 

@@ -2158,7 +2158,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.20 · build 20</span>
+          <span className="sidebar-version">v0.9.0-beta.21 · build 21</span>
         </div>
       </aside>
       <main>
@@ -2574,7 +2574,11 @@ function App() {
                       </p>
                     </>
                   ) : (
-                    <><p>{r.path || r.target}</p>{r.changes && <TagChanges changes={r.changes} current={r.tags}/>}</>
+                    review.operation === "organise" ? <section className="metadata-source">
+                      <dl><dt>Current path</dt><dd style={{whiteSpace:"break-spaces",overflowWrap:"anywhere"}}>{r.path}</dd>
+                      <dt>Proposed path</dt><dd style={{whiteSpace:"break-spaces",overflowWrap:"anywhere"}}>{r.target || r.path}</dd></dl>
+                      <small>File tags stay unchanged.</small>
+                    </section> : <><p>{r.path || r.target}</p>{r.changes && Object.keys(r.changes).length > 0 && <TagChanges changes={r.changes} current={r.tags}/>}</>
                   )}
                   {r.source_release_id && <p>Online source · Release {r.source_release_id} · Track {r.source_track_id}</p>}
                   {r.evidence && <small style={{ display: "block", marginTop: "4px" }}>{readable(r.evidence)}</small>}

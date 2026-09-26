@@ -1010,15 +1010,20 @@ pub async fn execute(
         let page = db
             .get_artist_rows(Some(root), None, None, None, None, 0, usize::MAX)
             .await?;
+        let pending: Vec<_> = page.rows.into_iter().filter(|artist| {
+            let name = artist["artist"].as_str().unwrap_or("");
+            !name.is_empty() && if selected.is_empty() { artist["resolved"] != true } else { selected.contains(name) }
+        }).collect();
+        if pending.is_empty() { return Ok(json!({"checked":0})); }
         let mut client = crate::tidal::TidalClient::from_db(db).await?;
         let conn = db.connect()?;
         let mut checked = 0;
-        for artist in page.rows {
+        for artist in pending {
             let name = artist["artist"].as_str().unwrap_or("");
             if name.is_empty()
                 || (!selected.is_empty() && !selected.contains(name))
                 || (selected.is_empty()
-                    && matches!(artist["status"].as_str(), Some("confirmed" | "auto")))
+                    && artist["resolved"] == true)
             {
                 continue;
             }
@@ -1056,6 +1061,10 @@ pub async fn execute(
             for candidate in candidates {
                 if cancel.load(Ordering::Relaxed) {
                     break;
+                }
+                if crate::matching::name_key(name) != crate::matching::name_key(&candidate.name) {
+                    scores.push(json!({"id":candidate.id,"name":candidate.name,"score":0,"evidence":"Artist name differs; manual review required"}));
+                    continue;
                 }
                 let cache_key = format!("artist-evidence:{market}:{}", candidate.id);
                 let cat: crate::tidal::TidalCatalogue =
@@ -1116,13 +1125,13 @@ pub async fn execute(
                 db.choose_artist(name, &accepted).await?;
             }
             checked += 1;
-            state.progress_for(
-                kind,
-                &format!(
-                    "Artist checked · {name} · {} supported matches",
-                    accepted.len()
-                ),
-            );
+            let outcome = if accepted.is_empty() {
+                format!("Needs review · {name} · no release-title evidence for an exact artist name; use match details to inspect candidates or check recording links")
+            } else {
+                format!("Artist linked · {name} · {} supported artist IDs saved", accepted.len())
+            };
+            state.log_with_category(&outcome, "info", Some("online"));
+            state.progress_for(kind, &outcome);
         }
         return Ok(json!({"checked":checked}));
     }

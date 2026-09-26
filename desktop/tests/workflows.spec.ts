@@ -540,6 +540,9 @@ test("organise files previews and applies only to the disposable library", async
   await page.getByRole("checkbox",{name:"Select visible rows"}).check();
   await page.getByRole("button",{name:/Review & apply/}).click();
   await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByRole("dialog")).toContainText("Current path");
+  await expect(page.getByRole("dialog")).toContainText("Proposed path");
+  await expect(page.getByRole("dialog").getByRole("columnheader",{name:"Tag",exact:true})).toHaveCount(0);
   await page.getByRole("button",{name:"Confirm & continue"}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
   const indexed = await rpc("table", {route:"files",root:join(folder,"music"),limit:20});
@@ -604,4 +607,14 @@ test("artist context menu opens legacy candidates and local recordings", async (
   await page.getByRole("button",{name:"Add ID",exact:true}).first().click();
   await expect(page.getByRole("dialog").getByRole("textbox")).toHaveValue("900001");
   await expect(page.getByRole("button",{name:"Check these recording links"})).toBeEnabled();
+});
+
+
+test("match unresolved artists skips confirmed artists without network work", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link artists",exact:true}).click();
+  await page.getByRole("button",{name:"Match unresolved artists",exact:true}).click();
+  await expect.poll(async () => (await rpc("job.status")).result?.online_job?.status).toBe("complete");
+  const status = await rpc("job.status");
+  expect(status.result.online_job.result.checked).toBe(0);
 });

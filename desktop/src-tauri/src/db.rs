@@ -3148,6 +3148,7 @@ impl TursoDb {
                 "tracks": tracks,
                 "release": releases,
                 "status": display_status,
+                "resolved": !online_id.is_empty() && matches!(raw_status.to_lowercase().as_str(), "confirmed" | "auto"),
                 "online_id": online_id,
                 "evidence": clean_evidence,
             }));
@@ -4750,6 +4751,8 @@ with sqlite3.connect('{db}') as db:
             .await
             .unwrap();
         assert_eq!(matched_page.total, 2); // The Beatles and Radiohead
+        assert!(matched_page.rows.iter().all(|row| row["resolved"] == true));
+        assert!(unresolved_page.rows.iter().all(|row| row["resolved"] == false));
 
         // 4. Review filter (candidate/ambiguous or confirm identity)
         let review_page = store
