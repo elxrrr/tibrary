@@ -189,7 +189,7 @@ pub async fn link_library_mode(
                 let stamp: String = row.get(1).unwrap_or_default();
                 (
                     serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null),
-                    serde_json::from_str::<Value>(&stamp).ok() == Some(json!([0, 0, size, mtime])),
+                    crate::db::link_stamp_matches(&stamp, size, mtime),
                 )
             } else {
                 (Value::Null, false)
@@ -261,7 +261,7 @@ pub async fn link_library_mode(
         ..Default::default()
     };
 
-    let group_count = groups.len();
+    let group_count = groups.values().filter(|tracks| tracks.iter().any(|t| eligible.contains(&t.path))).count();
     let mut group_idx = 0;
 
     for ((art_key, alb_key, _folder), group_tracks) in groups {
@@ -273,12 +273,7 @@ pub async fn link_library_mode(
             continue;
         }
         group_idx += 1;
-        if group_idx % 5 == 0 || group_idx == group_count {
-            progress(format!(
-                "Linking releases · {}/{} albums",
-                group_idx, group_count
-            ));
-        }
+        progress(format!("Checking release · {}/{} releases · {} — {} · {} local tracks · cached candidates first", group_idx, group_count, group_tracks[0].artist, group_tracks[0].album, group_tracks.len()));
 
         // Look up online releases for this artist
         let mut candidate_releases = Vec::new();
@@ -326,10 +321,11 @@ pub async fn link_library_mode(
                     .cloned()
                     .unwrap_or_else(|| "[]".to_string());
                 let payload_str = payload.to_string();
-                let _ = conn.execute(
+                conn.execute(
                     "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
                     (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                ).await;
+                ).await.map_err(|e| format!("Could not save track link: {e}"))?;
+                progress(format!("Unmatched · {}/{} tracks checked · {} — {} · {} · no release in linked artist cache", summary.linked + summary.review + summary.unmatched, total, track.artist, track.title, track.album));
             }
             continue;
         }
@@ -340,7 +336,7 @@ pub async fn link_library_mode(
                 return Ok(summary);
             }
             if !release.tracks_loaded {
-                progress(format!("Loading release details · {}", release.title));
+                progress(format!("Loading release details · {group_idx}/{group_count} releases · {} — {} · release ID {}", release.artist, release.title, release.id));
                 let details = crate::actions::release(db, &release.id, market, false).await?;
                 *release = serde_json::from_value(details).map_err(|e| e.to_string())?;
             }
@@ -501,10 +497,10 @@ pub async fn link_library_mode(
                     }
                     payload["catalogue_options"] = json!(scored_candidates.iter().filter_map(|(r,s)|s.alignments.get(&track.path).map(|a|json!({"id":r.id,"title":r.title,"track_id":a.remote_track_id,"tracks":r.track_count,"artist":r.artist,"album":r.title,"position_label":format!("Disc {} · Track {}/{}",a.disc_number,a.track_number,r.track_count),"evidence":({let mut reasons=s.conflicts.clone(); if credit_scores[&r.id]>0 { reasons.push(format!("{} shared local contributor credits support this release",credit_scores[&r.id])); } reasons.join("; ")}),"structure":{"compatible":s.compatible,"reasons":s.conflicts},"compatible":s.compatible}))).collect::<Vec<_>>());
                     let payload_str = payload.to_string();
-                    let _ = conn.execute(
+                    conn.execute(
                         "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
                         (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                    ).await;
+                    ).await.map_err(|e| format!("Could not save track link: {e}"))?;
                 } else {
                     summary.review += 1;
                     let payload = json!({
@@ -514,10 +510,10 @@ pub async fn link_library_mode(
                         "checked_at": chrono::Utc::now().timestamp(),
                     });
                     let payload_str = payload.to_string();
-                    let _ = conn.execute(
+                    conn.execute(
                         "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
                         (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                    ).await;
+                    ).await.map_err(|e| format!("Could not save track link: {e}"))?;
                 }
             }
         } else {
@@ -533,10 +529,19 @@ pub async fn link_library_mode(
                     .cloned()
                     .unwrap_or_else(|| "[]".to_string());
                 let payload_str = payload.to_string();
-                let _ = conn.execute(
+                conn.execute(
                     "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
                     (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
-                ).await;
+                ).await.map_err(|e| format!("Could not save track link: {e}"))?;
+            }
+        }
+        for track in group_tracks.iter().filter(|t| eligible.contains(&t.path)) {
+            let mut saved = conn.query("SELECT payload FROM track_links WHERE path=? AND market=?", (track.path.as_str(), market)).await.map_err(|e|e.to_string())?;
+            if let Some(row) = saved.next().await.map_err(|e|e.to_string())? {
+                let raw: String = row.get(0).map_err(|e|e.to_string())?;
+                let result: Value = serde_json::from_str(&raw).map_err(|e|e.to_string())?;
+                let outcome = match result["status"].as_str() { Some("linked") => "Linked", Some("review") => "Needs review", _ => "Unmatched" };
+                progress(format!("{outcome} · {}/{} tracks checked · {} — {} · {} · {}", summary.linked + summary.review + summary.unmatched, total, track.artist, track.title, track.album, result["catalogue_note"].as_str().or(result["note"].as_str()).unwrap_or("Recording checked")));
             }
         }
     }
@@ -635,11 +640,13 @@ mod tests {
         ).await.unwrap();
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let summary = link_library(&store, "GB", "/music", cancel, |_| {})
+        let events = std::sync::Mutex::new(Vec::new());
+        let summary = link_library(&store, "GB", "/music", cancel, |message| events.lock().unwrap().push(message))
             .await
             .unwrap();
 
         assert_eq!(summary.total, 1);
+        assert!(events.lock().unwrap().iter().any(|event| event.starts_with("Linked · 1/1 tracks checked")));
         assert_eq!(summary.linked, 1);
         assert_eq!(summary.unmatched, 0);
 
@@ -663,6 +670,7 @@ mod tests {
             .unwrap()
             .contains("shared local contributor"));
 
+        conn.execute("UPDATE track_links SET stamp='[99,123,100,100,456]' WHERE path='/music/bohemian.flac'", ()).await.unwrap();
         let repeated = link_library(
             &store,
             "GB",

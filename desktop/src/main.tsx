@@ -58,7 +58,6 @@ const groups = [
     items: [
       ["correct", "Correct tags", Tags],
       ["organise", "Organise files", Folder],
-      ["mqa", "MQA audit", ShieldCheck],
       ["local", "Local duplicates", Music2],
     ],
   },
@@ -87,6 +86,7 @@ const groups = [
     name: "Update library",
     icon: Sparkles,
     items: [
+      ["mqa", "MQA audit", ShieldCheck],
       ["metadata", "Add missing tags", Tags],
       ["artwork", "Fix artwork", Image],
       ["online", "Online replacements", RefreshCw],
@@ -2178,7 +2178,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.16 · build 16</span>
+          <span className="sidebar-version">v0.9.0-beta.17 · build 17</span>
         </div>
       </aside>
       <main>
@@ -2187,15 +2187,15 @@ function App() {
             <h1>{titles[route] || "Overview"}</h1>
           </div>
           <div className="header-actions">
-            {[state?.job, state?.online_job, state?.download_job].some(job => active(job) && job?.kind !== "connections") && (
+            {[state?.job, state?.online_job, state?.download_job].some(job => active(job)) && (
               <div className="header-workloads" role="status" aria-live="off">
-                {[state?.job, state?.online_job, state?.download_job].filter(job => active(job) && job?.kind !== "connections").map((job) => {
+                {[state?.job, state?.online_job, state?.download_job].filter(job => active(job)).map((job) => {
                   const progress = workload(job, downloadMonitor, clock);
-                  return <div className="header-workload" key={job!.id} title={job?.message}>
+                  return <button className="header-workload" aria-label={`Show activity: ${jobTitle(job?.kind)}`} key={job!.id} title={job?.message} onClick={() => setRoute("activity")}>
                     <LoaderCircle className="spin" size={13}/>
-                    <span>{jobTitle(job?.kind)} · {compactProgress(progress?.percent)}</span>
+                    <span>{jobTitle(job?.kind)} · {compactProgress(progress?.percent)} · {job?.message}</span>
                     {progress?.percent != null && <span className="header-workload-bar" style={{width: `${progress.percent}%`}}/>}
-                  </div>;
+                  </button>;
                 })}
               </div>
             )}
@@ -2211,25 +2211,7 @@ function App() {
                 </option>
               ))}
             </select>
-            {route !== "activity" && (
-              <button
-                className={
-                  active(state?.job) || active(state?.online_job) || active(state?.download_job) ? "activity-pill running" : "activity-pill"
-                }
-                onClick={() => setRoute("activity")}
-              >
-                {active(state?.job) || active(state?.online_job) || active(state?.download_job) ? (
-                  <LoaderCircle className="spin" size={16} />
-                ) : (
-                  <Activity size={16} />
-                )}{" "}
-                {active(state?.job) || active(state?.online_job) || active(state?.download_job)
-                  ? state?.job?.status === "cancelling" || state?.online_job?.status === "cancelling" || state?.download_job?.status === "cancelling"
-                    ? "Cancelling…"
-                    : "Working"
-                  : "Activity"}
-              </button>
-            )}
+
           </div>
         </header>
         {error && (

@@ -2061,6 +2061,9 @@ async fn handle_rpc_uncached(
                         "started": started,
                         "result": null
                     });
+                    if ["Linked ·", "Needs review ·", "Unmatched ·"].iter().any(|prefix| msg.starts_with(prefix)) {
+                        backend_prog.log_with_category(&msg, "info", Some("online"));
+                    }
                     backend_prog.update_online_job_progress(&msg, prog_job.clone());
                     if let Some(ref app) = app_prog {
                         let _ = app.emit(

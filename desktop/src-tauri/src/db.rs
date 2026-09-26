@@ -522,19 +522,11 @@ impl TursoDb {
 
             let mut has_link = false;
             if let Some((stamp_str, payload_str)) = saved_links.get(&path) {
-                if let (Ok(stamp_json), Ok(payload_json)) = (
+                if let (Ok(_stamp_json), Ok(payload_json)) = (
                     serde_json::from_str::<Value>(stamp_str),
                     serde_json::from_str::<Value>(payload_str),
                 ) {
-                    let stamp_matches = match stamp_json.as_array() {
-                        Some(arr) if arr.len() >= 4 => {
-                            arr[2].as_i64() == Some(size) && arr[3].as_i64() == Some(mtime)
-                        }
-                        Some(arr) if arr.len() >= 2 => {
-                            arr[0].as_i64() == Some(size) && arr[1].as_i64() == Some(mtime)
-                        }
-                        _ => false,
-                    };
+                    let stamp_matches = link_stamp_matches(stamp_str, size, mtime);
                     if stamp_matches
                         && !matches!(
                             payload_json["status"].as_str(),
@@ -1445,8 +1437,7 @@ impl TursoDb {
                     let size: i64 = row.get(3).unwrap_or_default();
                     let mtime: i64 = row.get(4).unwrap_or_default();
                     let current = row.get::<i64>(5).unwrap_or(0) == 1
-                        && serde_json::from_str::<Value>(&stamp).ok()
-                            == Some(json!([0, 0, size, mtime]));
+                        && link_stamp_matches(&stamp, size, mtime);
                     if current && (payload["status"] == "linked" || payload["status"].is_null()) {
                         if let Some(artist) = serde_json::from_str::<Value>(&metadata)
                             .ok()
@@ -3715,6 +3706,12 @@ fn extract_tag_f64(val: &Value, keys: &[&str]) -> Option<f64> {
         }
     }
     None
+}
+
+pub fn link_stamp_matches(raw: &str, size: i64, mtime: i64) -> bool {
+    let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(raw) else { return false; };
+    let offset = if parts.len() >= 4 { 2 } else if parts.len() == 2 { 0 } else { return false; };
+    parts[offset].as_i64() == Some(size) && parts[offset + 1].as_i64() == Some(mtime)
 }
 
 fn is_compilation_artist(artist: &str) -> bool {

@@ -158,3 +158,5 @@ Closing the window or choosing Quit while downloading asks whether to keep downl
 - Catalogue refreshes show the current artist, market and scope in Activity. Progress is saved after each artist. Interrupted refreshes resume when the app next opens; explicit cancellation stays cancelled. **Resume refresh** continues a stopped or failed refresh using its saved scope. Local file changes and downloads are not automatically replayed.
 
 Compilation placeholders such as “Various artists” stay out of the artist inbox and bulk artist matching; their individual file and release links remain intact. Refresh progress uses completed-artist counts, displays small nonzero progress as `<1%`, and shows `Working` until the first artist completes.
+
+Linking recognises both legacy and current file signatures, avoiding unnecessary rechecks of unchanged linked tracks. Activity retains each checked track’s link/review/unmatched outcome. The header task indicator opens Activity and includes the current work details; MQA audit is under Update library.

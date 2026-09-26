@@ -304,7 +304,7 @@ main {
   max-width: 70%;
 }
 .header-workloads { display: flex; gap: 7px; min-width: 0; }
-.header-workload { position: relative; overflow: hidden; display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border-radius: 8px; background: var(--accent-soft); color: var(--text); font-size: 11px; white-space: nowrap; max-width: 330px; }
+.header-workload { position: relative; overflow: hidden; display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border-radius: 8px; background: var(--accent-soft); color: var(--text); font-size: 11px; white-space: nowrap; max-width: min(42vw, 560px); }
 .header-workload > span:not(.header-workload-bar) { overflow: hidden; text-overflow: ellipsis; }
 .header-workload-bar { position: absolute; height: 2px; bottom: 0; left: 0; background: var(--accent); transition: width .3s ease; }
 .header-actions select {
