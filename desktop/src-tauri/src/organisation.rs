@@ -5,32 +5,33 @@ use unicode_normalization::UnicodeNormalization;
 pub const DEFAULT_LAYOUT: &str =
     "{albumartist}/{album} ({year})/{disc}/{disc_prefix}{tracknumber} - {title}";
 
-pub fn safe_component(value: &str, _final_part: bool) -> Result<String, String> {
-    if value.trim().is_empty() {
-        return Err("Component is empty".to_string());
-    }
-
-    // Strip/replace illegal filename characters
-    let mut cleaned = String::with_capacity(value.len());
-    let mut after_separator = false;
+// Clean tag text before adding template punctuation. Separators only join content;
+// they must not produce a dangling dash at a tag or bracket boundary.
+fn clean_tag(value: &str) -> String {
+    let mut out = String::new();
+    let mut separator = false;
     for c in value.chars() {
-        if after_separator && c.is_whitespace() { continue; }
-        after_separator = false;
         match c {
-            '/' | '\\' | ':' | '|' => {
-                while cleaned.ends_with(char::is_whitespace) { cleaned.pop(); }
-                if !cleaned.ends_with(" -") && !cleaned.is_empty() { cleaned.push_str(" -"); }
-                if !cleaned.is_empty() { cleaned.push(' '); }
-                after_separator = true;
-            }
-            '*' | '?' | '"' | '<' | '>' | '\0'..='\x1f' | '\x7f' => {
-                // skip illegal characters
-            }
-            _ => cleaned.push(c),
+            '/' | '\\' | ':' | '|' => { separator = true; continue; }
+            '<' | '>' | '*' | '?' | '"' | '\0'..='\x1f' | '\x7f' => continue,
+            _ => {}
         }
+        if separator && c.is_whitespace() { continue; }
+        if separator {
+            while out.ends_with(char::is_whitespace) { out.pop(); }
+            if !out.is_empty() && !out.ends_with(['(', '[', '{']) && ![')', ']', '}'].contains(&c) {
+                if !out.ends_with('-') { out.push_str(" -"); }
+                out.push(' ');
+            }
+            separator = false;
+        }
+        out.push(c);
     }
+    out.split_whitespace().collect::<Vec<_>>().join(" ").nfc().collect()
+}
 
-    let mut result: String = cleaned.trim().nfc().collect();
+pub fn safe_component(value: &str, _final_part: bool) -> Result<String, String> {
+    let mut result = clean_tag(value);
 
     // Strip trailing spaces and dots
     // Windows disallows trailing dots/spaces on directories as well as files.
@@ -117,6 +118,12 @@ pub fn format_layout(
 
     let disc_relevant = disc_total > 1 || disc_num > 1;
 
+    let artist = clean_tag(artist);
+    let album = clean_tag(album);
+    let title = clean_tag(title);
+    if artist.is_empty() || album.is_empty() || title.is_empty() {
+        return Err("Artist, release or title produces an empty filename after removing unsafe characters".into());
+    }
     let parts: Vec<&str> = tpl.split('/').collect();
     let mut resolved_path = root.to_path_buf();
 
@@ -146,19 +153,20 @@ pub fn format_layout(
 
         let track_str = format!("{:02}", track_num);
 
+        if year.is_empty() { part_str = part_str.replace(" ({year})", ""); }
         part_str = part_str
-            .replace("{albumartist}", artist)
-            .replace("{artist}", tags.get("artist").map(String::as_str).unwrap_or(artist))
+            .replace("{albumartist}", &artist)
+            .replace("{artist}", tags.get("artist").map(String::as_str).unwrap_or(&artist))
             .replace("{discnumber}", &format!("{disc_num:02}"))
-            .replace("{album}", album)
-            .replace("{title}", title)
+            .replace("{album}", &album)
+            .replace("{title}", &title)
             .replace("{year}", year)
             .replace("{disc}", &disc_folder)
             .replace("{disc_prefix}", &disc_prefix)
             .replace("{tracknumber}", &track_str);
 
-        // Clean up empty parentheses e.g. " ()" if year is missing
-        part_str = part_str.replace(" ()", "").trim().to_string();
+        // Trim template whitespace without removing literal punctuation from tags.
+        part_str = part_str.trim().to_string();
 
         let safe = safe_component(&part_str, is_last)?;
         resolved_path.push(safe);
@@ -215,6 +223,23 @@ mod tests {
             path,
             PathBuf::from("/Music/Queen/A Night at the Opera (1975)/11 - Bohemian Rhapsody.flac")
         );
+    }
+
+    #[test]
+    fn real_library_punctuation_preserves_text_without_extra_spaces_or_dashes() {
+        for (tag, expected) in [
+            ("> album title goes here <", "album title goes here"),
+            ("W:/2016ALBUM/", "W - 2016ALBUM"),
+            ("FoV_v2.0 [CHEDI.hack::]", "FoV_v2.0 [CHEDI.hack]"),
+            ("//M\\\\", "M"), ("https://", "https"),
+            ("while(1<2)", "while(12)"),
+            ("when da snacks match da fit (:prayer hands:)", "when da snacks match da fit (prayer hands)"),
+            ("Acid Disk 2 ", "Acid Disk 2"),
+            ("Chopped &  Screwed", "Chopped & Screwed"),
+        ] {
+            let tags = HashMap::from([("albumartist".into(), "Artist".into()), ("album".into(), tag.into()), ("date".into(), "2012".into()), ("title".into(), "Resonator ()".into())]);
+            assert_eq!(format_layout(Path::new("/Music"), &tags, None, "flac").unwrap(), PathBuf::from(format!("/Music/Artist/{expected} (2012)/01 - Resonator ().flac")));
+        }
     }
 
     #[test]

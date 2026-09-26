@@ -2158,7 +2158,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.18 · build 18</span>
+          <span className="sidebar-version">v0.9.0-beta.19 · build 19</span>
         </div>
       </aside>
       <main>

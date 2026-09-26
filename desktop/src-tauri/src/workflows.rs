@@ -160,10 +160,17 @@ pub fn plan_workflow(
     template: Option<&str>,
 ) -> Vec<WorkflowRowPlan> {
     let mut plans = Vec::new();
+    let mut folder_years: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
     let mut indexed: HashMap<_, Vec<_>> = HashMap::new();
     for row in rows.iter().filter(|r| r.present) {
         let tags = extract_tags_map(&row.metadata);
-        indexed.entry(release_key(row, &tags)).or_default().push(tags);
+        let key = release_key(row, &tags);
+        for date in [tags.get("year"), tags.get("date")].into_iter().flatten() {
+            if let Some(year) = date.trim().get(..4).filter(|y| y.chars().all(|c| c.is_ascii_digit())) {
+                folder_years.entry(key.0.clone()).or_default().insert(year.to_owned());
+            }
+        }
+        indexed.entry(key).or_default().push(tags);
     }
 
     for row in rows.iter().filter(|r| r.present) {
@@ -285,6 +292,10 @@ pub fn plan_workflow(
                     let target_str = target_path.display().to_string();
                     // APFS spelling differences alone do not require moving audio.
                     if target_str.nfc().collect::<String>().to_lowercase() != row.path.nfc().collect::<String>().to_lowercase() {
+                        let years = folder_years.get(&release_key(row, &current_tags).0).cloned().unwrap_or_default();
+                        if template.unwrap_or(crate::organisation::DEFAULT_LAYOUT).contains("{year}") && years.len() > 1 {
+                            issues.push(format!("Conflicting release years in saved tags: {}. No move proposed: correct the release dates first so the album stays together.", years.into_iter().collect::<Vec<_>>().join(", ")));
+                        } else {
                         let source = Path::new(&row.path).strip_prefix(&row.root).unwrap_or(Path::new(&row.path));
                         let destination = target_path.strip_prefix(&row.root).unwrap_or(&target_path);
                         if source.parent() != destination.parent() {
@@ -294,6 +305,7 @@ pub fn plan_workflow(
                             issues.push(format!("Filename: {} → {}", source.file_name().unwrap_or_default().to_string_lossy(), destination.file_name().unwrap_or_default().to_string_lossy()));
                         }
                         target = Some(target_str);
+                        }
                     }
                 }
             }
@@ -399,6 +411,19 @@ mod tests {
         let key_plans = plan_workflow(&rows, "keys", None);
         assert_eq!(key_plans.len(), 1);
         assert_eq!(key_plans[0].changes.get("initialkey").unwrap(), "9B");
+    }
+
+    #[test]
+    fn organise_does_not_split_release_with_conflicting_year_tags() {
+        let rows: Vec<_> = ["2022", "2023"].iter().enumerate().map(|(i, year)| LocalFileRecord {
+            path: format!("/music/Artist/Release (2023)/0{} - Song.flac", i + 1),
+            root: "/music".into(), size: 1, mtime: 1, present: true, error: None,
+            metadata: Some(serde_json::json!({"albumartist":"Artist", "album":"Release", "title":"Song", "year":year, "date":"2023", "tracknumber":i+1})),
+        }).collect();
+        let plans = plan_workflow(&rows, "organise", None);
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].target.is_none());
+        assert!(plans[0].issues[0].contains("Conflicting release years"));
     }
 
     #[test]

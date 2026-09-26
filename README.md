@@ -23,6 +23,8 @@
 
 By pairing your local albums and tracks with their streaming counterparts, Tibrary can fill available metadata—including release dates, artwork, disc numbers, Camelot keys and BPM. It also caches track credits, with contributor names and roles, to support release matching and recommendations. Availability depends on what the provider returns; missing credits never become invented metadata.
 
+Folder previews clean tag whitespace before adding template separators, preserve literal title parentheses, and flag conflicting release years for review instead of splitting an album between folders.
+
 **Scan your library, review proposed changes, and approve edits before they touch your files.** Duplicate removal uses the system Trash. Catalogue linking itself changes only the app database.
 
 ---
