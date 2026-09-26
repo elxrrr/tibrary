@@ -339,3 +339,14 @@ Validation for this patch: 49 Rust tests passed (2 opt-in live tests skipped), 2
 - Local duplicates retain their cached groups and display release dates before replacement destinations. Adding dates to existing cached groups uses indexed tags rather than recomputing duplicate matches.
 
 Validation used disposable fixture libraries and an isolated copy of the production database. The snapshot contained 90,714 missing release rows; subsequent sorts took 0.15–0.25 seconds. Initial state loading still took about 13 seconds in the debug build, so cold-start performance remains a known limitation. No original NVME files were changed.
+
+
+### Navigation and credit evidence — build 12
+
+- Persistent back/forward controls and a sidebar toggle stay beside the native window controls. Hiding the sidebar expands the content pane. Startup still opens Overview.
+- Overview library and latest-missing lists scroll independently; the latter displays at most five 64-pixel rows.
+- Release detail requests use `include=items,items.credits`. Older cached releases can fetch only missing credits through batched `/tracks?include=credits` requests. Contributor relationship pagination is followed, while names, roles, category IDs and artist IDs remain attached to their source track. Successful empty responses are cached; incomplete optional requests wait at least a day before retrying. A manual release refresh can recheck them.
+- Credits support ranking structurally valid link candidates and appear in their evidence. They cannot override conflicting ISRCs, mixes, durations or positions. Recommendation evidence can come from current verified linked recordings even when the local tags have no credits; unverified recommendations never become evidence for other recommendations.
+- The read-only live check for release 234657671 returned six tracks and no credit entries. Mock compound responses verify populated credits and pagination detection. Availability is provider-dependent. README screenshots use disposable sample data, not the live music library.
+
+Validation: 72 Rust tests passed (5 opt-in checks skipped), two focused WebKit workflows passed (including all-page rendering and sidebar/history interactions), and the opt-in live credits request passed. The macOS app bundle was rebuilt. Tests used disposable files and databases; original NVME audio files were unchanged.

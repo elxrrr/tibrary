@@ -194,6 +194,11 @@ aside {
   background: linear-gradient(to right, var(--sidebar) 229px, var(--line) 229px, var(--line) 230px, var(--bg) 230px);
   user-select: none;
 }
+.sidebar-hidden .drag-region { background: var(--bg); }
+#app-sidebar[hidden] { display: none; }
+.window-navigation { display: flex; align-items: center; gap: 2px; width: fit-content; margin-left: 100px; height: 42px; }
+.window-navigation button { width: 30px; height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; color: var(--muted); }
+.window-navigation button:hover:not(:disabled) { background: var(--card); color: var(--text); }
 .nav-item {
   justify-content: flex-start;
   background: transparent;
@@ -1287,9 +1292,9 @@ dialog p {
   scrollbar-gutter: stable;
 }
 .overview-page { display: flex; flex-direction: column; }
-.overview-dashboard { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.latest-missing-card { flex: 1; min-height: 250px; display: flex; flex-direction: column; }
-.latest-missing-card .overview-list { flex: 1; min-height: 0; max-height: none; }
+.overview-dashboard { display: flex; flex-direction: column; flex-shrink: 0; }
+.latest-missing-card { display: flex; flex-direction: column; flex-shrink: 0; }
+.latest-missing-card .overview-list { height: auto; max-height: 320px; flex: 0 0 auto; }
 .overview-list > .library-row {
   height: 64px;
   box-sizing: border-box;

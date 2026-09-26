@@ -104,6 +104,7 @@ pub async fn link_library_scoped(
     let mut local_tracks = Vec::new();
     let mut file_stamps = HashMap::new();
     let mut totals = HashMap::new();
+    let mut local_credits = HashMap::new();
     let mut eligible = HashSet::new();
 
     while let Some(row) = file_stmt.next().await.map_err(|e| e.to_string())? {
@@ -119,6 +120,10 @@ pub async fn link_library_scoped(
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(Value::Null);
 
+        local_credits.insert(
+            path.clone(),
+            crate::recommendations::local_credit_names(&meta),
+        );
         let tags = crate::workflows::extract_tags_map(&Some(meta.clone()));
         let text = |key: &str| tags.get(key).cloned().unwrap_or_default();
         let number = |key: &str| {
@@ -319,6 +324,7 @@ pub async fn link_library_scoped(
         }
         // Match against candidates
         let mut scored_candidates = Vec::new();
+        let mut credit_scores = HashMap::new();
         for rel in &candidate_releases {
             let mut res = structure_match(&group_tracks, rel);
             let unofficial = rel.official == Some(false)
@@ -348,6 +354,16 @@ pub async fn link_library_scoped(
                     .push("Compilation; enable in settings to allow automatic matching".into());
             }
             for track in &group_tracks {
+                if track.track_number > 0
+                    && res.alignments.get(&track.path).is_some_and(|alignment| {
+                        alignment.track_number != track.track_number
+                            || alignment.disc_number != track.disc_number
+                    })
+                {
+                    res.compatible = false;
+                    res.conflicts
+                        .push("Track or disc positions differ from local tags".into());
+                }
                 let (total, discs) = totals[&track.path];
                 let remote_total = rel
                     .tracks
@@ -363,6 +379,28 @@ pub async fn link_library_scoped(
                         .push("Release totals differ from local tags".into());
                 }
             }
+            let shared: usize = group_tracks
+                .iter()
+                .map(|track| {
+                    let Some(local) = local_credits.get(&track.path) else {
+                        return 0;
+                    };
+                    let Some(alignment) = res.alignments.get(&track.path) else {
+                        return 0;
+                    };
+                    let Some(remote) = rel
+                        .tracks
+                        .iter()
+                        .find(|track| track.id == alignment.remote_track_id)
+                    else {
+                        return 0;
+                    };
+                    crate::recommendations::credit_names(&remote.credits)
+                        .intersection(local)
+                        .count()
+                })
+                .sum();
+            credit_scores.insert(rel.id.clone(), shared);
             scored_candidates.push((rel, res));
         }
 
@@ -372,6 +410,7 @@ pub async fn link_library_scoped(
                 .cmp(&a.1.compatible)
                 .then_with(|| b.1.matched_count.cmp(&a.1.matched_count))
                 .then_with(|| a.1.conflicts.len().cmp(&b.1.conflicts.len()))
+                .then_with(|| credit_scores[&b.0.id].cmp(&credit_scores[&a.0.id]))
         });
 
         let (best_rel, best_struct) = &scored_candidates[0];
@@ -427,7 +466,7 @@ pub async fn link_library_scoped(
                                 .map(|a| json!({"album_id":r.id,"track_id":a.remote_track_id})))
                             .collect::<Vec<_>>());
                     }
-                    payload["catalogue_options"] = json!(scored_candidates.iter().filter_map(|(r,s)|s.alignments.get(&track.path).map(|a|json!({"id":r.id,"title":r.title,"track_id":a.remote_track_id,"tracks":r.track_count,"artist":r.artist,"album":r.title,"position_label":format!("Disc {} · Track {}/{}",a.disc_number,a.track_number,r.track_count),"evidence":s.conflicts.join("; "),"structure":{"compatible":s.compatible,"reasons":s.conflicts},"compatible":s.compatible}))).collect::<Vec<_>>());
+                    payload["catalogue_options"] = json!(scored_candidates.iter().filter_map(|(r,s)|s.alignments.get(&track.path).map(|a|json!({"id":r.id,"title":r.title,"track_id":a.remote_track_id,"tracks":r.track_count,"artist":r.artist,"album":r.title,"position_label":format!("Disc {} · Track {}/{}",a.disc_number,a.track_number,r.track_count),"evidence":({let mut reasons=s.conflicts.clone(); if credit_scores[&r.id]>0 { reasons.push(format!("{} shared local contributor credits support this release",credit_scores[&r.id])); } reasons.join("; ")}),"structure":{"compatible":s.compatible,"reasons":s.conflicts},"compatible":s.compatible}))).collect::<Vec<_>>());
                     let payload_str = payload.to_string();
                     let _ = conn.execute(
                         "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
@@ -501,7 +540,7 @@ mod tests {
         ).await.unwrap();
 
         // 2. Seed catalogue
-        let cat = TidalCatalogue {
+        let mut cat = TidalCatalogue {
             id: "queen_id".to_string(),
             name: "Queen".to_string(),
             releases: vec![TidalRelease {
@@ -533,6 +572,15 @@ mod tests {
                 ..Default::default()
             }],
         };
+        let mut other = cat.releases[0].clone();
+        other.id = "other_edition".into();
+        other.tracks[0].id = "other_track".into();
+        cat.releases[0].tracks[0].credits = json!([{"name":"Freddie Mercury","role":"Composer"}]);
+        cat.releases.insert(0, other);
+        let mut conflict = cat.releases[1].clone();
+        conflict.id = "wrong_position".into();
+        conflict.tracks[0].track_number = 2;
+        cat.releases.insert(0, conflict);
         conn.execute(
             "INSERT INTO catalogue (artist_id, market, payload, fetched) VALUES ('queen_id', 'GB', ?, '2026-01-01')",
             (serde_json::to_string(&cat).unwrap().as_str(),),
@@ -544,6 +592,7 @@ mod tests {
             "artist": "Queen",
             "album": "A Night at the Opera",
             "duration": 355.0,
+            "composer": "Freddie Mercury",
             "track_number": 1,
             "disc_number": 1
         });
@@ -575,6 +624,11 @@ mod tests {
         assert_eq!(p["status"], "linked");
         assert_eq!(p["ids"]["track_id"], "track_101");
         assert_eq!(p["ids"]["album_id"], "album_1");
+        assert_eq!(p["placements"].as_array().unwrap().len(), 2);
+        assert!(p["catalogue_options"][0]["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("shared local contributor"));
 
         let repeated = link_library(
             &store,

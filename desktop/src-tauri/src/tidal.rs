@@ -40,6 +40,8 @@ pub struct TidalTrack {
     pub audio_modes: Vec<String>,
     pub media_metadata: Value,
     pub credits: Value,
+    pub credits_complete: bool,
+    pub credits_checked_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,6 +126,23 @@ where
 
 #[cfg(test)]
 mod release_payload_tests {
+    #[test]
+    fn compound_credits_stay_with_their_track_and_preserve_roles() {
+        let payload = serde_json::json!({"data":[{"id":"one","type":"tracks"},{"id":"two","type":"tracks"}],"included":[
+            {"id":"one","type":"tracks","attributes":{"title":"Song"},"relationships":{"credits":{"data":[{"id":"writer","type":"credits"}],"links":{"next":"?page[cursor]=next"}}}},
+            {"id":"two","type":"tracks","attributes":{"title":"Other"},"relationships":{"credits":{"data":[]}}},
+            {"id":"writer","type":"credits","attributes":{"name":"Example Person","role":"Composer"},"relationships":{"category":{"data":{"id":"writing"}},"artist":{"data":{"id":"artist-id"}}}},
+            {"id":"unrelated","type":"credits","attributes":{"name":"Unrelated Person","role":"Producer"}}
+        ]});
+        let tracks = super::parse_release_tracks(&payload).unwrap();
+        assert_eq!(tracks[0].credits.as_array().unwrap().len(), 1);
+        assert_eq!(tracks[0].credits[0]["role"], "Composer");
+        assert_eq!(tracks[0].credits[0]["roleId"], "writing");
+        assert_eq!(tracks[0].credits[0]["artist_id"], "artist-id");
+        assert!(!tracks[0].credits_complete);
+        assert_eq!(tracks[1].credits, serde_json::json!([]));
+        assert!(tracks[1].credits_complete);
+    }
     #[test]
     fn release_artist_accepts_cached_object_or_string() {
         let object: super::TidalRelease = serde_json::from_value(serde_json::json!({
@@ -211,6 +230,11 @@ pub fn catalogue_next(current: &str, next: &str) -> Result<String, String> {
     if !target.query_pairs().any(|(k, _)| k == "countryCode") {
         if let Some((_, market)) = current.query_pairs().find(|(k, _)| k == "countryCode") {
             target.query_pairs_mut().append_pair("countryCode", &market);
+        }
+    }
+    if !target.query_pairs().any(|(key, _)| key == "include") {
+        if let Some((_, include)) = current.query_pairs().find(|(key, _)| key == "include") {
+            target.query_pairs_mut().append_pair("include", &include);
         }
     }
     Ok(target.to_string())
@@ -934,7 +958,7 @@ impl TidalClient {
         release_id: &str,
         market: &str,
     ) -> Result<Vec<TidalTrack>, String> {
-        let mut next=Some(format!("https://openapi.tidal.com/v2/albums/{release_id}/relationships/items?countryCode={market}&include=items"));
+        let mut next=Some(format!("https://openapi.tidal.com/v2/albums/{release_id}/relationships/items?countryCode={market}&include=items,items.credits"));
         let mut tracks = Vec::new();
         let mut visited = std::collections::HashSet::new();
         while let Some(url) = next {
@@ -954,7 +978,101 @@ impl TidalClient {
         tracks.dedup_by(|a, b| {
             a.id == b.id && a.disc_number == b.disc_number && a.track_number == b.track_number
         });
+        self.fill_track_credits(&mut tracks, market).await;
         Ok(tracks)
+    }
+
+    /// Upgrade older cached track lists without fetching the release again. Empty
+    /// credit lists are valid results; failed optional lookups wait a day to retry.
+    pub async fn fill_track_credits(&mut self, tracks: &mut [TidalTrack], market: &str) {
+        let now = Utc::now().timestamp();
+        let pending: Vec<usize> = tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| {
+                !track.credits_complete
+                    && track.credits_checked_at.is_none_or(|at| now - at >= 86_400)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for batch in pending.chunks(20) {
+            let ids = batch
+                .iter()
+                .map(|&index| tracks[index].id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut url = Url::parse("https://openapi.tidal.com/v2/tracks").unwrap();
+            url.query_pairs_mut()
+                .append_pair("countryCode", market)
+                .append_pair("filter[id]", &ids)
+                .append_pair("include", "credits");
+            // Stamp the attempt even on failure, preventing a broken optional
+            // endpoint from creating a request loop during ordinary linking.
+            for &index in batch {
+                tracks[index].credits_checked_at = Some(now);
+            }
+            let Ok(payload) = self.get_json(url.as_str()).await else {
+                for &index in &pending {
+                    tracks[index].credits_checked_at = Some(now);
+                }
+                break;
+            };
+            let resources = payload["data"].as_array().cloned().unwrap_or_default();
+            let included = payload["included"].as_array().cloned().unwrap_or_default();
+            for &index in batch {
+                let track = &mut tracks[index];
+                let Some(resource) = resources.iter().find(|r| r["id"] == track.id) else {
+                    continue;
+                };
+                let (credits, complete) = included_credits(resource, &included);
+                let mut values = credits.as_array().cloned().unwrap_or_default();
+                if !complete {
+                    values.extend(track.credits.as_array().into_iter().flatten().cloned());
+                }
+                let mut next = relationship_next(&resource["relationships"]["credits"]);
+                let mut complete = complete;
+                let mut visited = std::collections::HashSet::new();
+                while let Some(link) = next.take() {
+                    let Ok(mut next_url) = catalogue_next(url.as_str(), &link)
+                        .and_then(|s| Url::parse(&s).map_err(|e| e.to_string()))
+                    else {
+                        break;
+                    };
+                    if !next_url.query_pairs().any(|(key, _)| key == "include") {
+                        next_url.query_pairs_mut().append_pair("include", "credits");
+                    }
+                    if !visited.insert(next_url.to_string()) {
+                        break;
+                    }
+                    let Ok(page) = self.get_json(next_url.as_str()).await else {
+                        break;
+                    };
+                    let page_items = page["included"].as_array().cloned().unwrap_or_default();
+                    let references = page["data"].as_array().cloned().unwrap_or_default();
+                    let found: Vec<_> = references
+                        .iter()
+                        .filter_map(|r| {
+                            page_items
+                                .iter()
+                                .find(|item| item["type"] == "credits" && item["id"] == r["id"])
+                        })
+                        .map(normalized_credit)
+                        .collect();
+                    if found.len() != references.len() {
+                        break;
+                    }
+                    values.extend(found);
+                    next = relationship_next(&page);
+                    complete = next.is_none();
+                }
+                let mut seen = std::collections::HashSet::new();
+                values.retain(|value| seen.insert(value.to_string()));
+                if credits.is_array() {
+                    track.credits = json!(values);
+                }
+                track.credits_complete = complete;
+            }
+        }
     }
 
     pub async fn save_catalogue_to_db(
@@ -1028,6 +1146,61 @@ impl TidalClient {
     }
 }
 
+fn normalized_credit(resource: &Value) -> Value {
+    let mut credit = resource
+        .get("attributes")
+        .cloned()
+        .unwrap_or_else(|| resource.clone());
+    if !credit.is_object() {
+        return Value::Null;
+    }
+    if let Some(id) = resource.get("id") {
+        credit["id"] = id.clone();
+    }
+    if let Some(relationships) = resource.get("relationships") {
+        credit["relationships"] = relationships.clone();
+        if let Some(id) = relationships["artist"]["data"]["id"].as_str() {
+            credit["artist_id"] = json!(id);
+        }
+        if let Some(id) = relationships["category"]["data"]["id"].as_str() {
+            credit["roleId"] = json!(id);
+        }
+    }
+    credit
+}
+
+fn relationship_next(relationship: &Value) -> Option<String> {
+    relationship["links"]["next"]
+        .as_str()
+        .or_else(|| relationship["links"]["next"]["href"].as_str())
+        .filter(|link| !link.is_empty())
+        .map(str::to_owned)
+}
+
+fn included_credits(item: &Value, included: &[Value]) -> (Value, bool) {
+    if let Some(credits) = item["attributes"]["credits"].as_array() {
+        return (
+            json!(credits.iter().map(normalized_credit).collect::<Vec<_>>()),
+            true,
+        );
+    }
+    let relationship = &item["relationships"]["credits"];
+    let Some(refs) = relationship["data"].as_array() else {
+        return (Value::Null, false);
+    };
+    let credits: Vec<_> = refs
+        .iter()
+        .filter_map(|reference| {
+            included
+                .iter()
+                .find(|resource| resource["type"] == "credits" && resource["id"] == reference["id"])
+        })
+        .map(normalized_credit)
+        .collect();
+    let complete = credits.len() == refs.len() && relationship_next(relationship).is_none();
+    (json!(credits), complete)
+}
+
 pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> {
     let included = payload["included"]
         .as_array()
@@ -1046,6 +1219,7 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
             .ok_or("Incomplete release track details")?;
         let a = &item["attributes"];
         let m = &reference["meta"];
+        let (credits, credits_complete) = included_credits(item, included);
         tracks.push(TidalTrack {
             id: item["id"].as_str().ok_or("Missing track ID")?.into(),
             title: format_title(a["title"].as_str().unwrap_or(""), a["version"].as_str()),
@@ -1072,14 +1246,9 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
             media_tags: string_list(a.get("mediaTags")),
             audio_modes: string_list(a.get("audioModes")),
             media_metadata: a.get("mediaMetadata").cloned().unwrap_or(Value::Null),
-            credits: a
-                .get("credits")
-                .or_else(|| {
-                    item.get("relationships")
-                        .and_then(|r| r.get("contributors"))
-                })
-                .cloned()
-                .unwrap_or(Value::Null),
+            credits,
+            credits_complete,
+            credits_checked_at: credits_complete.then(|| Utc::now().timestamp()),
         });
     }
     Ok(tracks)
@@ -1193,6 +1362,24 @@ mod tests {
             assert!(!c.client_id.is_empty());
             assert!(!c.client_secret.is_empty());
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "Explicit read-only live credits check using saved credentials"]
+    async fn live_release_credits() {
+        let mut client =
+            TidalClient::from_env_or_keychain().expect("Saved catalogue credentials required");
+        let tracks = client.get_release_details("234657671", "GB").await.unwrap();
+        assert!(!tracks.is_empty());
+        assert!(tracks.iter().all(|track| track.credits_complete));
+        println!(
+            "{} tracks checked; {} credit entries returned (empty lists are cached too)",
+            tracks.len(),
+            tracks
+                .iter()
+                .map(|track| track.credits.as_array().map_or(0, Vec::len))
+                .sum::<usize>()
+        );
     }
 
     #[tokio::test]

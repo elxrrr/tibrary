@@ -1350,29 +1350,10 @@ impl TursoDb {
                     .or_default()
                     .insert(crate::matching::name_key(&rights));
             }
-            for role in [
-                "composer",
-                "lyricist",
-                "songwriter",
-                "producer",
-                "engineer",
-                "mixer",
-            ] {
-                let names: Vec<String> = meta["tags"][role].as_array()
-                    .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-                    .unwrap_or_else(|| extract_tag_str(&meta, &[role]).into_iter().collect());
-                for names in names {
-                    for name in names.split(';') {
-                        let key = crate::matching::name_key(name);
-                        if !key.is_empty() {
-                            local_contributors
-                                .entry(artist_key.clone())
-                                .or_default()
-                                .insert(key);
-                        }
-                    }
-                }
-            }
+            local_contributors
+                .entry(artist_key.clone())
+                .or_default()
+                .extend(crate::recommendations::local_credit_names(&meta));
             let folder = crate::duplicates::extract_release_folder(&path);
             let edition = local_by_folder
                 .entry((artist_key, title_key, folder))
@@ -1446,15 +1427,42 @@ impl TursoDb {
         // 2. Load linked album IDs from track_links
         let mut links_stmt = conn
             .query(
-                "SELECT payload FROM track_links WHERE market = ?",
+                "SELECT l.payload,f.metadata,l.stamp,f.size,f.mtime,f.present FROM track_links l LEFT JOIN local_files f ON f.path=l.path WHERE l.market=?",
                 (market,),
             )
             .await
             .map_err(|e| e.to_string())?;
+        let mut linked_credit_tracks: HashMap<String, HashSet<String>> = HashMap::new();
         let mut linked_album_tracks: HashMap<String, usize> = HashMap::new();
         while let Some(row) = links_stmt.next().await.map_err(|e| e.to_string())? {
             if let Ok(Some(payload_str)) = row.get::<Option<String>>(0) {
                 if let Ok(payload) = serde_json::from_str::<Value>(&payload_str) {
+                    let metadata: String = row.get(1).unwrap_or_default();
+                    let stamp: String = row.get(2).unwrap_or_default();
+                    let size: i64 = row.get(3).unwrap_or_default();
+                    let mtime: i64 = row.get(4).unwrap_or_default();
+                    let current = row.get::<i64>(5).unwrap_or(0) == 1
+                        && serde_json::from_str::<Value>(&stamp).ok()
+                            == Some(json!([0, 0, size, mtime]));
+                    if current && (payload["status"] == "linked" || payload["status"].is_null()) {
+                        if let Some(artist) = serde_json::from_str::<Value>(&metadata)
+                            .ok()
+                            .and_then(|m| extract_album_artist(&m))
+                        {
+                            let key = crate::matching::name_key(&artist);
+                            let mut sources = vec![&payload["ids"]];
+                            sources.extend(payload["placements"].as_array().into_iter().flatten());
+                            for source in sources {
+                                if let Some(id) = source["track_id"].as_str() {
+                                    linked_credit_tracks
+                                        .entry(id.to_owned())
+                                        .or_default()
+                                        .insert(key.clone());
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(album_id) = payload
                         .get("ids")
                         .and_then(|ids| ids.get("album_id"))
@@ -1523,6 +1531,26 @@ impl TursoDb {
                 Some(r) => r,
                 None => continue,
             };
+
+            // Use remote credits only when anchored to a currently verified local
+            // recording. Catalogue membership or a recommendation is never an anchor.
+            for track in releases
+                .iter()
+                .flat_map(|release| release["tracks"].as_array().into_iter().flatten())
+            {
+                if let Some(artists) = track["id"]
+                    .as_str()
+                    .and_then(|id| linked_credit_tracks.get(id))
+                {
+                    let names = crate::recommendations::credit_names(&track["credits"]);
+                    for artist in artists {
+                        local_contributors
+                            .entry(artist.clone())
+                            .or_default()
+                            .extend(names.iter().filter(|name| *name != artist).cloned());
+                    }
+                }
+            }
 
             for rel in releases {
                 let id = rel
@@ -3663,6 +3691,47 @@ fn is_compilation_artist(artist: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn recommendations_use_only_current_verified_remote_credit_anchors() {
+        let folder =
+            std::env::temp_dir().join(format!("tibrary-credit-anchors-{}", uuid::Uuid::new_v4()));
+        let store = super::TursoDb::open(&folder.join("db")).await.unwrap();
+        let conn = store.connect().unwrap();
+        let credits = serde_json::json!([{"name":"Writer One","role":"Composer"},{"name":"Writer Two","role":"Producer"}]);
+        let catalogue = serde_json::json!({"id":"artist","name":"Example","releases":[
+            {"id":"owned","title":"Owned","artist":"Example","date":"2020-01-01","available":true,"tracks_loaded":true,"track_count":1,"tracks":[{"id":"anchor","title":"Owned song","credits":credits}]},
+            {"id":"new","title":"New","artist":"Example","date":"2021-01-01","available":true,"primary_artist_verified":true,"tracks_loaded":true,"track_count":2,"tracks":[{"id":"new1","title":"New one","credits":credits},{"id":"new2","title":"New two","credits":credits}]}
+        ]});
+        conn.execute(
+            "INSERT INTO catalogue(artist_id,market,payload) VALUES('artist','GB',?)",
+            (catalogue.to_string(),),
+        )
+        .await
+        .unwrap();
+        let meta =
+            serde_json::json!({"albumartist":"Example","album":"Owned","title":"Owned song"});
+        conn.execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES('/music/song.flac','/music',10,20,?,1)", (meta.to_string(),)).await.unwrap();
+        let link =
+            serde_json::json!({"status":"linked","ids":{"track_id":"anchor","album_id":"owned"}});
+        conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES('/music/song.flac','GB','[0,0,10,20]',?)", (link.to_string(),)).await.unwrap();
+        let rows = store.build_missing_rows("GB").await.unwrap();
+        let row = rows.iter().find(|row| row.id == "new").unwrap();
+        assert_eq!(row.recommendation, "Recommended");
+        conn.execute("UPDATE local_files SET mtime=21", ())
+            .await
+            .unwrap();
+        let rows = store.build_missing_rows("GB").await.unwrap();
+        assert_ne!(
+            rows.iter()
+                .find(|row| row.id == "new")
+                .unwrap()
+                .recommendation,
+            "Recommended"
+        );
+        drop(conn);
+        drop(store);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
     #[tokio::test]
     async fn clearing_one_activity_stream_preserves_the_others() {
         let path =

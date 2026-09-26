@@ -56,6 +56,10 @@ test.afterEach(async () => {
   rmSync(folder, { recursive: true, force: true });
 });
 test("all workflow routes render with no runtime errors", async ({ page }) => {
+  if (process.env.TIBRARY_SCREENSHOTS) {
+    await page.emulateMedia({colorScheme:"dark"});
+    await rpc("queue.decision", {ids:["910002","910003","910004","910005","910006"],decision:"removed"});
+  }
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("/");
@@ -65,6 +69,11 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Working", exact: true }),
   ).toHaveCount(0);
+  const screenshots: Record<string, string> = {"Prepare library":"prepare_library", "Link artists":"link_artists", "Link releases":"link_releases", "Missing releases":"missing_releases", "Local duplicates":"local_duplicates", "MQA audit":"mqa_audit", "Favourite artists":"favourite_artists", "Activity":"activity_log"};
+  if (process.env.TIBRARY_SCREENSHOTS) {
+    await expect(page.getByRole("region",{name:"Latest missing releases"}).locator(".library-row").first()).toBeVisible();
+    await page.screenshot({path:"docs/imgs/overview.png"});
+  }
   for (const name of [
     "Prepare library",
     "Correct tags",
@@ -102,8 +111,40 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
         "false",
       );
     await expect(page.getByRole("alert")).toHaveCount(0);
+    if (process.env.TIBRARY_SCREENSHOTS && screenshots[name]) {
+      if (name === "Local duplicates") {
+        await page.getByRole("button", {name:"Scan tags",exact:true}).click();
+        await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+        await expect(page.getByRole("button", {name:"Rescan tags",exact:true})).toBeVisible();
+      }
+      await page.mouse.move(1590, 10);
+      await page.screenshot({path:`docs/imgs/${screenshots[name]}.png`});
+    }
   }
   expect(errors).toEqual([]);
+});
+
+test("window navigation remains available with the sidebar hidden and overview lists stay bounded", async ({page}) => {
+  await rpc("queue.decision", {ids:["910002","910003","910004","910005","910006"],decision:"removed"});
+  await page.goto("/");
+  await expect(page.getByRole("button", {name:"Back",exact:true})).toBeDisabled();
+  await page.locator("aside").getByRole("button", {name:"Prepare library",exact:true}).click();
+  await page.locator("aside").getByRole("button", {name:"Link catalogue",exact:true}).click();
+  await page.getByRole("button", {name:"Hide sidebar",exact:true}).click();
+  await expect(page.locator("aside")).toBeHidden();
+  expect((await page.locator("main").boundingBox())!.x).toBe(0);
+  await page.getByRole("button", {name:"Back",exact:true}).click();
+  await expect(page.getByRole("heading", {name:"Prepare library",exact:true})).toBeVisible();
+  await page.getByRole("button", {name:"Forward",exact:true}).click();
+  await expect(page.getByRole("heading", {name:"Link catalogue",exact:true})).toBeVisible();
+  await page.getByRole("button", {name:"Back",exact:true}).click();
+  await page.getByRole("button", {name:"Show sidebar",exact:true}).click();
+  await page.locator("aside").getByRole("button", {name:"Overview",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Forward",exact:true})).toBeDisabled();
+  const list = page.getByRole("region", {name:"Latest missing releases"});
+  await expect(list.locator(".library-row").first()).toBeVisible();
+  expect((await list.boundingBox())!.height).toBeLessThanOrEqual(320);
+  expect(await list.evaluate(element => getComputedStyle(element).overflowY)).toBe("auto");
 });
 test("local table sorting and filters are usable", async ({ page }) => {
   await page.goto("/");

@@ -10,7 +10,9 @@ import {
   ArrowUpRight,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
+  PanelLeft,
   Copy,
   Disc,
   Download,
@@ -212,8 +214,17 @@ function getLogCategory(log: { message: string; category?: string; level?: strin
 function App() {
   const initialRoute: string = "overview";
   const [state, setState] = useState<AppState | null>(null),
-    [route, setRoute] = useState("overview"),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
+  const [navigation, setNavigation] = useState({ pages: ["overview"], index: 0 });
+  const route = navigation.pages[navigation.index];
+  const setRoute = useCallback((page: string) => setNavigation(previous =>
+    previous.pages[previous.index] === page ? previous : {
+      pages: [...previous.pages.slice(0, previous.index + 1), page], index: previous.index + 1,
+    }), []);
+  const [sidebarVisible, setSidebarVisible] = useState(() => localStorage.getItem("tibrary.sidebar") !== "hidden");
+  function moveHistory(offset: number) {
+    setNavigation(previous => ({ ...previous, index: Math.max(0, Math.min(previous.pages.length - 1, previous.index + offset)) }));
+  }
   const [collapsed, setCollapsed] = useState(new Set<string>()),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
@@ -253,7 +264,7 @@ function App() {
     if (route !== "overview" || !state) return;
     let alive = true;
     call("table", {route: "missing", timeline: "All missing releases", status: "Missing release",
-      sort: "date", direction: "desc", limit: 50, recommendation: "All recommendations"})
+      sort: "date", direction: "desc", limit: 20, recommendation: "All recommendations"})
       .then((result) => { if (alive) { setLatestMissing(result.rows); setMissingReleaseCount(result.total); } })
       .catch((e) => { if (alive) notifyError(e); });
     return () => { alive = false; };
@@ -1338,7 +1349,7 @@ function App() {
                 <strong>Absorbable Duplicates Found:</strong> Older releases, singles, and EPs are fully contained within larger albums. You can safely trash redundant tracks while keeping complete versions.
               </span>
             </div>
-            <button
+            {data.rows.some((row: Row) => row.status === "Chained duplicate") && <button
               onClick={() => {
                 const chained = data.rows
                   .filter((r: any) => r.status === "Chained duplicate")
@@ -1347,7 +1358,7 @@ function App() {
               }}
             >
               Select all chained ({data.rows.filter((r: any) => r.status === "Chained duplicate").length})
-            </button>
+            </button>}
           </div>
         )}
         <DataTable
@@ -2103,9 +2114,15 @@ function App() {
     });
   }
   return (
-    <div className="app">
-      <div className="drag-region" data-tauri-drag-region aria-hidden="true" />
-      <aside>
+    <div className={"app" + (sidebarVisible ? "" : " sidebar-hidden")}>
+      <div className="drag-region" data-tauri-drag-region>
+        <nav className="window-navigation" aria-label="Page navigation">
+          <button aria-label="Back" title="Back" disabled={navigation.index === 0} onClick={() => moveHistory(-1)}><ChevronLeft size={18}/></button>
+          <button aria-label="Forward" title="Forward" disabled={navigation.index === navigation.pages.length - 1} onClick={() => moveHistory(1)}><ChevronRight size={18}/></button>
+          <button aria-label={sidebarVisible ? "Hide sidebar" : "Show sidebar"} title={sidebarVisible ? "Hide sidebar" : "Show sidebar"} aria-expanded={sidebarVisible} aria-controls="app-sidebar" onClick={() => { localStorage.setItem("tibrary.sidebar", sidebarVisible ? "hidden" : "visible"); setSidebarVisible(!sidebarVisible); }}><PanelLeft size={18}/></button>
+        </nav>
+      </div>
+      <aside id="app-sidebar" hidden={!sidebarVisible}>
         <button
           className={"nav-item " + (route === "overview" ? "current" : "")}
           onClick={() => setRoute("overview")}
@@ -2155,7 +2172,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.11 · build 11</span>
+          <span className="sidebar-version">v0.9.0-beta.12 · build 12</span>
         </div>
       </aside>
       <main>

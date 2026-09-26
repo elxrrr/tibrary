@@ -1,5 +1,6 @@
 """Disposable real-file fixture for desktop integration tests, with zero external dependencies."""
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -62,8 +63,10 @@ def main():
     db_file = root / 'db'
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
-    f1 = library / 'First Light.flac'
-    f2 = library / 'Drift.flac'
+    screenshot_mode = bool(os.environ.get('TIBRARY_SCREENSHOTS'))
+    album_folder = library / 'North Assembly/Blue Hours (2020)' if screenshot_mode else library
+    f1 = album_folder / 'First Light.flac'
+    f2 = album_folder / 'Drift.flac'
     write_flac(f1, 'North Assembly', 'Blue Hours', 'First Light', 1, 3)
     write_flac(f2, 'North Assembly', 'Blue Hours', 'Drift', 2, 3)
 
@@ -109,6 +112,15 @@ def main():
 
         conn.execute("INSERT OR REPLACE INTO local_files VALUES (?, ?, ?, ?, ?, NULL, 1)", (str(f1), str(library), f1.stat().st_size, f1.stat().st_mtime_ns, json.dumps(meta1)))
         conn.execute("INSERT OR REPLACE INTO local_files VALUES (?, ?, ?, ?, ?, NULL, 1)", (str(f2), str(library), f2.stat().st_size, f2.stat().st_mtime_ns, json.dumps(meta2)))
+
+        if screenshot_mode:
+            for path, album, title, track, total, duration in [
+                (album_folder / 'Low Tide.flac', 'Blue Hours', 'Low Tide', 3, 3, 200.0),
+                (library / 'North Assembly/First Light (2019)/First Light.flac', 'First Light', 'First Light', 1, 1, 180.0),
+            ]:
+                write_flac(path, 'North Assembly', album, title, track, total)
+                metadata = {'albumartist':'North Assembly','artist':'North Assembly','album':album,'title':title,'tracknumber':str(track),'tracktotal':str(total),'discnumber':'1','duration':duration,'date':'2020-04-03'}
+                conn.execute("INSERT OR REPLACE INTO local_files VALUES (?, ?, ?, ?, ?, NULL, 1)", (str(path), str(library), path.stat().st_size, path.stat().st_mtime_ns, json.dumps(metadata)))
 
         conn.execute("INSERT OR REPLACE INTO mappings VALUES ('North Assembly', '900001', 'confirmed', 'fixture', 1)")
         conn.execute("INSERT OR REPLACE INTO mappings VALUES ('Wrong', '900001', 'confirmed', 'fixture', 1)")

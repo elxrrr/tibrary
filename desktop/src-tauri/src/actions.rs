@@ -54,10 +54,18 @@ pub async fn files(db: &TursoDb, root: &str) -> Result<Vec<LocalFileRecord>, Str
 
 /// Rebuild the visible audit list from indexed files and prior per-file results.
 /// Changed files become "Not audited" until the user runs the audio inspection.
-pub async fn cached_mqa_rows(db: &TursoDb, indexed: &[LocalFileRecord]) -> Result<Vec<Value>, String> {
+pub async fn cached_mqa_rows(
+    db: &TursoDb,
+    indexed: &[LocalFileRecord],
+) -> Result<Vec<Value>, String> {
     let conn = db.connect()?;
-    let mut query = conn.query("SELECT key,payload FROM app_preferences WHERE key LIKE 'mqa-audit:%'", ())
-        .await.map_err(|e| e.to_string())?;
+    let mut query = conn
+        .query(
+            "SELECT key,payload FROM app_preferences WHERE key LIKE 'mqa-audit:%'",
+            (),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     let mut saved = std::collections::HashMap::new();
     while let Some(row) = query.next().await.map_err(|e| e.to_string())? {
         let key: String = row.get(0).map_err(|e| e.to_string())?;
@@ -83,15 +91,29 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
     }
     let key = format!("tag-review:{market}:{id}");
     let cached = db.get_preference(&key).await?;
-    if !force {
-        if let Some(v) = cached.as_ref().filter(|v| v["tracks_loaded"] == true) {
-            return Ok(v.clone());
+    let mut value = match cached.filter(|v| v["tracks_loaded"] == true) {
+        Some(value) => value,
+        None => {
+            db.get_detail(&json!({"release_id":id, "market":market}))
+                .await?
         }
-    }
-    let mut value = db
-        .get_detail(&json!({"release_id":id, "market":market}))
-        .await?;
+    };
     if !force && value["tracks_loaded"] == true {
+        let mut tracks: Vec<crate::tidal::TidalTrack> =
+            serde_json::from_value(value["tracks"].clone()).map_err(|e| e.to_string())?;
+        let due = tracks.iter().any(|track| {
+            !track.credits_complete
+                && track
+                    .credits_checked_at
+                    .is_none_or(|at| chrono::Utc::now().timestamp() - at >= 86_400)
+        });
+        if due {
+            if let Ok(mut client) = crate::tidal::TidalClient::from_db(db).await {
+                client.fill_track_credits(&mut tracks, market).await;
+                value["tracks"] = serde_json::to_value(tracks).map_err(|e| e.to_string())?;
+                return publish_release(db, id, market, value).await;
+            }
+        }
         return Ok(value);
     }
     let mut client = crate::tidal::TidalClient::from_db(db).await?;
@@ -121,6 +143,16 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
     value["tracks"] = serde_json::to_value(&tracks).map_err(|e| e.to_string())?;
     value["tracks_loaded"] = json!(true);
     value["track_count"] = json!(tracks.len());
+    publish_release(db, id, market, value).await
+}
+
+async fn publish_release(
+    db: &TursoDb,
+    id: &str,
+    market: &str,
+    value: Value,
+) -> Result<Value, String> {
+    let key = format!("tag-review:{market}:{id}");
     db.set_preference(&key, &value).await?;
     // Publish details to every catalogue reference and existing queue entry.
     let conn = db.connect()?;
@@ -726,7 +758,13 @@ pub async fn execute(
     }
     if kind == "optimizations" || kind == "local_duplicates" || kind == "check_replacements" {
         if kind == "local_duplicates" || args["scope"] != "remote" && kind != "check_replacements" {
-            state.progress_for(kind, &format!("Checking {} indexed files for absorbable releases", indexed.len()));
+            state.progress_for(
+                kind,
+                &format!(
+                    "Checking {} indexed files for absorbable releases",
+                    indexed.len()
+                ),
+            );
             let clusters = crate::duplicates::find_duplicate_clusters(&indexed);
             let rows = crate::duplicates::clusters_to_group_rows(&clusters);
             db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
@@ -736,7 +774,10 @@ pub async fn execute(
                 &json!(crate::duplicates::manifest_fingerprint(&indexed)),
             )
             .await?;
-            state.progress_for(kind, &format!("Found {} absorbable release groups", rows.len()));
+            state.progress_for(
+                kind,
+                &format!("Found {} absorbable release groups", rows.len()),
+            );
             return Ok(json!({"opportunities":rows.len()}));
         }
         state.progress_for(kind, "Comparing cached online releases with indexed albums");
@@ -761,7 +802,16 @@ pub async fn execute(
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            if position % 100 == 0 { state.progress_for(kind, &format!("Checking cached releases · {}/{}", position + 1, remote_total)); }
+            if position % 100 == 0 {
+                state.progress_for(
+                    kind,
+                    &format!(
+                        "Checking cached releases · {}/{}",
+                        position + 1,
+                        remote_total
+                    ),
+                );
+            }
             if target.available != Some(true)
                 || target.date.as_str() > chrono::Utc::now().format("%Y-%m-%d").to_string().as_str()
             {
@@ -1297,7 +1347,11 @@ pub async fn execute(
         }
         db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows))
             .await?;
-        db.set_preference(&format!("desktop-mqa-manifest:{root}"), &json!(crate::duplicates::manifest_fingerprint(&indexed))).await?;
+        db.set_preference(
+            &format!("desktop-mqa-manifest:{root}"),
+            &json!(crate::duplicates::manifest_fingerprint(&indexed)),
+        )
+        .await?;
         return Ok(json!({"files":rows.len()}));
     }
     Err(format!(

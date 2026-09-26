@@ -21,9 +21,9 @@
 
 **Tibrary** matches your local music files against official online releases to give your collection rich, comprehensive tags and help you discover new music.
 
-By pairing your local albums and tracks with their official streaming counterparts, Tibrary accurately fills in missing metadata—including full album credits, release years, cover artwork, disc numbers, and DJ tags like Camelot keys and BPM. At the same time, it follows your favourite artists across their entire discography so you can easily track new singles, EPs, and albums you don't have yet.
+By pairing your local albums and tracks with their streaming counterparts, Tibrary can fill available metadata—including release dates, artwork, disc numbers, Camelot keys and BPM. It also caches track credits, with contributor names and roles, to support release matching and recommendations. Availability depends on what the provider returns; missing credits never become invented metadata.
 
-Everything is local and non-destructive: **scan your library, review proposed changes clearly, and apply edits or sync updates only when you explicitly approve.**
+**Scan your library, review proposed changes, and approve edits before they touch your files.** Duplicate removal uses the system Trash. Catalogue linking itself changes only the app database.
 
 ---
 
@@ -38,10 +38,18 @@ Everything is local and non-destructive: **scan your library, review proposed ch
 - 📋 **Acquisition Queue:** Keep a checklist of missing tracks or releases you want to collect, with options to export lists or manage approved items.
 - ⬇️ **Reviewed Downloads:** Download approved audio with bounded parallel transfers, per-track progress, and recoverable redownloads. Local preparation remains available during downloads.
 - 📊 **Clear Activity:** Follow local work, catalogue checks and downloads in separate live panels, with independent search and history controls.
+- 🧭 **Flexible Workspace:** Use back and forward navigation beside the window controls. Hide the sidebar to give the current page the full window width; navigation stays available.
+- 🧩 **Credit Evidence:** Shared composers, songwriters, producers and other credited contributors can support recommendations. Only current verified local links or local tags provide reference evidence; shared names never override recording or release-structure conflicts. Credits, including empty results, are cached for reuse.
 
 ---
 
 ## 🖼️ Visual Tour
+
+Screenshots below use a disposable sample library.
+
+<div align="center">
+  <img src="./desktop/docs/imgs/overview.png" alt="Overview with persistent navigation and a scrollable latest missing releases list" width="90%" />
+</div>
 
 ### 1. Prepare & Clean Library
 Inspect your library, scan for modified files, audit for MQA streams, and resolve duplicate tracks.
@@ -52,7 +60,7 @@ Inspect your library, scan for modified files, audit for MQA streams, and resolv
 <br/>
 
 ### 2. Link Artists
-Match local artist folders to verified online artist profiles across collaborations and alias variations.
+Match album artists from local tags to online artist profiles across collaborations and alias variations.
 <div align="center">
   <img src="./desktop/docs/imgs/link_artists.png" alt="Link Artists Interface" width="90%" />
 </div>
@@ -104,6 +112,13 @@ npm --prefix desktop run tauri dev
 ```
 
 On macOS, you can also launch the prebuilt application directly using `./Start.command`.
+
+To build a local macOS application with Node.js and the Rust toolchain installed:
+
+```sh
+npm --prefix desktop run tauri build -- --bundles app
+open desktop/src-tauri/target/release/bundle/macos/Tibrary.app
+```
 
 ---
 

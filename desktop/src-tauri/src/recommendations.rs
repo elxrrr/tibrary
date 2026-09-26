@@ -3,6 +3,59 @@
 use serde_json::Value;
 use std::collections::HashSet;
 
+pub fn credit_names(credits: &Value) -> HashSet<String> {
+    credits
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|credit| {
+            ["role", "roleId"].iter().any(|field| {
+                credit[field]
+                    .as_str()
+                    .is_some_and(|role| !role.trim().is_empty())
+            })
+        })
+        .filter_map(|credit| {
+            credit["name"]
+                .as_str()
+                .or_else(|| credit["person"].as_str())
+        })
+        .map(crate::matching::name_key)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+pub fn local_credit_names(metadata: &Value) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for role in [
+        "composer",
+        "lyricist",
+        "songwriter",
+        "producer",
+        "engineer",
+        "mixer",
+    ] {
+        let value = metadata["tags"]
+            .get(role)
+            .or_else(|| metadata.get(role))
+            .unwrap_or(&Value::Null);
+        let values: Vec<&str> = if let Some(values) = value.as_array() {
+            values.iter().filter_map(Value::as_str).collect()
+        } else {
+            value.as_str().into_iter().collect()
+        };
+        for value in values {
+            names.extend(
+                value
+                    .split(';')
+                    .map(crate::matching::name_key)
+                    .filter(|name| !name.is_empty()),
+            );
+        }
+    }
+    names
+}
+
 /// Count independently corroborated contributors from already indexed music.
 /// A lone shared name never makes a release "Recommended".
 pub fn shared_contributor_evidence(
@@ -14,27 +67,21 @@ pub fn shared_contributor_evidence(
     };
     let mut people = HashSet::new();
     let mut matched_tracks = 0;
+    let mut seen_recordings = HashSet::new();
     for track in tracks {
-        let mut track_matched = false;
-        let credits = track.get("credits").and_then(Value::as_array);
-        for credit in credits.into_iter().flatten() {
-            // Only a named, explicitly credited contributor is evidence. Bare
-            // relationship IDs and main artist names are not independent proof.
-            let named = credit
-                .get("name")
-                .and_then(Value::as_str)
-                .or_else(|| credit.get("person").and_then(Value::as_str));
-            let role = credit.get("roleId").or_else(|| credit.get("role"));
-            let Some(name) = named.filter(|_| role.is_some()) else {
+        let names = credit_names(&track["credits"]);
+        let shared: Vec<_> = names.intersection(local).cloned().collect();
+        if !shared.is_empty() {
+            let recording = track["isrc"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| track["id"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| track.to_string());
+            if !seen_recordings.insert(recording) {
                 continue;
-            };
-            let key = crate::matching::name_key(name);
-            if !key.is_empty() && local.contains(&key) {
-                people.insert(key);
-                track_matched = true;
             }
-        }
-        if track_matched {
+            people.extend(shared);
             matched_tracks += 1;
         }
     }
@@ -145,6 +192,22 @@ mod tests {
         );
         assert_eq!(
             shared_contributor_evidence(Some(&local), Some(&tracks[..1].to_vec())),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn duplicate_editions_and_missing_roles_do_not_inflate_credit_evidence() {
+        let local = HashSet::from(["writer".into()]);
+        let track =
+            serde_json::json!({"isrc":"GB123","credits":[{"name":"Writer","role":"Composer"}]});
+        let tracks = vec![
+            track.clone(),
+            track,
+            serde_json::json!({"id":"other","credits":[{"name":"Writer","roleId":null}]}),
+        ];
+        assert_eq!(
+            shared_contributor_evidence(Some(&local), Some(&tracks)),
             (1, 1)
         );
     }
