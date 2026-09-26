@@ -84,7 +84,7 @@ fn total(tags: &HashMap<String, String>, key: &str, position: &str) -> u32 {
         tags.get(position).and_then(|s| s.split('/').nth(1)).and_then(|s| s.trim().parse().ok()).unwrap_or(0)
     }
 }
-fn release_key(row: &LocalFileRecord, tags: &HashMap<String, String>) -> (String, String, String) {
+pub(crate) fn release_key(row: &LocalFileRecord, tags: &HashMap<String, String>) -> (String, String, String) {
     let mut folder = Path::new(&row.path).parent().unwrap_or(Path::new(&row.root));
     if folder.file_name().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("disc ")) {
         folder = folder.parent().unwrap_or(folder);
@@ -149,6 +149,26 @@ pub async fn plan_cached(db: &crate::db::TursoDb, rows: &[LocalFileRecord], acti
                     plan.issues.push(format!("{total_key}: {count:02} confirmed by cached release(s) {} with matching recordings and positions", candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")));
                 }
             }
+        }
+    }
+    // Explicitly chosen complete releases can reconcile alternate local disc layouts.
+    // Merely sharing one recording is insufficient: every file must match uniquely.
+    for group in crate::release_anchor::verified(db, rows, &market).await? {
+        let discs = group.release.tracks.iter().map(|t|t.disc_number).max().unwrap_or(1);
+        for (file, track) in group.files.iter().zip(&group.release.tracks) {
+            let tags = extract_tags_map(&file.metadata);
+            let count = group.release.tracks.iter().filter(|t|t.disc_number == track.disc_number).count() as u32;
+            let corrected = [("tracknumber", track.track_number),("discnumber",track.disc_number),("tracktotal",count),("disctotal",discs)];
+            let changes: HashMap<String,String> = corrected.into_iter().filter_map(|(k,n)| { let v=format!("{n:02}"); (tags.get(k)!=Some(&v)).then(||(k.to_string(),v)) }).collect();
+            if changes.is_empty() { continue; }
+            let index = plans.iter().position(|p|p.path == file.path).unwrap_or_else(|| {
+                plans.push(WorkflowRowPlan {path:file.path.clone(),root:file.root.clone(),title:tags.get("title").cloned().unwrap_or_default(),artist:tags.get("albumartist").or(tags.get("artist")).cloned().unwrap_or_default(),album:tags.get("album").cloned().unwrap_or_default(),current_tags:tags.clone(),changes:HashMap::new(),target:None,issues:vec![]});
+                plans.len()-1
+            });
+            let plan=&mut plans[index];
+            plan.changes.extend(changes);
+            plan.issues.retain(|i| !i.starts_with("tracktotal") && !i.starts_with("disctotal"));
+            plan.issues.push(format!("Complete recording sequence verified against chosen release {}: use online Disc {:02}/{:02}, Track {:02}/{:02}; files stay in place",group.release.id,track.disc_number,discs,track.track_number,count));
         }
     }
     Ok(plans)

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod release_artists;
+mod release_anchor;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -1576,6 +1577,8 @@ async fn handle_rpc_uncached(
     }
     if method == "tracks.choose" {
         db.choose_track_link(&args).await?;
+        let linked = release_anchor::propagate(db, args["path"].as_str().unwrap_or(""), args["market"].as_str().unwrap_or("GB")).await?;
+        state.log_with_category(&format!("Manual placement saved · {linked} additional tracks linked from the complete cached release · file tags unchanged"), "info", Some("linking"));
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
         }

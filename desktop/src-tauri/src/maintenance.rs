@@ -211,6 +211,11 @@ pub async fn apply_batch(db: &TursoDb, root: &str, items: &[FileApplyItem]) -> A
 pub async fn refresh_number_links(db: &TursoDb, root: &str, paths: &std::collections::HashSet<String>) {
     let settings = db.get_settings().await.unwrap_or_default();
     let market = settings["general"]["market"].as_str().unwrap_or("GB");
+    if let Ok(files) = crate::actions::files(db, root).await {
+        let keys: std::collections::HashSet<_> = files.iter().filter(|f|paths.contains(&f.path)).map(|f|crate::workflows::release_key(f,&crate::workflows::extract_tags_map(&f.metadata))).collect();
+        let peers: Vec<_> = files.into_iter().filter(|f|keys.contains(&crate::workflows::release_key(f,&crate::workflows::extract_tags_map(&f.metadata)))).collect();
+        if let Err(error) = crate::release_anchor::propagate_files(db,&peers,market).await { eprintln!("Cached sibling link refresh: {error}"); }
+    }
     if let Err(error) = crate::linking::link_library_mode(db, market, root,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| {}, Some(paths), false, true).await {
         eprintln!("Cached link refresh after tag correction: {error}");

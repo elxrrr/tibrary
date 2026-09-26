@@ -2515,6 +2515,7 @@ impl TursoDb {
             .ok_or("Local file is no longer indexed")?;
         let size: i64 = row.get(0).map_err(|e| e.to_string())?;
         let mtime: i64 = row.get(1).map_err(|e| e.to_string())?;
+        drop(file);
         let now_iso = json!([0, 0, size, mtime]).to_string();
         let payload = json!({
             "status":"linked", "manual":true,

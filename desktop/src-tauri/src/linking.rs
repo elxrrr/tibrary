@@ -217,6 +217,7 @@ pub async fn link_library_mode(
             && (old["status"] == "linked"
                 || (old["status"].is_null() && old["ids"]["track_id"].as_str().is_some()));
         if !is_ignored
+            && !(cached_only && linked)
             && selected.map(|s| s.contains(&path)).unwrap_or(!linked)
             && (!editions_only
                 || (!linked

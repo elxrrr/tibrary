@@ -43,6 +43,8 @@ This filter compares the **first credited album artist ID** with your linked art
 
 Catalogue workflows share HTTP connections, token renewal and rate-limit cooldowns. Concurrent requests for the same release wait for its cached result; unrelated releases can proceed independently. Album summaries fetch artist IDs, genres and replacement IDs together, and retain those IDs for the artist filter. Existing track-credit, artwork and DJ metadata caches remain reusable across workflows.
 
+When you manually choose a track placement, the app also checks its complete local release against the cached online recording sequence. If every recording matches uniquely and in order, unlinked siblings can inherit that release; existing links and ignored tracks are preserved. **Correct tags → Track & disc numbers** offers the online numbering and totals, including a local multi-disc release represented online as one disc. Review and apply those tags first, then use **Organise files** separately to update paths. Incomplete, ambiguous or conflicting recording sets are not automatically propagated.
+
 No database reset or full local rescan is needed to collect this online metadata. Update the local library only when files or tags have changed outside the app.
 
 ## ✨ Features
