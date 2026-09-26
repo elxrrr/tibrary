@@ -3,6 +3,7 @@ mod release_artists;
 mod release_anchor;
 mod availability;
 mod network;
+mod progress;
 mod subscriber_metadata;
 use serde_json::{json, Value};
 use std::{
@@ -210,6 +211,8 @@ pub struct Backend {
     pub log_epochs: Arc<[AtomicU64; 3]>,
     pub log_persist_gate: Arc<tokio::sync::Mutex<()>>,
     pub previews: Mutex<HashMap<String, Value>>,
+    progress_estimates: Mutex<progress::Progress>,
+    progress_clock: std::time::Instant,
     pub dispatch_gate: tokio::sync::Mutex<()>,
     pub read_gate: tokio::sync::Mutex<()>,
     pub view_cache: Mutex<HashMap<String, (u64, std::time::Instant, Value)>>,
@@ -233,6 +236,8 @@ impl Default for Backend {
             log_epochs: Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]),
             log_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             previews: Mutex::new(HashMap::new()),
+            progress_estimates: Mutex::new(progress::Progress::default()),
+            progress_clock: std::time::Instant::now(),
             dispatch_gate: tokio::sync::Mutex::new(()),
             read_gate: tokio::sync::Mutex::new(()),
             view_cache: Mutex::new(HashMap::new()),
@@ -324,6 +329,12 @@ impl Backend {
         }
     }
 
+    fn measure_progress(&self, job: &mut Value, message: &str) {
+        if job["progress_measured"] == true { job["completed"]=Value::Null; job["total"]=Value::Null; }
+        self.progress_estimates.lock().unwrap().update(job, message, self.progress_clock.elapsed().as_secs_f64());
+        job["progress_updated_at"]=json!(chrono::Utc::now().timestamp_millis() as f64/1000.);
+    }
+
     pub fn progress(&self, message: &str) {
         let job = self.active_job.lock().unwrap().clone();
         if let Some(mut job) = job {
@@ -356,14 +367,22 @@ impl Backend {
         *self.online_job.lock().unwrap() = Some(job);
     }
 
-    pub fn update_online_job_progress(&self, message: &str, job: Value) {
+    pub fn update_online_job_progress(&self, message: &str, mut job: Value) -> Value {
+        let mut current=self.online_job.lock().unwrap();
+        if let Some(saved)=current.as_ref() {
+            if saved["id"] != job["id"] || matches!(saved["status"].as_str(),Some("complete"|"cancelled"|"failed")) { return saved.clone(); }
+        }
+        self.measure_progress(&mut job, message);
+        if self.online_cancel.lock().unwrap().as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {job["status"]=json!("cancelling");}
         let id = job["id"].as_str().unwrap_or("online").to_string();
-        *self.online_job.lock().unwrap() = Some(job);
+        *current = Some(job.clone());
         let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":message,"level":"info","category":"online","progress_id":id});
         self.logs.replace_progress(&id, entry);
+        job
     }
 
-    pub fn finish_online_job(&self, job: Value) {
+    pub fn finish_online_job(&self, mut job: Value) {
+        self.progress_estimates.lock().unwrap().finish(&mut job);
         self.view_cache.lock().unwrap().clear();
         self.logs.retain(|entry| entry["progress_id"] != job["id"]);
         if let Some(message) = job["message"].as_str() {
@@ -422,7 +441,13 @@ impl Backend {
         *self.download_job.lock().unwrap() = Some(job);
     }
 
-    pub fn update_download_job(&self, mut job: Value) {
+    pub fn update_download_job(&self, mut job: Value) -> Value {
+        let mut current=self.download_job.lock().unwrap();
+        if let Some(saved)=current.as_ref() {
+            if saved["id"] != job["id"] || matches!(saved["status"].as_str(),Some("complete"|"cancelled"|"failed")) { return saved.clone(); }
+        }
+        let message=job["message"].as_str().unwrap_or("").to_owned();
+        self.measure_progress(&mut job, &message);
         if self
             .download_cancel
             .lock()
@@ -432,10 +457,12 @@ impl Backend {
         {
             job["status"] = json!("cancelling");
         }
-        *self.download_job.lock().unwrap() = Some(job);
+        *current = Some(job.clone());
+        job
     }
 
-    pub fn finish_download_job(&self, job: Value) {
+    pub fn finish_download_job(&self, mut job: Value) {
+        self.progress_estimates.lock().unwrap().finish(&mut job);
         if let Some(message) = job["message"].as_str() {
             self.log_with_category(
                 message,
@@ -462,7 +489,12 @@ impl Backend {
         Some(current.clone())
     }
 
-    pub fn update_job_progress(&self, msg: &str, mut job: Value) {
+    pub fn update_job_progress(&self, msg: &str, mut job: Value) -> Value {
+        let mut current=self.active_job.lock().unwrap();
+        if let Some(saved)=current.as_ref() {
+            if saved["id"] != job["id"] || matches!(saved["status"].as_str(),Some("complete"|"cancelled"|"failed")) { return saved.clone(); }
+        }
+        self.measure_progress(&mut job, msg);
         if self
             .active_job_cancel
             .lock()
@@ -491,10 +523,12 @@ impl Backend {
         let id = job["id"].as_str().unwrap_or("progress");
         let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":msg,"level":"info","category":cat.unwrap_or("general"),"progress_id":id});
         self.logs.replace_progress(id, entry);
-        *self.active_job.lock().unwrap() = Some(job);
+        *current = Some(job.clone());
+        job
     }
 
-    pub fn finish_job(&self, final_job: Value) {
+    pub fn finish_job(&self, mut final_job: Value) {
+        self.progress_estimates.lock().unwrap().finish(&mut final_job);
         self.view_cache.lock().unwrap().clear();
         self.logs
             .retain(|entry| entry["progress_id"] != final_job["id"]);
@@ -1710,7 +1744,7 @@ async fn handle_rpc_uncached(
                         "started": started,
                         "result": null
                     });
-                    backend_prog.update_job_progress(msg, prog_job.clone());
+                    let prog_job = backend_prog.update_job_progress(msg, prog_job.clone());
                     if let Some(ref app) = app_prog {
                         let _ = app.emit(
                             "backend-event",
@@ -1893,7 +1927,7 @@ async fn handle_rpc_uncached(
                     "started": started,
                     "result": null
                 });
-                backend_prog.update_online_job_progress(&msg, prog_job.clone());
+                let prog_job = backend_prog.update_online_job_progress(&msg, prog_job.clone());
                 if let Some(ref app) = app_clone {
                     let _ = app.emit(
                         "backend-event",
@@ -1958,7 +1992,7 @@ async fn handle_rpc_uncached(
                             saved_progress["completed"] = json!(checked);
                             let message = format!("Saved releases · {checked}/{total} artists complete · {name} · {} releases · {market}", catalogue.releases.len());
                             saved_progress["message"] = json!(message);
-                            backend_prog.update_online_job_progress(&message, saved_progress.clone());
+                            let saved_progress = backend_prog.update_online_job_progress(&message, saved_progress.clone());
                             if let Some(ref app) = app_clone {
                                 let _ = app.emit("backend-event", json!({"event":"progress","message":message,"online_job":saved_progress}));
                             }
@@ -2110,7 +2144,7 @@ async fn handle_rpc_uncached(
                     if ["Linked ·", "Needs review ·", "Unmatched ·"].iter().any(|prefix| msg.starts_with(prefix)) {
                         backend_prog.log_with_category(&msg, "info", Some("online"));
                     }
-                    backend_prog.update_online_job_progress(&msg, prog_job.clone());
+                    let prog_job = backend_prog.update_online_job_progress(&msg, prog_job.clone());
                     if let Some(ref app) = app_prog {
                         let _ = app.emit(
                             "backend-event",
@@ -2320,7 +2354,7 @@ async fn handle_rpc_uncached(
                         "started": started,
                         "result": null
                     });
-                    backend_prog.update_download_job(prog_job.clone());
+                    let prog_job = backend_prog.update_download_job(prog_job.clone());
                     if let Some(ref a) = app_prog {
                         let _ = a.emit(
                             "backend-event",
@@ -2800,6 +2834,16 @@ mod activity_tests {
         assert!(online_cancel.load(Ordering::Relaxed));
         assert!(!local_cancel.load(Ordering::Relaxed));
         assert!(!download_cancel.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn late_worker_updates_cannot_restart_finished_jobs() {
+        let backend=Backend::new();
+        let job=json!({"id":"old","kind":"download","status":"running"});
+        backend.start_download_job(job.clone(),Arc::new(AtomicBool::new(false)));
+        backend.finish_download_job(json!({"id":"old","status":"cancelled"}));
+        assert_eq!(backend.update_download_job(job.clone())["status"],"cancelled");
+        backend.start_download_job(json!({"id":"new","status":"running"}),Arc::new(AtomicBool::new(false)));
+        assert_eq!(backend.update_download_job(job)["id"],"new");
     }
     #[test]
     fn progress_replaces_one_row_and_preserves_errors() {

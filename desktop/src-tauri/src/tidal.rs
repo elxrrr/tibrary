@@ -259,23 +259,6 @@ fn retry_delay(header: Option<&str>, attempt: usize) -> Duration {
     crate::network::retry_after(header, attempt)
 }
 
-// Reuse connection pools across short-lived workflow clients. Authentication is
-// attached per request, never stored in default headers on the shared client.
-fn catalogue_http(timeout: u64) -> Result<reqwest::Client, String> {
-    type Clients = std::collections::HashMap<u64, reqwest::Client>;
-    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<Clients>> = std::sync::OnceLock::new();
-    let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
-    if let Some(client) = clients.get(&timeout) {
-        return Ok(client.clone());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout))
-        .build()
-        .map_err(|e| e.to_string())?;
-    clients.insert(timeout, client.clone());
-    Ok(client)
-}
-
 pub struct TidalClient {
     db: TursoDb,
     http: reqwest::Client,
@@ -288,7 +271,7 @@ impl TidalClient {
         let settings = db.get_preference("provider").await?.unwrap_or(Value::Null);
         Ok(Self {
             db: db.clone(),
-            http: catalogue_http(
+            http: crate::network::client(
                 settings["request_timeout_sec"]
                     .as_u64()
                     .unwrap_or(20)
@@ -480,7 +463,7 @@ impl TidalClient {
             .map(|a| resource_id(&a["id"]))
             .collect();
         if !ids.is_empty() {
-            self.db.set_preference(&format!("release-artists:{market}:{id}"),&json!({"ids":ids,"checked_at":raw["checked_at"],"source":"subscriber album credits"})).await?;
+            self.db.set_preference(&format!("release-artists:{market}:{id}"),&json!({"ids":ids,"names":album_artists(raw).iter().map(|a|a["name"].clone()).collect::<Vec<_>>(),"checked_at":raw["checked_at"],"source":"subscriber album credits"})).await?;
         }
         if let Some(available) = subscriber_available(raw) {
             self.db

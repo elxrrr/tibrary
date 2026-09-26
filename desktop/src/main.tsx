@@ -47,7 +47,7 @@ import {
 } from "./api";
 import { DataTable, Column } from "./DataTable";
 import { ActivityView, streamFor } from "./ActivityView";
-import { workload, jobTitle, compactProgress } from "./ActivityView";
+import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import "./style.css";
 const groups = [
@@ -2078,7 +2078,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.31 · build 31</span>
+          <span className="sidebar-version">v0.9.0-beta.32 · build 32</span>
         </div>
       </aside>
       <main>
@@ -2091,9 +2091,9 @@ function App() {
               <div className="header-workloads" role="status" aria-live="off">
                 {[state?.job, state?.online_job, state?.download_job].filter(job => active(job)).map((job) => {
                   const progress = workload(job, downloadMonitor, clock);
-                  return <button className="header-workload" aria-label={`Show activity: ${jobTitle(job?.kind)}`} key={job!.id} title={job?.message} onClick={() => setRoute("activity")}>
+                  return <button className="header-workload" aria-label={`Show activity: ${jobTitle(job?.kind)}`} key={job!.id} title={`${job?.message} · ${progress?.label}`} onClick={() => setRoute("activity")}>
                     <LoaderCircle className="spin" size={13}/>
-                    <span>{jobTitle(job?.kind)} · {compactProgress(progress?.percent)} · {job?.message}</span>
+                    <span>{jobTitle(job?.kind)} · {progress?.label}</span>
                     {progress?.percent != null && <span className="header-workload-bar" style={{width: `${progress.percent}%`}}/>}
                   </button>;
                 })}

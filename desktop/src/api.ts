@@ -9,6 +9,11 @@ export type Job = {
   finished?: number;
   completed?: number;
   total?: number;
+  percent?: number;
+  eta_seconds?: number | null;
+  items_per_second?: number | null;
+  progress_updated_at?: number;
+  progress_phase?: string;
   historical?: boolean;
   result?: any;
 };

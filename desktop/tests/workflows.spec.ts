@@ -622,3 +622,65 @@ test("match unresolved artists skips confirmed artists without network work", as
   const status = await rpc("job.status");
   expect(status.result.online_job.result.checked).toBe(0);
 });
+
+test("missing release filters, bidirectional sort and paging preserve the release rows", async ({page}) => {
+  await rpc("queue.decision",{ids:["910002","910003","910004","910005","910006"],decision:"removed"});
+  const args={route:"missing",timeline:"All missing releases",artist_scope:"My album artists",sort:"release",direction:"asc",limit:2};
+  const first=(await rpc("table",{...args,offset:0})).result;
+  const second=(await rpc("table",{...args,offset:2})).result;
+  expect(first.rows.length).toBe(2);
+  expect(second.rows.length).toBeGreaterThan(0);
+  expect(first.rows.map((r:any)=>r.id).some((id:string)=>second.rows.some((r:any)=>r.id===id))).toBe(false);
+  const all=(await rpc("table",{...args,limit:100})).result;
+  const reverse=(await rpc("table",{...args,limit:100,direction:"desc"})).result;
+  expect(reverse.rows.map((r:any)=>r.id)).toEqual(all.rows.map((r:any)=>r.id).reverse());
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await page.getByRole("combobox",{name:"Release type",exact:true}).selectOption("EP");
+  await expect(page.locator("tbody")).toContainText("Between Stations");
+  await expect(page.locator("tbody")).not.toContainText("Night Maps");
+  await page.getByRole("combobox",{name:"Release type",exact:true}).selectOption("All types");
+  await page.getByRole("textbox",{name:"Filter table",exact:true}).fill("Night Maps");
+  await expect(page.locator("tbody")).toContainText("Night Maps");
+  await expect(page.locator("tbody")).not.toContainText("Between Stations");
+});
+
+test("activity shows measured progress across navigation and disables repeated cancellation", async ({page}) => {
+  let job:any={id:"qa-job",kind:"link",status:"running",message:"Checking North Assembly — Night Maps",started:Date.now()/1000,completed:5,total:10,eta_seconds:20,progress_updated_at:Date.now()/1000};
+  let cancellations=0;
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.cancel") {cancellations++;job={...job,status:"cancelling"};await route.fulfill({json:{result:true}});return;}
+    const response=await rpc(request.method,request.args);
+    if(["state","job.status"].includes(request.method) && response.result) response.result.online_job=job;
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  const indicator=page.getByRole("button",{name:"Show activity: Link releases",exact:true});
+  await expect(indicator).toContainText("50%");
+  await expect(indicator).toContainText("20s remaining");
+  await indicator.click();
+  await expect(page.getByRole("progressbar",{name:"Online actions progress"})).toHaveAttribute("value","50");
+  await page.screenshot({path:"/tmp/tibrary-qa-activity.png"});
+  await page.getByRole("button",{name:"Cancel task",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Cancelling…",exact:true})).toBeDisabled();
+  expect(cancellations).toBe(1);
+  await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
+  await expect(indicator).toContainText("Cancelling");
+});
+
+test("a failed table request can be retried without freezing navigation", async ({page})=>{
+  let failed=false;
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(!failed && request.method==="table" && request.args.route==="missing") {failed=true;await route.fulfill({json:{error:"Temporary catalogue failure"}});return;}
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await expect(page.getByRole("alert")).toContainText("Temporary catalogue failure");
+  await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await expect(page.locator(".table-scroll")).toHaveAttribute("aria-busy","false");
+  await expect(page.locator("tbody tr").first()).toBeVisible();
+});

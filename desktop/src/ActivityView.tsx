@@ -41,26 +41,23 @@ function formatDuration(seconds: number): string {
 
 export function workload(job: Job | null | undefined, monitor: Record<string, Row>, now: number) {
   if (!active(job)) return null;
-  const parsed = job?.message?.match(/(?:^|\D)([\d,]+)\s*(?:\/|of)\s*([\d,]+)(?!\d)/i);
-  let done = job?.completed ?? (parsed ? Number(parsed[1].replaceAll(",", "")) : 0);
-  let total = job?.total ?? (parsed ? Number(parsed[2].replaceAll(",", "")) : 0);
-  if (job?.kind === "download") {
+  let done = job?.completed ?? 0;
+  let total = job?.total ?? 0;
+  if (job?.kind === "download" && !total) {
     const batches = Object.values(monitor).filter(row => row.kind === "batch");
-    if (batches.length) {
-      done = batches.reduce((n, row) => n + Number(row.completed_tracks || 0), 0);
-      total = batches.reduce((n, row) => n + Number(row.total_tracks || 0), 0);
-    }
+    done = batches.reduce((n, row) => n + Number(row.completed_tracks || 0), 0);
+    total = batches.reduce((n, row) => n + Number(row.total_tracks || 0), 0);
   }
-  if (!total || !Number.isFinite(total)) return { label: "Working", percent: null as number | null };
+  if (!total || !Number.isFinite(total)) return { label: "Measuring workload · ETA estimating…", percent: null as number | null };
   done = Math.min(total, Math.max(0, done));
-  const elapsed = Math.max(1, now / 1000 - Number(job?.started || now / 1000));
-  const rate = done / elapsed;
-  const remaining = done && rate > 0 ? ` · ~${formatDuration((total - done) / rate)} remaining · ${rate.toFixed(1)} items/s` : "";
-  return { label: `${Math.round(done / total * 100)}% · ${done.toLocaleString()}/${total.toLocaleString()}${remaining}`, percent: done / total * 100 };
+  const stale = job?.progress_updated_at != null && now / 1000 - job.progress_updated_at > 15;
+  const eta = job?.status === "cancelling" ? "Cancelling…" : stale ? "Waiting for next result · ETA updating…" : job?.eta_seconds != null ? `~${formatDuration(job.eta_seconds)} remaining` : "ETA estimating…";
+  return { label: `${compactProgress(done / total * 100)} · ${done.toLocaleString()}/${total.toLocaleString()} · ${eta}`, percent: done / total * 100 };
 }
 
 export function compactProgress(percent: number | null | undefined): string {
-  if (percent == null || percent === 0) return "Working";
+  if (percent == null) return "Working";
+  if (percent === 0) return "0%";
   if (percent < 1) return "<1%";
   return `${Math.floor(percent)}%`;
 }
@@ -166,13 +163,13 @@ function WorkerStatus({ title, job, onCancel }: { title: string; job?: Job | nul
     return () => window.clearTimeout(timer);
   }, [job?.id, job?.status, job?.finished, job?.historical]);
   const running = active(job);
-  const progress = running && job?.message?.match(/([\d,]+)\s*(?:\/|of)\s*([\d,]+)/i);
+  const progress = workload(job, {}, Date.now());
   const detail = running ? (job?.message || "Working") : completedId === job?.id ? "Task complete" : "Awaiting task...";
   return <div className="card activity-status" role="status">
     <div><small>{title}</small><h2>{running ? "Task in progress..." : detail}</h2>
-      {running && <p>{progress ? `Processing ${progress[1]}/${progress[2]} · ` : ""}{job?.message}</p>}
+      {running && <><p>{job?.message}</p><p className="job-progress-label">{progress?.label}</p><progress aria-label={`${title} progress`} max={100} value={progress?.percent ?? undefined}/></>}
     </div>
-    {running && <button onClick={() => onCancel(job!.kind)}>Cancel task</button>}
+    {running && <button disabled={job?.status === "cancelling"} onClick={() => onCancel(job!.kind)}>{job?.status === "cancelling" ? "Cancelling…" : "Cancel task"}</button>}
   </div>;
 }
 

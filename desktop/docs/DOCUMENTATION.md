@@ -1,8 +1,8 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.11 (build 11)
+> **Version:** 0.9.0-beta.32 (build 32)
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
-> **Core Stack:** Tauri v2 · Rust 1.80+ · Turso / libsql · React 19 · Lofty  
+> **Core Stack:** Tauri v2 · Rust stable · Turso SQLite · React 19 · Lofty
 
 ---
 
@@ -26,13 +26,13 @@ Build 11 makes Activity status describe the current task and clears completion a
 
 This remains a beta, not a certified public release. The Rust migration audit restored previously unhandled desktop actions and removed silent-success fallbacks. Linking and extended review write database associations only; filesystem edits require a current, explicit preview. File changes invalidate reviewed writes. Jobs run independently of navigation, with lightweight progress polling and revision-based table caches.
 
-Connections now consist of application credentials for the official catalogue API and **one shared subscriber sign-in** for favourites, extended metadata and audio downloads. These are distinct authorization types; duplicate subscriber connection controls were removed. Account tokens are saved in macOS Keychain. No Python service is required.
+Connections use **one shared subscriber sign-in** for discovery, favourites, extended metadata and audio downloads. Developer authentication and its settings have been removed. Account tokens are saved in macOS Keychain. No Python service is required.
 
 Verification uses disposable files/databases, mocked catalogue data, and WebKit against the actual Rust RPC backend. Routine Rust tests do not consume live API quota; credential-store/live catalogue tests are explicitly ignored unless requested. A read-only snapshot of the production library was used to exercise all table routes, without modifying library files. On that 19,243-track snapshot, cold link-table construction took about 7.5 seconds; cached filtering took 16–17 ms. Cold-start query optimization remains useful future work.
 
-Build 10 gives local, online and download tasks separate running states and in-memory activity buffers. Each Activity panel can be searched, copied and cleared independently. Overview displays the newest 50 cached missing releases in a scrollable card. The missing-release index now prefers album-artist tags across both metadata layouts, treats complete standard/deluxe editions as owned by default, and uses cached UPC, ISRC, label, copyright and verified primary-artist evidence when present. "Recheck cached releases" rebuilds recommendations without spending API quota; it does not reread files on disk. The catalogue and account connection dates are written on first successful connection and do not change on later diagnostics. Only the official catalogue integration is active: MusicBrainz, Discogs and Spotify are not queried, so their release-group identifiers are used only if already present in cached data.
+Build 10 gives local, online and download tasks separate running states and in-memory activity buffers. Each Activity panel can be searched, copied and cleared independently. Overview displays the newest 50 cached missing releases in a scrollable card. The missing-release index now prefers album-artist tags across both metadata layouts, treats complete standard/deluxe editions as owned by default, and uses cached UPC, ISRC, label, copyright and verified primary-artist evidence when present. "Recheck cached releases" rebuilds recommendations without spending API quota; it does not reread files on disk. The catalogue and account connection dates are written on first successful connection and do not change on later diagnostics. Only the subscriber catalogue integration is active: MusicBrainz, Discogs and Spotify are not queried, so their release-group identifiers are used only if already present in cached data.
 
-Live official catalogue authentication, artist search and audio-only release pagination were checked. Cassie release `140303440` returns 12 audio tracks, excluding its video. An isolated authenticated one-track download and two-track parallel download passed using the saved account; both wrote only to temporary folders. A copied real FLAC passed local preview, tag application, MQA audit, and source-integrity checks. Segmented transfers and recoverable redownload publishing have focused tests. The cached-catalogue copyright-object format that caused the Online replacements and Optimizations deserialization failure now parses correctly. Non-macOS packaging and notarized public distribution are not validated by this audit.
+Live subscriber authentication, artist search and audio-only release pagination were checked. Cassie release `140303440` returns 12 audio tracks, excluding its video. An isolated authenticated one-track download and two-track parallel download passed using the saved account; both wrote only to temporary folders. A copied real FLAC passed local preview, tag application, MQA audit, and source-integrity checks. Segmented transfers and recoverable redownload publishing have focused tests. The cached-catalogue copyright-object format that caused the Online replacements and Optimizations deserialization failure now parses correctly. Non-macOS packaging and notarized public distribution are not validated by this audit.
 
 ## 1. Architecture Overview
 
@@ -367,3 +367,27 @@ Validation: 99 offline Rust tests, 3 frontend unit tests and 27 WebKit workflows
 Endpoint reference: [Minim subscriber API implementation](https://minim.readthedocs.io/en/latest/_modules/minim/tidal.html). This is an implementation reference, not an installed dependency.
 
 The selected live FLAC was independently checked with ffprobe: 16-bit/44.1 kHz audio and embedded 1280×1280 JPEG artwork. The subscriber token also returned HTTP 200 from the v2 optional catalogue metadata endpoint; the final workflow test verifies this route and its cache without developer credentials.
+
+
+## Build 32 — progress, album artist accuracy and QA
+
+### Implementation
+
+- `progress.rs` owns per-job, phase-aware estimates. A monotonic-clock 30-second speed window is smoothed with an 80/20 moving average. Resumed/cached counts establish the baseline instead of inflating speed. Nested release lookups cannot reset overall track-link progress. Percent/count/ETA fields reach both events and status snapshots; finished jobs release estimator state.
+- Activity cards and the clickable header share the same progress values. Unknown-size discovery displays “Measuring workload” and ETA estimating; stale results are marked as waiting. A precise ETA cannot be promised before work is measured or while the service is stalled.
+- Scanning enumerates audio paths once, then reads only changed tags against an exact total. Cancellation preserves missing-file status; unreadable directory enumeration cannot mark an entire subtree missing. MQA decoding and duplicate comparisons run on blocking workers; duplicate cancellation retains the previous results.
+- `network::client` shares connection pools across catalogue, metadata, favourites and artwork workflows. Credited-album prefetch uses up to three concurrent requests through the existing global adaptive limiter; deduplication, per-release gates, cache-first reads and 429 cooldown remain in force.
+- Missing-release names prefer the subscriber album summary, then explicit album-level saved metadata/credits, then the release’s own artist field. They never infer the album artist from a track performer or combine names from artist discovery pages. The existing primary-artist market filter remains separate.
+- Correction preview joins use a path index instead of repeatedly scanning the file list.
+
+### Reproducible QA
+
+Run `cargo test --manifest-path desktop/src-tauri/Cargo.toml`, `npm --prefix desktop test`, then build the debug backend and run `npm --prefix desktop run test:e2e`.
+
+The WebKit suite exercises every main route and the shared table/selection components: bidirectional sorting, missing-release paging/filtering, parent/child approvals, queue/requeue, context menus, matching review, preview/apply on disposable FLACs, MQA/duplicate scans, navigation during jobs, progress/ETA, cancellation feedback, failed-query recovery, settings, themes, sidebar/history and sign-in redirect validation/cancellation. Rust tests cover actual cache/database and file operations, structural linking, credits, market isolation, throttling/cancellation and parallel segmented downloads.
+
+Explicit live checks use temporary databases/output directories: `live_subscriber_workflows`, `live_parallel_cache`, and `live_subscriber_download_pipeline` (pass `-- --ignored --nocapture`). They exercise search, discography, market availability, favourites, full credits, optional catalogue metadata, cache reuse without authentication, real FLAC download, tag indexing and cached linking. The live download fixture also deliberately changes its temporary tags and filename, then verifies number-total repair and organisation while preserving BPM and audio duration. Never point mutation fixtures at a real music library.
+
+Scope limits: these checks do not prove every possible OS/theme/accessibility combination or remote catalogue response. New-account browser approval, platform packaging outside macOS, and long-duration network outages still need release QA. No new pause mechanism is introduced; cancellation and existing catalogue refresh checkpoints remain supported.
+
+**Build 32 verification result:** 104 Rust tests, 4 frontend unit tests and 30 WebKit workflow tests passed. Three explicitly enabled live checks passed, including temporary FLAC number repair and organisation. Seven live/credential tests remain opt-in during routine offline runs. The macOS bundle is built locally and ad-hoc signed; NVME music files were not modified.

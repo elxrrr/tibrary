@@ -45,7 +45,7 @@ pub async fn cached(db: &TursoDb, market: &str) -> Result<HashMap<String, Value>
                 })
                 .collect();
             if !ids.is_empty() {
-                legacy.insert(id,json!({"ids":ids,"checked_at":value["tag_checked_at"].as_f64().unwrap_or(0.0) as i64,"source":"saved album credits"}));
+                legacy.insert(id,json!({"ids":ids,"names":[value["album_artist"].as_str().or_else(||value["artist"].as_str()).unwrap_or("")],"checked_at":value["tag_checked_at"].as_f64().unwrap_or(0.0) as i64,"source":"saved album credits"}));
             }
         }
     }
@@ -60,6 +60,33 @@ pub async fn cached(db: &TursoDb, market: &str) -> Result<HashMap<String, Value>
         }
     }
     Ok(legacy)
+}
+
+/// Resolve display names once per table read from album-level caches. Never use
+/// the discovery page artist or a track performer as the release's album artist.
+pub async fn album_names(db: &TursoDb, market: &str) -> Result<HashMap<String, String>, String> {
+    let conn=db.connect()?;
+    let mut rows=conn.query("SELECT key,payload FROM app_preferences WHERE key LIKE ? ORDER BY key",
+        (format!("subscriber-summary:{market}:%"),)).await.map_err(|e|e.to_string())?;
+    let mut names=HashMap::new();
+    while let Some(row)=rows.next().await.map_err(|e|e.to_string())? {
+        let key:String=row.get(0).map_err(|e|e.to_string())?;
+        let payload:String=row.get(1).map_err(|e|e.to_string())?;
+        let Ok(value)=serde_json::from_str::<Value>(&payload) else {continue};
+        let name=value["artist"]["name"].as_str().or_else(||value["artists"].as_array()?.first()?["name"].as_str());
+        if let Some(name)=name.filter(|n|!n.trim().is_empty()) {
+            names.entry(key.rsplit(':').next().unwrap_or("").to_owned()).or_insert_with(||name.trim().to_owned());
+        }
+    }
+    Ok(names)
+}
+
+pub fn display_name(release: &Value, saved: Option<&str>, credits: Option<&Value>) -> String {
+    saved.or_else(|| release["album_artist"].as_str())
+        .or_else(||credits?.get("names")?.as_array()?.first()?.as_str())
+        .filter(|v|!v.trim().is_empty())
+        .or_else(||release["artist"].as_str().filter(|v|!v.trim().is_empty()))
+        .unwrap_or("Unknown album artist").trim().to_owned()
 }
 
 pub fn classify(value: Option<&Value>, linked: &std::collections::HashSet<String>) -> &'static str {
@@ -213,5 +240,17 @@ mod tests {
         );
         assert_eq!(classify(values.get("2"), &linked), "My album artists");
         assert_eq!(classify(None, &linked), "Artist credits not checked");
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    #[test]
+    fn album_cache_precedes_guest_and_discovery_names() {
+        let release=json!({"artist":"Featured performer","tracks":[{"artist":"Guest"}]});
+        assert_eq!(display_name(&release,Some("Album owner"),None),"Album owner");
+        assert_eq!(display_name(&release,None,Some(&json!({"names":["Album owner","Guest"]}))),"Album owner");
+        assert_eq!(display_name(&json!({"tracks":[{"artist":"Guest"}]}),None,None),"Unknown album artist");
     }
 }

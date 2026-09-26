@@ -1477,6 +1477,7 @@ impl TursoDb {
         }
 
         let album_credit_cache = crate::release_artists::cached(self, market).await?;
+        let album_names = crate::release_artists::album_names(self, market).await?;
         // Exploratory search caches are not subscriptions to an artist's releases.
         let linked_artists: HashSet<String> = self.get_linked_artist_ids().await?.into_iter().collect();
         // 3. Load catalogue
@@ -1557,7 +1558,6 @@ impl TursoDb {
             }
 
             for rel in releases {
-                if let Ok(parsed) = serde_json::from_value::<crate::tidal::TidalRelease>(rel.clone()) { full_releases.entry(parsed.id.clone()).or_insert(parsed); }
                 let id = rel
                     .get("id")
                     .map(|v| v.to_string().trim_matches('"').to_string())
@@ -1597,12 +1597,12 @@ impl TursoDb {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let rel_artist = rel
-                    .get("artist")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&artist_name)
-                    .trim()
-                    .to_string();
+                let rel_artist = crate::release_artists::display_name(rel,
+                    album_names.get(&id).map(String::as_str), album_credit_cache.get(&id));
+                if let Ok(mut parsed) = serde_json::from_value::<crate::tidal::TidalRelease>(rel.clone()) {
+                    parsed.artist=rel_artist.clone();
+                    full_releases.entry(parsed.id.clone()).or_insert(parsed);
+                }
 
                 let rel_type = rel
                     .get("type")
@@ -1853,9 +1853,6 @@ impl TursoDb {
                     }
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         let existing = e.get_mut();
-                        if !rel_artist.is_empty() && !existing.artists.contains(&rel_artist) {
-                            existing.artists.push(rel_artist);
-                        }
                         if !existing.expanded_available && tracks_loaded {
                             existing.expanded_available = true;
                             existing.children = children;
@@ -1913,12 +1910,6 @@ impl TursoDb {
                     let existing_rec = Self::recommendation_priority(&existing.recommendation);
                     let cand_rec = Self::recommendation_priority(&rel.recommendation);
 
-                    for art in &rel.artists {
-                        if !existing.artists.contains(art) {
-                            existing.artists.push(art.clone());
-                        }
-                    }
-
                     let old_replaced = full_releases.get(&existing.id).and_then(|r| r.replacement_id.as_ref()).is_some_and(|id| id == &rel.id);
                     let should_replace = (old_replaced && rel.available == Some(true) && cand_pri >= existing_pri) || cand_pri > existing_pri
                         || (cand_pri == existing_pri && cand_rec > existing_rec)
@@ -1931,15 +1922,7 @@ impl TursoDb {
                             && (!existing.expanded_available && rel.expanded_available));
 
                     if should_replace {
-                        let mut merged_artists = existing.artists.clone();
-                        for art in &rel.artists {
-                            if !merged_artists.contains(art) {
-                                merged_artists.push(art.clone());
-                            }
-                        }
-                        let mut chosen = rel;
-                        chosen.artists = merged_artists;
-                        *existing = chosen;
+                        *existing = rel;
                     }
                 }
             }
@@ -4852,6 +4835,8 @@ with sqlite3.connect('{db}') as db:
         .unwrap();
 
         conn.execute("INSERT OR IGNORE INTO mappings(artist,tidal_id,status) SELECT artist_id,artist_id,'confirmed' FROM catalogue", ()).await.unwrap();
+        // Album-level credits, not a union of whichever artist pages contain it.
+        store.set_preference("subscriber-summary:GB:rel_shared", &json!({"artist":{"name":"Asketa & Natan Chaim"}})).await.unwrap();
         let page = store
             .get_missing_rows("GB", None, None, None, None, None, None, None, 0, 10)
             .await

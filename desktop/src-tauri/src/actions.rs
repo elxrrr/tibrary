@@ -124,7 +124,7 @@ async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool) -> Resu
     }
     let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
     let mut tracks = {
-        let http=reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().map_err(|e|e.to_string())?;
+        let http=crate::network::client(20)?;
         match crate::subscriber_metadata::load(db,&http,id,market,Arc::new(AtomicBool::new(false)),force).await {
             Ok(raw)=>crate::subscriber_metadata::tracks(&raw)?,
             Err(error) if value["tracks_loaded"] == true && !force => {
@@ -317,10 +317,7 @@ pub async fn execute(
         } else {
             metrics["catalogue"] = json!({"ok":false,"message":"Connect your streaming account"});
         }
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let http = crate::network::client(20)?;
         let token = crate::stream_download::get_valid_token(db, &http).await;
         let mut user_detail = String::new();
         let result = match token {
@@ -374,10 +371,7 @@ pub async fn execute(
         return Ok(diagnostics);
     }
     if kind == "favourites" {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let http = crate::network::client(20)?;
         let token = crate::stream_download::get_valid_token(db, &http).await?;
         let saved = crate::stream_download::load_saved_token(db)
             .await
@@ -552,6 +546,7 @@ pub async fn execute(
         sources.sort();
         sources.dedup();
         let mut completed = 0;
+        let total_sources=sources.len();
         for path in sources {
             if cancel.load(Ordering::Relaxed) {
                 break;
@@ -562,7 +557,7 @@ pub async fn execute(
             state.progress_for(
                 kind,
                 &format!(
-                    "Moved duplicate to Trash · {}",
+                    "Moved duplicate to Trash · {completed}/{total_sources} files · {}",
                     std::path::Path::new(&path)
                         .file_name()
                         .unwrap_or_default()
@@ -830,7 +825,13 @@ pub async fn execute(
                     indexed.len()
                 ),
             );
-            let clusters = crate::duplicates::find_duplicate_clusters(&indexed);
+            let files=indexed.clone();
+            let cancelled=cancel.clone();
+            let backend=state.clone();
+            let task=kind.to_owned();
+            let clusters=tokio::task::spawn_blocking(move ||crate::duplicates::find_duplicate_clusters_with_progress(&files,&cancelled,|done,total|backend.progress_for(&task,&format!("Comparing local releases · {done}/{total} artists"))))
+                .await.map_err(|e|e.to_string())?;
+            if cancel.load(Ordering::Relaxed) {return Ok(json!({"cancelled":true}));}
             let rows = crate::duplicates::clusters_to_group_rows(&clusters);
             db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
                 .await?;
@@ -940,10 +941,7 @@ pub async fn execute(
         return Ok(json!({"opportunities":rows.len()}));
     }
     if kind == "artwork" {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(25))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let http = crate::network::client(25)?;
         let mut token = None;
         let mut output = vec![];
         let cache = db
@@ -952,13 +950,11 @@ pub async fn execute(
             .ok_or("Invalid cache directory")?
             .join("artwork-cache");
         std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-        for file in indexed
-            .iter()
-            .filter(|f| ids.is_empty() || ids.contains(&f.path))
-        {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
+        let artwork_files:Vec<_>=indexed.iter().filter(|f|ids.is_empty() || ids.contains(&f.path)).collect();
+        let total_artwork=artwork_files.len();
+        for (position,file) in artwork_files.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {break;}
+            state.progress_for(kind,&format!("Checking artwork · {position}/{total_artwork} files · {}",file.path));
             let tags = workflows::extract_tags_map(&file.metadata);
             let detail = db
                 .get_detail(&json!({"path":file.path,"market":market}))
@@ -1050,6 +1046,7 @@ pub async fn execute(
         }
         drop(saved);
         let mut checked = 0;
+        let total_artists=pending.len();
         for artist in pending {
             let name = artist["artist"].as_str().unwrap_or("");
             if name.is_empty()
@@ -1062,7 +1059,7 @@ pub async fn execute(
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            state.progress_for(kind, &format!("Finding artist matches · {name}"));
+            state.progress_for(kind, &format!("Finding artist matches · {checked}/{total_artists} artists · {name}"));
             let titles: Vec<String> = indexed
                 .iter()
                 .filter_map(|f| {
@@ -1172,10 +1169,7 @@ pub async fn execute(
     }
     if kind == "metadata" || kind == "manual_candidate" {
         let mut output = vec![];
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let http = crate::network::client(20)?;
         let mut subscriber_token = None;
         let mut prepared = Vec::new();
         let mut albums = Vec::new();
@@ -1202,7 +1196,8 @@ pub async fn execute(
         let album_metadata = if kind == "metadata" {
             crate::subscriber_metadata::prefetch(db, &http, albums, market, cancel.clone(), |message| state.progress_for(kind,message)).await?
         } else { std::collections::HashMap::new() };
-        for (file, detail) in prepared {
+        let total_files=prepared.len();
+        for (position, (file, detail)) in prepared.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) { break; }
             let tags = workflows::extract_tags_map(&file.metadata);
             let album = args["album_id"]
@@ -1210,7 +1205,7 @@ pub async fn execute(
                 .or(detail["linked_ids"]["album_id"].as_str())
                 .or_else(|| tags.get("tidal_album_id").map(String::as_str));
             let Some(album) = album else { continue };
-            state.progress_for(kind, &format!("Checking missing metadata · {} — {} · {} · release ID {album}", tags.get("albumartist").or(tags.get("artist")).map(String::as_str).unwrap_or("Unknown artist"), tags.get("title").map(String::as_str).unwrap_or("Untitled track"), tags.get("album").map(String::as_str).unwrap_or("Unknown release")));
+            state.progress_for(kind, &format!("Checking missing metadata · {position}/{total_files} files · {} — {} · {} · release ID {album}", tags.get("albumartist").or(tags.get("artist")).map(String::as_str).unwrap_or("Unknown artist"), tags.get("title").map(String::as_str).unwrap_or("Untitled track"), tags.get("album").map(String::as_str).unwrap_or("Unknown release")));
             let value = release(db, album, market, false).await?;
             let mut rel: crate::tidal::TidalRelease =
                 serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
@@ -1369,7 +1364,8 @@ pub async fn execute(
             state.progress_for(
                 kind,
                 &format!(
-                    "Applied {count} files · {}",
+                    "Applying reviewed changes · {}/{} files · {count} applied · {}",
+                    count + errors.len(), ids.len(),
                     std::path::Path::new(path)
                         .file_name()
                         .unwrap_or_default()
@@ -1402,9 +1398,12 @@ pub async fn execute(
             return Err("Unknown local operation".into());
         }
         let template = settings["organisation"]["template"].as_str();
+        state.progress_for(kind,&format!("Planning local corrections · 0/{} files · cached tags only",indexed.len()));
         let plans = workflows::plan_cached(db, &indexed, action, template).await?;
+        state.progress_for(kind,&format!("Local corrections ready · {0}/{0} files",indexed.len()));
+        let file_index:std::collections::HashMap<_,_>=indexed.iter().map(|f|(f.path.as_str(),f)).collect();
         let rows:Vec<Value>=plans.into_iter().filter(|p|ids.is_empty()||ids.contains(&p.path)).map(|p| {
-            let f=indexed.iter().find(|f|f.path==p.path).unwrap();
+            let f=file_index[p.path.as_str()];
             json!({"id":p.path,"path":p.path,"artist":p.artist,"release":p.album,"title":p.title,"tags":p.current_tags,"changes":p.changes,"target":p.target,"folder_operation":crate::organisation::folder_operation(&p.path, p.target.as_deref()),"evidence":p.issues.join("; "),"affected":!p.changes.is_empty() || p.target.is_some(),"status":if !p.changes.is_empty() || p.target.is_some() {"Needs update"} else {"Needs review"},"size":f.size,"mtime":f.mtime,"item":{"path":p.path,"target":p.target,"tags":p.changes}})
         }).collect();
         let id = uuid::Uuid::new_v4().to_string();
@@ -1413,7 +1412,8 @@ pub async fn execute(
     }
     if kind == "mqa" {
         let mut rows = vec![];
-        for file in &indexed {
+        for (position,file) in indexed.iter().enumerate() {
+            state.progress_for(kind,&format!("MQA audit · {position}/{} files · {}",indexed.len(),file.path));
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -1425,8 +1425,9 @@ pub async fn execute(
                 }) {
                 saved.unwrap()["result"].clone()
             } else {
-                serde_json::to_value(crate::mqa::audit_file(std::path::Path::new(&file.path)))
-                    .map_err(|e| e.to_string())?
+                let path=file.path.clone();
+                tokio::task::spawn_blocking(move ||serde_json::to_value(crate::mqa::audit_file(std::path::Path::new(&path))))
+                    .await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?
             };
             db.set_preference(
                 &key,

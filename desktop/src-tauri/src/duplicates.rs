@@ -332,6 +332,10 @@ fn is_better_master(a: &LocalRelease, b: &LocalRelease) -> bool {
 }
 
 pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluster> {
+    find_duplicate_clusters_with_progress(files,&std::sync::atomic::AtomicBool::new(false),|_,_|{})
+}
+
+pub fn find_duplicate_clusters_with_progress(files: &[LocalFileRecord], cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(usize,usize)) -> Vec<DuplicateCluster> {
     let releases = parse_local_releases(files);
     if releases.len() < 2 {
         return Vec::new();
@@ -344,12 +348,15 @@ pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluste
         artist_groups.entry(normalize_text(&release.artist)).or_default().push(index);
     }
     let groups: Vec<_> = artist_groups.into_iter().collect();
-    for (left_key, left) in &groups {
+    for (position,(left_key, left)) in groups.iter().enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {return Vec::new();}
+        progress(position,groups.len());
         for (right_key, right) in &groups {
             if !left_key.is_empty() && !right_key.is_empty()
                 && left_key != right_key && !left_key.contains(right_key) && !right_key.contains(left_key) { continue; }
             for &i in left {
                 for &j in right {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {return Vec::new();}
                     if i == j || !is_release_contained(&releases[i], &releases[j]) { continue; }
                     // A complete clone has two possible parents. Keep only the
                     // higher-quality deterministic winner so the graph is acyclic.
@@ -362,6 +369,7 @@ pub fn find_duplicate_clusters(files: &[LocalFileRecord]) -> Vec<DuplicateCluste
         }
     }
 
+    progress(groups.len(),groups.len());
     if parents.is_empty() {
         return Vec::new();
     }

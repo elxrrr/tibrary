@@ -341,3 +341,20 @@ async fn live_metadata_concurrency() {
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// Reuse connection pools across short-lived workflow clients. Authentication is
+// attached per request, never stored in default headers on the shared client.
+pub fn client(timeout: u64) -> Result<reqwest::Client, String> {
+    type Clients = std::collections::HashMap<u64, reqwest::Client>;
+    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<Clients>> = std::sync::OnceLock::new();
+    let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
+    if let Some(client) = clients.get(&timeout) {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout))
+        .build()
+        .map_err(|e| e.to_string())?;
+    clients.insert(timeout, client.clone());
+    Ok(client)
+}

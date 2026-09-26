@@ -244,6 +244,7 @@ pub async fn link_library_mode(
     drop(cat_stmt);
     drop(map_stmt);
     let total = eligible.len();
+    progress(format!("Linking recordings · 0/{total} tracks · cached links retained"));
     if total == 0 {
         return Ok(LinkSummary::default());
     }

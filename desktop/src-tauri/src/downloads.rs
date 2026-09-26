@@ -217,8 +217,12 @@ impl DownloadManager {
         let roots = db.list_roots(market).await?;
         let mut completed_count = 0;
         let mut failed_count = 0;
+        let mut processed_tracks=0usize;
+        let mut planned_tracks:Vec<usize>=items.iter().map(|(_,release)|release["selected_tracks"].as_array().map(Vec::len)
+            .or_else(||release["track_count"].as_u64().map(|n|n as usize)).unwrap_or(0)).collect();
 
-        for (ident, release) in &items {
+        for (release_index, (ident, release)) in items.iter().enumerate() {
+            progress_cb(format!("Downloading releases · {}/{} releases",release_index,items.len()));
             if cancel_flag.load(Ordering::Relaxed) {
                 break;
             }
@@ -376,6 +380,8 @@ impl DownloadManager {
 
             let mut all_tracks_ok = true;
             let total_tracks = tracks.len();
+            planned_tracks[release_index]=total_tracks;
+            let planned_total=if planned_tracks.iter().all(|n|*n>0) {planned_tracks.iter().sum()} else {0};
             monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":0,"status":"running"}));
             let mut relative_track_filenames = Vec::new();
             let mut existing_published_files = Vec::new();
@@ -419,13 +425,16 @@ impl DownloadManager {
                     let extension = if stream.mime_type.contains("mp4") || stream.codec.to_lowercase().contains("mp4") || stream.codec.to_lowercase().contains("aac") { ".m4a" } else { ".flac" };
                     let source = stage.join(format!(".source-{}{}", track.id, extension));
                     let started = std::time::Instant::now();
+                    let estimator = std::sync::Mutex::new(crate::progress::Estimate::default());
                     let last = std::sync::Mutex::new((std::time::Instant::now() - Duration::from_secs(1), 255u8));
                     let progress = |pct: u8, bytes: u64, total_bytes: Option<u64>| {
                         let mut latest = last.lock().unwrap();
                         if pct == latest.1 && latest.0.elapsed() < Duration::from_millis(250) { return; }
                         if latest.0.elapsed() < Duration::from_millis(250) && pct < 100 { return; }
                         *latest = (std::time::Instant::now(), pct);
-                        let speed = bytes as f64 / started.elapsed().as_secs_f64().max(0.001);
+                        let mut estimate = estimator.lock().unwrap();
+                        estimate.observe(started.elapsed().as_secs_f64(),bytes,total_bytes.unwrap_or(u64::MAX),"bytes");
+                        let speed = estimate.rate.unwrap_or(0.);
                         let estimated_total = total_bytes.or_else(|| if pct > 0 { Some(bytes.saturating_mul(100) / pct as u64) } else { None });
                         let remaining = estimated_total.and_then(|total| if speed > 0.0 { Some((total.saturating_sub(bytes) as f64 / speed).ceil() as u64) } else { None });
                         monitor(json!({"kind":"track","id":track.id,"release_id":release_id,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"downloading","percent":pct,"bytes":bytes,"total_bytes":total_bytes,"estimated_total_bytes":estimated_total,"bytes_per_second":speed,"eta_seconds":remaining}));
@@ -438,6 +447,7 @@ impl DownloadManager {
             }
 
             for (idx, track) in tracks.iter().enumerate() {
+                if planned_total>0 {progress_cb(format!("Downloading audio · {}/{planned_total} tracks · {album_artist_name} — {release_title} · {}",processed_tracks+idx,track.title));}
                 if cancel_flag.load(Ordering::Relaxed) {
                     all_tracks_ok = false;
                     break;
@@ -795,6 +805,8 @@ impl DownloadManager {
                 }
             }
 
+            processed_tracks+=total_tracks;
+            if planned_total>0 {progress_cb(format!("Saved audio · {processed_tracks}/{planned_total} tracks · {album_artist_name} — {release_title}"));}
             completed_count += 1;
             for (idx, track) in tracks.iter().enumerate() {
                 monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"complete","percent":100}));
@@ -903,5 +915,24 @@ async fn live_subscriber_download_pipeline() {
     client.save_catalogue_to_db(&db,"GB",&crate::tidal::TidalCatalogue{id:"3924".into(),name:"Cassie".into(),releases:vec![album]}).await.unwrap();
     let links=crate::linking::link_library_mode(&db,"GB",&output.to_string_lossy(),cancel,|line|println!("{line}"),None,false,true).await.unwrap();
     assert_eq!(links.linked,1);
-    println!("Download, metadata, queue completion, scan and cached linking passed in {}",dir.display());
+    // Exercise real decoded audio through local repair and organisation as well.
+    let root=output.to_string_lossy().to_string();
+    let path=files[0].to_string_lossy().to_string();
+    let wrong=output.join("Wrong filename.flac").to_string_lossy().to_string();
+    let corrupt=crate::maintenance::FileApplyItem{path:path.clone(),target:Some(wrong.clone()),artwork:None,
+        tags:std::collections::HashMap::from([("tracknumber".into(),"7/1".into()),("tracktotal".into(),"1".into()),("discnumber".into(),"1".into()),("disctotal".into(),"1".into())])};
+    crate::maintenance::apply_file_item(&db,&root,&corrupt).await.unwrap();
+    let indexed=db.get_local_files_page(Some(&root),usize::MAX,0).await.unwrap().0;
+    let plans=crate::workflows::plan_cached(&db,&indexed,"numbers",None).await.unwrap();
+    assert_eq!(plans[0].changes.get("tracktotal").map(String::as_str),Some("12"));
+    crate::maintenance::apply_file_item(&db,&root,&crate::maintenance::FileApplyItem{path:wrong.clone(),target:None,artwork:None,tags:plans[0].changes.clone()}).await.unwrap();
+    let indexed=db.get_local_files_page(Some(&root),usize::MAX,0).await.unwrap().0;
+    let layout=crate::workflows::plan_cached(&db,&indexed,"organise",None).await.unwrap();
+    let target=layout[0].target.clone().expect("wrong filename needs organising");
+    crate::maintenance::apply_file_item(&db,&root,&crate::maintenance::FileApplyItem{path:wrong,target:Some(target.clone()),artwork:None,tags:std::collections::HashMap::new()}).await.unwrap();
+    let repaired=crate::scanner::read_audio_metadata(Path::new(&target)).unwrap();
+    assert_eq!(repaired.tracktotal.as_deref(),Some("12"));
+    assert_eq!(repaired.bpm,metadata.bpm);
+    assert!((repaired.duration-metadata.duration).abs()<0.01);
+    println!("Download, metadata, queue completion, scan, linking, number repair and organisation passed in {}",dir.display());
 }

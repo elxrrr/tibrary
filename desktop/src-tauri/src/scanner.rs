@@ -252,79 +252,44 @@ pub async fn scan_library_with_options(
 
     let allowed_exts: HashSet<&str> = AUDIO_EXTS.iter().copied().collect();
     let mut pending_dirs = vec![root_path.clone()];
+    let mut paths = Vec::new();
+    let mut last_report = Instant::now();
+    // Enumerate once before reading tags, so the processing denominator is real.
+    while let Some(dir) = pending_dirs.pop() {
+        if cancelled.load(Ordering::Relaxed) {break;}
+        let entries=fs::read_dir(&dir).map_err(|e|format!("Cannot read folder {}: {e}; missing-file status unchanged",dir.display()))?;
+        for entry in entries {
+            if cancelled.load(Ordering::Relaxed) {break;}
+            let entry=entry.map_err(|e|format!("Folder enumeration failed: {e}"))?;
+            let kind=entry.file_type().map_err(|e|e.to_string())?;
+            if kind.is_symlink() {continue;}
+            if kind.is_dir() {
+                if !entry.file_name().to_string_lossy().starts_with(".tibrary-") {pending_dirs.push(entry.path());}
+            } else if kind.is_file() && allowed_exts.contains(entry.path().extension().and_then(|s|s.to_str()).unwrap_or("").to_ascii_lowercase().as_str()) {paths.push(entry.path());}
+        }
+        if last_report.elapsed() >= Duration::from_millis(250) {
+            progress(&format!("Discovering library · {} audio files found · {}",paths.len(),dir.display()));
+            last_report=Instant::now();
+            tokio::task::yield_now().await;
+        }
+    }
+    let total=paths.len();
+    progress(&format!("Reading local tags · 0/{total} files"));
     let mut seen_paths = HashSet::new();
-
     let mut summary = ScanSummary::default();
     let mut pending_writes: Vec<PendingWrite> = Vec::new();
     let mut restored_paths = Vec::new();
-    let mut last_report = Instant::now();
-
-    while let Some(dir) = pending_dirs.pop() {
-        if cancelled.load(Ordering::Relaxed) {
-            summary.status = "cancelled".to_string();
-            break;
-        }
-
-        if last_report.elapsed() >= Duration::from_millis(250) {
-            progress(&format!("Checking folder · {}", dir.display()));
-            last_report = Instant::now();
-        }
-
-        let entries = match fs::read_dir(&dir) {
-            Ok(it) => it,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            if cancelled.load(Ordering::Relaxed) {
-                summary.status = "cancelled".to_string();
-                break;
+    if cancelled.load(Ordering::Relaxed) {summary.status="cancelled".into();}
+    for (position,path) in paths.into_iter().enumerate() {
+            if cancelled.load(Ordering::Relaxed) {summary.status="cancelled".into();break;}
+            if last_report.elapsed() >= Duration::from_millis(250) {
+                progress(&format!("Reading local tags · {position}/{total} files · {} read · {} unchanged",summary.read,summary.unchanged));
+                last_report=Instant::now();
+                tokio::task::yield_now().await;
             }
-
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-
-            if file_type.is_symlink() {
-                continue;
-            }
-
-            let path = entry.path();
-            if file_type.is_dir() {
-                if entry.file_name().to_string_lossy().starts_with(".tibrary-") {
-                    continue;
-                }
-                pending_dirs.push(path);
-                continue;
-            }
-
-            if !file_type.is_file() {
-                continue;
-            }
-
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-
-            if !allowed_exts.contains(ext.as_str()) {
-                continue;
-            }
-
-            let path_str = match path.to_str() {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-
+            let path_str=path.to_str().ok_or("Unsupported non-UTF8 music path")?.to_owned();
             seen_paths.insert(path_str.clone());
-
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
+            let metadata=match fs::metadata(&path) {Ok(m)=>m,Err(_)=>{summary.errors+=1;continue;}};
             let size = metadata.len() as i64;
             let mtime = mtime_ns(&metadata);
 
@@ -361,17 +326,8 @@ pub async fn scan_library_with_options(
                 flush_writes(&conn, &mut pending_writes).await?;
             }
 
-            if last_report.elapsed() >= Duration::from_millis(250) {
-                progress(&format!(
-                    "Scanned {} files · {} read · {} unchanged",
-                    seen_paths.len(),
-                    summary.read,
-                    summary.unchanged
-                ));
-                last_report = Instant::now();
-            }
-        }
     }
+    if summary.status != "cancelled" {progress(&format!("Reading local tags · {total}/{total} files · saving index"));}
 
     // Flush any remaining writes
     if !pending_writes.is_empty() {
@@ -514,6 +470,17 @@ mod tests {
             .expect("Second scan failed");
         assert_eq!(summary2.read, 0);
         assert_eq!(summary2.unchanged, 1);
+        assert!(progress_messages.lock().unwrap().iter().any(|m|m.contains("0/1 files")));
+        assert!(progress_messages.lock().unwrap().iter().any(|m|m.contains("1/1 files")));
+        // A cancelled enumeration must not publish missing-file decisions.
+        fs::remove_file(&song_path).unwrap();
+        let stopped=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(true)),|_|{}).await.unwrap();
+        assert_eq!(stopped.status,"cancelled");
+        assert_eq!(store.get_local_files_page(None,10,0).await.unwrap().1,1);
+        let final_scan=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+        assert_eq!(final_scan.missing,1);
+        assert_eq!(store.get_local_files_page(None,10,0).await.unwrap().1,0);
+
 
         let _ = fs::remove_dir_all(temp_dir);
     }

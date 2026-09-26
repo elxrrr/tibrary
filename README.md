@@ -190,3 +190,7 @@ Compilation placeholders such as “Various artists” stay out of the artist in
 Linking recognises both legacy and current file signatures, avoiding unnecessary rechecks of unchanged linked tracks. Activity retains each checked track’s link/review/unmatched outcome. The header task indicator opens Activity and includes the current work details; MQA audit is under Update library.
 
 Folder previews identify moves, renames, or both, with separate before/after folder and filename evidence. The default layout avoids appending a year already present at the end of the album tag. Downloads & files keeps destination, layout and audio options together. Missing releases uses linked artist IDs, excluding unrelated catalogues retained from searches.
+
+### Activity and metadata
+
+Background work shows measured counts, percentage and a smoothed ETA in Activity and the clickable header. Folder discovery stays indeterminate until the file count is known. Subscriber metadata reuses pooled connections and cached credited albums, with bounded parallel requests and automatic rate-limit backoff. Missing releases uses album-level artist metadata, rather than collecting featured performers from artist pages.
