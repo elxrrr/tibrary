@@ -296,6 +296,13 @@ pub fn plan_workflow(
                         if template.unwrap_or(crate::organisation::DEFAULT_LAYOUT).contains("{year}") && years.len() > 1 {
                             issues.push(format!("Conflicting release years in saved tags: {}. No move proposed: correct the release dates first so the album stays together.", years.into_iter().collect::<Vec<_>>().join(", ")));
                         } else {
+                        let source_spaces = row.path.chars().filter(|c| *c == ' ').count();
+                        let target_spaces = target_str.chars().filter(|c| *c == ' ').count();
+                        if source_spaces > target_spaces && row.path.split_whitespace().collect::<Vec<_>>().join(" ") == target_str {
+                            issues.push(format!("Remove {} extra space(s); words and tags stay unchanged", source_spaces - target_spaces));
+                        } else if row.path.replace('\u{a0}', " ") == target_str {
+                            issues.push("Replace non-breaking space with a normal space; words and tags stay unchanged".into());
+                        }
                         let source = Path::new(&row.path).strip_prefix(&row.root).unwrap_or(Path::new(&row.path));
                         let destination = target_path.strip_prefix(&row.root).unwrap_or(&target_path);
                         if source.parent() != destination.parent() {

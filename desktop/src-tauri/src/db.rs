@@ -3468,12 +3468,29 @@ impl TursoDb {
                 } else {
                     json!({})
                 };
-            let mut linked=conn.query("SELECT tidal_id FROM mappings WHERE artist=? UNION SELECT tidal_id FROM additional_mappings WHERE artist=?",(artist,artist)).await.map_err(|e|e.to_string())?;
+            let mut linked=conn.query("SELECT tidal_id FROM mappings WHERE artist=? AND tidal_id IS NOT NULL AND tidal_id != '' UNION SELECT tidal_id FROM additional_mappings WHERE artist=? AND tidal_id IS NOT NULL AND tidal_id != ''",(artist,artist)).await.map_err(|e|e.to_string())?;
             let mut ids = vec![];
             while let Some(row) = linked.next().await.map_err(|e| e.to_string())? {
                 ids.push(row.get::<String>(0).map_err(|e| e.to_string())?);
             }
-            return Ok(json!({"artist":artist,"ids":ids,"review":payload}));
+            let mut payload = payload;
+            if let Some(candidates) = payload["candidates"].as_array_mut() {
+                for candidate in candidates {
+                    if candidate["id"].is_null() { candidate["id"] = candidate["artist"]["id"].clone(); }
+                    if candidate["name"].is_null() { candidate["name"] = candidate["artist"]["name"].clone(); }
+                }
+            }
+            let mut local_files = Vec::new();
+            let root = args["root"].as_str().unwrap_or("");
+            let mut files = conn.query("SELECT path,metadata FROM local_files WHERE present=1 AND (?='' OR root=?)", (root,root)).await.map_err(|e| e.to_string())?;
+            while let Some(row) = files.next().await.map_err(|e| e.to_string())? {
+                let metadata = row.get::<Option<String>>(1).ok().flatten().and_then(|s| serde_json::from_str(&s).ok());
+                let tags = crate::workflows::extract_tags_map(&metadata);
+                if tags.get("albumartist").or(tags.get("artist")).is_some_and(|s| crate::matching::name_key(s) == crate::matching::name_key(artist)) {
+                    local_files.push(json!({"path":row.get::<String>(0).map_err(|e|e.to_string())?,"title":tags.get("title"),"release":tags.get("album"),"performers":tags.get("artist"),"isrc":tags.get("isrc")}));
+                }
+            }
+            return Ok(json!({"artist":artist,"ids":ids,"review":payload,"local_files":local_files}));
         }
 
         if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
@@ -4921,6 +4938,19 @@ with sqlite3.connect('{db}') as db:
             .unwrap();
         assert_eq!(reconsidered.rows[0].status, "Owned partial");
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn unresolved_artist_detail_accepts_null_mapping_and_legacy_candidates() {
+        let temp = std::env::temp_dir().join(format!("artist_detail_{}", uuid::Uuid::new_v4()));
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Sad Alex',NULL,'review')", ()).await.unwrap();
+        conn.execute("INSERT INTO match_reviews(artist,payload) VALUES('Sad Alex',?)", (json!({"candidates":[{"artist":{"id":"8790541","name":"Sad Alex"}}]}).to_string(),)).await.unwrap();
+        let detail = db.get_detail(&json!({"artist":"Sad Alex"})).await.unwrap();
+        assert_eq!(detail["ids"], json!([]));
+        assert_eq!(detail["review"]["candidates"][0]["id"], "8790541");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]

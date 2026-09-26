@@ -16,6 +16,17 @@ pub struct LinkSummary {
     pub unmatched: usize,
 }
 
+// A wrong Album Artist must not override exact recording evidence. This only
+// supplies candidates; whole-release totals and positions still decide linking.
+fn exact_recording_release(tracks: &[LocalTrackInfo], release: &TidalRelease) -> bool {
+    release.available != Some(false) && release.tracks_loaded && !tracks.is_empty()
+        && tracks.iter().all(|local| {
+            let Some(isrc) = local.isrc.as_deref().filter(|s| !s.trim().is_empty()) else { return false; };
+            release.tracks.iter().any(|remote| remote.isrc.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(isrc))
+                && crate::release_matching::recording_matches(&local.title, local.duration, Some(isrc), &remote.title, remote.duration, remote.isrc.as_deref(), true))
+        })
+}
+
 pub async fn link_library(
     db: &TursoDb,
     market: &str,
@@ -295,6 +306,39 @@ pub async fn link_library_mode(
             }
         }
 
+        // Fall back across cached artist catalogues only with exact ISRC and
+        // title/duration evidence for every local recording, never artist-name similarity.
+        if candidate_releases.is_empty() {
+            for release in catalogues_by_artist.values().flatten() {
+                if title_key(&release.title) == alb_key && exact_recording_release(&group_tracks, release)
+                    && !candidate_releases.iter().any(|r| r.id == release.id) {
+                    candidate_releases.push(release.clone());
+                }
+            }
+        }
+        if candidate_releases.is_empty() && !cached_only && selected.is_some() {
+            if let Some(anchor) = group_tracks.iter().find(|t| t.isrc.as_deref().is_some_and(|s| !s.trim().is_empty())) {
+                let key = format!("recording-isrc-releases:{market}:{}:{}", anchor.isrc.as_deref().unwrap(), title_key(&anchor.title));
+                let cached = db.get_preference(&key).await?;
+                let ids: Vec<String> = if let Some(value) = cached.filter(|v| v["checked_at"].as_i64().is_some_and(|at| chrono::Utc::now().timestamp() - at < 86400)) {
+                    serde_json::from_value(value["ids"].clone()).unwrap_or_default()
+                } else {
+                    progress(format!("Searching exact recording · {} — {} · checking ISRC before considering another artist", anchor.artist, anchor.title));
+                    let mut client = crate::tidal::TidalClient::from_db(db).await?;
+                    let ids = client.releases_for_isrc(anchor.isrc.as_deref().unwrap(), market).await?;
+                    db.set_preference(&key, &json!({"ids":ids,"checked_at":chrono::Utc::now().timestamp()})).await?;
+                    ids
+                };
+                for id in ids {
+                    if cancel.load(Ordering::Relaxed) { return Ok(summary); }
+                    let release: TidalRelease = serde_json::from_value(crate::actions::release(db, &id, market, false).await?).map_err(|e| e.to_string())?;
+                    if title_key(&release.title) == alb_key && exact_recording_release(&group_tracks, &release) {
+                        candidate_releases.push(release);
+                    }
+                }
+            }
+        }
+
         // Provider replacement IDs are candidate edges, never identity proof.
         // Keep the original placement and require the normal recording/position checks.
         let replacement_ids: Vec<_> = candidate_releases.iter().filter_map(|r| r.replacement_id.clone()).collect();
@@ -313,7 +357,7 @@ pub async fn link_library_mode(
                 summary.unmatched += 1;
                 let payload = json!({
                     "status": "unmatched",
-                    "note": "No matching release in linked artist catalogues",
+                    "note": "No verified release found; check release tags and recording identifiers",
                     "checked_at": chrono::Utc::now().timestamp(),
                 });
                 let stamp = file_stamps
@@ -325,7 +369,7 @@ pub async fn link_library_mode(
                     "INSERT OR REPLACE INTO track_links (path, market, stamp, payload) VALUES (?, ?, ?, ?)",
                     (track.path.as_str(), market, stamp.as_str(), payload_str.as_str()),
                 ).await.map_err(|e| format!("Could not save track link: {e}"))?;
-                progress(format!("Unmatched · {}/{} tracks checked · {} — {} · {} · no release in linked artist cache", summary.linked + summary.review + summary.unmatched, total, track.artist, track.title, track.album));
+                progress(format!("Unmatched · {}/{} tracks checked · {} — {} · {} · no verified release found", summary.linked + summary.review + summary.unmatched, total, track.artist, track.title, track.album));
             }
             continue;
         }
@@ -555,6 +599,21 @@ mod tests {
     use super::*;
     use crate::tidal::TidalTrack;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn wrong_artist_fallback_requires_exact_recordings() {
+        let tracks = vec![LocalTrackInfo { path:"song.flac".into(), title:"High Hopes".into(), artist:"Wrong Artist".into(), album:"High Hopes".into(), duration:180.0, track_number:1, disc_number:1, isrc:Some("USP6L2100619".into()) }];
+        let mut release = TidalRelease { title:"High Hopes".into(), artist:"Correct Artist".into(), available:Some(true), tracks_loaded:true, tracks:vec![TidalTrack {title:"High Hopes".into(), duration:180.0, isrc:Some("USP6L2100619".into()), ..Default::default()}], ..Default::default() };
+        assert!(exact_recording_release(&tracks, &release));
+        release.tracks[0].duration = 190.0;
+        assert!(!exact_recording_release(&tracks, &release));
+        release.tracks[0].duration = 180.0;
+        release.tracks[0].isrc = None;
+        assert!(!exact_recording_release(&tracks, &release));
+        release.tracks[0].isrc = Some("USP6L2100619".into());
+        release.available = Some(false);
+        assert!(!exact_recording_release(&tracks, &release));
+    }
 
     #[tokio::test]
     async fn test_link_library_pipeline() {

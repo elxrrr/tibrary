@@ -27,6 +27,15 @@ test.beforeEach(async ({ page }) => {
       },
     },
   );
+  if (test.info().title.startsWith("artist context menu opens")) {
+  execFileSync("python3", ["-c", `import sqlite3,json,sys
+c=sqlite3.connect(sys.argv[1])
+c.execute("CREATE TABLE IF NOT EXISTS match_reviews(artist TEXT PRIMARY KEY,status TEXT,payload TEXT,error TEXT,updated TEXT)")
+c.execute("UPDATE mappings SET tidal_id=NULL,status='review'")
+for artist, in c.execute("SELECT artist FROM mappings").fetchall():
+ c.execute("INSERT OR REPLACE INTO match_reviews(artist,payload) VALUES(?,?)",(artist,json.dumps({"candidates":[{"artist":{"id":"900001","name":"North Assembly"},"evidence":"Saved candidate"}]})))
+c.commit()`, join(folder,"db")]);
+  }
   child = spawn(
     join(root, "desktop/src-tauri/target/debug/tibrary"),
     ["--rpc", "--db", join(folder, "db")],
@@ -583,4 +592,16 @@ test("cached release recheck reports activity and preserves release order and to
   const state = (await rpc("state")).result;
   expect(state.logs.some((log:any)=>log.category === "online" && log.message.includes("Cached release check complete"))).toBe(true);
   expect(state.online_job.message).toContain("music files unchanged");
+});
+
+
+test("artist context menu opens legacy candidates and local recordings", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link artists",exact:true}).click();
+  await page.locator("tbody tr").first().click({button:"right"});
+  await page.getByRole("menuitem",{name:"View metadata / match details"}).click();
+  await expect(page.getByRole("dialog")).toContainText("Local recordings");
+  await page.getByRole("button",{name:"Add ID",exact:true}).first().click();
+  await expect(page.getByRole("dialog").getByRole("textbox")).toHaveValue("900001");
+  await expect(page.getByRole("button",{name:"Check these recording links"})).toBeEnabled();
 });

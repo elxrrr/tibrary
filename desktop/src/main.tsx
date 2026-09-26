@@ -572,7 +572,7 @@ function App() {
           track: row.parent ? row : null,
         });
       } else if (route === "artists" || route === "favourites") {
-        const d = await call("detail", { artist: row.artist });
+        const d = await call("detail", { artist: row.artist, root });
         setManual((d.ids || []).join(","));
         setDetail(d);
       } else if (route === "local" || route === "online") {
@@ -2158,7 +2158,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.19 · build 19</span>
+          <span className="sidebar-version">v0.9.0-beta.20 · build 20</span>
         </div>
       </aside>
       <main>
@@ -2285,7 +2285,7 @@ function App() {
                     Show in Finder
                   </button>
                 </div>
-                {detail.folder_target && <section className="metadata-source"><h3>Proposed folder layout</h3><p>{detail.folder_evidence}</p><dl><dt>Current path</dt><dd>{detail.path}</dd><dt>Proposed path</dt><dd>{detail.folder_target}</dd></dl><p>{detail.folder_target === detail.path ? "This file already follows the saved folder template. No change is proposed." : "Only the file location or filename changes. Tags remain unchanged."}</p></section>}
+                {detail.folder_target && <section className="metadata-source"><h3>Proposed folder layout</h3><p>{detail.folder_evidence}</p><dl><dt>Current path</dt><dd style={{whiteSpace:"break-spaces"}}>{detail.path}</dd><dt>Proposed path</dt><dd style={{whiteSpace:"break-spaces"}}>{detail.folder_target}</dd></dl><p>{detail.folder_target === detail.path ? "This file already follows the saved folder template. No change is proposed." : "Only the file location or filename changes. Tags remain unchanged."}</p></section>}
                 {detail.proposed && Object.keys(detail.proposed).length > 0 && <section><h3>Proposed changes</h3>
                   {detail.source_release_id && <p>Online source · Release {detail.source_release_id} · Track {detail.source_track_id}</p>}
                   <TagChanges changes={detail.proposed} current={detail.tags}/></section>}
@@ -2404,6 +2404,11 @@ function App() {
                   Choose one or more confirmed artist IDs. Existing mappings
                   remain until you save.
                 </p>
+                {!!detail.local_files?.length && <section className="metadata-source"><h3>Local recordings</h3>
+                  <p>Recording links can identify a release despite an incorrect album artist. This does not change file tags or assign a different artist identity.</p>
+                  <div className="table-wrap"><table className="metadata-table"><thead><tr><th>Track</th><th>Release</th><th>Performer credits</th><th>ISRC</th></tr></thead><tbody>{detail.local_files.map((f: any) => <tr key={f.path}><td>{f.title}</td><td>{f.release}</td><td>{f.performers}</td><td>{f.isrc || "Not saved"}</td></tr>)}</tbody></table></div>
+                  <button disabled={busy} onClick={async () => { await run("link", { ids: detail.local_files.map((f: any) => f.path) }); setDetail(null); }}>Check these recording links</button>
+                </section>}
                 {(detail.review?.candidates || []).map((c: any, i: number) => (
                   <article className="candidate" key={i}>
                     <div>

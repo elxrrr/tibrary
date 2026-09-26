@@ -691,6 +691,27 @@ impl TidalClient {
         Ok(artists)
     }
 
+    pub async fn releases_for_isrc(&mut self, isrc: &str, market: &str) -> Result<Vec<String>, String> {
+        let mut url = Url::parse("https://openapi.tidal.com/v2/tracks").map_err(|e|e.to_string())?;
+        url.query_pairs_mut().append_pair("filter[isrc]", isrc).append_pair("countryCode", market).append_pair("include", "albums");
+        let mut next = Some(url.to_string());
+        let mut visited = std::collections::HashSet::new();
+        let mut ids = Vec::new();
+        while let Some(url) = next {
+            if !visited.insert(url.clone()) { return Err("Recording lookup repeated a page".into()); }
+            let payload = self.get_json(&url).await?;
+            for track in payload["data"].as_array().into_iter().flatten() {
+                if !track["attributes"]["isrc"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(isrc)) { continue; }
+                for album in track["relationships"]["albums"]["data"].as_array().into_iter().flatten() {
+                    if let Some(id) = album["id"].as_str() { ids.push(id.to_owned()); }
+                }
+            }
+            next = payload["links"]["next"].as_str().or_else(||payload["links"]["next"]["href"].as_str())
+                .map(|n| catalogue_next(&url,n)).transpose()?;
+        }
+        ids.sort(); ids.dedup(); Ok(ids)
+    }
+
     pub async fn search_tracks(
         &mut self,
         query: &str,
