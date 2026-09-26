@@ -22,6 +22,11 @@ export function streamFor(entry: ActivityEntry): ActivityStream {
   return "local";
 }
 
+export function jobTitle(kind?: string): string {
+  const titles: Record<string, string> = {discography: "Refresh releases", cached_releases: "Recheck cached releases", link: "Link releases", match_artists: "Match artists", preview: "Review local tags", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Downloads", scan: "Scan library", apply: "Apply reviewed changes"};
+  return titles[kind || ""] || kind?.replaceAll("_", " ") || "Task";
+}
+
 function stamp(at: string): string {
   const date = new Date(at);
   return Number.isNaN(date.getTime()) ? at : date.toLocaleString(undefined, { hour12: false });
@@ -107,7 +112,7 @@ function StreamPanel({ stream, title, entries, monitor, job, onClear }: {
       {jobMatches && stream !== "downloads" && <div className="batch-log">
         <button className="batch-toggle" aria-expanded={Boolean(expanded[job!.id])} onClick={() => setExpanded(old => ({...old, [job!.id]: !old[job!.id]}))}>
           {expanded[job!.id] ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
-          <strong>{job!.kind.replaceAll("_", " ")}</strong><span>{job!.message}</span><span className="status-badge status-running">Running</span>
+          <strong>{jobTitle(job!.kind)}</strong><span>{job!.message}</span><span className="status-badge status-running">Running</span>
         </button>
         {expanded[job!.id] && <div className="batch-children">{recent.length ? recent.map((entry, i) => <LogRow entry={entry} key={`${entry.at}-${i}`}/>) : <p>Waiting for the next step…</p>}</div>}
       </div>}
@@ -181,8 +186,8 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
   }), [logs]);
   return <div className="activity-view">
     <div className="activity-status-grid">
-      <WorkerStatus title="Local actions" job={job} onCancel={onCancel}/>
       <WorkerStatus title="Online actions" job={onlineJob} onCancel={onCancel}/>
+      <WorkerStatus title="Local actions" job={job} onCancel={onCancel}/>
       <WorkerStatus title="Downloads" job={downloadJob} onCancel={onCancel}/>
     </div>
     <div className="activity-split">

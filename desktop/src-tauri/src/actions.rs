@@ -15,7 +15,8 @@ use std::{
 pub fn handles(kind: &str) -> bool {
     matches!(
         kind,
-        "preview"
+        "cached_releases"
+            | "preview"
             | "apply"
             | "mqa"
             | "release_details"
@@ -240,6 +241,12 @@ pub async fn execute(
 ) -> Result<Value, String> {
     let settings = db.get_settings().await?;
     let market = settings["general"]["market"].as_str().unwrap_or("GB");
+    if kind == "cached_releases" {
+        state.progress_for(kind, "Rechecking saved releases · ownership and recommendations · local cache only; music files unchanged");
+        db.invalidate_missing_rows();
+        let page = db.get_missing_rows(market, Some("All missing releases"), None, None, None, None, None, None, 0, 0).await?;
+        return Ok(json!({"message":format!("Cached release check complete · {} missing, incomplete or queued releases · music files unchanged", page.total), "total":page.total}));
+    }
     if kind == "release_details" {
         let id = args["id"].as_str().ok_or("Select a release")?;
         release(db, id, market, args["force"].as_bool().unwrap_or(false)).await?;
@@ -826,9 +833,9 @@ pub async fn execute(
                 state.progress_for(
                     kind,
                     &format!(
-                        "Checking cached releases · {}/{}",
+                        "Checking cached releases · {}/{} · {} — {} · release ID {}",
                         position + 1,
-                        remote_total
+                        remote_total, target.artist, target.title, target.id
                     ),
                 );
             }
@@ -1142,6 +1149,7 @@ pub async fn execute(
                 .or(detail["linked_ids"]["album_id"].as_str())
                 .or_else(|| tags.get("tidal_album_id").map(String::as_str));
             let Some(album) = album else { continue };
+            state.progress_for(kind, &format!("Checking missing metadata · {} — {} · {} · release ID {album}", tags.get("albumartist").or(tags.get("artist")).map(String::as_str).unwrap_or("Unknown artist"), tags.get("title").map(String::as_str).unwrap_or("Untitled track"), tags.get("album").map(String::as_str).unwrap_or("Unknown release")));
             let value = release(db, album, market, false).await?;
             let mut rel: crate::tidal::TidalRelease =
                 serde_json::from_value(value).map_err(|e| e.to_string())?;

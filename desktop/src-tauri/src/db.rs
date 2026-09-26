@@ -119,6 +119,7 @@ pub struct TursoDb {
     pub db: Database,
     pub path: PathBuf,
     pub revision: Arc<std::sync::atomic::AtomicU64>,
+    missing_rows_gate: Arc<tokio::sync::Mutex<()>>,
     missing_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<MissingRow>)>>>,
     link_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<LinkRow>)>>>,
     favourite_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<Value>)>>>,
@@ -141,6 +142,7 @@ impl TursoDb {
             db,
             path: path_buf,
             revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            missing_rows_gate: Arc::new(tokio::sync::Mutex::new(())),
             missing_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             link_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             favourite_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -793,7 +795,7 @@ impl TursoDb {
                 market,
                 Some("All missing releases"),
                 None,
-                Some("Missing release"),
+                None,
                 None,
                 None,
                 None,
@@ -2023,6 +2025,7 @@ impl TursoDb {
         offset: usize,
         limit: usize,
     ) -> Result<TablePage<MissingRow>, String> {
+        let build_guard = self.missing_rows_gate.lock().await;
         let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
         let key = format!("{market}:{}", chrono::Utc::now().format("%Y-%m-%d"));
         let cached = self
@@ -2041,6 +2044,8 @@ impl TursoDb {
             cache.insert(key, (revision, rows.clone()));
             rows
         };
+
+        drop(build_guard);
 
         // Apply filters
         if let Some(sf) = status_filter {
@@ -2125,7 +2130,7 @@ impl TursoDb {
         // Sort by date desc (or requested sort)
         let sort_col = sort.unwrap_or("date");
         let desc = direction.map(|d| d == "desc").unwrap_or(sort_col == "date");
-        rows.sort_by(|a, b| {
+        if limit > 0 { rows.sort_by(|a, b| {
             let ord = match sort_col {
                 "artist" => a.artist.to_lowercase().cmp(&b.artist.to_lowercase()),
                 "release" => a.release.to_lowercase().cmp(&b.release.to_lowercase()),
@@ -2139,8 +2144,8 @@ impl TursoDb {
                 ord.reverse()
             } else {
                 ord
-            }
-        });
+            }.then_with(|| a.artist.cmp(&b.artist)).then_with(|| a.release.cmp(&b.release)).then_with(|| a.id.cmp(&b.id))
+        }); }
 
         let total = rows.len();
         let page_rows = if offset < total {

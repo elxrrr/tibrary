@@ -47,7 +47,7 @@ import {
 } from "./api";
 import { DataTable, Column } from "./DataTable";
 import { ActivityView, streamFor } from "./ActivityView";
-import { workload } from "./ActivityView";
+import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import "./style.css";
 const groups = [
@@ -130,7 +130,7 @@ const organisationActions = [
   ],
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
-const onlineKinds = new Set(["link", "discography", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
+const onlineKinds = new Set(["link", "discography", "cached_releases", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
 const descriptions: Record<string, string> = {
   overview: "Your library, from local preparation to new music.",
   correct:
@@ -230,7 +230,7 @@ function App() {
     [toast, setToast] = useState(""),
     [closing, setClosing] = useState(false),
     [stopped, setStopped] = useState(false);
-  const [data, setData] = useState<{ rows: Row[]; total: number; scanned?: boolean }>({
+  const [data, setData] = useState<{ rows: Row[]; total: number; missing_total?: number; scanned?: boolean }>({
       rows: [],
       total: 0,
     }),
@@ -263,7 +263,7 @@ function App() {
   useEffect(() => {
     if (route !== "overview" || !state) return;
     let alive = true;
-    call("table", {route: "missing", timeline: "All missing releases", status: "Missing release",
+    call("table", {route: "missing", timeline: "All missing releases", status: "all",
       sort: "date", direction: "desc", limit: 20, recommendation: "All recommendations"})
       .then((result) => { if (alive) { setLatestMissing(result.rows); setMissingReleaseCount(result.total); } })
       .catch((e) => { if (alive) notifyError(e); });
@@ -731,7 +731,7 @@ function App() {
     Icon: any = Music2,
   ) {
     return (
-      <button className="metric" onClick={() => setRoute(target)}>
+      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
         <span className="metric-title">
           <Icon size={18} />
           {title}
@@ -766,7 +766,7 @@ function App() {
               {card(
                 "Missing releases",
                 missingReleaseCount?.toLocaleString(),
-                "Cached releases not owned locally",
+                "Missing, incomplete and queued releases",
                 "missing",
                 Disc,
               )}
@@ -872,7 +872,7 @@ function App() {
           <section className="card latest-missing-card">
             <div className="section-heading">
               <h2>Latest missing releases</h2>
-              <button onClick={() => { setTimeline("All missing releases"); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
+              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
                 View missing releases
               </button>
             </div>
@@ -1149,7 +1149,12 @@ function App() {
             >
               Find new releases (online)
             </button>
-            <button disabled={busy} onClick={() => mutate("missing.rebuild")} title="Recalculate ownership and recommendations from saved local tags and catalogue data without contacting the service">
+            {state?.catalogue_refresh && state.catalogue_refresh.status !== "complete" && state.catalogue_refresh.completed.length < state.catalogue_refresh.ids.length && !active(state.online_job) && (
+              <button disabled={busy} onClick={() => run("discography", { ...state.catalogue_refresh, resume: true })}>
+                Resume refresh ({state.catalogue_refresh.completed.length}/{state.catalogue_refresh.ids.length})
+              </button>
+            )}
+            <button disabled={busy} onClick={() => run("cached_releases")} title="Recalculate ownership and recommendations from saved local tags and catalogue data without contacting the service">
               Recheck cached releases
             </button>
             <button
@@ -1339,7 +1344,7 @@ function App() {
           <span>
             {selected.size
               ? `${selected.size} selected`
-              : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}`}
+              : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}${route === "missing" ? ` matching filters · ${(data.missing_total ?? data.total).toLocaleString()} missing, incomplete or queued in total` : ""}`}
           </span>
         </div>
         {route === "local" && data.rows.length > 0 && (
@@ -2173,7 +2178,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.14 · build 14</span>
+          <span className="sidebar-version">v0.9.0-beta.15 · build 15</span>
         </div>
       </aside>
       <main>
@@ -2188,7 +2193,7 @@ function App() {
                   const progress = workload(job, downloadMonitor, clock);
                   return <div className="header-workload" key={job!.id} title={job?.message}>
                     <LoaderCircle className="spin" size={13}/>
-                    <span>{job?.kind === "download" ? "Downloads" : job?.kind?.replaceAll("_", " ")} · {progress?.label}</span>
+                    <span>{jobTitle(job?.kind)} · {progress?.percent != null ? `${Math.round(progress.percent)}%` : "Working"}</span>
                     {progress?.percent != null && <span className="header-workload-bar" style={{width: `${progress.percent}%`}}/>}
                   </div>;
                 })}

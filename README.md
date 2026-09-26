@@ -150,3 +150,9 @@ Closing the window or choosing Quit while downloading asks whether to keep downl
 - Ownership uses distinct, current recording links and checks multi-disc completeness. Deleting the database is unnecessary: refresh the catalogue and rerun previews while preserving your saved decisions.
 - Organise files shows exact current/proposed paths and component-level reasons. Years use four digits; slash-form track numbers parse correctly; Unicode/case-only differences do not propose moves. Multi-disc filenames use `02.01 - Title`.
 - MQA signal badges are red; no-signal results are green. Unaffected rows show no replacement action.
+
+### Cached release checks and refresh progress
+
+- **Recheck cached releases** recalculates ownership and recommendations in a background task using saved data. It does not contact the service, rewrite tags or move files. Activity reports its completion.
+- Missing-release totals count missing, incomplete and queued releases across the cached catalogue. The table also shows how many releases match its current filters; the Overview card opens the corresponding unfiltered missing list.
+- Catalogue refreshes show the current artist, market and scope in Activity. Progress is saved after each artist. Interrupted refreshes resume when the app next opens; explicit cancellation stays cancelled. **Resume refresh** continues a stopped or failed refresh using its saved scope. Local file changes and downloads are not automatically replayed.

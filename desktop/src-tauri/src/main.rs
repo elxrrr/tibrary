@@ -33,10 +33,18 @@ pub mod tidal;
 pub mod workflows;
 use db::TursoDb;
 
+/// Resume only matching scopes, and count each durable artist result once.
+fn completed_refresh_ids(saved: &Value, ids: &[String], market: &str, detailed: bool, resume: bool) -> Vec<String> {
+    if !resume || saved["market"] != market || saved["detailed"] != detailed { return Vec::new(); }
+    let completed: Vec<String> = serde_json::from_value(saved["completed"].clone()).unwrap_or_default();
+    ids.iter().filter(|id| completed.contains(id)).cloned().collect()
+}
+
 fn is_online_job(kind: &str) -> bool {
     matches!(
         kind,
         "link"
+            | "cached_releases"
             | "discography"
             | "release_details"
             | "connections"
@@ -603,6 +611,7 @@ async fn handle_rpc_uncached(
     method: String,
     mut args: Value,
 ) -> Result<Value, String> {
+    let method = if method == "missing.rebuild" { args = json!({"kind":"cached_releases","args":args}); "job.start".to_string() } else { method };
     if method == "job.status" {
         return Ok(
             json!({"job":state.active_job.lock().unwrap().clone(),"online_job":state.online_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.snapshot(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
@@ -674,7 +683,7 @@ async fn handle_rpc_uncached(
                     } else {
                         "complete"
                     },
-                    format!("Finished · {kind}"),
+                    v["message"].as_str().map(str::to_owned).unwrap_or_else(|| format!("Finished · {kind}")),
                     v,
                 ),
                 Err(e) => (
@@ -694,7 +703,7 @@ async fn handle_rpc_uncached(
             } else {
                 backend.finish_job(finished.clone());
             }
-            database.bump_revision();
+            if kind != "cached_releases" { database.bump_revision(); }
             let _ = database.set_preference("desktop-last-job", &finished).await;
             if let Some(app) = app {
                 let _ = app.emit(
@@ -945,6 +954,7 @@ async fn handle_rpc_uncached(
         }
         let root = args.get("root").and_then(|v| v.as_str());
         let mut snapshot = db.get_state(active, &logs, root).await?;
+        snapshot["catalogue_refresh"] = db.get_preference("catalogue-refresh-checkpoint").await?.unwrap_or(Value::Null);
         snapshot["online_job"] = json!(state.online_job.lock().unwrap().clone());
         snapshot["download_job"] = json!(state.download_job.lock().unwrap().clone());
         snapshot["auth_url"] = state
@@ -1011,14 +1021,6 @@ async fn handle_rpc_uncached(
             db.clear_log_stream(stream).await?;
         }
         return Ok(json!({ "cleared": true, "stream": stream }));
-    }
-    if method == "missing.rebuild" {
-        db.invalidate_missing_rows();
-        state.view_cache.lock().unwrap().clear();
-        if let Some(app) = app_handle {
-            let _ = app.emit("backend-event", json!({"event":"changed"}));
-        }
-        return Ok(json!({"rebuilt":true}));
     }
 
     // TABLE ROUTES
@@ -1089,7 +1091,10 @@ async fn handle_rpc_uncached(
                 limit,
             )
             .await?;
-        return serde_json::to_value(page).map_err(|e| e.to_string());
+        let missing = db.get_missing_rows(market, Some("All missing releases"), None, None, None, None, None, None, 0, 0).await?;
+        let mut value = serde_json::to_value(page).map_err(|e|e.to_string())?;
+        value["missing_total"] = json!(missing.total);
+        return Ok(value);
     }
     if method == "table" {
         let route = args
@@ -1799,7 +1804,7 @@ async fn handle_rpc_uncached(
             .unwrap_or("GB")
             .to_string();
 
-        let ids: Vec<String> = if let Some(ids_val) = inner_args.get("ids") {
+        let mut ids: Vec<String> = if let Some(ids_val) = inner_args.get("ids") {
             if let Some(arr) = ids_val.as_array() {
                 if arr.is_empty() {
                     return Err("Select a linked artist before refreshing its releases".to_string());
@@ -1814,10 +1819,23 @@ async fn handle_rpc_uncached(
             db.get_linked_artist_ids().await?
         };
 
+        ids.sort();
+        ids.dedup();
         if ids.is_empty() {
             return Err("No linked artists found in library. Match artists first.".to_string());
         }
 
+        // Checkpoints contain only IDs/options; completed artist catalogues are already durable.
+        let saved = db.get_preference("catalogue-refresh-checkpoint").await?.unwrap_or(Value::Null);
+        let resume = inner_args["resume"].as_bool().unwrap_or(false);
+        let completed = completed_refresh_ids(&saved, &ids, &market, detailed, resume);
+        let mut names = HashMap::new();
+        let conn = db.connect()?;
+        let mut artists = conn.query("SELECT tidal_id,artist FROM mappings UNION SELECT tidal_id,artist FROM additional_mappings", ()).await.map_err(|e|e.to_string())?;
+        while let Some(row) = artists.next().await.map_err(|e|e.to_string())? {
+            if let (Ok(id),Ok(name)) = (row.get::<String>(0),row.get::<String>(1)) { names.insert(id,name); }
+        }
+        db.set_preference("catalogue-refresh-checkpoint", &json!({"ids":ids,"completed":completed,"market":market,"detailed":detailed,"status":"running"})).await?;
         let job_id = uuid::Uuid::new_v4().to_string();
         let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
         let total = ids.len();
@@ -1825,7 +1843,7 @@ async fn handle_rpc_uncached(
             "id": job_id,
             "kind": "discography",
             "status": "running",
-            "message": format!("Refreshing releases · 0/{}", total),
+            "message": format!("Refreshing releases · {}/{} artists · {} · {}", completed.len(), total, market, if detailed { "release and track details" } else { "release list" }),
             "started": started,
             "result": null
         });
@@ -1839,16 +1857,19 @@ async fn handle_rpc_uncached(
         let j_id = job_id.clone();
 
         tauri::async_runtime::spawn(async move {
-            let mut checked = 0;
+            let mut completed = completed;
+            let mut checked = completed.len();
             let mut failure: Option<String> = None;
             let backend_prog = backend_task.clone();
 
-            for (index, artist_id) in ids.iter().enumerate() {
+            for artist_id in &ids {
+                if completed.contains(artist_id) { continue; }
                 if cancel_flag.load(Ordering::Relaxed) {
                     break;
                 }
 
-                let msg = format!("Refreshing releases · {}/{}", index + 1, total);
+                let name = names.get(artist_id).map(String::as_str).unwrap_or(artist_id);
+                let msg = format!("Refreshing releases · {checked}/{total} artists complete · {name} · artist ID {artist_id} · {market} · {}", if detailed { "release and track details" } else { "release list" });
                 let prog_job = json!({
                     "id": j_id.clone(),
                     "kind": "discography",
@@ -1884,6 +1905,11 @@ async fn handle_rpc_uncached(
                             break;
                         } else {
                             checked += 1;
+                            completed.push(artist_id.clone());
+                            if let Err(e) = db_clone.set_preference("catalogue-refresh-checkpoint", &json!({"ids":ids,"completed":completed,"market":market,"detailed":detailed,"status":"running"})).await {
+                                failure = Some(format!("Could not save refresh progress: {e}"));
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1904,7 +1930,7 @@ async fn handle_rpc_uncached(
                 "complete"
             };
             let message = if is_cancelled {
-                "Refresh release list · cancelled; completed results retained".to_string()
+                if backend_task.quit_prompt.load(Ordering::SeqCst) { format!("Refresh paused · {checked}/{total} artists saved · resumes next launch") } else { format!("Refresh cancelled · {checked}/{total} artists saved · use Resume refresh to continue") }
             } else if let Some(error) = failure {
                 format!("Refresh stopped after {checked} artists; cached results retained. {error}")
             } else {
@@ -1914,6 +1940,8 @@ async fn handle_rpc_uncached(
                 )
             };
 
+            let checkpoint_status = if is_cancelled && backend_task.quit_prompt.load(Ordering::SeqCst) { "running" } else { status };
+            let _ = db_clone.set_preference("catalogue-refresh-checkpoint", &json!({"ids":ids,"completed":completed,"market":market,"detailed":detailed,"status":checkpoint_status})).await;
             let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
             let final_job = json!({
                 "id": j_id,
@@ -2573,6 +2601,20 @@ fn main() {
                     backend.logs.load(loaded);
                 }
             }
+            // Only read-only catalogue refreshes resume automatically. Explicit cancellation stays cancelled.
+            let resume_db = turso_db.clone();
+            let resume_backend = backend.clone();
+            let resume_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(Some(saved)) = resume_db.get_preference("catalogue-refresh-checkpoint").await {
+                    if saved["status"] == "running" {
+                        let args = json!({"kind":"discography","args":{"ids":saved["ids"],"market":saved["market"],"detailed":saved["detailed"],"resume":true}});
+                        if let Err(error) = handle_rpc_call(Some(&resume_app), &resume_backend, &resume_db, "job.start".into(), args).await {
+                            resume_backend.log_with_category(&format!("Saved catalogue refresh could not resume: {error}"), "error", Some("online"));
+                        }
+                    }
+                }
+            });
             app.manage(turso_db);
             Ok(())
         })
@@ -2621,6 +2663,16 @@ fn main() {
 
 #[cfg(test)]
 mod activity_tests {
+    #[test]
+    fn catalogue_resume_skips_only_saved_artists_in_the_same_scope() {
+        let ids = vec!["one".into(), "two".into(), "three".into()];
+        let saved = serde_json::json!({"market":"GB","detailed":false,"completed":["one","one","removed","two"]});
+        assert_eq!(super::completed_refresh_ids(&saved, &ids, "GB", false, true), vec!["one", "two"]);
+        assert!(super::completed_refresh_ids(&saved, &ids, "US", false, true).is_empty());
+        assert!(super::completed_refresh_ids(&saved, &ids, "GB", true, true).is_empty());
+        assert!(super::completed_refresh_ids(&saved, &ids, "GB", false, false).is_empty());
+    }
+
     #[test]
     fn activity_buffers_route_categories_and_clear_independently() {
         let buffers = super::ActivityBuffers::default();

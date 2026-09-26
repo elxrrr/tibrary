@@ -427,6 +427,7 @@ test("activity has independent online, local and download panels", async ({page}
   await expect(page.getByRole("region", {name:"Online actions"})).toBeVisible();
   await expect(page.getByRole("region", {name:"Local actions"})).toBeVisible();
   await expect(page.getByRole("region", {name:"Downloads"})).toBeVisible();
+  await expect(page.locator(".activity-status small")).toHaveText(["Online actions", "Local actions", "Downloads"]);
   await expect(page.locator(".activity-status h2")).toHaveText(["Awaiting task...", "Awaiting task...", "Awaiting task..."]);
   expect((await page.getByRole("region", {name:"Downloads"}).boundingBox())?.height).toBeGreaterThan(500);
   await page.getByRole("searchbox", {name:"Search local actions"}).fill("nothing matches");
@@ -565,4 +566,21 @@ test("table reloads when saved page size arrives after the initial table", async
   await expect.poll(()=>limits).toContain(50);
   releaseSettings();
   await expect.poll(()=>limits).toContain(25);
+});
+
+
+test("cached release recheck reports activity and preserves release order and totals", async ({page}) => {
+  await page.goto("/");
+  await page.locator(".metric").filter({hasText:"Missing releases"}).click();
+  const args = {route:"missing",timeline:"All missing releases",sort:"date",direction:"desc",limit:100};
+  const before = (await rpc("table",args)).result;
+  expect(before.total).toBe(before.missing_total);
+  await page.getByRole("button",{name:"Recheck cached releases",exact:true}).click();
+  await expect.poll(async () => (await rpc("job.status")).result.online_job?.status).toBe("complete");
+  const after = (await rpc("table",args)).result;
+  expect(after.rows.map((row:any)=>row.id)).toEqual(before.rows.map((row:any)=>row.id));
+  expect(after.missing_total).toBe(before.missing_total);
+  const state = (await rpc("state")).result;
+  expect(state.logs.some((log:any)=>log.category === "online" && log.message.includes("Cached release check complete"))).toBe(true);
+  expect(state.online_job.message).toContain("music files unchanged");
 });
