@@ -254,3 +254,67 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "Read-only live comparison using saved catalogue and subscriber credentials"]
+async fn live_metadata_comparison() {
+    use crate::{db::TursoDb, tidal::TidalClient};
+    use serde_json::{json, Value};
+    let dir = std::env::temp_dir().join(format!("tibrary-metadata-probe-{}", uuid::Uuid::new_v4()));
+    let db = TursoDb::open(dir.join("db")).await.unwrap();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let token = crate::stream_download::get_valid_token(&db, &http)
+        .await
+        .expect("Subscriber connection required");
+    let mut client = TidalClient::from_env_or_keychain().expect("Catalogue credentials required");
+    client.get_token().await.unwrap(); // Exclude initial authentication from timings.
+    for id in ["234657671", "140303440"] {
+        let start = Instant::now();
+        let tracks = client.get_release_details(id, "GB").await.unwrap();
+        let catalogue_ms = start.elapsed().as_millis();
+        let start = Instant::now();
+        let response = get(
+            http.get(format!("https://api.tidal.com/v1/albums/{id}/tracks"))
+                .query(&[("countryCode", "GB"), ("limit", "100"), ("offset", "0")])
+                .bearer_auth(&token),
+            Duration::from_millis(350),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        if !status.is_success() {
+            println!("Release {id}: subscriber HTTP {status}");
+            continue;
+        }
+        let payload: Value = response.json().await.unwrap();
+        let elapsed = start.elapsed().as_millis();
+        let items = payload["items"].as_array().expect("Track array");
+        let count = |keys: &[&str]| {
+            items
+                .iter()
+                .filter(|v| keys.iter().any(|key| !v[*key].is_null() && v[*key] != ""))
+                .count()
+        };
+        println!(
+            "{}",
+            json!({"release":id,"catalogue":{"ms":catalogue_ms,"tracks":tracks.len(),"isrc":tracks.iter().filter(|t|t.isrc.is_some()).count(),"bpm":tracks.iter().filter(|t|t.bpm.is_some()).count(),"key":tracks.iter().filter(|t|t.key.is_some()).count(),"credits":tracks.iter().filter(|t|t.credits.as_array().is_some_and(|a|!a.is_empty())).count(),"genres":tracks.iter().filter(|t|!t.genres.is_empty()).count()},"subscriber_album_page":{"ms":elapsed,"tracks":items.len(),"total":payload["totalNumberOfItems"],"isrc":count(&["isrc"]),"bpm":count(&["bpm"]),"key":count(&["key","tonality"]),"credits":count(&["credits","contributors"]),"genres":count(&["genres","genre"]),"copyright":count(&["copyright"])}})
+        );
+        let track_ids: std::collections::HashSet<_> =
+            tracks.iter().map(|t| t.id.as_str()).collect();
+        println!(
+            "Release {id}: {} subscriber track IDs also in catalogue",
+            items
+                .iter()
+                .filter(|t| track_ids.contains(t["id"].to_string().as_str()))
+                .count()
+        );
+    }
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
