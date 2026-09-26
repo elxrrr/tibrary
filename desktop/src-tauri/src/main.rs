@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod release_artists;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -45,6 +46,7 @@ fn is_online_job(kind: &str) -> bool {
         kind,
         "link"
             | "cached_releases"
+            | "release_artists"
             | "discography"
             | "release_details"
             | "connections"

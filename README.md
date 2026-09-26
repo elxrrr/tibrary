@@ -37,6 +37,10 @@ Folder previews clean tag whitespace before adding template separators, preserve
 2. **Missing releases → Update recommendation data** refreshes linked artists and fills missing track details, credits, genres and replacement information. Current details are reused; unavailable fields are not invented. Progress is saved per artist, with release details cached as they complete. Use **Resume refresh** after interruption.
 3. **Recheck cached releases** recalculates recommendations locally. Composer, songwriter and other contributor connections are anchored to verified local recordings, alongside artist credits, labels, rights, genres and recording overlap. Suspect releases remain inspectable through the filters.
 
+For a narrower artist-based list, use **Missing releases → Check release artists**, then choose **My album artists** in the recommendation filter. This checks the current time range in batches of up to 20 release summaries, without fetching track lists. Saved album artist IDs are reused for 90 days; unavailable results are retried after one day. Each batch is saved, so running the action again continues unfinished checks. No database reset is needed.
+
+This filter compares the **first credited album artist ID** with your linked artists. It is a useful stricter view, not proof that a release is official; collaborations led by another artist appear under **Other artist appearances**. **Artist credits not checked** retains unknown results, and **All recommendations** keeps everything inspectable. These saved IDs also inform recommendation scoring.
+
 No database reset or full local rescan is needed to collect this online metadata. Update the local library only when files or tags have changed outside the app.
 
 ## ✨ Features

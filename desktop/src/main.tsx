@@ -130,7 +130,7 @@ const organisationActions = [
   ],
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
-const onlineKinds = new Set(["link", "discography", "cached_releases", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
+const onlineKinds = new Set(["link", "discography", "cached_releases", "release_artists", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
 const descriptions: Record<string, string> = {
   overview: "Your library, from local preparation to new music.",
   correct:
@@ -1121,6 +1121,7 @@ function App() {
             >
               Find new releases (online)
             </button>
+            <button disabled={busy} onClick={() => run("release_artists", { timeline })} title="Check album artist credits for this time range in small batches. Reuses saved credits and resumes unfinished checks when run again; no track downloads.">Check release artists</button>
             <button disabled={busy} onClick={() => run("discography", { detailed: true })} title="Refresh linked artists, fill missing track lists, credits and genres, and reuse up-to-date cached details. Progress can be resumed.">Update recommendation data</button>
             {state?.catalogue_refresh && state.catalogue_refresh.status !== "complete" && state.catalogue_refresh.completed.length < state.catalogue_refresh.ids.length && !active(state.online_job) && (
               <button disabled={busy} onClick={() => run("discography", { ...state.catalogue_refresh, resume: true })}>
@@ -1220,11 +1221,15 @@ function App() {
             </select>
             <select
               aria-label="Recommendation"
+              title="My album artists keeps releases whose first credited album artist is one of your linked artists. Other appearances and unchecked credits remain available separately; artist order is not proof of an official release."
               value={recommendation}
               onChange={(e) => { setRecommendation(e.target.value); setOffset(0); }}
             >
               {[
                 "All recommendations",
+                "My album artists",
+                "Other artist appearances",
+                "Artist credits not checked",
                 "Recommended",
                 "Potential",
                 "Suspect / Low match",
@@ -2131,7 +2136,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.22 · build 22</span>
+          <span className="sidebar-version">v0.9.0-beta.23 · build 23</span>
         </div>
       </aside>
       <main>

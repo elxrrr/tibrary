@@ -16,6 +16,7 @@ pub fn handles(kind: &str) -> bool {
     matches!(
         kind,
         "cached_releases"
+            | "release_artists"
             | "preview"
             | "apply"
             | "mqa"
@@ -241,6 +242,7 @@ pub async fn execute(
 ) -> Result<Value, String> {
     let settings = db.get_settings().await?;
     let market = settings["general"]["market"].as_str().unwrap_or("GB");
+    if kind == "release_artists" { return crate::release_artists::refresh(db,state,args,cancel).await; }
     if kind == "cached_releases" {
         state.progress_for(kind, "Rechecking saved releases · ownership and recommendations · local cache only; music files unchanged");
         db.invalidate_missing_rows();

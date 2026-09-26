@@ -1476,6 +1476,7 @@ impl TursoDb {
             }
         }
 
+        let album_credit_cache = crate::release_artists::cached(self, market).await?;
         // Exploratory search caches are not subscriptions to an artist's releases.
         let linked_artists: HashSet<String> = self.get_linked_artist_ids().await?.into_iter().collect();
         // 3. Load catalogue
@@ -1736,18 +1737,9 @@ impl TursoDb {
                     .get("official")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let primary_verified = rel
-                    .get("primary_artist_verified")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let primary = primary_verified;
-                let conflict = rel["artist_credits"]
-                    .as_array()
-                    .and_then(|credits| credits.first())
-                    .and_then(Value::as_str)
-                    .is_some_and(|first| {
-                        crate::matching::name_key(first) != crate::matching::name_key(&artist_name)
-                    });
+                let saved_lead = album_credit_cache.get(&id).and_then(|v|v["ids"].as_array()).and_then(|a|a.first()).and_then(Value::as_str);
+                let primary = saved_lead.map(|lead|lead == artist_id).unwrap_or_else(||rel["primary_artist_verified"].as_bool().unwrap_or(false));
+                let conflict = saved_lead.map(|lead|lead != artist_id).unwrap_or_else(|| rel["artist_credits"].as_array().and_then(|a|a.first()).and_then(Value::as_str).is_some_and(|name|crate::matching::name_key(name) != crate::matching::name_key(&artist_name)));
                 let label = rel
                     .get("label")
                     .and_then(Value::as_str)
@@ -2068,7 +2060,12 @@ impl TursoDb {
             }
         }
 
-        if let Some(rf) = recommendation {
+        if recommendation.is_some_and(|v| ["My album artists", "Other artist appearances", "Artist credits not checked"].contains(&v)) {
+            let credits = crate::release_artists::cached(self, market).await?;
+            let linked = self.get_linked_artist_ids().await?.into_iter().collect();
+            rows.retain(|r| crate::release_artists::classify(credits.get(&r.id), &linked) == recommendation.unwrap());
+        }
+        if let Some(rf) = recommendation.filter(|v| !["My album artists", "Other artist appearances", "Artist credits not checked"].contains(v)) {
             let rf_clean = rf.trim();
             if rf_clean != "All recommendations" && rf_clean != "all" && !rf_clean.is_empty() {
                 rows.retain(|r| {
