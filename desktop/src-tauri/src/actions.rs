@@ -1189,16 +1189,33 @@ pub async fn execute(
             .build()
             .map_err(|e| e.to_string())?;
         let mut subscriber_token = None;
-        for file in indexed
-            .iter()
-            .filter(|f| ids.is_empty() || ids.contains(&f.path))
-        {
-            if cancel.load(Ordering::Relaxed) {
-                break;
+        let mut prepared = Vec::new();
+        let mut albums = Vec::new();
+        let mut complete_dj: std::collections::HashMap<String, HashSet<String>> = std::collections::HashMap::new();
+        for file in indexed.iter().filter(|f| ids.is_empty() || ids.contains(&f.path)) {
+            if cancel.load(Ordering::Relaxed) { break; }
+            let detail = db.get_detail(&json!({"path":file.path,"market":market})).await?;
+            let tags = workflows::extract_tags_map(&file.metadata);
+            if let Some(album) = args["album_id"].as_str().or(detail["linked_ids"]["album_id"].as_str()).or_else(||tags.get("tidal_album_id").map(String::as_str)) {
+                if !complete_dj.contains_key(album) {
+                    let cached = db.get_preference(&format!("tag-review:{market}:{album}")).await?;
+                    let complete = cached.as_ref().and_then(|v|v["tracks"].as_array()).into_iter().flatten()
+                        .filter(|t|t["bpm"].as_f64().is_some_and(|n|n>0.) && t["key"].as_str().is_some_and(|s|!s.is_empty()))
+                        .filter_map(|t|t["id"].as_str().map(str::to_owned)).collect();
+                    complete_dj.insert(album.to_owned(),complete);
+                }
+                let track_id = detail["linked_ids"]["track_id"].as_str().or_else(||tags.get("tidal_track_id").map(String::as_str));
+                if track_id.is_none_or(|id| !complete_dj[album].contains(id)) { albums.push(album.to_owned()); }
             }
-            let detail = db
-                .get_detail(&json!({"path":file.path,"market":market}))
-                .await?;
+            // Retain only IDs, not the full candidate/metadata payload for every file.
+            prepared.push((file,json!({"linked_ids":detail["linked_ids"]})));
+            if prepared.len() % 100 == 0 { state.progress_for(kind,&format!("Preparing metadata · {} files checked for cached DJ data",prepared.len())); }
+        }
+        let album_metadata = if kind == "metadata" {
+            crate::subscriber_metadata::prefetch(db, &http, albums, market, cancel.clone(), |message| state.progress_for(kind,message)).await?
+        } else { std::collections::HashMap::new() };
+        for (file, detail) in prepared {
+            if cancel.load(Ordering::Relaxed) { break; }
             let tags = workflows::extract_tags_map(&file.metadata);
             let album = args["album_id"]
                 .as_str()
@@ -1251,6 +1268,12 @@ pub async fn execute(
                 continue;
             };
             let mut track = rel.tracks[index].clone();
+            if let Some(items) = album_metadata.get(album).and_then(|v|v["items"].as_array()) {
+                if let Some(raw) = items.iter().find(|v|v["id"].as_str().map(str::to_owned).unwrap_or_else(||v["id"].to_string()) == track.id) {
+                    crate::subscriber_metadata::merge(&mut track, raw);
+                }
+            }
+
             if track.bpm.is_none() || track.key.is_none() {
                 let key = format!("dj-check:{market}:{}", track.id);
                 let cached = db.get_preference(&key).await?;
@@ -1279,17 +1302,7 @@ pub async fn execute(
                         Value::Null
                     }
                 };
-                if extra["isrc"].as_str().is_some()
-                    && extra["isrc"].as_str() == track.isrc.as_deref()
-                {
-                    track.bpm = track.bpm.or(extra["bpm"].as_f64());
-                    track.key = track
-                        .key
-                        .or_else(|| extra["key"].as_str().map(str::to_owned));
-                    track.key_scale = track
-                        .key_scale
-                        .or_else(|| extra["keyScale"].as_str().map(str::to_owned));
-                }
+                crate::subscriber_metadata::merge(&mut track, &extra);
             }
             rel.tracks[index] = track.clone();
             db.set_preference(&format!("tag-review:{market}:{}", rel.id), &json!(rel))
@@ -1612,7 +1625,8 @@ mod tests {
         crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {})
             .await
             .unwrap();
-        db.set_preference("tag-review:GB:123", &json!({"id":"123","title":"Release","artist":"Wrong Featured Credit","tracks_loaded":true,"track_count":1,"tracks":[{"id":"456","title":"Example","track_number":1,"disc_number":1,"bpm":124.0,"key":"G","key_scale":"major"}]})).await.unwrap();
+        db.set_preference("tag-review:GB:123", &json!({"id":"123","title":"Release","artist":"Wrong Featured Credit","tracks_loaded":true,"track_count":1,"tracks":[{"id":"456","title":"Example","isrc":"TEST123","track_number":1,"disc_number":1}]})).await.unwrap();
+        db.set_preference("subscriber-album:GB:123", &json!({"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":456,"isrc":"TEST123","bpm":124.0,"key":"G","keyScale":"major"}]})).await.unwrap();
         let backend = Arc::new(Backend::new());
         let before = std::fs::read(&path).unwrap();
         let result = execute(

@@ -9,6 +9,9 @@ use std::{
 };
 use tokio::sync::{Mutex, Semaphore};
 
+#[cfg(test)]
+static THROTTLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct Pace {
     interval: Duration,
     next: Instant,
@@ -161,6 +164,10 @@ pub async fn get(
         match response {
             Ok(response) => {
                 let status = response.status();
+                #[cfg(test)]
+                if status.as_u16() == 429 {
+                    THROTTLES.fetch_add(1, Ordering::Relaxed);
+                }
                 if status.is_success() {
                     scheduler.pace.lock().await.success();
                     return Ok(response);
@@ -314,6 +321,85 @@ async fn live_metadata_comparison() {
                 .filter(|t| track_ids.contains(t["id"].to_string().as_str()))
                 .count()
         );
+    }
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "Explicit bounded live concurrency benchmark, 36 album GETs plus warmup"]
+async fn live_metadata_concurrency() {
+    let dir = std::env::temp_dir().join(format!("tibrary-concurrency-{}", uuid::Uuid::new_v4()));
+    let db = crate::db::TursoDb::open(dir.join("db")).await.unwrap();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let token = crate::stream_download::get_valid_token(&db, &http)
+        .await
+        .unwrap();
+    let ids = [
+        "234657671",
+        "140303440",
+        "470388645",
+        "285803",
+        "447957706",
+        "366071478",
+    ];
+    async fn fetch(
+        http: reqwest::Client,
+        token: String,
+        id: &'static str,
+    ) -> Result<usize, String> {
+        let response = get(
+            http.get(format!("https://api.tidal.com/v1/albums/{id}/tracks"))
+                .query(&[("countryCode", "GB"), ("limit", "100"), ("offset", "0")])
+                .bearer_auth(token),
+            Duration::from_millis(350),
+            2,
+            None,
+        )
+        .await?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+        Ok(value["items"].as_array().ok_or("Missing tracks")?.len())
+    }
+    fetch(http.clone(), token.clone(), ids[0]).await.unwrap();
+    for concurrency in [1, 2, 3, 3, 2, 1] {
+        let scheduler = lane("api.tidal.com:443".into(), Duration::from_millis(350), true);
+        // Equal starting pace for each trial; never bypass a service cooldown.
+        {
+            let mut pace = scheduler.pace.lock().await;
+            pace.interval = Duration::from_millis(350);
+            pace.successes = 0;
+        }
+        let before = THROTTLES.load(Ordering::Relaxed);
+        let start = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut ids = ids.into_iter();
+        let mut tracks = 0;
+        for _ in 0..concurrency {
+            if let Some(id) = ids.next() {
+                tasks.spawn(fetch(http.clone(), token.clone(), id));
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            tracks += result.unwrap().unwrap();
+            if let Some(id) = ids.next() {
+                tasks.spawn(fetch(http.clone(), token.clone(), id));
+            }
+        }
+        println!(
+            "concurrency={concurrency} releases=6 tracks={tracks} elapsed_ms={} http_429={}",
+            start.elapsed().as_millis(),
+            THROTTLES.load(Ordering::Relaxed) - before
+        );
+        if THROTTLES.load(Ordering::Relaxed) > before {
+            break;
+        }
     }
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
