@@ -12,7 +12,7 @@ use std::{
 
 const MAX_AGE: i64 = 30 * 86400;
 // Match the shared API lane; spacing and 429 cooldown remain global.
-const WORKERS: usize = 3;
+const WORKERS: usize = crate::network::METADATA_CONCURRENCY;
 
 pub fn merge(track: &mut TidalTrack, raw: &Value) {
     // Never cross-fill a different recording, even when a release title agrees.

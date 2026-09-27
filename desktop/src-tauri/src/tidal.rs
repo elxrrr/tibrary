@@ -259,11 +259,13 @@ fn retry_delay(header: Option<&str>, attempt: usize) -> Duration {
     crate::network::retry_after(header, attempt)
 }
 
+#[derive(Clone)]
 pub struct TidalClient {
     db: TursoDb,
     http: reqwest::Client,
     request_spacing: Duration,
     attempts: usize,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TidalClient {
@@ -271,6 +273,7 @@ impl TidalClient {
         let settings = db.get_preference("provider").await?.unwrap_or(Value::Null);
         Ok(Self {
             db: db.clone(),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             http: crate::network::client(
                 settings["request_timeout_sec"]
                     .as_u64()
@@ -288,6 +291,11 @@ impl TidalClient {
                 .unwrap_or(2)
                 .clamp(1, 5) as usize,
         })
+    }
+
+    pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     pub async fn authenticate(&mut self) -> Result<String, String> {
@@ -317,7 +325,7 @@ impl TidalClient {
                 .bearer_auth(token),
             self.request_spacing,
             self.attempts,
-            None,
+            Some(self.cancel.as_ref()),
         )
         .await?;
         let status = response.status();
@@ -532,7 +540,7 @@ impl TidalClient {
                         .header("Accept", "application/vnd.api+json"),
                     self.request_spacing,
                     self.attempts,
-                    None,
+                    Some(self.cancel.as_ref()),
                 )
                 .await?;
                 if !response.status().is_success() {
@@ -550,6 +558,7 @@ impl TidalClient {
             .await;
             let payload = match response {
                 Ok(payload) => payload,
+                Err(error) if self.cancel.load(std::sync::atomic::Ordering::Relaxed) => return Err(error),
                 Err(error) => {
                     self.db
                         .set_preference(&pause_key, &json!({"until":now+3600,"message":error}))
@@ -675,6 +684,37 @@ impl TidalClient {
         Ok(ids)
     }
 
+    async fn artist_name(&mut self, artist_id: &str, market: &str) -> Result<String, String> {
+        let key = format!("subscriber-artist:{market}:{artist_id}");
+        let saved = self.db.get_preference(&key).await?;
+        let now = Utc::now().timestamp();
+        if let Some(value) = &saved {
+            if value["checked_at"].as_i64().is_some_and(|at| (0..30 * 86400).contains(&(now-at))) {
+                if let Some(name) = value["name"].as_str().filter(|name| !name.is_empty()) { return Ok(name.to_owned()); }
+            }
+        } else {
+            // Bootstrap the name cache from recent catalogue snapshots after upgrade.
+            // Once expired, fetch a fresh profile rather than extending stale names forever.
+            let conn = self.db.connect()?;
+            let mut rows = conn.query("SELECT json_extract(payload,'$.name'),fetched FROM catalogue WHERE artist_id=? AND market=?", (artist_id,market)).await.map_err(|e|e.to_string())?;
+            let prior = rows.next().await.map_err(|e|e.to_string())?.and_then(|row| {
+                let name = row.get::<String>(0).ok()?;
+                let fetched = row.get::<String>(1).ok()?;
+                let at = chrono::DateTime::parse_from_rfc3339(&fetched).ok()?.timestamp();
+                (!name.is_empty() && (0..30*86400).contains(&(now-at))).then_some((name,at))
+            });
+            drop(rows);
+            if let Some((name,at)) = prior {
+                self.db.set_preference(&key,&json!({"name":name,"checked_at":at})).await?;
+                return Ok(name);
+            }
+        }
+        let artist = self.request(&format!("artists/{artist_id}"),market,&[]).await?;
+        let name = artist["name"].as_str().filter(|name| !name.is_empty()).ok_or("Artist name missing")?.to_owned();
+        self.db.set_preference(&key,&json!({"name":name,"checked_at":now})).await?;
+        Ok(name)
+    }
+
     pub async fn get_artist_catalogue(
         &mut self,
         artist_id: &str,
@@ -684,17 +724,11 @@ impl TidalClient {
         if artist_id.is_empty() || !artist_id.bytes().all(|b| b.is_ascii_digit()) {
             return Err("Invalid artist ID".into());
         }
-        let artist = self
-            .request(&format!("artists/{artist_id}"), market, &[])
-            .await?;
-        let name = artist["name"]
-            .as_str()
-            .ok_or("Artist name missing")?
-            .to_owned();
+        let name = self.artist_name(artist_id,market).await?;
         // Main catalogue excludes guest compilation appearances by default.
         // Users can explicitly include them in Release matching & recommendations.
-        let settings = self.db.get_settings().await?;
-        let filters = if settings["general"]["recommend_compilations"] == true {
+        let settings = self.db.get_preference("desktop").await?.or(self.db.get_preference("ui").await?).unwrap_or(Value::Null);
+        let filters = if settings["recommend_compilations"] == true {
             vec!["", "EPSANDSINGLES", "COMPILATIONS"]
         } else {
             vec!["", "EPSANDSINGLES"]
@@ -752,7 +786,7 @@ impl TidalClient {
             &self.http,
             id,
             market,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            self.cancel.clone(),
             false,
         )
         .await?;
@@ -766,71 +800,79 @@ impl TidalClient {
         catalogue: &TidalCatalogue,
     ) -> Result<(), String> {
         let conn = db.connect()?;
-        let mut payload = serde_json::to_value(catalogue).map_err(|e| e.to_string())?;
-        let mut previous = conn
-            .query(
-                "SELECT payload FROM catalogue WHERE artist_id=? AND market=?",
-                (catalogue.id.as_str(), market),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(row) = previous.next().await.map_err(|e| e.to_string())? {
-            let raw: String = row.get(0).map_err(|e| e.to_string())?;
-            if let Ok(old) = serde_json::from_str::<Value>(&raw) {
-                if let (Some(fresh), Some(prior)) = (
-                    payload["releases"].as_array_mut(),
-                    old["releases"].as_array(),
-                ) {
-                    for release in fresh {
-                        if let Some(cached) = prior.iter().find(|r| r["id"] == release["id"]) {
-                            for field in [
-                                "upc",
-                                "original_release_date",
-                                "audio_modes",
-                                "media_metadata",
-                                "quality",
-                                "copyright",
-                                "label",
-                                "official",
-                                "release_group_id",
-                                "primary_type",
-                                "secondary_types",
-                                "artist_credits",
-                                "genres",
-                                "replacement_id",
-                            ] {
-                                let absent = release[field].is_null()
-                                    || release[field].as_str().is_some_and(str::is_empty)
-                                    || release[field].as_array().is_some_and(Vec::is_empty);
-                                if absent && !cached[field].is_null() {
-                                    release[field] = cached[field].clone();
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e|e.to_string())?;
+        let result = async {
+            let mut payload = serde_json::to_value(catalogue).map_err(|e| e.to_string())?;
+            let mut previous = conn
+                .query(
+                    "SELECT payload FROM catalogue WHERE artist_id=? AND market=?",
+                    (catalogue.id.as_str(), market),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(row) = previous.next().await.map_err(|e| e.to_string())? {
+                let raw: String = row.get(0).map_err(|e| e.to_string())?;
+                if let Ok(old) = serde_json::from_str::<Value>(&raw) {
+                    if let (Some(fresh), Some(prior)) = (
+                        payload["releases"].as_array_mut(),
+                        old["releases"].as_array(),
+                    ) {
+                        for release in fresh {
+                            if let Some(cached) = prior.iter().find(|r| r["id"] == release["id"]) {
+                                for field in [
+                                    "upc",
+                                    "original_release_date",
+                                    "audio_modes",
+                                    "media_metadata",
+                                    "quality",
+                                    "copyright",
+                                    "label",
+                                    "official",
+                                    "release_group_id",
+                                    "primary_type",
+                                    "secondary_types",
+                                    "artist_credits",
+                                    "genres",
+                                    "replacement_id",
+                                ] {
+                                    let absent = release[field].is_null()
+                                        || release[field].as_str().is_some_and(str::is_empty)
+                                        || release[field].as_array().is_some_and(Vec::is_empty);
+                                    if absent && !cached[field].is_null() {
+                                        release[field] = cached[field].clone();
+                                    }
                                 }
-                            }
-                            if release["discovery_checked_at"].is_null() {
-                                release["discovery_checked_at"] =
-                                    cached["discovery_checked_at"].clone();
-                            }
-                            if release["tracks_loaded"] != true && cached["tracks_loaded"] == true {
-                                release["tracks"] = cached["tracks"].clone();
-                                release["tracks_loaded"] = json!(true);
-                                release["track_count"] = cached["track_count"].clone();
+                                if release["discovery_checked_at"].is_null() {
+                                    release["discovery_checked_at"] =
+                                        cached["discovery_checked_at"].clone();
+                                }
+                                if release["tracks_loaded"] != true && cached["tracks_loaded"] == true {
+                                    release["tracks"] = cached["tracks"].clone();
+                                    release["tracks_loaded"] = json!(true);
+                                    release["track_count"] = cached["track_count"].clone();
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        drop(previous);
-        let json_payload = payload.to_string();
-        let now_str = Utc::now().to_rfc3339();
+            drop(previous);
+            let json_payload = payload.to_string();
+            let now_str = Utc::now().to_rfc3339();
 
-        conn.execute(
-            "INSERT OR REPLACE INTO catalogue (artist_id, market, payload, fetched) VALUES (?, ?, ?, ?)",
-            (catalogue.id.as_str(), market, json_payload.as_str(), now_str.as_str()),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR REPLACE INTO catalogue (artist_id, market, payload, fetched) VALUES (?, ?, ?, ?)",
+                (catalogue.id.as_str(), market, json_payload.as_str(), now_str.as_str()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
+            TursoDb::index_catalogue(&conn,&catalogue.id,market,&payload).await?;
+            conn.execute("COMMIT", ()).await.map_err(|e|e.to_string())?;
+            Ok::<_,String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        result?;
         db.bump_revision();
         Ok(())
     }
@@ -1272,6 +1314,8 @@ mod subscriber_tests {
         let dir = std::env::temp_dir().join(format!("subscriber-cache-{}", uuid::Uuid::new_v4()));
         let db = TursoDb::open(dir.join("db")).await.unwrap();
         let mut client = TidalClient::from_db(&db).await.unwrap();
+        db.set_preference("subscriber-artist:GB:4", &json!({"name":"Main","checked_at":Utc::now().timestamp()})).await.unwrap();
+        assert_eq!(client.artist_name("4","GB").await.unwrap(),"Main");
         let raw = json!({"id":12,"title":"Release","artist":{"id":4,"name":"Main"},"checked_at":Utc::now().timestamp(),"allowStreaming":true,"streamReady":true});
         client.cache_summary(&raw, "GB").await.unwrap();
         let payload = client.albums(&["12".into()], "GB", false).await.unwrap();

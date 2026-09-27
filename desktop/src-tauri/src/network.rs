@@ -9,6 +9,8 @@ use std::{
 };
 use tokio::sync::{Mutex, Semaphore};
 
+pub const METADATA_CONCURRENCY: usize = 3;
+
 #[cfg(test)]
 static THROTTLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -65,7 +67,7 @@ fn lane(key: String, initial: Duration, api: bool) -> Arc<Lane> {
                         Duration::ZERO
                     },
                 )),
-                slots: Semaphore::new(if api { 3 } else { 8 }),
+                slots: Semaphore::new(if api { METADATA_CONCURRENCY } else { 8 }),
             })
         })
         .clone()
@@ -290,7 +292,7 @@ async fn live_metadata_concurrency() {
         id: &'static str,
     ) -> Result<usize, String> {
         let response = get(
-            http.get(format!("https://api.tidal.com/v1/albums/{id}/tracks"))
+            http.get(format!("https://api.tidal.com/v1/albums/{id}/items/credits"))
                 .query(&[("countryCode", "GB"), ("limit", "100"), ("offset", "0")])
                 .bearer_auth(token),
             Duration::from_millis(350),
@@ -305,12 +307,12 @@ async fn live_metadata_concurrency() {
         Ok(value["items"].as_array().ok_or("Missing tracks")?.len())
     }
     fetch(http.clone(), token.clone(), ids[0]).await.unwrap();
-    for concurrency in [1, 2, 3, 3, 2, 1] {
+    for (interval_ms,concurrency) in [(350,1),(350,2),(350,3),(100,1),(100,2),(100,3)] {
         let scheduler = lane("api.tidal.com:443".into(), Duration::from_millis(350), true);
         // Equal starting pace for each trial; never bypass a service cooldown.
         {
             let mut pace = scheduler.pace.lock().await;
-            pace.interval = Duration::from_millis(350);
+            pace.interval = Duration::from_millis(interval_ms);
             pace.successes = 0;
         }
         let before = THROTTLES.load(Ordering::Relaxed);
@@ -330,7 +332,7 @@ async fn live_metadata_concurrency() {
             }
         }
         println!(
-            "concurrency={concurrency} releases=6 tracks={tracks} elapsed_ms={} http_429={}",
+            "spacing_ms={interval_ms} concurrency={concurrency} releases=6 tracks={tracks} elapsed_ms={} http_429={}",
             start.elapsed().as_millis(),
             THROTTLES.load(Ordering::Relaxed) - before
         );

@@ -190,6 +190,8 @@ impl TursoDb {
             "CREATE TABLE IF NOT EXISTS mappings(artist TEXT PRIMARY KEY, tidal_id TEXT, status TEXT, evidence TEXT, manual INTEGER DEFAULT 0)",
             "CREATE TABLE IF NOT EXISTS additional_mappings(artist TEXT, tidal_id TEXT, PRIMARY KEY(artist,tidal_id))",
             "CREATE TABLE IF NOT EXISTS catalogue(artist_id TEXT, market TEXT, payload TEXT, fetched TEXT, PRIMARY KEY(artist_id,market))",
+            "CREATE TABLE IF NOT EXISTS catalogue_release_index(artist_id TEXT, market TEXT, release_id TEXT, PRIMARY KEY(artist_id,market,release_id))",
+            "CREATE INDEX IF NOT EXISTS catalogue_release_lookup ON catalogue_release_index(market,release_id,artist_id)",
             "CREATE TABLE IF NOT EXISTS track_links(path TEXT, market TEXT, stamp TEXT, payload TEXT, PRIMARY KEY(path,market))",
             "CREATE TABLE IF NOT EXISTS favourite_artists(cache_id TEXT PRIMARY KEY, payload TEXT, fetched TEXT)",
             "CREATE TABLE IF NOT EXISTS queue(id TEXT PRIMARY KEY, payload TEXT, approved INTEGER DEFAULT 0, decision TEXT DEFAULT 'queued', updated TEXT)",
@@ -211,6 +213,49 @@ impl TursoDb {
         drop(columns);
         if !has_context { conn.execute("ALTER TABLE activity_logs ADD COLUMN job_context TEXT", ()).await.map_err(|e|e.to_string())?; }
         Ok(())
+    }
+
+    /// Called inside the same write transaction as the catalogue snapshot.
+    /// An empty ID marks even an empty catalogue as indexed.
+    pub(crate) async fn index_catalogue(conn: &Connection, artist: &str, market: &str, payload: &Value) -> Result<(), String> {
+        conn.execute("DELETE FROM catalogue_release_index WHERE artist_id=? AND market=?", (artist,market)).await.map_err(|e|e.to_string())?;
+        conn.execute("INSERT INTO catalogue_release_index VALUES(?,?,'')", (artist,market)).await.map_err(|e|e.to_string())?;
+        let mut seen = HashSet::new();
+        for release in payload["releases"].as_array().into_iter().flatten() {
+            if let Some(id) = release["id"].as_str().filter(|id| !id.is_empty()) {
+                if seen.insert(id) {
+                    conn.execute("INSERT INTO catalogue_release_index VALUES(?,?,?)", (artist,market,id)).await.map_err(|e|e.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Backfill existing databases lazily, once per artist; never discard cached data.
+    pub(crate) async fn ensure_catalogue_release_index(&self) -> Result<(), String> {
+        const MISSING: &str = "SELECT artist_id,market,payload FROM catalogue c WHERE NOT EXISTS (SELECT 1 FROM catalogue_release_index i WHERE i.artist_id=c.artist_id AND i.market=c.market)";
+        let conn = self.connect()?;
+        let mut probe = conn.query(&format!("{MISSING} LIMIT 1"), ()).await.map_err(|e|e.to_string())?;
+        let missing = probe.next().await.map_err(|e|e.to_string())?.is_some();
+        drop(probe);
+        if !missing { return Ok(()); }
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e|e.to_string())?;
+        let result = async {
+            let mut rows = conn.query(MISSING, ()).await.map_err(|e|e.to_string())?;
+            let mut snapshots = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|e|e.to_string())? {
+                snapshots.push((row.get::<String>(0).map_err(|e|e.to_string())?, row.get::<String>(1).map_err(|e|e.to_string())?, row.get::<String>(2).map_err(|e|e.to_string())?));
+            }
+            drop(rows);
+            for (artist,market,raw) in snapshots {
+                let payload: Value = serde_json::from_str(&raw).map_err(|e|e.to_string())?;
+                Self::index_catalogue(&conn,&artist,&market,&payload).await?;
+            }
+            conn.execute("COMMIT", ()).await.map_err(|e|e.to_string())?;
+            Ok::<_,String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        result
     }
 
     pub async fn log_activity(

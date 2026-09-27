@@ -45,7 +45,7 @@ A release is marked superseded only when cached evidence shows a newer available
 | Refresh track details and credits | Refresh metadata for a particular release. |
 | Recheck availability | Request a fresh market-availability check. |
 
-All online workflows use one subscriber connection. Requests reuse pooled connections, market-scoped caches and bounded concurrency, with shared rate-limit backoff. Provider errors are not treated as proof that a release is unavailable.
+All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Recent artist names and track credits are reused for 30 days, while release lists are checked for new music. Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
 
 BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. Missing fields are not invented. Missing-tag previews preserve existing tags. No developer credentials or database reset are needed.
 

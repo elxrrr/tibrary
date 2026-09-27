@@ -1850,7 +1850,7 @@ async fn handle_rpc_uncached(
             && args.get("kind").and_then(|v| v.as_str()) == Some("discography"))
     {
         let client_opt = tidal::TidalClient::from_db(db).await.ok();
-        let mut client = match client_opt {
+        let client = match client_opt {
             Some(c) => c,
             None => {
                 return Err(
@@ -1934,13 +1934,30 @@ async fn handle_rpc_uncached(
             let mut failure: Option<String> = None;
             let backend_prog = backend_task.clone();
 
-            for artist_id in &ids {
-                if completed.contains(artist_id) { continue; }
-                if cancel_flag.load(Ordering::Relaxed) {
-                    break;
+            // Keep three artists in flight, sharing the global API pacing lane.
+            // Catalogue/queue writes and checkpoints remain serial and durable.
+            let mut pending: std::collections::VecDeque<_> = ids.iter().filter(|id| !completed.contains(id)).cloned().collect();
+            let mut fetches = tokio::task::JoinSet::new();
+            loop {
+                if cancel_flag.load(Ordering::Relaxed) { break; }
+                while fetches.len() < network::METADATA_CONCURRENCY {
+                    let Some(artist_id) = pending.pop_front() else { break; };
+                    let mut worker = client.clone().with_cancel(cancel_flag.clone());
+                    let worker_market = market.clone();
+                    let name = names.get(&artist_id).unwrap_or(&artist_id);
+                    backend_task.progress_for("discography", &format!("Checking release list · {name} · {checked}/{total} artists saved · {market}"));
+                    fetches.spawn(async move {
+                        let result = worker.get_artist_catalogue(&artist_id, &worker_market, false).await;
+                        (artist_id, result)
+                    });
                 }
-
-                let name = names.get(artist_id).map(String::as_str).unwrap_or(artist_id);
+                let Some(task) = fetches.join_next().await else { break; };
+                let (artist_id, catalogue_result) = match task {
+                    Ok(value) => value,
+                    Err(error) => { failure = Some(format!("Catalogue worker stopped: {error}")); break; }
+                };
+                if cancel_flag.load(Ordering::Relaxed) { break; }
+                let name = names.get(&artist_id).map(String::as_str).unwrap_or(&artist_id);
                 let msg = format!("Refreshing releases · {checked}/{total} artists complete · {name} · artist ID {artist_id} · {market} · {}", if detailed { "release and track details" } else { "release list" });
                 let prog_job = json!({
                     "id": j_id.clone(),
@@ -1963,10 +1980,7 @@ async fn handle_rpc_uncached(
                     );
                 }
 
-                match client
-                    .get_artist_catalogue(artist_id, &market, false)
-                    .await
-                {
+                match catalogue_result {
                     Ok(catalogue) => {
                         if let Err(e) = client
                             .save_catalogue_to_db(&db_clone, &market, &catalogue)
@@ -1978,7 +1992,7 @@ async fn handle_rpc_uncached(
                             break;
                         } else {
                             if detailed {
-                                if let Ok(http)=reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build() {
+                                if let Ok(http)=network::client(20) {
                                     if let Err(error)=subscriber_metadata::prefetch(&db_clone,&http,catalogue.releases.iter().map(|r|r.id.clone()).collect(),&market,cancel_flag.clone(),|message|backend_task.progress_for("discography",&format!("{name} · {message}"))).await {
                                         backend_task.log(&format!("Subscriber metadata cache: {error}"));
                                     }
@@ -2003,7 +2017,7 @@ async fn handle_rpc_uncached(
                                             if let Err(error) = db_clone.set_preference(&key, saved).await { failure = Some(error); break; }
                                         }
                                     }
-                                    if let Err(error) = actions::release(&db_clone, &release.id, &market, false).await {
+                                    if let Err(error) = actions::release_with_cancel(&db_clone, &release.id, &market, false, cancel_flag.clone()).await {
                                         failure = Some(format!("{} — {}: {error}", name, release.title));
                                         break;
                                     }
@@ -2036,6 +2050,8 @@ async fn handle_rpc_uncached(
                 }
             }
 
+            fetches.abort_all();
+            while fetches.join_next().await.is_some() {}
             let is_cancelled = cancel_flag.load(Ordering::Relaxed);
             let status = if is_cancelled {
                 "cancelled"
@@ -2778,6 +2794,48 @@ fn main() {
 
 #[cfg(test)]
 mod activity_tests {
+    #[tokio::test]
+    #[ignore = "Read-only live catalogue refresh, metadata, cancellation and resume using a disposable database"]
+    async fn live_catalogue_refresh_pipeline() {
+        let dir = std::env::temp_dir().join(format!("catalogue-refresh-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        async fn wait(backend: &Arc<Backend>) -> Value {
+            tokio::time::timeout(std::time::Duration::from_secs(120),async {
+                loop {
+                    let job = backend.online_job.lock().unwrap().clone().unwrap();
+                    if ["complete","failed","cancelled"].contains(&job["status"].as_str().unwrap_or("")) { return job; }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }).await.expect("Refresh did not finish")
+        }
+        for (label,ids,detailed) in [
+            ("cold release lists",vec!["3870503","3924"],false),
+            ("warm release lists",vec!["3870503","3924"],false),
+            ("cold recommendation metadata",vec!["3870503"],true),
+            ("warm recommendation metadata",vec!["3870503"],true),
+        ] {
+            let start=std::time::Instant::now();
+            handle_rpc_call(None,&backend,&db,"job.start".into(),json!({"kind":"discography","args":{"ids":ids,"market":"GB","detailed":detailed}})).await.unwrap();
+            let job=wait(&backend).await;
+            assert_eq!(job["status"],"complete","{job}");
+            assert_eq!(job["result"]["checked"],ids.len());
+            let saved=db.get_preference("catalogue-refresh-checkpoint").await.unwrap().unwrap();
+            assert_eq!(saved["completed"].as_array().unwrap().len(),ids.len());
+            println!("{label}: {} artists, {} ms",ids.len(),start.elapsed().as_millis());
+        }
+        let args=json!({"kind":"discography","args":{"ids":["3870503","3924"],"market":"GB"}});
+        handle_rpc_call(None,&backend,&db,"job.start".into(),args.clone()).await.unwrap();
+        handle_rpc_call(None,&backend,&db,"job.cancel".into(),json!({"kind":"discography"})).await.unwrap();
+        assert_eq!(wait(&backend).await["status"],"cancelled");
+        let mut resumed=args;
+        resumed["args"]["resume"]=json!(true);
+        handle_rpc_call(None,&backend,&db,"job.start".into(),resumed).await.unwrap();
+        assert_eq!(wait(&backend).await["status"],"complete");
+        println!("Cancellation and resume passed; no local audio accessed");
+        drop(backend);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn catalogue_resume_skips_only_saved_artists_in_the_same_scope() {
         let ids = vec!["one".into(), "two".into(), "three".into()];

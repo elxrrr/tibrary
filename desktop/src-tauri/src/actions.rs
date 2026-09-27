@@ -100,10 +100,10 @@ pub(crate) fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
-    release_from(db,id,market,force).await
+    release_with_cancel(db,id,market,force,Arc::new(AtomicBool::new(false))).await
 }
 
-async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
+pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, force: bool, cancel: Arc<AtomicBool>) -> Result<Value, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
         return Err("Select a release with a valid online ID".into());
     }
@@ -125,8 +125,9 @@ async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool) -> Resu
     let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
     let mut tracks = {
         let http=crate::network::client(20)?;
-        match crate::subscriber_metadata::load(db,&http,id,market,Arc::new(AtomicBool::new(false)),force).await {
+        match crate::subscriber_metadata::load(db,&http,id,market,cancel.clone(),force).await {
             Ok(raw)=>crate::subscriber_metadata::tracks(&raw)?,
+            Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
             Err(error) if value["tracks_loaded"] == true && !force => {
                 value["metadata_note"]=json!(format!("Saved metadata retained: {error}. Reconnect your account and retry if needed."));
                 return Ok(value);
@@ -137,7 +138,7 @@ async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool) -> Resu
     crate::subscriber_metadata::supplement(&mut tracks,&old_tracks);
     let summary_loaded = value["title"] == "Release not found";
     if summary_loaded {
-        let mut client = crate::tidal::TidalClient::from_db(db).await?;
+        let mut client = crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
         let raw = client.albums(&[id.to_owned()],market,force).await?;
         let data = raw["data"]
             .as_array()
@@ -157,10 +158,11 @@ async fn release_from(db: &TursoDb, id: &str, market: &str, force: bool) -> Resu
     }
     if value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || (force && !summary_loaded) {
         if let Ok(mut client)=crate::tidal::TidalClient::from_db(db).await {
+            client = client.with_cancel(cancel.clone());
             fill_release_discovery(&mut client, &mut value, id, market, force).await;
         }
     }
-    let mut client=crate::tidal::TidalClient::from_db(db).await?;
+    let mut client=crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
     let optional=client.discovery(&[id.to_owned()],market,force).await?;
     if let Some(fields)=optional.get(id) { crate::tidal::merge_discovery(&mut value,fields); }
     value["track_metadata_source"]=json!("subscriber");
@@ -205,64 +207,71 @@ async fn publish_release(
     market: &str,
     value: Value,
 ) -> Result<Value, String> {
-    let key = format!("tag-review:{market}:{id}");
-    db.set_preference(&key, &value).await?;
-    if let (Some(available), Some(checked_at)) = (value["available"].as_bool(),value["availability_checked_at"].as_i64()) {
-        db.set_preference(&format!("release-live:{market}:{id}"), &json!({"available":available,"checked_at":checked_at})).await?;
-    }
+    db.ensure_catalogue_release_index().await?;
     // Publish details to every catalogue reference and existing queue entry.
     let conn = db.connect()?;
-    let mut rows = conn
-        .query(
-            "SELECT artist_id,payload FROM catalogue WHERE market=?",
-            (market,),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut updates = vec![];
-    while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
-        let artist: String = row.get(0).map_err(|e| e.to_string())?;
-        let raw: String = row.get(1).map_err(|e| e.to_string())?;
-        let mut cat: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        let mut changed = false;
-        if let Some(releases) = cat["releases"].as_array_mut() {
-            for r in releases {
-                if r["id"].as_str() == Some(id) {
-                    *r = value.clone();
-                    changed = true;
+    conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e|e.to_string())?;
+    let result = async {
+        conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("tag-review:{market}:{id}"),value.to_string())).await.map_err(|e|e.to_string())?;
+        if let (Some(available), Some(checked_at)) = (value["available"].as_bool(),value["availability_checked_at"].as_i64()) {
+            conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("release-live:{market}:{id}"),json!({"available":available,"checked_at":checked_at}).to_string())).await.map_err(|e|e.to_string())?;
+        }
+        let mut rows = conn
+            .query(
+                "SELECT c.artist_id,c.payload FROM catalogue c JOIN catalogue_release_index i ON i.artist_id=c.artist_id AND i.market=c.market WHERE i.market=? AND i.release_id=?",
+                (market,id),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut updates = vec![];
+        while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+            let artist: String = row.get(0).map_err(|e| e.to_string())?;
+            let raw: String = row.get(1).map_err(|e| e.to_string())?;
+            let mut cat: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            let mut changed = false;
+            if let Some(releases) = cat["releases"].as_array_mut() {
+                for r in releases {
+                    if r["id"].as_str() == Some(id) {
+                        *r = value.clone();
+                        changed = true;
+                    }
                 }
             }
+            if changed {
+                updates.push((artist, cat.to_string()));
+            }
         }
-        if changed {
-            updates.push((artist, cat.to_string()));
+        drop(rows);
+        for (artist, data) in updates {
+            conn.execute(
+                "UPDATE catalogue SET payload=? WHERE artist_id=? AND market=?",
+                (data.as_str(), artist.as_str(), market),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         }
-    }
-    drop(rows);
-    for (artist, data) in updates {
-        conn.execute(
-            "UPDATE catalogue SET payload=? WHERE artist_id=? AND market=?",
-            (data.as_str(), artist.as_str(), market),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    let mut q = conn
-        .query("SELECT payload FROM queue WHERE id=?", (id,))
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(row) = q.next().await.map_err(|e| e.to_string())? {
-        let raw: String = row.get(0).map_err(|e| e.to_string())?;
-        let mut queued: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        queued["tracks"] = value["tracks"].clone();
-        queued["tracks_loaded"] = json!(true);
-        drop(q);
-        conn.execute(
-            "UPDATE queue SET payload=? WHERE id=?",
-            (queued.to_string(), id),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
+        let mut q = conn
+            .query("SELECT payload FROM queue WHERE id=?", (id,))
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(row) = q.next().await.map_err(|e| e.to_string())? {
+            let raw: String = row.get(0).map_err(|e| e.to_string())?;
+            let mut queued: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            queued["tracks"] = value["tracks"].clone();
+            queued["tracks_loaded"] = json!(true);
+            drop(q);
+            conn.execute(
+                "UPDATE queue SET payload=? WHERE id=?",
+                (queued.to_string(), id),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        conn.execute("COMMIT", ()).await.map_err(|e|e.to_string())?;
+        Ok::<_,String>(())
+    }.await;
+    if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+    result?;
     db.bump_revision();
     Ok(value)
 }
@@ -286,7 +295,7 @@ pub async fn execute(
     if kind == "release_details" {
         let id = args["id"].as_str().ok_or("Select a release")?;
         state.progress_for(kind,&format!("Refreshing release {id} · subscriber track details and credits"));
-        let value=release_from(db, id, market, args["force"].as_bool().unwrap_or(false)).await?;
+        let value=release_with_cancel(db, id, market, args["force"].as_bool().unwrap_or(false), cancel.clone()).await?;
         state.progress_for(kind,&format!("Release {id} · {} tracks cached · {}",value["track_count"],value["metadata_note"].as_str().unwrap_or("complete")));
         return Ok(json!({"release_id":id}));
     }
@@ -1454,6 +1463,44 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn release_index_backfills_and_preserves_shared_releases_queue_and_markets() {
+        let dir = std::env::temp_dir().join(format!("release-index-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let conn = db.connect().unwrap();
+        let snapshot = json!({"id":"a","name":"Artist","releases":[{"id":"10","title":"Old"},{"id":"11","title":"Sibling"}]});
+        for (artist,market) in [("a","GB"),("b","GB"),("a","US")] {
+            conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES(?,?,?)", (artist,market,snapshot.to_string())).await.unwrap();
+        }
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('10',?,1,'queued')",(json!({"id":"10","selected_track_ids":["101"],"destination":"keep"}).to_string(),)).await.unwrap();
+        let one = json!({"id":"10","title":"Updated","tracks_loaded":true,"tracks":[{"id":"101"}]});
+        let two = json!({"id":"11","title":"Updated sibling","tracks_loaded":true,"tracks":[{"id":"111"}]});
+        let (a,b) = tokio::join!(publish_release(&db,"10","GB",one.clone()),publish_release(&db,"11","GB",two.clone()));
+        a.unwrap(); b.unwrap();
+        let mut rows = conn.query("SELECT artist_id,market,payload FROM catalogue",()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            let market: String = row.get(1).unwrap();
+            let payload: Value = serde_json::from_str(&row.get::<String>(2).unwrap()).unwrap();
+            assert_eq!(payload["releases"],if market=="GB" {json!([one,two])} else {snapshot["releases"].clone()});
+        }
+        drop(rows);
+        let mut rows = conn.query("SELECT payload,approved FROM queue WHERE id='10'",()).await.unwrap();
+        let row=rows.next().await.unwrap().unwrap();
+        let queued: Value=serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+        assert_eq!(queued["selected_track_ids"],json!(["101"]));
+        assert_eq!(queued["destination"],"keep");
+        assert_eq!(queued["tracks"],one["tracks"]);
+        assert_eq!(row.get::<i64>(1).unwrap(),1);
+        drop(rows);
+        let client=crate::tidal::TidalClient::from_db(&db).await.unwrap();
+        client.save_catalogue_to_db(&db,"GB",&crate::tidal::TidalCatalogue{id:"a".into(),name:"Artist".into(),releases:vec![]}).await.unwrap();
+        let mut rows=conn.query("SELECT artist_id FROM catalogue_release_index WHERE market='GB' AND release_id='10'",()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<String>(0).unwrap(),"b");
+        assert!(rows.next().await.unwrap().is_none());
+        drop(rows); drop(conn); drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn same_release_waits_while_other_releases_remain_independent() {
         let first = release_gate("test:GB:1".into());
