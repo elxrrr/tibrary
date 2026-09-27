@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.33 (build 33)
+> **Version:** 0.9.0-beta.34 (build 34)
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust stable · Turso SQLite · React 19 · Lofty
 
@@ -402,6 +402,9 @@ Artist review filters use current resolved state before inspecting historical ev
 
 ### Job activity history
 
-New activity records include job ID, kind and status. An additive `activity_logs.job_context` column keeps existing databases and their logs intact. The live buffer is bounded to 1,000 entries per stream; complete saved details are available through paginated `logs.job` requests. Progress callbacks keep one current progress row while archiving distinct step messages under the job. Start and finish records retain the same ID, so completed jobs remain grouped. Disabling Save activity logs retains the live window only. Pre-migration logs do not have inferred job ownership.
+New activity records include job ID, kind and status. An additive `activity_logs.job_context` column keeps existing databases and their logs intact. The live buffer is bounded to 1,000 entries per stream; complete saved details load automatically on expansion and scroll through paginated `logs.job` requests, without separate history buttons. Progress callbacks keep one current progress row while archiving distinct step messages under the job. Start and finish records retain the same ID, so completed jobs remain grouped. Disabling Save activity logs retains the live window only. Pre-migration logs do not have inferred job ownership.
 
 Finder Trash operations run asynchronously with a 30-second timeout. Fallback Trash names use unique IDs to avoid collisions between concurrent replacements; failed Trash operations retain files and return an error.
+
+
+**Build 34 UI follow-up:** Increased native traffic-light insets and reserved header space. Activity keeps live-row identity and stable progress-summary heights. Saved history loads on expansion/scroll. Table headers use opaque light/dark surfaces, including modal tables and tables refreshing in the background. Targeted WebKit checks cover navigation, automatic history, stable live activity and opaque table headers.

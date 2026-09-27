@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { Copy, Trash2, ChevronDown, ChevronRight } from "lucide-react";
 import { call, active, Job, Row } from "./api";
 
@@ -95,24 +95,43 @@ export function groupActivity(entries: ActivityEntry[], job?: Job | null) {
   return {groups: [...groups.values()].reverse(), standalone};
 }
 
-function JobHistory({id, recent}: {id: string; recent: ActivityEntry[]}) {
-  const [saved, setSaved] = useState<ActivityEntry[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [more, setMore] = useState(true);
+function JobHistory({id, recent, query}: {id: string; recent: ActivityEntry[]; query: string}) {
+  const [saved, setSaved] = useState<ActivityEntry[]>([]);
   const [error, setError] = useState("");
-  async function load() {
-    setLoading(true); setError("");
-    try {
-      const rows = await call("logs.job", {id, offset: saved?.length || 0}) as ActivityEntry[];
-      setSaved(old => [...(old || []), ...rows]); setMore(rows.length === 1000);
-    } catch (e) {setError(String(e));} finally {setLoading(false);}
-  }
-  const rows = saved ? [...new Map([...saved, ...recent.filter(entry => !entry.progress_id || !saved.some(old => old.message === entry.message))].map(entry => [`${entry.at}:${entry.message}`, entry])).values()].sort((a,b) => a.at.localeCompare(b.at)) : recent;
+  const sentinel = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    let disposed = false, loading = false, offset = 0, more = true;
+    const marker = sentinel.current;
+    const root = marker?.closest(".activity-log") || null;
+    let observer: IntersectionObserver | undefined;
+    async function load() {
+      if (disposed || loading || !more) return;
+      loading = true;
+      try {
+        const rows = await call("logs.job", {id, offset}) as ActivityEntry[];
+        if (disposed) return;
+        offset += rows.length; more = rows.length === 1000;
+        setSaved(old => [...old, ...rows]);
+      } catch (e) {if (!disposed) setError(String(e)); more = false;}
+      finally {loading = false;}
+    }
+    // Keep recent rows on screen while older history loads. Further pages arrive
+    // on scroll, without replacing the live log or introducing an action button.
+    load();
+    observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) void load();
+    }, {root, rootMargin: "150px"});
+    if (marker) observer.observe(marker);
+    return () => {disposed = true; observer?.disconnect();};
+  }, [id]);
+  const archived = [...new Map([...saved, ...recent.filter(entry => !entry.progress_id)].map(entry => [`${entry.at}:${entry.message}`, entry])).values()].sort((a,b) => a.at.localeCompare(b.at));
+  const live = recent.find(entry => entry.progress_id);
+  const rows = live && !archived.some(entry => entry.message === live.message) ? [...archived,live] : archived;
   return <div className="batch-children">
-    {rows.map((entry,i) => <LogRow entry={entry} key={`${entry.at}-${i}`}/>)}
-    {!rows.length && <p>No saved details yet. Activity saving may be disabled.</p>}
-    {more && <button disabled={loading} onClick={load}>{loading ? "Loading details…" : saved ? "Load more details" : "Load full saved history"}</button>}
-    {error && <p role="alert">{error}</p>}
+    {rows.filter(entry => !query || entry.message.toLocaleLowerCase().includes(query)).map(entry => <LogRow entry={entry} key={entry.progress_id || `${entry.at}:${entry.message}`}/>)}
+    {!rows.length && <p>No details recorded yet.</p>}
+    <div ref={sentinel} className="history-sentinel" aria-hidden="true"/>
+    {error && <p role="alert">Saved details could not load: {error}</p>}
   </div>;
 }
 
@@ -163,9 +182,9 @@ function StreamPanel({ stream, title, entries, monitor, job, onClear }: {
         return <div className="batch-log" key={group.id}>
           <button className="batch-toggle" aria-expanded={Boolean(expanded[group.id])} onClick={() => setExpanded(old => ({...old, [group.id]: !old[group.id]}))}>
             {expanded[group.id] ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
-            <strong>{jobTitle(group.kind)}</strong><span>{group.message}</span><span className={`status-badge status-${status}`}>{status}</span>
+            <strong>{jobTitle(group.kind)}</strong><span title={group.message}>{group.message}</span><span className={`status-badge status-${status}`}>{status}</span>
           </button>
-          {expanded[group.id] && <JobHistory id={group.id} recent={group.entries.filter(entry => !q || entry.message.toLocaleLowerCase().includes(q))}/>}
+          {expanded[group.id] && <JobHistory id={group.id} recent={group.entries} query={q}/>}
         </div>;
       })}
       {stream === "downloads" && batches.map(batch => {
@@ -216,7 +235,7 @@ function WorkerStatus({ title, job, onCancel }: { title: string; job?: Job | nul
   const detail = running ? (job?.message || "Working") : completedId === job?.id ? "Task complete" : "Awaiting task...";
   return <div className="card activity-status" role="status">
     <div><small>{title}</small><h2>{running ? "Task in progress..." : detail}</h2>
-      {running && <><p>{job?.message}</p><p className="job-progress-label">{progress?.label}</p><progress aria-label={`${title} progress`} max={100} value={progress?.percent ?? undefined}/></>}
+      {running && <><p title={job?.message}>{job?.message}</p><p title={progress?.label} className="job-progress-label">{progress?.label}</p><progress aria-label={`${title} progress`} max={100} value={progress?.percent ?? undefined}/></>}
     </div>
     {running && <button disabled={job?.status === "cancelling"} onClick={() => onCancel(job!.kind)}>{job?.status === "cancelling" ? "Cancelling…" : "Cancel task"}</button>}
   </div>;

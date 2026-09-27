@@ -438,7 +438,7 @@ function App() {
                     at: new Date().toISOString(),
                     message: p.message,
                     level: p.job?.status === "failed" ? "error" : p.level || "info",
-                    category: p.category || (p.job?.kind ? (p.job.kind === "scan" ? "scan" : p.job.kind === "download" ? "download" : p.job.kind === "link" ? "linking" : p.job.kind.includes("duplicate") ? "cleanup" : undefined) : undefined),
+                    category: p.category || (p.job?.kind ? (p.job.kind === "scan" ? "scan" : p.job.kind === "download" ? "download" : p.job.kind === "link" ? "linking" : p.job.kind.includes("duplicate") ? "cleanup" : "local") : undefined),
                   },
                 ].slice(-1000),
               }
@@ -2039,7 +2039,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.33 · build 33</span>
+          <span className="sidebar-version">v0.9.0-beta.34 · build 34</span>
         </div>
       </aside>
       <main>

@@ -728,6 +728,52 @@ test("completed job activity stays grouped with persistent per-item details", as
   await expect(panel.locator(".batch-children")).toHaveCount(0);
   await toggle.click();
   await expect(panel.locator(".batch-children")).toContainText("Reading local tags");
-  await panel.getByRole("button",{name:"Load full saved history"}).click();
+  await expect(panel.getByRole("button",{name:/Load (full saved history|more details)/})).toHaveCount(0);
   await expect(panel.locator(".batch-children .log-row")).toHaveCount(history.length);
+});
+
+
+test("table headers remain opaque in light and dark themes, including dialogs", async ({page}) => {
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  for (const theme of ["light","dark"]) {
+    await page.evaluate(theme => {document.documentElement.dataset.theme=theme},theme);
+    const header=page.getByRole("columnheader").first();
+    await expect(header).toBeVisible();
+    expect(await header.evaluate(el=>getComputedStyle(el).backgroundColor)).toMatch(/^rgb\(/);
+    expect(await header.evaluate(el=>getComputedStyle(el).opacity)).toBe("1");
+  }
+  await page.locator("tbody tr").first().dblclick();
+  await page.getByText("All saved tags & DJ checks",{exact:true}).click();
+  const header=page.getByRole("dialog").locator("th").first();
+  expect(await header.evaluate(el=>getComputedStyle(el).backgroundColor)).toMatch(/^rgb\(/);
+});
+
+
+test("local activity keeps its layout and expanded live row stable during updates", async ({page}) => {
+  let message = "Checking file 1 of 20";
+  const started=Date.now()/1000;
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    const response=await rpc(request.method,request.args);
+    if (["state","job.status"].includes(request.method) && response.result) {
+      response.result.job={id:"local-live",kind:"scan",status:"running",message,started,completed:1,total:20};
+      response.result.logs=[{at:new Date().toISOString(),message,category:"local",progress_id:"local-live",job_id:"local-live",job_kind:"scan",job_status:"running"}];
+    }
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
+  const panel=page.getByRole("region",{name:"Local actions",exact:true});
+  await panel.locator(".batch-toggle").click();
+  const row=panel.locator(".log-row").last();
+  await row.evaluate(element=>element.setAttribute("data-stability-check","retained"));
+  const top=(await panel.boundingBox())!.y;
+  message="Reading local tags · 12/20 files · An artist with a very long album name and an extended track title which needs to wrap across several lines without moving the panel";
+  await expect(row).toContainText("12/20");
+  await expect(row).toHaveAttribute("data-stability-check","retained");
+  expect((await panel.boundingBox())!.y).toBe(top);
+  await expect(panel.locator(".batch-toggle")).toHaveAttribute("aria-expanded","true");
+  await expect(panel.getByRole("button",{name:/saved history|more details/})).toHaveCount(0);
 });

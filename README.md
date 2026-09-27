@@ -198,4 +198,4 @@ Background work shows measured counts, percentage and a smoothed ETA in Activity
 
 Settings has two pages: **General** and **Activity**. Artist tables offer **Review match**, **Recheck selected artists** and **Unlink selected artists**; unlinking retains file tags, recording links and catalogue caches. Confirmed artists stay out of Needs review even when their old evidence mentions review.
 
-Activity groups each task into an expandable row, including completed tasks. Open a row for per-item checks and outcomes. **Load full saved history** retrieves older details in pages when activity saving is enabled; progress still updates one live summary. Logs captured before job grouping was added remain available as separate entries.
+Activity groups each task into an expandable row, including completed tasks. Open a row for per-item checks and outcomes. Saved details load automatically when a job is expanded, with older pages loaded as you scroll; progress still updates one live summary. Logs captured before job grouping was added remain available as separate entries.
