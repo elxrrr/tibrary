@@ -1,201 +1,72 @@
 <div align="center">
+<img src="desktop/src-tauri/icons/128x128.png" alt="Tibrary icon" width="96" />
 
-# Tibrary 🎵
+# Tibrary
 
-**A modern, local-first music library manager and catalogue companion app.**
+A local-first music library manager for macOS, built with Rust and Tauri.
 
-[![Rust](https://img.shields.io/badge/Rust-1.80+-orange?style=flat&logo=rust)](https://www.rust-lang.org/)
-[![Tauri](https://img.shields.io/badge/Tauri-v2-24C8D8?style=flat&logo=tauri)](https://v2.tauri.app/)
-[![React](https://img.shields.io/badge/React-19-61DAFB?style=flat&logo=react)](https://react.dev/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-
-<br/>
-
-<img src="./desktop/src-tauri/icons/128x128.png" alt="Tibrary App Icon" width="128" height="128" />
-
+**Clean up your files, link your collection, and find missing music.**
 </div>
 
----
+![Tibrary overview](desktop/docs/imgs/overview.png)
 
-## 🌟 Overview
+## What it does
 
-**Tibrary** matches your local music files against official online releases to give your collection rich, comprehensive tags and help you discover new music.
+- **Prepare your library:** preview tag corrections, organise folders and review local duplicates.
+- **Link your collection:** match album artists, recordings and whole releases using cached catalogue evidence.
+- **Find missing music:** discover new releases and incomplete albums, filter recommendations, and queue selected tracks.
+- **Update your files:** fill available tags—including BPM and Camelot keys—improve artwork, and audit MQA files.
+- **Follow the work:** separate activity panels for local tasks, online checks and downloads, with expandable details.
 
-By pairing your local albums and tracks with their streaming counterparts, Tibrary can fill available metadata—including release dates, artwork, disc numbers, Camelot keys and BPM. It also caches track credits, with contributor names and roles, to support release matching and recommendations. Availability depends on what the provider returns; missing credits never become invented metadata.
+Linking only updates the app database. File changes are reviewed separately; duplicate removal uses Trash. One subscriber account supplies catalogue metadata and downloads. Available metadata varies by release.
 
-Artist match details show local recordings and support targeted recording checks when Album Artist is incorrect. These checks use the subscriber API’s exact ISRC lookup and cached results, then require matching titles, durations, release totals and positions. Recording links never rewrite artist identities or file tags. Folder previews explain invisible whitespace changes explicitly and show current/proposed paths in the final confirmation. Matching unresolved artists skips confirmed and automatically matched identities; each checked artist records a link or review outcome in Activity.
+## Run on your Mac
 
-Folder previews clean tag whitespace before adding template separators, preserve literal title parentheses, and flag conflicting release years for review instead of splitting an album between folders.
-
-**Scan your library, review proposed changes, and approve edits before they touch your files.** Duplicate removal uses the system Trash. Catalogue linking itself changes only the app database.
-
----
-
-## Refreshing matching and recommendation data
-
-1. **Favourite artists → Refresh favourite artists**, then **Match local artists** (or **Link artists → Match artist**). Saved favourites provide candidates; local release evidence is still required. Confirmed artists are skipped unless explicitly selected.
-2. **Missing releases → Update recommendation data** refreshes linked artists and fills missing track details, contributor credits and available DJ metadata. Current details are reused; unavailable fields are not invented. Progress is saved per artist, with release details cached as they complete. Use **Resume refresh** after interruption.
-3. **Recheck cached releases** recalculates recommendations locally. Composer, songwriter and other contributor connections are anchored to verified local recordings, alongside artist credits, labels, rights, genres and recording overlap. Suspect releases remain inspectable through the filters.
-
-For a narrower artist-based list, use **Missing releases → Check release artists**, then choose **My album artists** in the recommendation filter. This checks the current time range in batches of up to 20 release summaries, without fetching track lists. Saved album artist IDs are reused for 90 days; unavailable results are retried after one day. Each batch is saved, so running the action again continues unfinished checks. No database reset is needed.
-
-This filter compares the **first credited album artist ID** with your linked artists. It is a useful stricter view, not proof that a release is official; collaborations led by another artist appear under **Other artist appearances**. **Artist credits not checked** retains unknown results, and **All recommendations** keeps everything inspectable. These saved IDs also inform recommendation scoring.
-
-Catalogue workflows share HTTP connections and token renewal. All catalogue, account, DJ metadata, artwork and download GET requests use shared per-host adaptive scheduling: successful requests gradually reduce API spacing, while throttling pauses every caller on that host using the service’s Retry-After value. API concurrency is bounded; audio segments retain their separate parallel download pipeline. Retries are limited and cancellation interrupts scheduled waits. OAuth exchanges are not automatically replayed. Concurrent requests for the same release wait for its cached result; unrelated releases can proceed independently. Album summaries fetch primary artist IDs, market availability, release dates and audio counts together, and retain those fields for the artist filter. Existing track-credit, artwork and DJ metadata caches remain reusable across workflows. Track details and credits use the subscriber connection’s album-with-credits endpoint. Release checks, recommendation-data updates, missing-tag previews and downloads share its per-market, 30-day cache. Bulk metadata jobs use two workers, exclude videos, and retain each contributor’s role. Missing-tag previews and new downloads can include composer, writer, producer, engineer and related credit tags; existing local tags are preserved. BPM/key cross-filling requires matching track ID and ISRC, with individual-track lookups available for gaps.
-
-**One account connection:** sign in under **Settings → General → Connection** for all searches, discography discovery, favourites, availability, credits, artwork and downloads. No developer client ID or secret is required. The Rust integration follows the subscriber endpoint shapes documented in [Minim’s TIDAL implementation](https://minim.readthedocs.io/en/latest/_modules/minim/tidal.html); Minim is not a runtime dependency.
-
-Missing releases and Overview now default to **My album artists**. Guest compilations are not fetched during normal discovery; enable compilation recommendations if you want those appearances. Existing cached appearances remain inspectable through **All recommendations**, **Other artist appearances**, or **Artist credits not checked**. Fresh catalogue summaries populate this evidence automatically; use **Check release artists** for older cached entries. GB (or your selected market) is sent on catalogue requests and included in cache keys.
-
-The same subscriber token also retrieves release genres and replacement IDs from the newer catalogue endpoint, in cached batches of up to 20 releases. These optional fields may be absent; previously cached values are retained and missing data is not fabricated. No developer connection is used. Track credits and BPM/key remain available where the service supplies them. Use **Update recommendation data** in Missing releases to populate credits for existing releases, or **Refresh track details and credits** for one release. No database reset is needed. Metadata previews do not write music files until approved.
-
-When you manually choose a track placement, the app also checks its complete local release against the cached online recording sequence. If every recording matches uniquely and in order, unlinked siblings can inherit that release; existing links and ignored tracks are preserved. **Correct tags → Track & disc numbers** offers the online numbering and totals, including a local multi-disc release represented online as one disc. Review and apply those tags first, then use **Organise files** separately to update paths. Incomplete, ambiguous or conflicting recording sets are not automatically propagated.
-
-Placement reviews in **Link releases** check release availability for your configured market and show only confirmed available releases. Online linking uses the same cache. Checks are batched (up to 20 IDs), reused for seven days for available releases and one day for unavailable releases; **Recheck availability** forces a fresh check. Metadata and artist-credit lookups also populate this cache. Network/authentication failures remain unverified, never proof that a release was removed. Saved historical links remain intact. API availability does not guarantee the provider’s website is free of temporary page errors.
-
-No database reset or full local rescan is needed to collect this online metadata. Update the local library only when files or tags have changed outside the app.
-
-## ✨ Features
-
-- ⚡ **Fast Library Scanning:** Quickly scans your local music folders (FLAC, ALAC, MP3, WAV, AIFF) and checks for new or modified files.
-- 🎯 **Accurate Catalogue Matching:** Matches your tracks and albums to official online releases using song titles, track lengths, album structure, and ISRCs to fetch comprehensive tags without guessing.
-- 🔍 **Track New & Missing Releases:** Compares your local collection against full artist discographies to spot missing albums, bonus tracks, or newly released music.
-- 🔬 **MQA Audio Audit:** Scans lossless FLAC files to identify authentic MQA streams so you can easily review, keep, or replace them.
-- 🗃️ **Duplicate Finder:** Detects duplicate tracks and alternative releases across your folders, comparing audio formats and quality so you can keep the best copy.
-- 🏷️ **Safe Tag & Folder Organization:** Standardizes track numbers, adds Camelot keys and BPM, and organizes folders into clean structures (`Artist/Album (Year)/Track - Title`). Changes are previewed first, and tags are updated without altering your audio quality.
-- 📋 **Acquisition Queue:** Keep a checklist of missing tracks or releases you want to collect, with options to export lists or manage approved items.
-- ⬇️ **Reviewed Downloads:** Download approved audio with bounded parallel transfers, per-track progress, and recoverable redownloads. Local preparation remains available during downloads.
-- 📊 **Clear Activity:** Follow local work, catalogue checks and downloads in separate live panels, with independent search and history controls.
-- 🧭 **Flexible Workspace:** Use back and forward navigation beside the window controls. Hide the sidebar to give the current page the full window width; navigation stays available.
-- 🧩 **Credit Evidence:** Shared composers, songwriters, producers and other credited contributors can support recommendations. Only current verified local links or local tags provide reference evidence; shared names never override recording or release-structure conflicts. Credits, including empty results, are cached for reuse.
-
----
-
-## 🖼️ Visual Tour
-
-Screenshots below use a disposable sample library.
-
-<div align="center">
-  <img src="./desktop/docs/imgs/overview.png" alt="Overview with persistent navigation and a scrollable latest missing releases list" width="90%" />
-</div>
-
-### 1. Prepare & Clean Library
-Inspect your library, scan for modified files, audit for MQA streams, and resolve duplicate tracks.
-<div align="center">
-  <img src="./desktop/docs/imgs/prepare_library.png" alt="Tibrary Prepare Library Overview" width="90%" />
-</div>
-
-<br/>
-
-### 2. Link Artists
-Match album artists from local tags to online artist profiles across collaborations and alias variations.
-<div align="center">
-  <img src="./desktop/docs/imgs/link_artists.png" alt="Link Artists Interface" width="90%" />
-</div>
-
-<br/>
-
-### 3. Match Releases
-Pair local tracks with official releases to review track mappings, lengths, and album editions.
-<div align="center">
-  <img src="./desktop/docs/imgs/link_releases.png" alt="Link Releases and Track Mappings" width="90%" />
-</div>
-
-<br/>
-
-### 4. Spot Missing Music & Track New Releases
-Audit artist discographies to find uncollected releases or new singles and add them to your queue.
-<div align="center">
-  <img src="./desktop/docs/imgs/missing_releases.png" alt="Missing Releases Detection" width="90%" />
-</div>
-
-<br/>
-
-### 5. Review Local Duplicates
-Compare audio formats, bit depths, and sample rates to clean up duplicate files safely.
-<div align="center">
-  <img src="./desktop/docs/imgs/local_duplicates.png" alt="Review Local Duplicates" width="90%" />
-</div>
-
-<br/>
-
-### 6. MQA Audio Audit
-Inspect FLAC audio frames to detect authentic MQA encoding.
-<div align="center">
-  <img src="./desktop/docs/imgs/mqa_audit.png" alt="MQA Detection and Audit" width="90%" />
-</div>
-
----
-
-## 🚀 Quick Start
+Install Xcode Command Line Tools, a current stable [Rust toolchain](https://rustup.rs/), and Node.js LTS. Then, from this repository:
 
 ```sh
-brew install ffmpeg
-
-# Install frontend dependencies
+brew install node ffmpeg
 npm --prefix desktop ci
-
-# Launch the app in development
-npm --prefix desktop run tauri dev
-```
-
-On macOS, you can also launch the prebuilt application directly using `./Start.command`.
-
-To build a local macOS application with Node.js and the Rust toolchain installed:
-
-```sh
 npm --prefix desktop run tauri build -- --bundles app
 open desktop/src-tauri/target/release/bundle/macos/Tibrary.app
 ```
 
----
+After building, use **Start.command** to reopen the app. Releases contain source code only; binaries are built locally.
 
-## 🙏 Credits & Attributions
+For development:
 
-- [**Lofty**](https://github.com/Serial-ATA/lofty-rs) — Audio tagging and metadata library in Rust.
-- [**Tauri**](https://v2.tauri.app/) — Desktop application framework.
-- [**Turso / libsql**](https://github.com/tursodatabase/libsql) — Embedded SQLite database engine.
-- [**AudioAuditor**](https://github.com/Angel2mp3/AudioAuditor) by Angel2mp3 — MQA signal detection reference.
-- **MQA Reverse Engineering Credits** — Pioneered by [purpl3F0x](https://github.com/purpl3F0x/MQA_identifier) and [Dniel97](https://github.com/Dniel97/MQA-identifier-python).
+```sh
+npm --prefix desktop run tauri dev
+```
 
----
+## Getting started
 
-## 📄 License
+1. Add a music folder on **Overview**.
+2. Use **Prepare library** to review local tags and folder layout.
+3. Sign in under **Settings → General → Connection**, then use **Link catalogue**.
+4. Browse **Complete library → Missing releases** and queue the music you want.
+5. Use **Update library** for missing tags, artwork and replacements.
 
-This project is licensed under the [MIT License](LICENSE).
+The catalogue cache is shared across workflows. Use **Update recommendation data** to collect missing online evidence, or **Recheck cached releases** to recalculate locally. Your database does not need resetting.
 
-### Safe number repairs and quitting
+## Screenshots
 
-Correct tags → Track & disc numbers flags impossible totals such as `04/1`. It proposes padded totals from consistent sibling tags or agreeing cached releases with matching recordings and positions. Incomplete or conflicting evidence stays for review. Applying a number repair refreshes the affected links from cache without an online scan.
+Captured from the current UI with a disposable sample library.
 
-Closing the window or choosing Quit while downloading asks whether to keep downloading or stop and quit. The latter waits for download cancellation before exiting. Completed downloads are retained.
+| Link releases | Missing releases |
+| --- | --- |
+| ![Link releases](desktop/docs/imgs/link_releases.png) | ![Missing releases](desktop/docs/imgs/missing_releases.png) |
 
-### Catalogue evidence and library previews
+| General settings | Activity |
+| --- | --- |
+| ![General settings](desktop/docs/imgs/general_settings.png) | ![Activity](desktop/docs/imgs/activity_log.png) |
 
-- Missing tags uses provider genres (track first, release fallback) and UPC when supplied, preserving existing tags. Genre and replacement relationships share the catalogue cache; missing data is upgraded as releases are inspected. Empty provider responses are valid, and optional lookup failures retain cached data.
-- Recording links still require release/position evidence. UPC agreement ranks otherwise valid editions; provider replacement IDs add candidates without overwriting saved identities. Genres provide recommendation context, never identity proof.
-- Missing releases marks an older release **Superseded** only when a newer, available release contains every exact recording, including its mix and duration. These entries remain accessible with the Superseded or All recommendations filter. Unloaded track lists and exclusive mixes are not assumed redundant.
-- Ownership uses distinct, current recording links and checks multi-disc completeness. Deleting the database is unnecessary: refresh the catalogue and rerun previews while preserving your saved decisions.
-- Organise files shows exact current/proposed paths and component-level reasons. Years use four digits; slash-form track numbers parse correctly; Unicode/case-only differences do not propose moves. Multi-disc filenames use `02.01 - Title`.
-- MQA signal badges are red; no-signal results are green. Unaffected rows show no replacement action.
+See the [guide](desktop/docs/DOCUMENTATION.md) for workflows, cache behaviour and development checks.
 
-### Cached release checks and refresh progress
+## Credits and licence
 
-- **Recheck cached releases** recalculates ownership and recommendations in a background task using saved data. It does not contact the service, rewrite tags or move files. Activity reports its completion.
-- Missing-release totals count missing, incomplete and queued releases across the cached catalogue. The table also shows how many releases match its current filters; the Overview card opens the corresponding unfiltered missing list.
-- Catalogue refreshes show the current artist, market and scope in Activity. Progress is saved after each artist. Interrupted refreshes resume when the app next opens; explicit cancellation stays cancelled. **Resume refresh** continues a stopped or failed refresh using its saved scope. Local file changes and downloads are not automatically replayed.
+Built with [Tauri](https://v2.tauri.app/), [React](https://react.dev/), [Lofty](https://github.com/Serial-ATA/lofty-rs) and [Turso](https://github.com/tursodatabase/turso).
 
-Compilation placeholders such as “Various artists” stay out of the artist inbox and bulk artist matching; their individual file and release links remain intact. Refresh progress uses completed-artist counts, displays small nonzero progress as `<1%`, and shows `Working` until the first artist completes.
+MQA detection references: [AudioAuditor](https://github.com/Angel2mp3/AudioAuditor), [purpl3F0x](https://github.com/purpl3F0x/MQA_identifier) and [Dniel97](https://github.com/Dniel97/MQA-identifier-python). Subscriber API reference: [Minim](https://minim.readthedocs.io/en/latest/_modules/minim/tidal.html).
 
-Linking recognises both legacy and current file signatures, avoiding unnecessary rechecks of unchanged linked tracks. Activity retains each checked track’s link/review/unmatched outcome. The header task indicator opens Activity and includes the current work details; MQA audit is under Update library.
-
-Folder previews identify moves, renames, or both, with separate before/after folder and filename evidence. The default layout avoids appending a year already present at the end of the album tag. Settings → General keeps connection, destination and layout settings together, with a separate Audio and file options card. The template reference shows individual tag-variable chips. Missing releases uses linked artist IDs, excluding unrelated catalogues retained from searches.
-
-### Activity and metadata
-
-Background work shows measured counts, percentage and a smoothed ETA in Activity and the clickable header. Folder discovery stays indeterminate until the file count is known. Subscriber metadata reuses pooled connections and cached credited albums, with bounded parallel requests and automatic rate-limit backoff. Missing releases uses album-level artist metadata, rather than collecting featured performers from artist pages.
-
-
-Settings has two pages: **General** and **Activity**. Artist tables offer **Review match**, **Recheck selected artists** and **Unlink selected artists**; unlinking retains file tags, recording links and catalogue caches. Confirmed artists stay out of Needs review even when their old evidence mentions review.
-
-Activity groups each task into an expandable row, including completed tasks. Open a row for per-item checks and outcomes. Saved details load automatically when a job is expanded, with older pages loaded as you scroll; progress still updates one live summary. Logs captured before job grouping was added remain available as separate entries.
+[MIT licence](LICENSE).

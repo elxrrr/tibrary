@@ -69,6 +69,7 @@ test.afterEach(async () => {
 test("all workflow routes render with no runtime errors", async ({ page }) => {
   if (process.env.TIBRARY_SCREENSHOTS) {
     await page.emulateMedia({colorScheme:"dark"});
+    await rpc("settings.save", {section:"downloads",values:{output:"/Users/demo/Music/Tibrary"}});
     await rpc("queue.decision", {ids:["910002","910003","910004","910005","910006"],decision:"removed"});
   }
   const errors: string[] = [];
@@ -80,7 +81,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Working", exact: true }),
   ).toHaveCount(0);
-  const screenshots: Record<string, string> = {"Prepare library":"prepare_library", "Link artists":"link_artists", "Link releases":"link_releases", "Missing releases":"missing_releases", "Local duplicates":"local_duplicates", "MQA audit":"mqa_audit", "Favourite artists":"favourite_artists", "Activity":"activity_log"};
+  const screenshots: Record<string, string> = {"Prepare library":"prepare_library", "Link artists":"link_artists", "Link releases":"link_releases", "Missing releases":"missing_releases", "Local duplicates":"local_duplicates", "MQA audit":"mqa_audit", "Favourite artists":"favourite_artists", "Activity":"activity_log", "General":"general_settings"};
   if (process.env.TIBRARY_SCREENSHOTS) {
     await expect(page.getByRole("region",{name:"Latest missing releases"}).locator(".library-row").first()).toBeVisible();
     await page.screenshot({path:"docs/imgs/overview.png"});
