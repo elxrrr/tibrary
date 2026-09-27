@@ -107,4 +107,6 @@ codesign --verify --deep --strict desktop/src-tauri/target/release/bundle/macos/
 
 `Start.command` opens the built app. `desktop/tools/Demo.command` uses a separate demo database.
 
+The editable app icon is `desktop/icon.svg`; platform icon files are in `desktop/src-tauri/icons/`. Regenerate them with the Tauri icon command when the artwork changes.
+
 Update the npm, Cargo and Tauri versions together with the sidebar version. Run the checks, refresh screenshots, commit and tag the tested revision. GitHub releases publish source only; do not attach the locally built app or installers. The local build is ad-hoc signed, not notarised.

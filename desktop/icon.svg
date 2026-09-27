@@ -1,1 +1,48 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect x="16" y="16" width="480" height="480" rx="112" fill="#273746"/><path d="M160 144h200v46H160zm0 88h140v46H160zm0 88h90v46h-90z" fill="#c4e0d4"/><circle cx="346" cy="336" r="46" fill="#c4e0d4"/><path d="M375 336V220" stroke="#c4e0d4" stroke-width="34" stroke-linecap="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <title>Tibrary — album stack</title>
+  <desc>Three mint album sleeves and a musical note on a deep teal rounded square.</desc>
+  <defs>
+    <linearGradient id="base" x1="160" y1="100" x2="830" y2="930" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#247A77"/><stop offset=".55" stop-color="#125653"/><stop offset="1" stop-color="#073936"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="200" y1="100" x2="760" y2="930" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#AEF7DE" stop-opacity=".55"/><stop offset=".48" stop-color="#83D8C5" stop-opacity=".08"/><stop offset="1" stop-color="#021F20" stop-opacity=".5"/>
+    </linearGradient>
+    <linearGradient id="back" x1="374" y1="233" x2="750" y2="630" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#68C7B0"/><stop offset="1" stop-color="#278E7E"/>
+    </linearGradient>
+    <linearGradient id="middle" x1="280" y1="250" x2="720" y2="750" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#BBEFDA"/><stop offset="1" stop-color="#66BEA4"/>
+    </linearGradient>
+    <linearGradient id="front" x1="253" y1="300" x2="691" y2="792" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F0FFF2"/><stop offset=".55" stop-color="#D0F5DE"/><stop offset="1" stop-color="#97DCBD"/>
+    </linearGradient>
+    <linearGradient id="note" x1="398" y1="406" x2="536" y2="671" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B6760"/><stop offset="1" stop-color="#104D49"/>
+    </linearGradient>
+    <filter id="tileShadow" x="50" y="50" width="924" height="930" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#001F23" flood-opacity=".22"/>
+    </filter>
+    <filter id="sleeveShadow" x="140" y="140" width="740" height="730" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="13" stdDeviation="15" flood-color="#002E2B" flood-opacity=".27"/>
+    </filter>
+  </defs>
+  <!-- Standard macOS icon inset; transparent space is intentional. -->
+  <g filter="url(#tileShadow)">
+    <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#base)"/>
+    <rect x="102" y="102" width="820" height="820" rx="182" stroke="url(#edge)" stroke-width="4"/>
+  </g>
+  <!-- Offset sleeves retain a recognisable silhouette at small sizes. -->
+  <g transform="rotate(-8 512 512)">
+    <rect x="343" y="237" width="408" height="454" rx="54" fill="url(#back)" stroke="#B8F8DE" stroke-opacity=".35" stroke-width="3"/>
+    <g filter="url(#sleeveShadow)">
+      <rect x="294" y="282" width="408" height="454" rx="54" fill="url(#middle)" stroke="#DBFFEB" stroke-opacity=".55" stroke-width="3"/>
+    </g>
+    <g filter="url(#sleeveShadow)">
+      <rect x="245" y="327" width="408" height="454" rx="54" fill="url(#front)"/>
+      <rect x="247" y="329" width="404" height="450" rx="52" stroke="#F5FFF7" stroke-opacity=".65" stroke-width="3"/>
+      <!-- Broad, single-note mark remains legible in Finder. -->
+      <path d="M454 431C454 419 462 411 474 409L543 397C552 395 559 402 559 410V444C559 452 554 458 546 460L500 468V629C500 663 473 687 438 687C405 687 384 670 384 645C384 618 411 598 442 598C446 598 450 598 454 599V431Z" fill="url(#note)"/>
+    </g>
+  </g>
+</svg>
