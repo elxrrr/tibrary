@@ -47,11 +47,6 @@
       <rect x="247" y="352" width="404" height="404" rx="16" stroke="#F5FFF7" stroke-opacity=".65" stroke-width="3"/>
       <!-- The record and label share the exact centre of the square sleeve. -->
       <circle cx="449" cy="554" r="148" fill="url(#vinyl)"/>
-      <g stroke="#B4E6CF" stroke-opacity=".13" stroke-width="2">
-        <circle cx="449" cy="554" r="134"/>
-        <circle cx="449" cy="554" r="120"/>
-        <circle cx="449" cy="554" r="106"/>
-      </g>
       <circle cx="449" cy="554" r="48" fill="url(#label)"/>
       <circle cx="449" cy="554" r="8" fill="#DDF8E6"/>
     </g>
