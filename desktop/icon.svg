@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
   <title>Tibrary — album stack</title>
-  <desc>Three mint album sleeves and a musical note on a deep teal rounded square.</desc>
+  <desc>Three square mint record sleeves with a centred vinyl record on a deep teal rounded square.</desc>
   <defs>
     <linearGradient id="base" x1="160" y1="100" x2="830" y2="930" gradientUnits="userSpaceOnUse">
       <stop stop-color="#247A77"/><stop offset=".55" stop-color="#125653"/><stop offset="1" stop-color="#073936"/>
@@ -17,8 +17,12 @@
     <linearGradient id="front" x1="253" y1="300" x2="691" y2="792" gradientUnits="userSpaceOnUse">
       <stop stop-color="#F0FFF2"/><stop offset=".55" stop-color="#D0F5DE"/><stop offset="1" stop-color="#97DCBD"/>
     </linearGradient>
-    <linearGradient id="note" x1="398" y1="406" x2="536" y2="671" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#1B6760"/><stop offset="1" stop-color="#104D49"/>
+    <linearGradient id="vinyl" x1="320" y1="425" x2="578" y2="683" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#122E2D"/><stop offset=".38" stop-color="#173B37"/>
+      <stop offset=".5" stop-color="#34574D"/><stop offset=".62" stop-color="#173B37"/><stop offset="1" stop-color="#0B2424"/>
+    </linearGradient>
+    <linearGradient id="label" x1="420" y1="509" x2="478" y2="599" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#93D8BD"/><stop offset="1" stop-color="#54AE92"/>
     </linearGradient>
     <filter id="tileShadow" x="50" y="50" width="924" height="930" filterUnits="userSpaceOnUse">
       <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#001F23" flood-opacity=".22"/>
@@ -34,15 +38,22 @@
   </g>
   <!-- Offset sleeves retain a recognisable silhouette at small sizes. -->
   <g transform="rotate(-8 512 512)">
-    <rect x="343" y="237" width="408" height="454" rx="54" fill="url(#back)" stroke="#B8F8DE" stroke-opacity=".35" stroke-width="3"/>
+    <rect x="343" y="260" width="408" height="408" rx="18" fill="url(#back)" stroke="#B8F8DE" stroke-opacity=".35" stroke-width="3"/>
     <g filter="url(#sleeveShadow)">
-      <rect x="294" y="282" width="408" height="454" rx="54" fill="url(#middle)" stroke="#DBFFEB" stroke-opacity=".55" stroke-width="3"/>
+      <rect x="294" y="305" width="408" height="408" rx="18" fill="url(#middle)" stroke="#DBFFEB" stroke-opacity=".55" stroke-width="3"/>
     </g>
     <g filter="url(#sleeveShadow)">
-      <rect x="245" y="327" width="408" height="454" rx="54" fill="url(#front)"/>
-      <rect x="247" y="329" width="404" height="450" rx="52" stroke="#F5FFF7" stroke-opacity=".65" stroke-width="3"/>
-      <!-- Broad, single-note mark remains legible in Finder. -->
-      <path d="M454 431C454 419 462 411 474 409L543 397C552 395 559 402 559 410V444C559 452 554 458 546 460L500 468V629C500 663 473 687 438 687C405 687 384 670 384 645C384 618 411 598 442 598C446 598 450 598 454 599V431Z" fill="url(#note)"/>
+      <rect x="245" y="350" width="408" height="408" rx="18" fill="url(#front)"/>
+      <rect x="247" y="352" width="404" height="404" rx="16" stroke="#F5FFF7" stroke-opacity=".65" stroke-width="3"/>
+      <!-- The record and label share the exact centre of the square sleeve. -->
+      <circle cx="449" cy="554" r="148" fill="url(#vinyl)"/>
+      <g stroke="#B4E6CF" stroke-opacity=".13" stroke-width="2">
+        <circle cx="449" cy="554" r="134"/>
+        <circle cx="449" cy="554" r="120"/>
+        <circle cx="449" cy="554" r="106"/>
+      </g>
+      <circle cx="449" cy="554" r="48" fill="url(#label)"/>
+      <circle cx="449" cy="554" r="8" fill="#DDF8E6"/>
     </g>
   </g>
 </svg>
