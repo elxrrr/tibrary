@@ -1379,3 +1379,11 @@ dialog p {
 
 .activity-status progress { width: 100%; height: 5px; accent-color: var(--accent); }
 .activity-status .job-progress-label { font-variant-numeric: tabular-nums; font-size: 12px; }
+
+/* Template help uses the same inset and spacing whether open or closed. */
+.template-reference { margin-top: 16px; overflow: hidden; }
+.template-reference > summary { padding: 12px 14px; cursor: pointer; }
+.template-tokens { display: flex; flex-wrap: wrap; gap: 10px; padding: 4px 14px 14px; }
+.template-token { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--sidebar); }
+.template-token small { color: var(--muted); }
+#connection-settings .connection-test { margin-top: 12px; }

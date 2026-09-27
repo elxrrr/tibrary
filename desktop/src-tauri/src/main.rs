@@ -261,6 +261,13 @@ impl Backend {
     }
 
     pub fn log_with_category(&self, msg: &str, level: &str, category: Option<&str>) {
+        let stream = activity_stream(&json!({"message":msg,"category":category}));
+        let slot = match stream { "online" => &self.online_job, "downloads" => &self.download_job, _ => &self.active_job };
+        let context = slot.try_lock().ok().and_then(|job| job.clone()).filter(|job| matches!(job["status"].as_str(), Some("running"|"cancelling")));
+        self.log_with_job(msg, level, category, context.as_ref());
+    }
+
+    fn log_with_job(&self, msg: &str, level: &str, category: Option<&str>, job: Option<&Value>) {
         let cat = category.unwrap_or_else(|| {
             let lower = msg.to_lowercase();
             if lower.contains("error") || lower.contains("failed") || lower.contains("fail") {
@@ -300,12 +307,14 @@ impl Backend {
         } else {
             level
         };
-        self.logs.push(json!({
+        let entry = json!({
+            "job_id":job.map(|j| &j["id"]), "job_kind":job.map(|j| &j["kind"]), "job_status":job.map(|j| &j["status"]),
             "at": &at,
             "message": msg,
             "level": log_level,
             "category": cat
-        }));
+        });
+        self.logs.push(entry.clone());
 
         // Persist to database if initialized and logging persistence is enabled
         if self.persist_logs.load(Ordering::SeqCst) {
@@ -315,14 +324,10 @@ impl Backend {
                 let epoch = self.log_epochs[index].load(Ordering::SeqCst);
                 let epochs = self.log_epochs.clone();
                 let gate = self.log_persist_gate.clone();
-                let at_str = at;
-                let msg_str = msg.to_string();
-                let lvl_str = log_level.to_string();
-                let cat_str = cat.to_string();
                 tauri::async_runtime::spawn(async move {
                     let _guard = gate.lock().await;
                     if epochs[index].load(Ordering::SeqCst) == epoch {
-                        let _ = db.log_activity(&at_str, &msg_str, &lvl_str, &cat_str).await;
+                        let _ = db.log_activity_entry(&entry).await;
                     }
                 });
             }
@@ -361,7 +366,7 @@ impl Backend {
 
     pub fn start_online_job(&self, job: Value, cancel: Arc<AtomicBool>) {
         if let Some(message) = job["message"].as_str() {
-            self.log_with_category(message, "info", Some("online"));
+            self.log_with_job(message, "info", Some("online"), Some(&job));
         }
         *self.online_cancel.lock().unwrap() = Some(cancel);
         *self.online_job.lock().unwrap() = Some(job);
@@ -372,12 +377,16 @@ impl Backend {
         if let Some(saved)=current.as_ref() {
             if saved["id"] != job["id"] || matches!(saved["status"].as_str(),Some("complete"|"cancelled"|"failed")) { return saved.clone(); }
         }
+        job["message"] = json!(message);
         self.measure_progress(&mut job, message);
         if self.online_cancel.lock().unwrap().as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {job["status"]=json!("cancelling");}
         let id = job["id"].as_str().unwrap_or("online").to_string();
-        *current = Some(job.clone());
-        let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":message,"level":"info","category":"online","progress_id":id});
+        if current.as_ref().and_then(|j|j["message"].as_str()) != Some(message) {
+            self.log_with_job(message, "info", Some("online"), Some(&job));
+        }
+        let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":message,"level":"info","category":"online","progress_id":id,"job_id":id,"job_kind":job["kind"],"job_status":job["status"]});
         self.logs.replace_progress(&id, entry);
+        *current = Some(job.clone());
         job
     }
 
@@ -386,14 +395,14 @@ impl Backend {
         self.view_cache.lock().unwrap().clear();
         self.logs.retain(|entry| entry["progress_id"] != job["id"]);
         if let Some(message) = job["message"].as_str() {
-            self.log_with_category(
+            self.log_with_job(
                 message,
                 if job["status"] == "failed" {
                     "error"
                 } else {
                     "info"
                 },
-                Some("online"),
+                Some("online"), Some(&job),
             );
         }
         *self.online_job.lock().unwrap() = Some(job);
@@ -429,14 +438,14 @@ impl Backend {
                 }
                 _ => None,
             };
-            self.log_with_category(msg, "info", cat);
+            self.log_with_job(msg, "info", cat.or(Some("local")), Some(&job));
         }
         *self.active_job_cancel.lock().unwrap() = Some(cancel_flag);
         *self.active_job.lock().unwrap() = Some(job);
     }
 
     pub fn start_download_job(&self, job: Value, cancel_flag: Arc<AtomicBool>) {
-        self.log_with_category("Download started", "info", Some("download"));
+        self.log_with_job("Download started", "info", Some("download"), Some(&job));
         *self.download_cancel.lock().unwrap() = Some(cancel_flag);
         *self.download_job.lock().unwrap() = Some(job);
     }
@@ -464,14 +473,14 @@ impl Backend {
     pub fn finish_download_job(&self, mut job: Value) {
         self.progress_estimates.lock().unwrap().finish(&mut job);
         if let Some(message) = job["message"].as_str() {
-            self.log_with_category(
+            self.log_with_job(
                 message,
                 if job["status"] == "failed" {
                     "error"
                 } else {
                     "info"
                 },
-                Some("download"),
+                Some("download"), Some(&job),
             );
         }
         *self.download_job.lock().unwrap() = Some(job);
@@ -494,6 +503,7 @@ impl Backend {
         if let Some(saved)=current.as_ref() {
             if saved["id"] != job["id"] || matches!(saved["status"].as_str(),Some("complete"|"cancelled"|"failed")) { return saved.clone(); }
         }
+        job["message"] = json!(msg);
         self.measure_progress(&mut job, msg);
         if self
             .active_job_cancel
@@ -516,12 +526,11 @@ impl Backend {
             }
             _ => None,
         };
-        let lower = msg.to_lowercase();
-        if lower.contains("failed") || lower.contains("unavailable") || lower.contains("warning") {
-            self.log_with_category(msg, "error", cat);
+        if current.as_ref().and_then(|j|j["message"].as_str()) != Some(msg) {
+            self.log_with_job(msg, if msg.to_lowercase().contains("failed") {"error"} else {"info"}, cat.or(Some("local")), Some(&job));
         }
         let id = job["id"].as_str().unwrap_or("progress");
-        let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":msg,"level":"info","category":cat.unwrap_or("general"),"progress_id":id});
+        let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":msg,"level":"info","category":cat.unwrap_or("local"),"progress_id":id,"job_id":id,"job_kind":job["kind"],"job_status":job["status"]});
         self.logs.replace_progress(id, entry);
         *current = Some(job.clone());
         job
@@ -553,7 +562,7 @@ impl Backend {
             } else {
                 "info"
             };
-            self.log_with_category(msg, lvl, cat);
+            self.log_with_job(msg, lvl, cat.or(Some("local")), Some(&final_job));
         }
         *self.active_job.lock().unwrap() = Some(final_job);
         *self.active_job_cancel.lock().unwrap() = None;
@@ -1047,6 +1056,11 @@ async fn handle_rpc_uncached(
             }
         }
         return Ok(json!(logs));
+    }
+    if method == "logs.job" {
+        let id = args["id"].as_str().ok_or("Missing job ID")?;
+        let _guard = state.log_persist_gate.lock().await;
+        return Ok(json!(db.job_activity(id, args["offset"].as_u64().unwrap_or(0) as usize).await?));
     }
     if method == "logs.clear" {
         let stream = args.get("stream").and_then(Value::as_str).unwrap_or("all");
@@ -1642,6 +1656,16 @@ async fn handle_rpc_uncached(
         }
         return Ok(json!(true));
     }
+    if method == "artists.unlink" {
+        let artists: Vec<String> = args["artists"].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).filter(|v| !v.trim().is_empty()).map(str::to_owned).collect();
+        if artists.is_empty() { return Err("Select artists to unlink".into()); }
+        db.unlink_artists(&artists).await?;
+        state.view_cache.lock().unwrap().clear();
+        state.log_with_category(&format!("Unlinked {} artist associations · recording links and files retained", artists.len()), "info", Some("online"));
+        if let Some(app) = app_handle { let _ = app.emit("backend-event", json!({"event":"changed"})); }
+        return Ok(json!(true));
+    }
     if method == "artists.choose" {
         let artist = args.get("artist").and_then(|v| v.as_str()).unwrap_or("");
         let ids: Vec<String> = args
@@ -2141,9 +2165,6 @@ async fn handle_rpc_uncached(
                         "started": started,
                         "result": null
                     });
-                    if ["Linked ·", "Needs review ·", "Unmatched ·"].iter().any(|prefix| msg.starts_with(prefix)) {
-                        backend_prog.log_with_category(&msg, "info", Some("online"));
-                    }
                     let prog_job = backend_prog.update_online_job_progress(&msg, prog_job.clone());
                     if let Some(ref app) = app_prog {
                         let _ = app.emit(
@@ -2846,21 +2867,25 @@ mod activity_tests {
         assert_eq!(backend.update_download_job(job)["id"],"new");
     }
     #[test]
-    fn progress_replaces_one_row_and_preserves_errors() {
+    fn progress_keeps_one_live_row_and_archives_job_details() {
         let backend = Backend::new();
         let job = json!({"id":"one","kind":"scan","status":"running"});
         backend.start_job(job.clone(), Arc::new(AtomicBool::new(false)));
         for i in 0..100 {
             backend.update_job_progress(&format!("Scanning {i}"), job.clone());
         }
-        assert_eq!(backend.logs.snapshot().len(), 1);
+        assert_eq!(backend.logs.snapshot().iter().filter(|r|r["progress_id"] == "one").count(), 1);
+        assert_eq!(backend.logs.snapshot().len(), 101);
         backend.update_job_progress("One file failed", job.clone());
-        assert_eq!(backend.logs.snapshot().len(), 2);
+        assert_eq!(backend.logs.snapshot().len(), 102);
         backend.finish_job(
             json!({"id":"one","kind":"scan","status":"complete","message":"Scanned 100 files"}),
         );
         let logs = backend.logs.snapshot();
-        assert_eq!(logs.len(), 2);
+        assert_eq!(logs.len(), 102);
+        assert!(logs.iter().all(|row|row["job_id"] == "one"));
+        assert_eq!(logs.last().unwrap()["job_status"], "complete");
+        assert!(logs.iter().any(|row| row["level"] == "error"));
         assert!(logs.iter().all(|row| row.get("progress_id").is_none()));
     }
 }

@@ -1,6 +1,6 @@
 # Tibrary — Complete Technical Documentation & Reference Manual
 
-> **Version:** 0.9.0-beta.32 (build 32)
+> **Version:** 0.9.0-beta.33 (build 33)
 > **Target Platforms:** macOS 13+ (Apple Silicon & Intel), Linux, Windows 10/11  
 > **Core Stack:** Tauri v2 · Rust stable · Turso SQLite · React 19 · Lofty
 
@@ -390,4 +390,18 @@ Explicit live checks use temporary databases/output directories: `live_subscribe
 
 Scope limits: these checks do not prove every possible OS/theme/accessibility combination or remote catalogue response. New-account browser approval, platform packaging outside macOS, and long-duration network outages still need release QA. No new pause mechanism is introduced; cancellation and existing catalogue refresh checkpoints remain supported.
 
-**Build 32 verification result:** 104 Rust tests, 4 frontend unit tests and 30 WebKit workflow tests passed. Three explicitly enabled live checks passed, including temporary FLAC number repair and organisation. Seven live/credential tests remain opt-in during routine offline runs. The macOS bundle is built locally and ad-hoc signed; NVME music files were not modified.
+**Build 33 verification:** 104 Rust tests, 5 frontend unit tests and 32 WebKit workflow tests passed. The live subscriber fixture downloads and redownloads a disposable FLAC, verifies the queue has only one entry, applies local number repairs and folder organisation, then reviews and removes a redundant copy through the app's consolidation action. The retained file and database are checked afterwards. NVME originals are never written by these tests. The macOS bundle is built locally and ad-hoc signed.
+
+### General settings and artist review
+
+Settings navigation contains General and Activity. General owns the single Connection card (with expandable diagnostics), Download folder & layout, and a separate Audio and file options card. Legacy internal connections/downloads destinations redirect to General. Template variables use individual chips with explanations.
+
+Artist review filters use current resolved state before inspecting historical evidence. Review match opens the existing candidate dialog; rechecking targets the selected artists and reuses cached evidence. Unlink removes primary and additional artist associations together, preserving recording links, cached catalogue data and music files.
+
+![General settings with one connection card and template-variable chips](imgs/general_settings.png)
+
+### Job activity history
+
+New activity records include job ID, kind and status. An additive `activity_logs.job_context` column keeps existing databases and their logs intact. The live buffer is bounded to 1,000 entries per stream; complete saved details are available through paginated `logs.job` requests. Progress callbacks keep one current progress row while archiving distinct step messages under the job. Start and finish records retain the same ID, so completed jobs remain grouped. Disabling Save activity logs retains the live window only. Pre-migration logs do not have inferred job ownership.
+
+Finder Trash operations run asynchronously with a 30-second timeout. Fallback Trash names use unique IDs to avoid collisions between concurrent replacements; failed Trash operations retain files and return an error.

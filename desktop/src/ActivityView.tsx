@@ -8,6 +8,9 @@ export type ActivityEntry = {
   category?: string;
   level?: string;
   progress_id?: string;
+  job_id?: string;
+  job_kind?: string;
+  job_status?: string;
 };
 export type ActivityStream = "online" | "local" | "downloads";
 
@@ -71,6 +74,48 @@ function LogRow({ entry }: { entry: ActivityEntry }) {
   </div>;
 }
 
+export function groupActivity(entries: ActivityEntry[], job?: Job | null) {
+  const groups = new Map<string, {id: string; kind?: string; status?: string; entries: ActivityEntry[]; message: string}>();
+  const standalone: ActivityEntry[] = [];
+  for (const entry of entries) {
+    const id = entry.job_id || entry.progress_id;
+    if (!id) { standalone.push(entry); continue; }
+    const group = groups.get(id) || {id, kind: entry.job_kind, entries: [], message: ""};
+    group.kind ||= entry.job_kind;
+    group.status = entry.job_status || group.status;
+    group.message = entry.message;
+    if (!entry.progress_id || group.entries.at(-1)?.message !== entry.message) group.entries.push(entry);
+    groups.set(id, group);
+  }
+  if (job?.id && (active(job) || groups.has(job.id))) {
+    const group = groups.get(job.id) || {id: job.id, entries: [], message: ""};
+    Object.assign(group, {kind: job.kind, status: job.status, message: job.message});
+    groups.set(job.id, group);
+  }
+  return {groups: [...groups.values()].reverse(), standalone};
+}
+
+function JobHistory({id, recent}: {id: string; recent: ActivityEntry[]}) {
+  const [saved, setSaved] = useState<ActivityEntry[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [more, setMore] = useState(true);
+  const [error, setError] = useState("");
+  async function load() {
+    setLoading(true); setError("");
+    try {
+      const rows = await call("logs.job", {id, offset: saved?.length || 0}) as ActivityEntry[];
+      setSaved(old => [...(old || []), ...rows]); setMore(rows.length === 1000);
+    } catch (e) {setError(String(e));} finally {setLoading(false);}
+  }
+  const rows = saved ? [...new Map([...saved, ...recent.filter(entry => !entry.progress_id || !saved.some(old => old.message === entry.message))].map(entry => [`${entry.at}:${entry.message}`, entry])).values()].sort((a,b) => a.at.localeCompare(b.at)) : recent;
+  return <div className="batch-children">
+    {rows.map((entry,i) => <LogRow entry={entry} key={`${entry.at}-${i}`}/>)}
+    {!rows.length && <p>No saved details yet. Activity saving may be disabled.</p>}
+    {more && <button disabled={loading} onClick={load}>{loading ? "Loading details…" : saved ? "Load more details" : "Load full saved history"}</button>}
+    {error && <p role="alert">{error}</p>}
+  </div>;
+}
+
 function StreamPanel({ stream, title, entries, monitor, job, onClear }: {
   stream: ActivityStream;
   title: string;
@@ -87,8 +132,8 @@ function StreamPanel({ stream, title, entries, monitor, job, onClear }: {
   const items = Object.values(monitor);
   const batches = stream === "downloads" ? items.filter(item => item.kind === "batch" && (!q || `${item.artist} ${item.release}`.toLocaleLowerCase().includes(q) || items.some(track => track.kind === "track" && track.release_id === item.release_id && `${track.title} ${track.status}`.toLocaleLowerCase().includes(q)))) : [];
   const standalone = stream === "downloads" ? items.filter(item => item.kind === "track" && !items.some(parent => parent.kind === "batch" && parent.release_id === item.release_id) && (!q || `${item.title} ${item.status}`.toLocaleLowerCase().includes(q))) : [];
-  const jobMatches = active(job) && (!q || `${job?.kind} ${job?.message}`.toLocaleLowerCase().includes(q) || filtered.some(entry => new Date(entry.at).getTime() >= Number(job?.started || 0) * 1000));
-  const recent = jobMatches ? filtered.filter(entry => new Date(entry.at).getTime() >= Number(job?.started || 0) * 1000) : [];
+  const {groups, standalone: ungrouped} = groupActivity(entries, job);
+  const visibleGroups = groups.filter(group => !q || `${jobTitle(group.kind)} ${group.message}`.toLocaleLowerCase().includes(q) || group.entries.some(entry => entry.message.toLocaleLowerCase().includes(q)));
   async function copy() {
     const lines = filtered.map(entry => `[${stamp(entry.at)}] [${(entry.category || "general").toUpperCase()}] ${entry.message}`);
     if (stream === "downloads") {
@@ -112,13 +157,17 @@ function StreamPanel({ stream, title, entries, monitor, job, onClear }: {
       <button aria-label={`Clear ${title.toLowerCase()}`} title="Clear this panel" disabled={clearing} onClick={async () => {setClearing(true); try {await onClear(stream);} finally {setClearing(false);}}}><Trash2 size={14}/></button>
     </div>
     <div className="activity-log">
-      {jobMatches && stream !== "downloads" && <div className="batch-log">
-        <button className="batch-toggle" aria-expanded={Boolean(expanded[job!.id])} onClick={() => setExpanded(old => ({...old, [job!.id]: !old[job!.id]}))}>
-          {expanded[job!.id] ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
-          <strong>{jobTitle(job!.kind)}</strong><span>{job!.message}</span><span className="status-badge status-running">Running</span>
-        </button>
-        {expanded[job!.id] && <div className="batch-children">{recent.length ? recent.map((entry, i) => <LogRow entry={entry} key={`${entry.at}-${i}`}/>) : <p>Waiting for the next step…</p>}</div>}
-      </div>}
+      {visibleGroups.map(group => {
+        const running = job?.id === group.id && active(job);
+        const status = running ? job!.status : ["complete", "failed", "cancelled"].includes(group.status || "") ? group.status : "interrupted";
+        return <div className="batch-log" key={group.id}>
+          <button className="batch-toggle" aria-expanded={Boolean(expanded[group.id])} onClick={() => setExpanded(old => ({...old, [group.id]: !old[group.id]}))}>
+            {expanded[group.id] ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
+            <strong>{jobTitle(group.kind)}</strong><span>{group.message}</span><span className={`status-badge status-${status}`}>{status}</span>
+          </button>
+          {expanded[group.id] && <JobHistory id={group.id} recent={group.entries.filter(entry => !q || entry.message.toLocaleLowerCase().includes(q))}/>}
+        </div>;
+      })}
       {stream === "downloads" && batches.map(batch => {
         const children = items.filter(item => item.kind === "track" && item.release_id === batch.release_id);
         const bytes = children.reduce((n, item) => n + Number(item.bytes || 0), 0);
@@ -135,8 +184,8 @@ function StreamPanel({ stream, title, entries, monitor, job, onClear }: {
         </div>;
       })}
       {stream === "downloads" && standalone.map(item => <DownloadTrack item={item} key={item.id}/>)}
-      {filtered.filter(entry => !recent.includes(entry)).slice().reverse().map((entry, i) => <LogRow entry={entry} key={`${entry.at}-${i}`}/>)}
-      {!filtered.length && !batches.length && !standalone.length && !jobMatches && <div className="activity-empty">No {title.toLowerCase()} to show.</div>}
+      {ungrouped.filter(entry => !q || entry.message.toLocaleLowerCase().includes(q)).slice().reverse().map((entry, i) => <LogRow entry={entry} key={`${entry.at}-${i}`}/>)}
+      {!filtered.length && !batches.length && !standalone.length && !visibleGroups.length && <div className="activity-empty">No {title.toLowerCase()} to show.</div>}
     </div>
   </section>;
 }

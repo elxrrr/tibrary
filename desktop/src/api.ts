@@ -25,7 +25,7 @@ export type AppState = {
   online_job?: Job | null;
   catalogue_refresh?: { ids: string[]; completed: string[]; market: string; detailed: boolean; status: string };
   download_job?: Job | null;
-  logs: { at: string; message: string; level?: string; category?: string; progress_id?: string }[];
+  logs: { at: string; message: string; level?: string; category?: string; progress_id?: string; job_id?: string; job_kind?: string; job_status?: string }[];
   settings: { market: string; theme: string };
   connections: any;
   diagnostics: any;

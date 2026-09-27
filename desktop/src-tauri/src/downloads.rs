@@ -907,6 +907,17 @@ async fn live_subscriber_download_pipeline() {
     let decision:String=rows.next().await.unwrap().unwrap().get(0).unwrap();assert_eq!(decision,"downloaded");
     assert_eq!(metadata.tracktotal.as_deref(),Some("12"));
     assert!(metadata.bpm.is_some());
+    // Redownload through the same queue entry; replace only this disposable file.
+    drop(rows);
+    crate::tag_writer::write_tags(&files[0], &std::collections::HashMap::from([("comment".to_string(), "Disposable previous copy".to_string())])).unwrap();
+    payload["redownload"] = json!(true);
+    conn.execute("UPDATE queue SET payload=?,approved=1,decision='queued' WHERE id='140303440'", (payload.to_string(),)).await.unwrap();
+    let replaced=DownloadManager::run_downloads(&db,None,Arc::new(AtomicBool::new(false)),"test-replace",|line|println!("{line}"),|_|{}).await.unwrap();
+    assert_eq!(replaced,1);
+    let mut queue_count=conn.query("SELECT COUNT(*) FROM queue",()).await.unwrap();
+    assert_eq!(queue_count.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),1);
+    drop(queue_count);
+    assert!((crate::scanner::read_audio_metadata(&files[0]).unwrap().duration-metadata.duration).abs()<0.01);
     let cancel=Arc::new(AtomicBool::new(false));
     crate::scanner::scan_library(&db,&output,cancel.clone(),|_|{}).await.unwrap();
     db.choose_artist("Cassie",&["3924".into()]).await.unwrap();
@@ -934,5 +945,22 @@ async fn live_subscriber_download_pipeline() {
     assert_eq!(repaired.tracktotal.as_deref(),Some("12"));
     assert_eq!(repaired.bpm,metadata.bpm);
     assert!((repaired.duration-metadata.duration).abs()<0.01);
-    println!("Download, metadata, queue completion, scan, linking, number repair and organisation passed in {}",dir.display());
+    // Review and remove a redundant copy via the same action used by the UI.
+    let duplicate_folder=output.join("Disposable duplicate (2000)");
+    fs::create_dir_all(&duplicate_folder).unwrap();
+    let duplicate=duplicate_folder.join(format!("qa-{}.flac",uuid::Uuid::new_v4()));
+    fs::copy(&target,&duplicate).unwrap();
+    crate::tag_writer::write_tags(&duplicate,&std::collections::HashMap::from([
+        ("album".into(),"Disposable duplicate".into()),("date".into(),"2000".into()),
+    ])).unwrap();
+    crate::scanner::scan_library(&db,&output,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+    let backend=Arc::new(crate::Backend::new());
+    let review=crate::actions::execute(&db,&backend,"review_consolidation",&json!({"root":root,"ids":[duplicate_folder.to_string_lossy()]}),Arc::new(AtomicBool::new(false))).await.unwrap();
+    let preview=backend.previews.lock().unwrap().get(review["preview_id"].as_str().unwrap()).unwrap().clone();
+    let removed=crate::actions::execute(&db,&backend,"consolidate",&json!({"root":root,"confirmed":true,"preview_id":review["preview_id"],"ids":[preview["rows"][0]["id"]]}),Arc::new(AtomicBool::new(false))).await.unwrap();
+    assert_eq!(removed["completed"],1);
+    assert!(!duplicate.exists());
+    assert!(Path::new(&target).exists());
+    assert_eq!(db.get_local_files_page(Some(&root),100,0).await.unwrap().1,1);
+    println!("Download, replacement, metadata, queue, scan, linking, number repair, organisation and reviewed duplicate removal passed in {}",dir.display());
 }

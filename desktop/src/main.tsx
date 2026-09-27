@@ -98,8 +98,6 @@ const groups = [
     icon: Settings,
     items: [
       ["general", "General", SlidersHorizontal],
-      ["connections", "Connections", Link],
-      ["downloads", "Downloads & files", ArrowDownToLine],
       ["activity", "Activity", Activity],
     ],
   },
@@ -152,9 +150,7 @@ const descriptions: Record<string, string> = {
   queue: "Only approved audio tracks will be downloaded.",
   downloaded: "Releases explicitly completed by the download engine.",
   favourites: "One row per artist across all confirmed identities.",
-  connections: "Catalogue access, account sessions and extended metadata.",
-  downloads: "Audio quality, output folders and service pacing.",
-  general: "Application display, libraries and matching preferences.",
+  general: "Connection, libraries, downloads, file layout and preferences.",
 };
 const fileColumns: Column[] = [
   { key: "artist", label: "Album artist" },
@@ -200,27 +196,19 @@ function Modal({
     </dialog>
   );
 }
-function getLogCategory(log: { message: string; category?: string; level?: string }): string {
-  if (log.category) return log.category;
-  const msg = (log.message || "").toLowerCase();
-  if (log.level === "error" || msg.includes("error") || msg.includes("failed") || msg.includes("fail") || msg.includes("err")) return "error";
-  if (msg.includes("download") || msg.includes("streamrip") || msg.includes("saving track") || msg.includes("fetching track")) return "download";
-  if (msg.includes("scan") || msg.includes("read tags") || msg.includes("indexed") || msg.includes("refresh local")) return "scan";
-  if (msg.includes("link") || msg.includes("catalogue") || msg.includes("match") || msg.includes("artist")) return "linking";
-  if (msg.includes("trash") || msg.includes("duplicate") || msg.includes("clean") || msg.includes("consolidation") || msg.includes("re-scan")) return "cleanup";
-  return "general";
-}
-
 function App() {
   const initialRoute: string = "overview";
   const [state, setState] = useState<AppState | null>(null),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
   const [navigation, setNavigation] = useState({ pages: ["overview"], index: 0 });
   const route = navigation.pages[navigation.index];
-  const setRoute = useCallback((page: string) => setNavigation(previous =>
+  const setRoute = useCallback((target: string) => {
+    const page = ["connections", "downloads"].includes(target) ? "general" : target;
+    setNavigation(previous =>
     previous.pages[previous.index] === page ? previous : {
       pages: [...previous.pages.slice(0, previous.index + 1), page], index: previous.index + 1,
-    }), []);
+    });
+  }, []);
   const [sidebarVisible, setSidebarVisible] = useState(() => localStorage.getItem("tibrary.sidebar") !== "hidden");
   function moveHistory(offset: number) {
     setNavigation(previous => ({ ...previous, index: Math.max(0, Math.min(previous.pages.length - 1, previous.index + offset)) }));
@@ -433,7 +421,7 @@ function App() {
       if (p.event === "progress" && p.online_job) {
         setState((s) => s ? { ...s, online_job: p.online_job, logs: [
           ...s.logs.filter(log => log.progress_id !== p.online_job.id),
-          {progress_id:p.online_job.id, at:new Date().toISOString(), message:p.message, category:"online", level:"info"}
+          {job_id:p.online_job.id, job_kind:p.online_job.kind, job_status:p.online_job.status, progress_id:p.online_job.id, at:new Date().toISOString(), message:p.message, category:"online", level:"info"}
         ].slice(-1000)} : s);
       }
       if (p.event === "progress" && !p.download_job && !p.online_job)
@@ -445,6 +433,7 @@ function App() {
                 logs: [
                   ...s.logs.filter(log => !p.job?.id || log.progress_id !== p.job.id),
                   {
+                    job_id: p.job?.id, job_kind: p.job?.kind, job_status: p.job?.status,
                     progress_id: p.job?.id,
                     at: new Date().toISOString(),
                     message: p.message,
@@ -788,15 +777,8 @@ function App() {
                     : id === "queue"
                       ? `${s.queued || 0} releases`
                       : id === "general"
-                        ? `${state?.roots.length || 0} libraries`
-                        : id === "connections"
-                          ? state?.diagnostics?.metrics &&
-                            Object.values(state.diagnostics.metrics).every(
-                              (m: any) => m.ok,
-                            )
-                            ? "Connected"
-                            : "Check connections"
-                          : [
+                        ? `${state?.roots.length || 0} libraries · ${state?.connections.account ? "Connected" : "Sign-in needed"}`
+                        : [
                                 "correct",
                                 "organise",
                                 "metadata",
@@ -810,9 +792,7 @@ function App() {
                               ? `${(s.missing_releases ?? s.missing ?? 0).toLocaleString()} releases`
                               : id === "downloaded"
                                 ? `${s.downloaded || 0} releases`
-                                : id === "downloads"
-                                  ? "Lossless audio"
-                                  : "Open",
+                                : "Open",
                 descriptions[id] || "Review and manage",
                 id,
                 Icon,
@@ -994,6 +974,8 @@ function App() {
                 ? "Match selected artists"
                 : "Match artist"}
             </button>
+            <button disabled={!selected.size} onClick={() => loadDetail({id: [...selected][0]})}>Review match</button>
+            <button disabled={busy || !selected.size} onClick={() => unlinkArtists([...selected])}>Unlink selected artists</button>
           </>
         )}
         {["metadata", "artwork"].includes(route) && (
@@ -1522,8 +1504,7 @@ function App() {
   }
   function settingsPage() {
     if (!settings) return <div className="card">Loading settings…</div>;
-    if (route === "general")
-      return (
+    return (
         <>
           <section className="card">
             <h2>Application & display</h2>
@@ -1559,6 +1540,8 @@ function App() {
               />
             </label>
           </section>
+          {connectionSettings()}
+          {downloadSettings()}
           <section className="card">
             <h2>Release matching &amp; recommendations</h2>
             <label className="setting-row" title="Treat a complete local standard or deluxe edition as owned when its artist and release title agree. Turn off to inspect each edition separately."><span>Treat a complete standard or deluxe edition as owned</span>
@@ -1631,71 +1614,30 @@ function App() {
           </section>
         </>
       );
-    if (route === "connections")
-      return (
-        <>
-          <div className="metrics">
-            {Object.entries(state?.diagnostics?.metrics || {}).map(
-              ([key, m]: [string, any]) => {
-                const msg =
-                  m.message === "Catalogue authentication verified" ||
-                  m.message === "Account verified"
-                    ? ""
-                    : m.message || "";
-                return (
-                  <div className="metric static" key={key}>
-                    <span className="metric-title">
-                      {key === "download"
-                        ? "User"
-                        : key === "catalogue"
-                        ? "Catalogue"
-                        : key.charAt(0).toUpperCase() + key.slice(1)}
-                    </span>
-                    <strong>{m.ok ? "Connected" : "Needs attention"}</strong>
-                    <small>
-                      {key === "download"
-                        ? m.ok
-                          ? m.connected_on
-                            ? `Connected on: ${m.connected_on}`
-                            : "Connected date unavailable"
-                          : msg || "Needs attention"
-                        : key === "catalogue"
-                          ? m.ok
-                            ? [m.connected_on ? `Connected on: ${m.connected_on}` : "", m.latency_ms !== undefined ? `${m.latency_ms} ms` : ""].filter(Boolean).join(" · ")
-                            : msg || "Needs attention"
-                          : [
-                              m.latency_ms ? `· ${m.latency_ms} ms` : "",
-                              msg,
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")}
-                    </small>
-                  </div>
-                );
-              },
-            )}
-          </div>
-          <section className="card">
-            <h2>Streaming account</h2>
+  }
+  function connectionSettings() {
+    const diagnostics = Object.values(state?.diagnostics?.metrics || {}) as any[];
+    const needsAttention = diagnostics.some(metric => !metric.ok);
+    return <section className="card" id="connection-settings">
+            <div className="section-heading"><h2>Connection</h2><span className={`status-badge ${state?.connections.account ? "status-complete" : "status-warning"}`}>{state?.connections.account ? needsAttention ? "Needs attention" : "Connected" : "Sign-in needed"}</span></div>
+
             <p className="muted">One sign-in for catalogue searches, favourites, track credits, artwork and downloads.</p>
             <div className="toolbar">
               <button
                 className={state?.connections.account ? "" : "primary"}
-                disabled={busy || Boolean(state?.connections.account)}
+                disabled={submitting || active(state?.online_job) || Boolean(state?.connections.account)}
                 onClick={() => run("connect_account")}
               >
                 Connect account
               </button>
               <button
-                disabled={busy || !state?.connections.account}
+                disabled={submitting || active(state?.online_job) || !state?.connections.account}
                 onClick={() => mutate("account.disconnect")}
               >
                 Disconnect account
               </button>
             </div>
-          </section>
-
-          <button className="connection-test" disabled={busy || active(state?.online_job) && state?.online_job?.kind === "connections"} onClick={() => run("connections")}
+          <button className="connection-test" disabled={submitting || active(state?.online_job)} onClick={() => run("connections")}
             title={state?.online_job?.kind === "connections" && !active(state.online_job)
               ? Object.values(state?.diagnostics?.metrics || {}).map((metric: any) => metric.ok ? "Connected" : metric.message || "Needs attention").join(" · ") || state.online_job.message
               : "Test configured connections"}>
@@ -1703,8 +1645,12 @@ function App() {
             {state?.online_job?.kind === "connections" && active(state.online_job) ? "Testing connections…" : "Test connections"}
             {state?.online_job?.kind === "connections" && !active(state.online_job) && <span className={state.online_job.status === "complete" && Object.values(state?.diagnostics?.metrics || {}).length > 0 && Object.values(state?.diagnostics?.metrics || {}).every((metric: any) => metric.ok) ? "connection-result ok" : "connection-result warning"} aria-label={state.online_job.status === "complete" && Object.values(state?.diagnostics?.metrics || {}).every((metric: any) => metric.ok) ? "Connection test passed" : "Connection test needs attention"}/>}
           </button>
-        </>
-      );
+          {diagnostics.length > 0 && <details className="connection-details"><summary>Connection details</summary>
+            {Object.entries(state?.diagnostics?.metrics || {}).map(([key, metric]: [string, any]) => <p key={key}><strong>{key === "download" ? "Account and downloads" : key === "catalogue" ? "Catalogue" : key}</strong> · {metric.ok ? "Ready" : "Needs attention"}{metric.latency_ms != null ? ` · ${metric.latency_ms} ms` : ""}{metric.message ? ` · ${metric.message}` : ""}</p>)}
+          </details>}
+        </section>;
+  }
+  function downloadSettings() {
     return (
       <>
         <section className="card">
@@ -1739,12 +1685,18 @@ function App() {
             </button>
           </label>
           {field("Folder template", "organisation", "template")}
-          <details>
+          <details className="template-reference">
             <summary>Template reference & tag variables</summary>
-            <p>Default: <code>{"{albumartist}/{album} ({year})/{disc}/{disc_prefix}{tracknumber} - {title}"}</code></p>
-            <p>Extra: <code>{"{artist}"}</code> <code>{"{discnumber}"}</code></p>
+            <div className="template-tokens">{[
+              ["albumartist", "Album artist"], ["album", "Release title"], ["year", "Release year"],
+              ["disc", "Disc folder, only for multiple discs"], ["disc_prefix", "Disc prefix, only for multiple discs"],
+              ["tracknumber", "Padded track number"], ["title", "Track title"],
+              ["artist", "Track artist"], ["discnumber", "Disc number"],
+            ].map(([token, description]) => <span className="template-token" key={token} title={description}><code>{`{${token}}`}</code><small>{description}</small></span>)}</div>
           </details>
-          <h3>Audio and file options</h3>
+        </section>
+        <section className="card">
+          <h2>Audio and file options</h2>
           {field("Audio quality", "downloads", "quality", [
             { value: "HI_RES_LOSSLESS", label: "FLAC (24/192khz)" },
             { value: "LOSSLESS", label: "FLAC (16/44.1khz)" },
@@ -1807,6 +1759,11 @@ function App() {
       </>
     );
   }
+  async function unlinkArtists(artists: string[]) {
+    setMenu(null);
+    const result = await mutate("artists.unlink", {artists});
+    if (result) { setSelected(new Set()); setToast("Artist links removed. File tags and recording links are unchanged."); }
+  }
   function contextMenu() {
     if (!menu) return null;
     const r = menu.row;
@@ -1840,6 +1797,10 @@ function App() {
           <button role="menuitem" onClick={() => loadDetail(r)}>
             View metadata / match details
           </button>
+          {route === "artists" && <>
+            <button role="menuitem" disabled={busy} onClick={() => {setMenu(null); run("match_artists", {artists: ids});}}>Recheck selected artists</button>
+            <button role="menuitem" disabled={busy} onClick={() => unlinkArtists(ids)}>Unlink selected artists</button>
+          </>}
           {r.path && (
             <>
               <button
@@ -2078,7 +2039,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.0-beta.32 · build 32</span>
+          <span className="sidebar-version">v0.9.0-beta.33 · build 33</span>
         </div>
       </aside>
       <main>

@@ -24,6 +24,8 @@ test.beforeEach(async ({ page }) => {
       env: {
         ...process.env,
         PYTHONPATH: join(root, "desktop/tests"),
+        // Screenshot fixtures have extra tracks; keep functional tests isolated.
+        TIBRARY_SCREENSHOTS: test.info().title === "all workflow routes render with no runtime errors" ? process.env.TIBRARY_SCREENSHOTS || "" : "",
       },
     },
   );
@@ -103,8 +105,6 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     "Downloaded releases",
     "Settings",
     "General",
-    "Connections",
-    "Downloads & files",
     "Activity",
   ]) {
     await page
@@ -242,10 +242,10 @@ test("dark settings fit a full window and retain defaults", async ({
   await page.goto("/");
   await page
     .locator("aside")
-    .getByRole("button", { name: "Downloads & files", exact: true })
+    .getByRole("button", { name: "General", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: "Downloads & files", exact: true }),
+    page.getByRole("heading", { name: "General", exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Reset to default" }).click();
   await expect(page.getByRole("alert")).toHaveCount(0);
@@ -375,7 +375,7 @@ test("reviewed number corrections run through the UI and survive navigation", as
 
 test("account sign-in opens its prompt, rejects unrelated redirects and cancels", async ({ page }) => {
   await page.goto("/");
-  await page.locator("aside").getByRole("button",{name:"Connections",exact:true}).click();
+  await page.locator("aside").getByRole("button",{name:"General",exact:true}).click();
   await expect(page.getByRole("heading", {name:"Developer credentials",exact:true})).toHaveCount(0);
   await expect(page.getByLabel("Client secret")).toHaveCount(0);
   await page.getByRole("button",{name:"Connect account",exact:true}).click();
@@ -683,4 +683,51 @@ test("a failed table request can be retried without freezing navigation", async 
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
   await expect(page.locator(".table-scroll")).toHaveAttribute("aria-busy","false");
   await expect(page.locator("tbody tr").first()).toBeVisible();
+});
+
+
+test("General contains connection and separate template/audio cards; artist review and unlink stay consistent", async ({page}) => {
+  await page.goto("/");
+  const sidebar = page.locator("aside");
+  await sidebar.getByRole("button", {name:"General", exact:true}).click();
+  await expect(sidebar.getByRole("button",{name:"Connections",exact:true})).toHaveCount(0);
+  await expect(sidebar.getByRole("button",{name:"Downloads & files",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("heading",{name:"Connection",exact:true})).toBeVisible();
+  await page.getByText("Template reference & tag variables",{exact:true}).click();
+  await expect(page.locator(".template-token")).toHaveCount(9);
+  await expect(page.locator(".template-reference")).not.toContainText("Default:");
+  await expect(page.locator(".card").filter({has:page.getByRole("heading",{name:"Audio and file options",exact:true})})).not.toContainText("Folder template");
+  if (process.env.TIBRARY_SETTINGS_SCREENSHOT) await page.screenshot({path:"/tmp/tibrary-general-beta33.png"});
+  await sidebar.getByRole("button",{name:"Link artists",exact:true}).click();
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  const artist = (await rpc("table",{route:"artists",root:join(folder,"music")})).result.rows[0].id;
+  await rpc("artists.choose",{artist,ids:["900001"]});
+  await page.getByRole("combobox",{name:"Table filter"}).selectOption("review");
+  await expect(page.locator("tbody tr")).toHaveCount(0);
+  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await page.locator("tbody tr").first().click({button:"right"});
+  await expect(page.getByRole("menuitem",{name:"Recheck selected artists"})).toBeVisible();
+  await page.getByRole("menuitem",{name:"Unlink selected artists"}).click();
+  await expect(page.locator("tbody tr")).toContainText("Unresolved");
+  expect((await rpc("turso.stats",{root:join(folder,"music")})).result.track_count).toBe(2);
+});
+
+test("completed job activity stays grouped with persistent per-item details", async ({page}) => {
+  await page.goto("/");
+  const job = (await rpc("job.start",{kind:"scan",args:{root:join(folder,"music"),force:true}})).result;
+  await expect.poll(async()=> (await rpc("job.status")).result.job?.status).toBe("complete");
+  const history = (await rpc("logs.job",{id:job.id})).result;
+  expect(history.length).toBeGreaterThan(2);
+  expect(history.every((entry:any)=>entry.job_id === job.id)).toBe(true);
+  expect(history.some((entry:any)=>entry.message.includes("Reading local tags"))).toBe(true);
+  await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
+  const panel=page.getByRole("region",{name:"Local actions",exact:true});
+  const toggle=panel.getByRole("button",{name:/Scan library.*complete/}).first();
+  await expect(toggle).toBeVisible();
+  await expect(panel.locator(".batch-children")).toHaveCount(0);
+  await toggle.click();
+  await expect(panel.locator(".batch-children")).toContainText("Reading local tags");
+  await panel.getByRole("button",{name:"Load full saved history"}).click();
+  await expect(panel.locator(".batch-children .log-row")).toHaveCount(history.length);
 });

@@ -613,31 +613,28 @@ pub async fn trash_file_or_directory(path_str: &str) -> Result<(), String> {
             "tell application \"Finder\" to delete POSIX file \"{}\"",
             esc
         );
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30),
+            tokio::process::Command::new("osascript").kill_on_drop(true)
+                .arg("-e").arg(&script).output()).await;
 
-        if let Ok(out) = output {
+        if let Ok(Ok(out)) = output {
             if out.status.success() {
                 return Ok(());
             }
         }
     }
 
+    // Finder may have completed just before its response timed out.
+    if !path.exists() { return Ok(()); }
+
     // Fallback: move to ~/.Trash if exists
     if let Some(home) = std::env::var_os("HOME") {
         let trash_dir = Path::new(&home).join(".Trash");
         if trash_dir.is_dir() {
             if let Some(file_name) = path.file_name() {
-                let mut target = trash_dir.join(file_name);
-                if target.exists() {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    target = trash_dir.join(format!("{}_{}", ts, file_name.to_string_lossy()));
-                }
+                // Concurrent replacements can have identical filenames. Never replace
+                // an existing Trash entry with a timestamp collision.
+                let target = trash_dir.join(format!("{}_{}", uuid::Uuid::new_v4(), file_name.to_string_lossy()));
                 if std::fs::rename(path, &target).is_ok() {
                     return Ok(());
                 }

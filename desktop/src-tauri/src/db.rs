@@ -202,6 +202,14 @@ impl TursoDb {
                 .await
                 .map_err(|e| format!("Schema init error on '{}': {}", stmt, e))?;
         }
+        // Additive migration: preserve existing activity and attach new entries to jobs.
+        let mut columns = conn.query("PRAGMA table_info(activity_logs)", ()).await.map_err(|e|e.to_string())?;
+        let mut has_context = false;
+        while let Some(row) = columns.next().await.map_err(|e|e.to_string())? {
+            has_context |= row.get::<String>(1).unwrap_or_default() == "job_context";
+        }
+        drop(columns);
+        if !has_context { conn.execute("ALTER TABLE activity_logs ADD COLUMN job_context TEXT", ()).await.map_err(|e|e.to_string())?; }
         Ok(())
     }
 
@@ -212,10 +220,14 @@ impl TursoDb {
         level: &str,
         category: &str,
     ) -> Result<(), String> {
+        self.log_activity_entry(&json!({"at":at,"message":message,"level":level,"category":category})).await
+    }
+
+    pub async fn log_activity_entry(&self, entry: &Value) -> Result<(), String> {
         let conn = self.connect()?;
         conn.execute(
-            "INSERT INTO activity_logs (at, message, level, category) VALUES (?, ?, ?, ?)",
-            (at, message, level, category),
+            "INSERT INTO activity_logs (at, message, level, category, job_context) VALUES (?, ?, ?, ?, ?)",
+            (entry["at"].as_str().unwrap_or(""), entry["message"].as_str().unwrap_or(""), entry["level"].as_str().unwrap_or("info"), entry["category"].as_str().unwrap_or("general"), json!({"job_id":entry["job_id"],"job_kind":entry["job_kind"],"job_status":entry["job_status"]}).to_string()),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -226,7 +238,7 @@ impl TursoDb {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
-                "SELECT at, message, level, category FROM activity_logs ORDER BY id DESC LIMIT ?",
+                "SELECT at, message, level, category, job_context FROM activity_logs ORDER BY id DESC LIMIT ?",
                 (limit as i64,),
             )
             .await
@@ -237,7 +249,9 @@ impl TursoDb {
             let msg: String = row.get(1).unwrap_or_default();
             let lvl: String = row.get(2).unwrap_or_else(|_| "info".to_string());
             let cat: String = row.get(3).unwrap_or_else(|_| "general".to_string());
+            let context: Value = row.get::<String>(4).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
             logs.push(json!({
+                "job_id": context["job_id"], "job_kind":context["job_kind"], "job_status":context["job_status"],
                 "at": at,
                 "message": msg,
                 "level": lvl,
@@ -246,6 +260,20 @@ impl TursoDb {
         }
         logs.reverse();
         Ok(logs)
+    }
+
+    pub async fn job_activity(&self, job_id: &str, offset: usize) -> Result<Vec<Value>, String> {
+        let conn = self.connect()?;
+        let mut rows = conn.query("SELECT at,message,level,category,job_context FROM activity_logs WHERE json_extract(job_context,'$.job_id')=? ORDER BY id LIMIT 1000 OFFSET ?", (job_id, offset as i64)).await.map_err(|e|e.to_string())?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e|e.to_string())? {
+            let mut entry: Value = row.get::<String>(4).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+            for (index, key) in ["at","message","level","category"].iter().enumerate() {
+                entry[*key] = json!(row.get::<String>(index).unwrap_or_default());
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
     }
 
     pub async fn clear_logs(&self) -> Result<(), String> {
@@ -2450,6 +2478,25 @@ impl TursoDb {
         Ok(())
     }
 
+    /// Remove only artist associations; retain cached releases and recording links.
+    pub async fn unlink_artists(&self, artists: &[String]) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e| e.to_string())?;
+        let result = async {
+            for artist in artists {
+                for table in ["mappings", "additional_mappings"] {
+                    conn.execute(&format!("DELETE FROM {table} WHERE lower(artist)=lower(?)"), (artist.as_str(),))
+                        .await.map_err(|e| e.to_string())?;
+                }
+            }
+            conn.execute("COMMIT", ()).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        if result.is_ok() { self.bump_revision(); }
+        result
+    }
+
     pub async fn choose_artist(&self, artist: &str, ids: &[String]) -> Result<(), String> {
         let conn = self.connect()?;
         if let Some(primary) = ids.first() {
@@ -3118,6 +3165,7 @@ impl TursoDb {
             let releases = artist_albums.get(&artist).map(|s| s.len()).unwrap_or(0);
             let clean_evidence = Self::clean_evidence_str(&evidence);
             let display_status = match raw_status.to_lowercase().as_str() {
+                "auto" | "confirmed" if online_id.is_empty() => "Unresolved",
                 "auto" => "Auto-matched",
                 "confirmed" => "Confirmed",
                 "review" => "Needs review",
@@ -3182,11 +3230,11 @@ impl TursoDb {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_lowercase();
-                        st.contains("review")
+                        r["resolved"] != true && (st.contains("review")
                             || st.contains("candidate")
                             || st.contains("ambiguous")
                             || ev.contains("confirm identity")
-                            || ev.contains("review")
+                            || ev.contains("review"))
                     });
                 }
                 _ => {} // "all" or any other
@@ -4746,7 +4794,8 @@ with sqlite3.connect('{db}') as db:
             .get_artist_rows(None, Some("review"), None, None, None, 0, 10)
             .await
             .unwrap();
-        assert_eq!(review_page.total, 2); // Radiohead (confirm identity) and Pink Floyd (ambiguous)
+        assert_eq!(review_page.total, 1); // Confirmed/auto matches never leak through old evidence.
+        assert_eq!(review_page.rows[0]["artist"], "Pink Floyd");
 
         // 5. Search
         let search_page = store
@@ -4764,7 +4813,14 @@ with sqlite3.connect('{db}') as db:
             .unwrap();
         assert_eq!(sort_page.rows[0]["artist"], "The Beatles");
         assert_eq!(sort_page.rows[0]["tracks"], 2);
-
+        store.choose_artist("The Beatles", &["123".into(),"124".into()]).await.unwrap();
+        store.unlink_artists(&["The Beatles".into(),"Radiohead".into()]).await.unwrap();
+        let pending = store.get_artist_rows(None,Some("unresolved"),None,None,None,0,10).await.unwrap();
+        assert_eq!(pending.total,3);
+        let mut extras=conn.query("SELECT COUNT(*) FROM additional_mappings",()).await.unwrap();
+        assert_eq!(extras.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),0);
+        assert_eq!(store.get_local_files_page(None,100,0).await.unwrap().1,7);
+        drop(extras);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
