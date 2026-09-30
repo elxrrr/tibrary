@@ -201,13 +201,7 @@ pub async fn refresh(
             state.progress_for("release_artists", &format!("Album artist credits · {checked}/{total} releases · {reused} reused · requesting {} release summaries", batch.len()));
             let payload = client.albums(batch,market,true).await?;
             let values = parse(&payload, batch, now);
-            for resource in payload["data"].as_array().into_iter().flatten() {
-                if let (Some(id), Some(available)) = (resource["id"].as_str(), crate::availability::available(resource)) {
-                    if batch.iter().any(|wanted|wanted==id) {
-                        db.set_preference(&format!("release-live:{market}:{id}"), &json!({"available":available,"checked_at":now})).await?;
-                    }
-                }
-            }
+            crate::availability::save_response(db, &payload, batch, market).await?;
             for id in batch {
                 let value = values.get(id).cloned().unwrap_or_else(
                     || json!({"ids":[],"checked_at":now,"source":"not returned for this market"}),

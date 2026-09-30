@@ -699,6 +699,66 @@ test("missing release filters, bidirectional sort and paging preserve the releas
   await expect(page.locator("tbody")).not.toContainText("Between Stations");
 });
 
+test("missing release availability checks use the requested scope and preserve unavailable inspection", async ({page}) => {
+  await rpc("queue.decision",{ids:["910001","910002","910003","910004","910005","910006"],decision:"removed"});
+  const checks:any[]=[];
+  let job:any;
+  await page.route("**/__test_rpc", async route => {
+    const request=route.request().postDataJSON();
+    if (request.method==="job.start" && request.args.kind==="check_availability") {
+      checks.push(request.args.args);
+      job={id:`availability-${checks.length}`,kind:"check_availability",status:checks.length===1?"running":"complete",
+        message:"Checking release availability · North Assembly — Blue Hours · GB",started:Date.now()/1000,completed:0,total:1};
+      await route.fulfill({json:{result:job}});
+      return;
+    }
+    const response=await rpc(request.method,request.args);
+    if(job && ["state","job.status"].includes(request.method) && response.result) response.result.online_job=job;
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  const sidebar=page.locator("aside");
+  await sidebar.getByRole("button",{name:"Missing releases",exact:true}).click();
+  await page.getByRole("combobox",{name:"Release timeline"}).selectOption("All missing releases");
+  await expect(page.locator("tbody")).not.toContainText("Private Weather");
+  await page.getByRole("combobox",{name:"Table filter"}).selectOption("Unavailable");
+  await expect(page.locator("tbody")).toContainText("Private Weather");
+  await expect(page.getByRole("combobox",{name:"Release timeline"})).toHaveValue("All missing releases");
+  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await page.getByRole("checkbox",{name:"Select Blue Hours",exact:true}).check();
+  await page.getByRole("button",{name:"Check availability",exact:true}).click();
+  await expect.poll(()=>checks.length).toBe(1);
+  expect(checks[0].ids).toEqual(["910001"]);
+  expect(checks[0].force).toBeUndefined();
+  await expect(page.getByRole("button",{name:"Check availability",exact:true})).toBeDisabled();
+  await sidebar.getByRole("button",{name:"Overview",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Show activity: Check release availability",exact:true})).toBeVisible();
+  job={...job,status:"complete",completed:1,message:"Availability check complete · cached results saved"};
+  await sidebar.getByRole("button",{name:"Missing releases",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Check availability",exact:true})).toBeEnabled();
+  const visible=(await rpc("table",{route:"missing",timeline:"All missing releases",recommendation:"My album artists",filter:"all",limit:50})).result.rows;
+  await page.getByRole("button",{name:"Check availability",exact:true}).click();
+  await expect.poll(()=>checks.length).toBe(2);
+  expect([...checks[1].ids].sort()).toEqual(visible.map((row:any)=>row.id).sort());
+  await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
+  await page.getByRole("button",{name:"Actions for track First Light",exact:true}).click();
+  await page.getByRole("menuitem",{name:"Check release availability",exact:true}).click();
+  await expect.poll(()=>checks.length).toBe(3);
+  expect(checks[2].ids).toEqual(["910001"]);
+  expect(checks[2].force).toBe(true);
+  await page.getByText("More update options",{exact:true}).click();
+  await page.getByRole("button",{name:"Check saved release availability",exact:true}).click();
+  await expect.poll(()=>checks.length).toBe(4);
+  expect(checks[3].ids).toBeUndefined();
+  expect(checks[3].force).toBeUndefined();
+  await page.getByText("More update options",{exact:true}).click();
+  await page.getByRole("button",{name:"Recheck saved availability online",exact:true}).click();
+  await expect.poll(()=>checks.length).toBe(5);
+  expect(checks[4].ids).toBeUndefined();
+  expect(checks[4].force).toBe(true);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
 test("activity shows measured progress across navigation and disables repeated cancellation", async ({page}) => {
   let job:any={id:"qa-job",kind:"link",status:"running",message:"Checking North Assembly — Night Maps",started:Date.now()/1000,completed:5,total:10,eta_seconds:20,progress_updated_at:Date.now()/1000};
   let cancellations=0;

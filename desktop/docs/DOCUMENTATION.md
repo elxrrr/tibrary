@@ -42,6 +42,9 @@ A release is marked superseded only when cached evidence shows a newer available
 | Update missing releases | Check linked artist release lists and fill new, changed or incomplete online details. |
 | More update options → Check release lists only | Check for new releases without collecting additional track details. |
 | More update options → Fill missing release artists | Fill album artist evidence for older cached releases. |
+| Check availability | Check selected releases, or the visible page; reuse recent market checks. |
+| More update options → Check saved release availability | Check all saved missing releases for your linked album artists using cached checks where possible. |
+| More update options → Recheck saved availability online | Request fresh checks, including previously unavailable releases; bypass cached availability. |
 | More update options → Recalculate saved results | Recalculate ownership and recommendations locally, without API requests. |
 | Reread all tags in General | Force a complete tag read if an external editor preserved file size and modification time. |
 | Refresh track details and credits | Refresh metadata for a particular release. |
@@ -50,6 +53,8 @@ A release is marked superseded only when cached evidence shows a newer available
 All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Metadata found during tagging, linking or downloading is shared with the other tools. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
 
 Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
+
+Availability is shared across artist, metadata and release checks for the selected market. Confirmed available results are reused for seven days, unavailable results for one day, and inconclusive results for one hour. Confirmed unavailable releases leave the default Missing releases view but remain inspectable through **Unavailable**. Timeouts and rate-limit errors (HTTP 429) never mark a release unavailable. Use **Recheck saved availability online** to request fresh checks without resetting the database.
 
 If upstream tags change without changing a release's summary, use its manual detail refresh. Failed optional genre/replacement lookups retry after a cooldown while retaining the saved track credits; successful empty fields do not trigger repeated checks.
 

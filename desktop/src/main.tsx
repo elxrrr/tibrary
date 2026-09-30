@@ -129,7 +129,7 @@ const organisationActions = [
   ],
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
-const onlineKinds = new Set(["link", "discography", "cached_releases", "release_artists", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
+const onlineKinds = new Set(["link", "discography", "cached_releases", "check_availability", "release_artists", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
 const descriptions: Record<string, string> = {
   overview: "Your library, from local preparation to new music.",
   correct:
@@ -1110,6 +1110,17 @@ function App() {
             >
               Update missing releases
             </button>
+            <button
+              disabled={busy || loading || (!data.rows.length && !Object.keys(selectedReleases(selection)).length)}
+              onClick={() => run("check_availability", {
+                ids: Object.keys(selectedReleases(selection)).length
+                  ? Object.keys(selectedReleases(selection))
+                  : data.rows.map(row => row.id),
+              })}
+              title="Check selected releases, or this page of visible releases when none are selected. Recent market checks are reused; confirmed unavailable releases leave the default view."
+            >
+              Check availability
+            </button>
             {state?.catalogue_refresh && state.catalogue_refresh.status !== "complete" && state.catalogue_refresh.completed.length < state.catalogue_refresh.ids.length && !active(state.online_job) && (
               <button disabled={busy} onClick={() => run("discography", { ...state.catalogue_refresh, resume: true })}>
                 Resume refresh ({state.catalogue_refresh.completed.length}/{state.catalogue_refresh.ids.length})
@@ -1120,6 +1131,8 @@ function App() {
               <div className="update-options-menu">
                 <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("discography");}} title="Check artist release lists and market availability without collecting additional track details.">Check release lists only</button>
                 <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("release_artists", { timeline });}} title="Fill missing album artist evidence for older saved releases; reuse existing checks.">Fill missing release artists</button>
+                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("check_availability");}} title="Check all saved missing releases for your linked album artists. Recent market checks are reused; no audio is downloaded.">Check saved release availability</button>
+                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("check_availability", {force:true});}} title="Request fresh market checks for all saved missing releases, including previously unavailable releases. Bypass cached availability checks; no audio is downloaded.">Recheck saved availability online</button>
                 <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("cached_releases");}} title="Recalculate ownership and recommendations from the shared database without contacting the service.">Recalculate saved results</button>
               </div>
             </details>
@@ -1191,7 +1204,7 @@ function App() {
           </div>
         )}
         {toolbar()}
-        {route === "missing" && <p className="hint scan-explainer">Update missing releases checks for new music and fills gaps in the shared catalogue. Saved tracks, credits and DJ data are reused across linking, tags and downloads. No audio is downloaded here.</p>}
+        {route === "missing" && <p className="hint scan-explainer">Saved tracks, credits and market checks are reused. Confirmed unavailable releases stay in the Unavailable filter; failed requests never mark releases unavailable. No audio is downloaded here.</p>}
         {route === "missing" && (
           <div className="filters secondary">
             <select
@@ -1278,7 +1291,7 @@ function App() {
             }}
           >
             <option value="all">
-              {route === "artists" ? "All artists" : "All items"}
+              {route === "artists" ? "All artists" : route === "missing" ? "Available and unchecked" : "All items"}
             </option>
             {["correct", "organise", "metadata", "artwork", "mqa"].includes(
               route,
@@ -1897,6 +1910,13 @@ function App() {
               title="Refresh track metadata and credits using your streaming account. Saved metadata is retained if the request fails."
               onClick={() => {run("release_details", {id:r.parent || r.id, force:true}); setMenu(null);}}>
               Refresh track details and credits
+            </button>
+          )}
+          {["missing", "queue"].includes(route) && (
+            <button role="menuitem" disabled={busy}
+              title="Recheck this release in your configured market, replacing its saved availability check."
+              onClick={() => {run("check_availability", {ids:[r.parent || r.id], force:true}); setMenu(null);}}>
+              Check release availability
             </button>
           )}
           {route === "downloaded" && (

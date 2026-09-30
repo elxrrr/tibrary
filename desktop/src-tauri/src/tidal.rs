@@ -461,18 +461,18 @@ impl TidalClient {
                 summaries.push(item.clone());
                 raw.push(item);
             }
-            self.cache_summaries(&summaries,market).await?;
+            self.cache_summaries(&summaries,market,batch).await?;
         }
         Ok(album_resources(&raw))
     }
 
     #[cfg(test)]
     async fn cache_summary(&self, raw: &Value, market: &str) -> Result<(), String> {
-        self.cache_summaries(std::slice::from_ref(raw),market).await
+        self.cache_summaries(std::slice::from_ref(raw),market,&[]).await
     }
 
-    async fn cache_summaries(&self, values: &[Value], market: &str) -> Result<(), String> {
-        if values.is_empty() { return Ok(()); }
+    async fn cache_summaries(&self, values: &[Value], market: &str, requested: &[String]) -> Result<(), String> {
+        if values.is_empty() && requested.is_empty() { return Ok(()); }
         let conn = self.db.connect()?;
         conn.execute("BEGIN IMMEDIATE",()).await.map_err(|error|error.to_string())?;
         let result = async {
@@ -487,8 +487,14 @@ impl TidalClient {
                 }
                 if let Some(available) = subscriber_available(raw) {
                     let value=json!({"available":available,"checked_at":raw["checked_at"]});
-                    conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("release-live:{market}:{id}"),value.to_string())).await.map_err(|error|error.to_string())?;
+                    conn.execute("INSERT INTO app_preferences(key,payload) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload WHERE COALESCE(json_extract(app_preferences.payload,'$.checked_at'),0) <= json_extract(excluded.payload,'$.checked_at')",(format!("release-live:{market}:{id}"),value.to_string())).await.map_err(|error|error.to_string())?;
                 }
+            }
+            // Successful summary batches also prove absence. Save withdrawals
+            // centrally wherever metadata is fetched, without another API call.
+            let returned: std::collections::HashSet<_> = values.iter().map(|value| resource_id(&value["id"])).collect();
+            for id in requested.iter().filter(|id| !returned.contains(*id)) {
+                conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("release-live:{market}:{id}"),json!({"available":false,"checked_at":Utc::now().timestamp()}).to_string())).await.map_err(|error|error.to_string())?;
             }
             conn.execute("COMMIT",()).await.map_err(|error|error.to_string())?;
             Ok::<_,String>(())
@@ -806,7 +812,7 @@ impl TidalClient {
                 releases.push(release);
             }
         }
-        self.cache_summaries(&summaries,market).await?;
+        self.cache_summaries(&summaries,market,&[]).await?;
         let extra = if enrich_discovery {
             let (reused, _, _) = crate::actions::recommendation_refresh_plan(&self.db,market,&releases).await?;
             let ids = releases.iter().filter(|r| !reused.contains(&r.id)).map(|r|r.id.clone()).collect::<Vec<_>>();
@@ -1414,6 +1420,9 @@ mod subscriber_tests {
         assert_eq!(client.artist_name("4","GB").await.unwrap(),"Main");
         let raw = json!({"id":12,"title":"Release","artist":{"id":4,"name":"Main"},"checked_at":Utc::now().timestamp(),"allowStreaming":true,"streamReady":true});
         client.cache_summary(&raw, "GB").await.unwrap();
+        client.cache_summaries(std::slice::from_ref(&raw),"GB",&["12".into(),"13".into()]).await.unwrap();
+        assert_eq!(db.get_preference("release-live:GB:13").await.unwrap().unwrap()["available"],false,"Successful metadata batches must retain omitted release availability for other views");
+        assert!(db.get_preference("release-live:US:13").await.unwrap().is_none());
         let payload = client.albums(&["12".into()], "GB", false).await.unwrap();
         assert_eq!(payload["data"][0]["id"], "12");
         assert!(db

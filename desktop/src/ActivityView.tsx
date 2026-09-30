@@ -26,7 +26,7 @@ export function streamFor(entry: ActivityEntry): ActivityStream {
 }
 
 export function jobTitle(kind?: string): string {
-  const titles: Record<string, string> = {discography: "Refresh releases", release_artists: "Check release artists", cached_releases: "Recheck cached releases", link: "Link releases", match_artists: "Match artists", preview: "Review local tags", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Downloads", scan: "Scan library", apply: "Apply reviewed changes"};
+  const titles: Record<string, string> = {discography: "Refresh releases", release_artists: "Check release artists", cached_releases: "Recheck cached releases", check_availability: "Check release availability", link: "Link releases", match_artists: "Match artists", preview: "Review local tags", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Downloads", scan: "Scan library", apply: "Apply reviewed changes"};
   return titles[kind || ""] || kind?.replaceAll("_", " ") || "Task";
 }
 

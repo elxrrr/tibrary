@@ -1585,6 +1585,28 @@ impl TursoDb {
 
         let album_credit_cache = crate::release_artists::cached(self, market).await?;
         let album_names = crate::release_artists::album_names(self, market).await?;
+        // Availability is shared across catalogue, placement and download checks.
+        // Read it once rather than retaining a stale artist-list flag or querying
+        // the preference table separately for every release.
+        let mut availability_rows = conn.query(
+            "SELECT key,payload FROM app_preferences WHERE key LIKE ?",
+            (format!("release-live:{market}:%"),),
+        ).await.map_err(|error| error.to_string())?;
+        let mut market_availability = HashMap::new();
+        let now = chrono::Utc::now().timestamp();
+        while let Some(row) = availability_rows.next().await.map_err(|error| error.to_string())? {
+            let key: String = row.get(0).map_err(|error| error.to_string())?;
+            let payload: String = row.get(1).map_err(|error| error.to_string())?;
+            let Ok(value) = serde_json::from_str::<Value>(&payload) else { continue; };
+            if let (Some(available), Some(checked_at)) = (value["available"].as_bool(), value["checked_at"].as_i64()) {
+                // Malformed, undated or future-dated entries cannot suppress a
+                // real release. Expired checks remain evidence until rechecked.
+                if checked_at > 0 && checked_at <= now + 60 {
+                    market_availability.insert(key.rsplit(':').next().unwrap_or("").to_owned(), (available, checked_at));
+                }
+            }
+        }
+        drop(availability_rows);
         // Exploratory search caches are not subscriptions to an artist's releases.
         let linked_artists: HashSet<String> = self.get_linked_artist_ids().await?.into_iter().collect();
         // 3. Load catalogue
@@ -1609,6 +1631,7 @@ impl TursoDb {
             quality: String,
             status: String,
             available: Option<bool>,
+            availability_checked_at: i64,
             approved: bool,
             expanded_available: bool,
             children: Vec<MissingChildTrack>,
@@ -1618,6 +1641,7 @@ impl TursoDb {
 
         let mut by_id: HashMap<String, MergedRelease> = HashMap::new();
         let mut full_releases: HashMap<String, crate::tidal::TidalRelease> = HashMap::new();
+        let mut full_availability_observed = HashMap::new();
 
         while let Some(row) = cat_stmt.next().await.map_err(|e| e.to_string())? {
             let artist_id: String = row.get(0).map_err(|e|e.to_string())?;
@@ -1706,9 +1730,23 @@ impl TursoDb {
                     .to_string();
                 let rel_artist = crate::release_artists::display_name(rel,
                     album_names.get(&id).map(String::as_str), album_credit_cache.get(&id));
+                let release_checked_at = rel["availability_checked_at"].as_i64()
+                    .or_else(|| rel["checked_at"].as_i64()).unwrap_or(0);
+                let saved_availability = market_availability.get(&id)
+                    .filter(|(_, checked_at)| *checked_at >= release_checked_at);
+                let available = saved_availability.map(|(available, _)| *available)
+                    .or_else(|| rel.get("available").and_then(Value::as_bool));
+                let availability_checked_at = saved_availability
+                    .map(|(_, checked_at)| *checked_at).unwrap_or(release_checked_at);
                 if let Ok(mut parsed) = serde_json::from_value::<crate::tidal::TidalRelease>(rel.clone()) {
                     parsed.artist=rel_artist.clone();
-                    full_releases.entry(parsed.id.clone()).or_insert(parsed);
+                    parsed.available=available;
+                    let latest = full_releases.entry(parsed.id.clone()).or_insert(parsed);
+                    if available.is_some() && full_availability_observed.get(&id)
+                        .is_none_or(|previous| availability_checked_at > *previous) {
+                        latest.available=available;
+                        full_availability_observed.insert(id.clone(), availability_checked_at);
+                    }
                 }
 
                 let rel_type = rel
@@ -1723,7 +1761,6 @@ impl TursoDb {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let available = rel.get("available").and_then(|v| v.as_bool());
                 let tracks_loaded = rel
                     .get("tracks_loaded")
                     .and_then(|v| v.as_bool())
@@ -1783,15 +1820,17 @@ impl TursoDb {
                             })
                             .max_by_key(|edition| edition.positions.len())
                     });
-                let (status, approved) = if let Some((decision, app)) = queue_decisions.get(&id) {
+                let (status, approved) = if available == Some(false) {
+                    // Keep queue decisions intact, but an unavailable release
+                    // must not remain actionable merely because it was queued.
+                    ("Unavailable".to_string(), false)
+                } else if let Some((decision, app)) = queue_decisions.get(&id) {
                     let st = match decision.as_str() {
                         "ignored" => "Ignored",
                         "downloaded" => "Owned complete",
                         _ => "Queued",
                     };
                     (st.to_string(), *app)
-                } else if available == Some(false) {
-                    ("Unavailable".to_string(), false)
                 } else if rel
                     .get("upc")
                     .and_then(Value::as_str)
@@ -1925,6 +1964,9 @@ impl TursoDb {
                 if status == "Owned alternate edition" {
                     reasons.push("A complete local edition with the same album artist and release title is already indexed".into());
                 }
+                if available == Some(false) {
+                    reasons.push(format!("The latest saved availability check confirms this release cannot be streamed in {market}. Saved links and queue decisions are retained."));
+                }
 
                 let norm_title = Self::normalize_release_title(&title);
                 let group_key = rel
@@ -1951,6 +1993,7 @@ impl TursoDb {
                             quality,
                             status,
                             available,
+                            availability_checked_at,
                             approved,
                             expanded_available: tracks_loaded,
                             children,
@@ -1960,6 +2003,16 @@ impl TursoDb {
                     }
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         let existing = e.get_mut();
+                        // The same ID can occur on several artist pages. Its
+                        // most recent known availability wins independently of
+                        // coverage or recommendation ranking, in both views.
+                        if available.is_some() && (existing.available.is_none()
+                            || availability_checked_at > existing.availability_checked_at) {
+                            existing.available = available;
+                            existing.availability_checked_at = availability_checked_at;
+                            existing.status = status.clone();
+                            existing.approved = approved;
+                        }
                         if !existing.expanded_available && tracks_loaded {
                             existing.expanded_available = true;
                             existing.children = children;
@@ -1969,7 +2022,8 @@ impl TursoDb {
                         if new_q > existing_q {
                             existing.quality = quality;
                         }
-                        if Self::coverage_priority(&status)
+                        if existing.available != Some(false) && available != Some(false)
+                            && Self::coverage_priority(&status)
                             > Self::coverage_priority(&existing.status)
                         {
                             existing.status = status;
@@ -1980,6 +2034,10 @@ impl TursoDb {
                         {
                             existing.recommendation = badge;
                             existing.evidence = reasons;
+                        }
+                        existing.evidence.retain(|reason| !reason.starts_with("The latest saved availability check confirms"));
+                        if existing.available == Some(false) {
+                            existing.evidence.push(format!("The latest saved availability check confirms this release cannot be streamed in {market}. Saved links and queue decisions are retained."));
                         }
                     }
                 }
@@ -2000,7 +2058,9 @@ impl TursoDb {
                 .unwrap_or_default();
             let key = (
                 artist_key,
-                rel.group_key.clone(),
+                // Keep unavailable IDs inspectable even when a live edition
+                // with the same title replaces them in the normal list.
+                if rel.available == Some(false) { format!("unavailable:{}", rel.id) } else { rel.group_key.clone() },
                 rel.track_count,
                 rel.rel_type.clone(),
             );
@@ -2073,7 +2133,7 @@ impl TursoDb {
 
         let catalogue: Vec<_> = full_releases.values().cloned().collect();
         let superseded = crate::recommendations::subsumed_releases(&catalogue);
-        let usable: HashSet<_> = rows.iter().filter(|r| r.recommendation == "Recommended" || r.recommendation == "Potential").map(|r| r.id.clone()).collect();
+        let usable: HashSet<_> = rows.iter().filter(|r| r.available == Some(true) && (r.recommendation == "Recommended" || r.recommendation == "Potential")).map(|r| r.id.clone()).collect();
         for row in &mut rows {
             let replacement = superseded.get(&row.id).or_else(|| full_releases.get(&row.id).and_then(|r| r.replacement_id.as_ref()));
             if let Some(id) = replacement.filter(|id| usable.contains(*id)) {
@@ -2126,6 +2186,10 @@ impl TursoDb {
         drop(build_guard);
 
         // Apply filters
+        let inspecting_unavailable = status_filter == Some("Unavailable");
+        if !inspecting_unavailable {
+            rows.retain(|row| row.available != Some(false));
+        }
         if let Some(sf) = status_filter {
             if sf != "All statuses"
                 && sf != "all"
@@ -2150,12 +2214,12 @@ impl TursoDb {
             }
         }
 
-        if recommendation.is_some_and(|v| ["My album artists", "Other artist appearances", "Artist credits not checked"].contains(&v)) {
+        if !inspecting_unavailable && recommendation.is_some_and(|v| ["My album artists", "Other artist appearances", "Artist credits not checked"].contains(&v)) {
             let credits = crate::release_artists::cached(self, market).await?;
             let linked = self.get_linked_artist_ids().await?.into_iter().collect();
             rows.retain(|r| crate::release_artists::classify(credits.get(&r.id), &linked) == recommendation.unwrap());
         }
-        if let Some(rf) = recommendation.filter(|v| !["My album artists", "Other artist appearances", "Artist credits not checked"].contains(v)) {
+        if let Some(rf) = recommendation.filter(|v| !inspecting_unavailable && !["My album artists", "Other artist appearances", "Artist credits not checked"].contains(v)) {
             let rf_clean = rf.trim();
             if rf_clean != "All recommendations" && rf_clean != "all" && !rf_clean.is_empty() {
                 rows.retain(|r| {
@@ -2168,7 +2232,7 @@ impl TursoDb {
             }
         }
 
-        if let Some(tl) = timeline {
+        if let Some(tl) = timeline.filter(|_| !inspecting_unavailable) {
             if tl == "Newer than newest owned" {
                 rows.retain(|r| {
                     ["Missing release", "Owned partial", "Queued"].contains(&r.status.as_str())
@@ -4420,6 +4484,79 @@ with sqlite3.connect('{db}') as db:
         assert_eq!(paged.offset, 1);
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn missing_releases_share_market_availability_and_keep_unavailable_ids_inspectable() {
+        let temp_dir = std::env::temp_dir().join(format!("missing_availability_{}", uuid::Uuid::new_v4()));
+        let store = TursoDb::open(temp_dir.join("library.sqlite3")).await.unwrap();
+        let conn = store.connect().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let release = |id: &str, title: &str, date: &str, count: usize| json!({
+            "id":id,"artist":"Example","title":title,"date":date,"type":"ALBUM",
+            "track_count":count,"available":true,"primary_artist_verified":true,"tracks_loaded":true,
+            "tracks":(0..count).map(|index|json!({"id":format!("{id}-{index}"),"title":format!("Song {index}"),
+                "isrc":format!("GB000{index}"),"duration":180.0,"disc_number":1,"track_number":index+1})).collect::<Vec<_>>()
+        });
+        let mut newer_summary = release("22", "Recently restored", "2020-01-01", 1);
+        newer_summary["availability_checked_at"] = json!(now);
+        let mut unknown = release("24", "Unchecked release", "2020-01-01", 1);
+        unknown["available"] = Value::Null;
+        let mut known_unavailable = release("25", "Unavailable bootleg", "2020-01-01", 1);
+        known_unavailable["available"] = json!(false);
+        let mut restored_reference = release("32", "Restored across artist pages", "2020-01-01", 1);
+        restored_reference["availability_checked_at"] = json!(now);
+        let mut stale_live_reference = release("33", "Removed larger edition", "2021-01-01", 2);
+        stale_live_reference["availability_checked_at"] = json!(now-20);
+        let releases = vec![
+            release("20", "Same release", "2020-01-01", 1),
+            release("21", "Same release", "2020-01-01", 1),
+            newer_summary,
+            release("23", "Different market", "2020-01-01", 1),
+            unknown,
+            known_unavailable,
+            release("30", "Earlier single", "2020-01-01", 1),
+            release("31", "Larger release", "2021-01-01", 2),
+            restored_reference.clone(),
+            stale_live_reference.clone(),
+        ];
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Example','artist','confirmed')",()).await.unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('artist','GB',?)",(json!({"id":"artist","name":"Example","releases":releases}).to_string(),)).await.unwrap();
+        restored_reference["available"] = json!(false);
+        restored_reference["availability_checked_at"] = json!(now-20);
+        stale_live_reference["available"] = json!(false);
+        stale_live_reference["availability_checked_at"] = json!(now);
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Example alias','z-artist','confirmed')",()).await.unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('z-artist','GB',?)",(json!({"id":"z-artist","name":"Example alias","releases":[restored_reference,stale_live_reference]}).to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO queue(id,payload,approved,decision,updated) VALUES('20','{}',1,'queued','2026-01-01')",()).await.unwrap();
+        store.apply_file_update("/Music/Latest/01.flac","/Music/Latest/01.flac","/Music",
+            &json!({"albumartist":"Example","album":"Latest local album","date":"2025-01-01"}),1,1).await.unwrap();
+        for id in ["20", "31"] {
+            store.set_preference(&format!("release-live:GB:{id}"),&json!({"available":false,"checked_at":now})).await.unwrap();
+        }
+        store.set_preference("release-live:GB:22",&json!({"available":false,"checked_at":now-10})).await.unwrap();
+        store.set_preference("release-live:US:23",&json!({"available":false,"checked_at":now})).await.unwrap();
+        store.set_preference("release-live:GB:24",&json!({"available":"false","checked_at":now})).await.unwrap();
+
+        let page = store.get_missing_rows("GB",None,None,None,None,None,None,None,0,100).await.unwrap();
+        let shown: HashSet<_> = page.rows.iter().map(|row|row.id.as_str()).collect();
+        assert_eq!(shown,HashSet::from(["21","22","23","24","30","32"]));
+        assert_eq!(page.rows.iter().find(|row|row.id == "22").unwrap().available,Some(true),"An older cached failure must not override a newer verified summary");
+        assert_eq!(page.rows.iter().find(|row|row.id == "24").unwrap().available,None,"Unknown or malformed checks must not suppress releases");
+        assert_ne!(page.rows.iter().find(|row|row.id == "30").unwrap().recommendation,"Superseded","An unavailable larger edition cannot supersede a live single");
+        assert_eq!(page.rows.iter().find(|row|row.id == "32").unwrap().available,Some(true),"An older reference on another artist page must not undo a newer positive observation");
+
+        let unavailable = store.get_missing_rows("GB",Some("Newer than newest owned"),Some("Recommended"),Some("Unavailable"),None,None,None,None,0,100).await.unwrap();
+        assert_eq!(unavailable.rows.iter().map(|row|row.id.as_str()).collect::<HashSet<_>>(),HashSet::from(["20","25","31","33"]));
+        assert!(unavailable.rows.iter().all(|row|row.status == "Unavailable" && !row.approved));
+        let mut queue = conn.query("SELECT approved,decision FROM queue WHERE id='20'",()).await.unwrap();
+        let row = queue.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(),1);
+        assert_eq!(row.get::<String>(1).unwrap(),"queued","Filtering must preserve saved queue decisions");
+        drop(queue);
+        drop(conn);
+        drop(store);
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[tokio::test]

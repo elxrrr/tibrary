@@ -19,6 +19,7 @@ pub fn handles(kind: &str) -> bool {
     matches!(
         kind,
         "cached_releases"
+            | "check_availability"
             | "release_artists"
             | "preview"
             | "apply"
@@ -304,7 +305,9 @@ fn apply_release_discovery(value: &mut Value, raw: &Value, id: &str) {
     value["discovery_checked_at"] = json!(chrono::Utc::now().timestamp());
     if let Some(available) = crate::availability::available(data) {
         value["available"] = json!(available);
-        value["availability_checked_at"] = value["discovery_checked_at"].clone();
+        // Reading a cached summary today is not a new availability observation.
+        // Its original timestamp must not overwrite a later withdrawal check.
+        value["availability_checked_at"] = data["attributes"]["checked_at"].as_i64().map(|at| json!(at)).unwrap_or_else(||value["discovery_checked_at"].clone());
     }
     if let Some(artists) = data["relationships"]["artists"]["data"].as_array() {
         value["album_artist_ids"] = json!(artists.iter().filter_map(|a| a["id"].as_str()).collect::<Vec<_>>());
@@ -359,7 +362,7 @@ async fn publish_release_update(
         }
         conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("tag-review:{market}:{id}"),value.to_string())).await.map_err(|e|e.to_string())?;
         if let (Some(available), Some(checked_at)) = (value["available"].as_bool(),value["availability_checked_at"].as_i64()) {
-            conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("release-live:{market}:{id}"),json!({"available":available,"checked_at":checked_at}).to_string())).await.map_err(|e|e.to_string())?;
+            conn.execute("INSERT INTO app_preferences(key,payload) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload WHERE COALESCE(json_extract(app_preferences.payload,'$.checked_at'),0) <= json_extract(excluded.payload,'$.checked_at')", (format!("release-live:{market}:{id}"),json!({"available":available,"checked_at":checked_at}).to_string())).await.map_err(|e|e.to_string())?;
         }
         let mut rows = conn
             .query(
@@ -462,6 +465,28 @@ pub async fn execute(
     let settings = db.get_settings().await?;
     let market = settings["general"]["market"].as_str().unwrap_or("GB");
     if kind == "release_artists" { return crate::release_artists::refresh(db,state,args,cancel).await; }
+    if kind == "check_availability" {
+        let mut ids: Vec<String> = if let Some(selected) = args.get("ids") {
+            serde_json::from_value(selected.clone()).map_err(|_| "Select releases with valid online IDs")?
+        } else {
+            state.progress_for(kind, "Preparing availability check · saved missing releases · music files unchanged");
+            let mut rows = db.get_missing_rows(market, Some("All missing releases"), Some("My album artists"), None, None, None, None, None, 0, usize::MAX).await?.rows;
+            // Revisit earlier unavailable results after their shorter retry window,
+            // so a release that returns to the market can become visible again.
+            rows.extend(db.get_missing_rows(market, None, None, Some("Unavailable"), None, None, None, None, 0, usize::MAX).await?.rows);
+            rows.into_iter().map(|row| row.id).collect()
+        };
+        if ids.iter().any(|id| id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit())) { return Err("Select releases with valid online IDs".into()); }
+        ids.sort(); ids.dedup();
+        let result = crate::availability::check_with_progress(db, &ids, market, args["force"].as_bool().unwrap_or(false), cancel,
+            |message| state.progress_for(kind, message),
+            |message| state.log_with_category(message, "info", Some("online")),
+        ).await?;
+        let available = result.values().filter(|value| **value == Some(true)).count();
+        let unavailable = result.values().filter(|value| **value == Some(false)).count();
+        let unknown = result.len() - available - unavailable;
+        return Ok(json!({"message":format!("Availability checked · {}/{} releases · {available} available · {unavailable} unavailable · {unknown} not confirmed · {market}", result.len(), ids.len()),"total":ids.len(),"checked":result.len(),"available":available,"unavailable":unavailable,"unknown":unknown}));
+    }
     if kind == "cached_releases" {
         state.progress_for(kind, "Rechecking saved releases · ownership and recommendations · local cache only; music files unchanged");
         db.invalidate_missing_rows();
@@ -1613,6 +1638,32 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn availability_job_reuses_saved_checks_and_old_metadata_cannot_revive_a_withdrawn_release() {
+        let dir = std::env::temp_dir().join(format!("availability-job-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for (id, status) in [("1",json!(true)),("2",json!(false)),("3",Value::Null)] {
+            db.set_preference(&format!("release-live:GB:{id}"), &json!({"available":status,"checked_at":now})).await.unwrap();
+        }
+        let backend = Arc::new(Backend::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        backend.start_online_job(json!({"id":"availability-test","kind":"check_availability","status":"running"}),cancel.clone());
+        let result = execute(&db,&backend,"check_availability",&json!({"ids":["1","2","3","1"]}),cancel).await.unwrap();
+        assert_eq!((result["checked"].as_u64(),result["available"].as_u64(),result["unavailable"].as_u64(),result["unknown"].as_u64()), (Some(3),Some(1),Some(1),Some(1)));
+        assert_eq!(backend.online_job.lock().unwrap().as_ref().unwrap()["completed"],3);
+        let mut old = json!({"id":"2","title":"Release","tracks":[]});
+        apply_release_discovery(&mut old,&json!({"data":[{"id":"2","attributes":{"availability":["STREAM"],"checked_at":now-14*86400}}]}),"2");
+        assert_eq!(old["availability_checked_at"],now-14*86400);
+        publish_release(&db,"2","GB",old).await.unwrap();
+        assert_eq!(db.get_preference("release-live:GB:2").await.unwrap().unwrap()["available"],false);
+        let cancelled = crate::availability::check_with_progress(&db,&["2".into(),"4".into()],"GB",false,Arc::new(AtomicBool::new(true)),|_|{},|_|{}).await;
+        assert!(cancelled.is_err());
+        assert!(db.get_preference("release-live:GB:4").await.unwrap().is_none());
+        assert_eq!(db.get_preference("release-live:GB:2").await.unwrap().unwrap()["available"],false);
+        drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn track_enrichment_publishes_parallel_updates_without_replacing_sibling_metadata_or_queue_selection() {

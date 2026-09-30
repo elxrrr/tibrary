@@ -50,6 +50,7 @@ fn is_online_job(kind: &str) -> bool {
     matches!(
         kind,
         "link"
+            | "check_availability"
             | "cached_releases"
             | "release_artists"
             | "discography"
