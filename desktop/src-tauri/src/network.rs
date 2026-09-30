@@ -267,7 +267,7 @@ mod tests {
 
 #[cfg(test)]
 #[tokio::test]
-#[ignore = "Explicit bounded live concurrency benchmark, 36 album GETs plus warmup"]
+#[ignore = "Explicit bounded live concurrency benchmark, six album GETs plus warmup"]
 async fn live_metadata_concurrency() {
     let dir = std::env::temp_dir().join(format!("tibrary-concurrency-{}", uuid::Uuid::new_v4()));
     let db = crate::db::TursoDb::open(dir.join("db")).await.unwrap();
@@ -281,10 +281,7 @@ async fn live_metadata_concurrency() {
     let ids = [
         "234657671",
         "140303440",
-        "470388645",
-        "285803",
         "447957706",
-        "366071478",
     ];
     async fn fetch(
         http: reqwest::Client,
@@ -307,7 +304,7 @@ async fn live_metadata_concurrency() {
         Ok(value["items"].as_array().ok_or("Missing tracks")?.len())
     }
     fetch(http.clone(), token.clone(), ids[0]).await.unwrap();
-    for (interval_ms,concurrency) in [(350,1),(350,2),(350,3),(100,1),(100,2),(100,3)] {
+    for (interval_ms,concurrency) in [(350,1),(350,3)] {
         let scheduler = lane("api.tidal.com:443".into(), Duration::from_millis(350), true);
         // Equal starting pace for each trial; never bypass a service cooldown.
         {
@@ -332,7 +329,7 @@ async fn live_metadata_concurrency() {
             }
         }
         println!(
-            "spacing_ms={interval_ms} concurrency={concurrency} releases=6 tracks={tracks} elapsed_ms={} http_429={}",
+            "spacing_ms={interval_ms} concurrency={concurrency} releases=3 tracks={tracks} elapsed_ms={} http_429={}",
             start.elapsed().as_millis(),
             THROTTLES.load(Ordering::Relaxed) - before
         );

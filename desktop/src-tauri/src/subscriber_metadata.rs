@@ -335,7 +335,7 @@ pub(crate) async fn load_with_cache_status(
     // A download and a metadata job can ask for the same release simultaneously.
     let gate =
         crate::actions::release_gate(format!("subscriber:{}:{market}:{album}", db.path.display()));
-    let _guard = gate.lock().await;
+    let _guard = crate::actions::release_guard(gate,cancel.as_ref()).await?;
     if !force {
         if let Some(value) = cached(db, album, market).await? {
             return Ok((value,true));

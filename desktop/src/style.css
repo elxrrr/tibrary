@@ -1439,4 +1439,14 @@ thead, thead tr, thead th { background: var(--table-header); opacity: 1; }
 .batch-toggle { min-height: 64px; }
 .batch-toggle > span:not(.status-badge) { line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .activity-panel .activity-log { scrollbar-gutter: stable; mask-image: none; }
+.activity-panel .job-toggle { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 4px 8px; min-height: 70px; }
+.activity-panel .job-toggle > svg { grid-column: 1; grid-row: 1; }
+.activity-panel .job-toggle > strong { grid-column: 2; grid-row: 1; }
+.activity-panel .job-toggle > .status-badge { grid-column: 3; grid-row: 1; }
+.activity-panel .job-toggle > span:not(.status-badge) { grid-column: 2 / 4; grid-row: 2; min-height: 2.8em; margin-left: 0; }
+.download-job-details { margin-left: 12px; border-left: 1px solid var(--line); }
+.download-job-details .release-toggle { min-height: 48px; padding-left: 10px; background: color-mix(in srgb, var(--card) 85%, var(--hover)); }
+.download-job-details .download-row { font-size: 12px; }
+.history-feedback { color: var(--muted); padding: 8px 12px; margin: 0; font-size: 12px; }
+.log-error .log-message { color: #ef7474; }
 .history-sentinel { height: 1px; }

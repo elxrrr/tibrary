@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const AUDIO_EXTS: &[&str] = &[
+pub(crate) const AUDIO_EXTS: &[&str] = &[
     "flac", "m4a", "mp4", "alac", "mp3", "aif", "aiff", "aifc", "wav", "wave",
 ];
 
@@ -265,8 +265,11 @@ pub async fn scan_library_with_options(
             let entry=entry.map_err(|e|format!("Folder enumeration failed: {e}"))?;
             let kind=entry.file_type().map_err(|e|e.to_string())?;
             if kind.is_symlink() {continue;}
+            // Tag updates also stage individual files beside the destination.
+            // They are never library tracks, even when a scan overlaps an edit.
+            if entry.file_name().to_string_lossy().starts_with(".tibrary-") {continue;}
             if kind.is_dir() {
-                if !entry.file_name().to_string_lossy().starts_with(".tibrary-") {pending_dirs.push(entry.path());}
+                pending_dirs.push(entry.path());
             } else if kind.is_file() && allowed_exts.contains(entry.path().extension().and_then(|s|s.to_str()).unwrap_or("").to_ascii_lowercase().as_str()) {paths.push(entry.path());}
         }
         if last_report.elapsed() >= Duration::from_millis(250) {

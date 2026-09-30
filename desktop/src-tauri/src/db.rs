@@ -277,14 +277,25 @@ impl TursoDb {
     }
 
     pub async fn log_activity_entry(&self, entry: &Value) -> Result<(), String> {
+        self.log_activity_entries(std::slice::from_ref(entry)).await
+    }
+
+    pub async fn log_activity_entries(&self, entries: &[Value]) -> Result<(), String> {
+        if entries.is_empty() { return Ok(()); }
         let conn = self.connect()?;
-        conn.execute(
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e| e.to_string())?;
+        let result = async {
+            for entry in entries { conn.execute(
             "INSERT INTO activity_logs (at, message, level, category, job_context) VALUES (?, ?, ?, ?, ?)",
             (entry["at"].as_str().unwrap_or(""), entry["message"].as_str().unwrap_or(""), entry["level"].as_str().unwrap_or("info"), entry["category"].as_str().unwrap_or("general"), json!({"job_id":entry["job_id"],"job_kind":entry["job_kind"],"job_status":entry["job_status"]}).to_string()),
         )
         .await
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        .map_err(|e| e.to_string())?; }
+            conn.execute("COMMIT", ()).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        result
     }
 
     pub async fn load_recent_logs(&self, limit: usize) -> Result<Vec<Value>, String> {
@@ -373,7 +384,11 @@ impl TursoDb {
             "local" => format!("NOT {download} AND NOT {online}"),
             _ => return Err("Unknown activity stream".into()),
         };
-        conn.execute(&format!("DELETE FROM activity_logs WHERE {condition}"), ())
+        // Keep saved-history clearing aligned with runtime channel ownership.
+        // Only old entries without job context need wording-based fallbacks.
+        let kinds = serde_json::to_string(crate::ONLINE_JOB_KINDS).map_err(|error| error.to_string())?;
+        let channel = format!("CASE WHEN json_extract(job_context,'$.job_kind')='download' THEN 'downloads' WHEN json_extract(job_context,'$.job_kind') IN (SELECT value FROM json_each(?)) THEN 'online' WHEN COALESCE(json_extract(job_context,'$.job_kind'),'') != '' THEN 'local' ELSE CASE WHEN {condition} THEN ? ELSE '' END END");
+        conn.execute(&format!("DELETE FROM activity_logs WHERE {channel}=?"), (kinds.as_str(), stream, stream))
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -513,6 +528,8 @@ impl TursoDb {
     ) -> Result<(), String> {
         let conn = self.connect()?;
         let meta_json = serde_json::to_string(meta).map_err(|e| e.to_string())?;
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e| e.to_string())?;
+        let result = async {
         let mut previous = conn
             .query("SELECT metadata FROM local_files WHERE path=?", (source,))
             .await
@@ -558,6 +575,11 @@ impl TursoDb {
             .await
             .map_err(|e| e.to_string())?;
 
+            // A previously absent target may retain obsolete choices. The source
+            // identity and explicit ignore choice move together.
+            conn.execute("DELETE FROM track_links WHERE path = ?", (target,)).await.map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM ignored_local_files WHERE path = ?", (target,)).await.map_err(|e| e.to_string())?;
+            conn.execute("UPDATE ignored_local_files SET path = ? WHERE path = ?", (target, source)).await.map_err(|e| e.to_string())?;
             conn.execute(
                 "UPDATE track_links SET path = ? WHERE path = ?",
                 (target, source),
@@ -581,6 +603,11 @@ impl TursoDb {
             .await
             .map_err(|e| e.to_string())?;
         }
+        conn.execute("COMMIT", ()).await.map_err(|e| e.to_string())?;
+        Ok::<_, String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        result?;
         self.note_local_change();
         Ok(())
     }
@@ -3018,49 +3045,23 @@ impl TursoDb {
         &self,
         selection: &HashMap<String, Option<Vec<String>>>,
     ) -> Result<(), String> {
+        self.queue_add_with_replacements(selection, &HashMap::new()).await
+    }
+
+    pub(crate) async fn queue_add_with_replacements(
+        &self,
+        selection: &HashMap<String, Option<Vec<String>>>,
+        replacements: &HashMap<String, Value>,
+    ) -> Result<(), String> {
         let conn = self.connect()?;
         let now_iso = chrono::Utc::now().to_rfc3339();
 
+        let settings = self.get_preference("desktop").await?
+            .or(self.get_preference("ui").await?).unwrap_or(Value::Null);
+        let market = settings["market"].as_str().unwrap_or("GB");
+        let mut prepared = Vec::with_capacity(selection.len());
         for (ident, sel_tracks) in selection {
-            let settings = self
-                .get_preference("desktop")
-                .await?
-                .or(self.get_preference("ui").await?)
-                .unwrap_or(Value::Null);
-            let market = settings["market"].as_str().unwrap_or("GB");
-            let mut cat_stmt = conn
-                .query("SELECT payload FROM catalogue WHERE market = ?", (market,))
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut found_release: Option<Value> = None;
-            while let Some(row) = cat_stmt.next().await.map_err(|e| e.to_string())? {
-                if let Ok(Some(cat_str)) = row.get::<Option<String>>(0) {
-                    if let Ok(cat_val) = serde_json::from_str::<Value>(&cat_str) {
-                        if let Some(releases) = cat_val.get("releases").and_then(|v| v.as_array()) {
-                            for r in releases {
-                                if r.get("id")
-                                    .map(|i| i.to_string().trim_matches('"').to_string())
-                                    .as_deref()
-                                    == Some(ident.as_str())
-                                {
-                                    found_release = Some(r.clone());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if found_release.is_some() {
-                    break;
-                }
-            }
-
-            if found_release.is_none() {
-                found_release = self
-                    .get_preference(&format!("tag-review:{market}:{ident}"))
-                    .await?;
-            }
-            let mut release = found_release.ok_or_else(|| {
+            let mut release = self.cached_release(ident, market).await?.ok_or_else(|| {
                 format!("Release {ident} has no cached metadata; refresh it before queueing")
             })?;
 
@@ -3090,15 +3091,28 @@ impl TursoDb {
                 release["selected_tracks"] = Value::Null;
             }
             release["url"] = json!(format!("https://tidal.com/album/{}", ident));
+            if let Some(audit) = replacements.get(ident) {
+                release["redownload"] = json!(true);
+                release["replacement_audit"] = audit.clone();
+            }
 
             let payload_str = serde_json::to_string(&release).map_err(|e| e.to_string())?;
-            conn.execute(
-                "INSERT INTO queue (id, payload, approved, decision, updated) VALUES (?, ?, 1, 'queued', ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, approved = 1, decision = 'queued', updated = excluded.updated",
-                (ident.as_str(), payload_str.as_str(), now_iso.as_str()),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            prepared.push((ident.as_str(), payload_str));
         }
+        // Validate the entire selection before committing any queue entries.
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|error| error.to_string())?;
+        let result = async {
+            for (ident, payload) in prepared {
+                conn.execute(
+                    "INSERT INTO queue (id, payload, approved, decision, updated) VALUES (?, ?, 1, 'queued', ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, approved = 1, decision = 'queued', updated = excluded.updated",
+                    (ident, payload.as_str(), now_iso.as_str()),
+                ).await.map_err(|error| error.to_string())?;
+            }
+            conn.execute("COMMIT", ()).await.map_err(|error| error.to_string())?;
+            Ok::<_,String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        result?;
         self.bump_revision();
         Ok(())
     }
@@ -3658,6 +3672,25 @@ impl TursoDb {
         })
     }
 
+    async fn cached_release(&self, release_id: &str, market: &str) -> Result<Option<Value>, String> {
+        if let Some(cached) = self.get_preference(&format!("tag-review:{market}:{release_id}")).await? {
+            return Ok(Some(cached));
+        }
+        self.ensure_catalogue_release_index().await?;
+        let conn = self.connect()?;
+        let mut rows = conn.query(
+            "SELECT r.value FROM catalogue_release_index i JOIN catalogue c ON c.artist_id=i.artist_id AND c.market=i.market JOIN json_each(c.payload,'$.releases') r WHERE i.release_id=? AND i.market=? AND CAST(json_extract(r.value,'$.id') AS TEXT)=? LIMIT 1",
+            (release_id, market, release_id),
+        ).await.map_err(|error| error.to_string())?;
+        match rows.next().await.map_err(|error| error.to_string())? {
+            Some(row) => {
+                let raw: String = row.get(0).map_err(|error| error.to_string())?;
+                serde_json::from_str(&raw).map(Some).map_err(|error| error.to_string())
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn get_detail(&self, args: &Value) -> Result<Value, String> {
         let conn = self.connect()?;
         if let Some(release_id) = args.get("release_id").and_then(|v| v.as_str()) {
@@ -3670,33 +3703,7 @@ impl TursoDb {
                 .as_str()
                 .or(settings["market"].as_str())
                 .unwrap_or("GB");
-            if let Some(cached) = self
-                .get_preference(&format!("tag-review:{market}:{release_id}"))
-                .await?
-            {
-                return Ok(cached);
-            }
-            let mut cat_stmt = conn
-                .query("SELECT payload FROM catalogue WHERE market = ?", (market,))
-                .await
-                .map_err(|e| e.to_string())?;
-            while let Some(row) = cat_stmt.next().await.map_err(|e| e.to_string())? {
-                if let Ok(Some(cat_str)) = row.get::<Option<String>>(0) {
-                    if let Ok(cat_val) = serde_json::from_str::<Value>(&cat_str) {
-                        if let Some(releases) = cat_val.get("releases").and_then(|v| v.as_array()) {
-                            for r in releases {
-                                if r.get("id")
-                                    .map(|i| i.to_string().trim_matches('"').to_string())
-                                    .as_deref()
-                                    == Some(release_id)
-                                {
-                                    return Ok(r.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            if let Some(cached) = self.cached_release(release_id, market).await? { return Ok(cached); }
             return Ok(json!({ "id": release_id, "title": "Release not found" }));
         }
 
@@ -4067,11 +4074,20 @@ mod tests {
         )
         .await
         .unwrap();
+        db.log_activity_entries(&[
+            json!({"at":"2026-09-26T12:00:03Z","message":"Could not download artwork","category":"error","level":"error","job_id":"metadata","job_kind":"metadata"}),
+            json!({"at":"2026-09-26T12:00:04Z","message":"API-like tag removed locally","category":"general","level":"info","job_id":"correct","job_kind":"correct"}),
+        ]).await.unwrap();
         db.clear_log_stream("local").await.unwrap();
         let remaining = db.load_recent_logs(10).await.unwrap();
-        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining.len(), 3);
         assert_eq!(remaining[0]["category"], "online");
         assert_eq!(remaining[1]["category"], "download");
+        assert_eq!(remaining[2]["job_id"], "metadata");
+        db.clear_log_stream("online").await.unwrap();
+        let remaining = db.load_recent_logs(10).await.unwrap();
+        assert_eq!(remaining.len(),1);
+        assert_eq!(remaining[0]["category"], "download");
         drop(db);
         let _ = std::fs::remove_file(path);
     }
@@ -4911,6 +4927,27 @@ with sqlite3.connect('{db}') as db:
         assert_eq!(store.queue_export("text", None).await.unwrap(),
             "https://tidal.com/track/2002\nhttps://tidal.com/track/2001\nhttps://tidal.com/track/5001\n");
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn indexed_release_lookup_and_batch_queue_keep_enriched_market_data() {
+        let dir = std::env::temp_dir().join(format!("indexed-queue-{}", uuid::Uuid::new_v4()));
+        let store = TursoDb::open(dir.join("db")).await.unwrap();
+        let conn = store.connect().unwrap();
+        let payload = json!({"releases":[{"id":"1","title":"Thin summary","tracks":[]}]});
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('artist','GB',?)", (payload.to_string().as_str(),)).await.unwrap();
+        let detail = store.get_detail(&json!({"release_id":"1","market":"GB"})).await.unwrap();
+        assert_eq!(detail["title"], "Thin summary"); // Legacy cache is indexed without losing it.
+        assert_eq!(store.get_detail(&json!({"release_id":"1","market":"US"})).await.unwrap()["title"], "Release not found");
+        store.set_preference("tag-review:GB:1", &json!({"id":"1","title":"Full details","tracks":[{"id":"10","bpm":120,"key":"8A"}]})).await.unwrap();
+        store.queue_add(&HashMap::from([("1".into(), Some(vec!["10".into()]))])).await.unwrap();
+        let queued = store.get_queue_rows("queue",None,None,None,None,0,10).await.unwrap();
+        assert_eq!(queued.rows[0].release, "Full details");
+        conn.execute("DELETE FROM queue", ()).await.unwrap();
+        store.set_preference("tag-review:GB:2", &json!({"id":"2","tracks":[{"id":"20"}]})).await.unwrap();
+        assert!(store.queue_add(&HashMap::from([("1".into(),None),("2".into(),Some(vec!["unknown".into()]))])).await.is_err());
+        assert_eq!(store.get_queue_rows("queue",None,None,None,None,0,10).await.unwrap().total,0);
+        drop(conn); drop(store); std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

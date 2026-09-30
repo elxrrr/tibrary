@@ -103,6 +103,50 @@ pub(crate) fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
     gate
 }
 
+/// Waiting for another job's cache fill must not make cancellation wait for
+/// that job's network timeout. Only the caller is cancelled; the owner keeps
+/// filling the shared cache for any other interested workflows.
+pub(crate) async fn release_guard(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    cancel: &AtomicBool,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let waiting = gate.lock_owned();
+    tokio::pin!(waiting);
+    loop {
+        if cancel.load(Ordering::Relaxed) { return Err("Cancelled".into()); }
+        tokio::select! {
+            guard = &mut waiting => return Ok(guard),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+/// Metadata preparation only needs the chosen recording/release IDs. Loading
+/// the full match dialog for every file also reads all alternative editions,
+/// credits and DJ checks, doing the same expensive work thousands of times.
+async fn metadata_link_ids(
+    db: &TursoDb,
+    paths: &[&str],
+    market: &str,
+    cancel: &AtomicBool,
+) -> Result<std::collections::HashMap<String, Value>, String> {
+    if paths.is_empty() || cancel.load(Ordering::Relaxed) { return Ok(Default::default()); }
+    let conn = db.connect()?;
+    let mut rows = conn.query(
+        "SELECT path, CASE WHEN json_valid(payload) THEN json_extract(payload,'$.ids') END FROM track_links WHERE market=? AND path IN (SELECT value FROM json_each(?))",
+        (market,json!(paths).to_string()),
+    ).await.map_err(|error|error.to_string())?;
+    let mut ids = std::collections::HashMap::new();
+    while let Some(row) = rows.next().await.map_err(|error|error.to_string())? {
+        if cancel.load(Ordering::Relaxed) { break; }
+        let path: String = row.get(0).map_err(|error|error.to_string())?;
+        if let Some(value) = row.get::<Option<String>>(1).ok().flatten().and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).filter(Value::is_object) {
+            ids.insert(path,value);
+        }
+    }
+    Ok(ids)
+}
+
 /// A normal catalogue refresh checks live release lists, then enriches only the
 /// new, changed or incomplete releases. Explicit release refreshes still force
 /// an API read when a user wants to recheck tags on an unchanged recording.
@@ -186,7 +230,7 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
         return Err("Select a release with a valid online ID".into());
     }
     let gate = release_gate(format!("{}:{market}:{id}", db.path.display()));
-    let _guard = gate.lock().await;
+    let _guard = release_guard(gate,cancel.as_ref()).await?;
     let key = format!("tag-review:{market}:{id}");
     let cached = db.get_preference(&key).await?;
     let mut value = match cached {
@@ -434,7 +478,7 @@ fn dj_check_reusable(value: &Value, now: i64) -> bool {
 async fn check_dj_metadata(db: &TursoDb, http: &reqwest::Client, track: &str, market: &str, cancel: Arc<AtomicBool>) -> Result<Value,String> {
     let key = format!("dj-check:{market}:{track}");
     let gate = release_gate(format!("dj:{}:{market}:{track}",db.path.display()));
-    let _guard = gate.lock().await;
+    let _guard = release_guard(gate,cancel.as_ref()).await?;
     if let Some(saved) = db.get_preference(&key).await?.filter(|saved|crate::tidal::resource_id(&saved["id"]) == track && dj_check_reusable(saved,chrono::Utc::now().timestamp())) { return Ok(saved); }
     let fetched = async {
         let token = crate::stream_download::get_valid_token(db,http).await?;
@@ -967,7 +1011,11 @@ pub async fn execute(
             return Err("Select audited tracks to queue".into());
         }
         let mut selection = std::collections::HashMap::<String, Option<Vec<String>>>::new();
+        let mut replacements = std::collections::HashMap::<String, Value>::new();
+        let selected_paths: Vec<_> = indexed.iter().filter(|file|ids.contains(&file.path)).map(|file|file.path.as_str()).collect();
+        let links = metadata_link_ids(db,&selected_paths,market,cancel.as_ref()).await?;
         for file in indexed.iter().filter(|f| ids.contains(&f.path)) {
+            if cancel.load(Ordering::Relaxed) { return Err("Cancelled; replacements were not queued".into()); }
             let audit = db
                 .get_preference(&format!("mqa-audit:{}", file.path))
                 .await?
@@ -978,20 +1026,21 @@ pub async fn execute(
             {
                 continue;
             }
-            let detail = db
-                .get_detail(&json!({"path":file.path,"market":market}))
-                .await?;
+            let linked = links.get(&file.path).cloned().unwrap_or(Value::Null);
             if let (Some(album), Some(track)) = (
-                detail["linked_ids"]["album_id"].as_str(),
-                detail["linked_ids"]["track_id"].as_str(),
+                linked["album_id"].as_str(),
+                linked["track_id"].as_str(),
             ) {
-                release(db, album, market, false).await?;
-                selection
+                let tracks=selection
                     .entry(album.into())
                     .or_insert_with(|| Some(vec![]))
                     .as_mut()
-                    .unwrap()
-                    .push(track.into());
+                    .unwrap();
+                if !tracks.iter().any(|id|id==track) { tracks.push(track.into()); }
+                let audit=replacements.entry(album.into()).or_insert_with(||json!({"root":root,"quality":"LOSSLESS","source_paths":{}}));
+                let sources=audit["source_paths"].as_object_mut().unwrap()
+                    .entry(track.to_owned()).or_insert_with(||json!([])).as_array_mut().unwrap();
+                if !sources.iter().any(|path|path.as_str()==Some(&file.path)) { sources.push(json!(file.path)); }
             }
         }
         if selection.is_empty() {
@@ -999,7 +1048,11 @@ pub async fn execute(
                 "No selected MQA tracks have verified recording links. Link them first.".into(),
             );
         }
-        db.queue_add(&selection).await?;
+        for album in selection.keys() {
+            release_with_cancel(db,album,market,false,cancel.clone()).await?;
+        }
+        if cancel.load(Ordering::Relaxed) { return Err("Cancelled; replacements were not queued".into()); }
+        db.queue_add_with_replacements(&selection,&replacements).await?;
         return Ok(json!({"releases":selection.len()}));
     }
     if kind == "queue_replacements" {
@@ -1162,7 +1215,6 @@ pub async fn execute(
     }
     if kind == "artwork" {
         let http = crate::network::client(25)?;
-        let mut token = None;
         let mut output = vec![];
         let cache = db
             .path
@@ -1176,24 +1228,24 @@ pub async fn execute(
         let mut checked = 0;
         let artwork_files:Vec<_>=indexed.iter().filter(|f|ids.is_empty() || ids.contains(&f.path)).collect();
         let total_artwork=artwork_files.len();
+        let selected_paths: Vec<_> = artwork_files.iter().map(|file|file.path.as_str()).collect();
+        let links = metadata_link_ids(db,&selected_paths,market,cancel.as_ref()).await?;
         for (position,file) in artwork_files.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {break;}
             checked += 1;
-            state.progress_for(kind,&format!("Checking artwork · {position}/{total_artwork} files · {}",file.path));
+            state.progress_for(kind,&format!("Checking artwork · {}/{total_artwork} files · {}",position+1,file.path));
             let (inspection, cached) = match maintenance::inspect_artwork(db, file, saved_inspections.get(&file.path), args["force"] == true).await {
                 Ok(result) => result,
                 Err(error) => {
-                    state.log(&format!("Artwork inspection failed · {} · {error}; file unchanged", file.path));
+                    state.log_for(kind,&format!("Artwork inspection failed · {} · {error}; file unchanged", file.path),"error");
                     continue;
                 }
             };
             if cached { reused += 1; } else { inspected += 1; }
             if inspection.has_standard_cover() { continue; }
             let tags = workflows::extract_tags_map(&file.metadata);
-            let detail = db
-                .get_detail(&json!({"path":file.path,"market":market}))
-                .await?;
-            let Some(album) = detail["linked_ids"]["album_id"]
+            let linked = links.get(&file.path).cloned().unwrap_or(Value::Null);
+            let Some(album) = linked["album_id"]
                 .as_str()
                 .or_else(|| tags.get("tidal_album_id").map(String::as_str))
             else {
@@ -1204,10 +1256,9 @@ pub async fn execute(
             }
             let target = cache.join(format!("{album}-1280.jpg"));
             if !target.exists() {
-                if token.is_none() {
-                    token = Some(crate::stream_download::get_valid_token(db, &http).await?);
-                }
-                let info=crate::subscriber_metadata::album_info(db,&http,album,token.as_ref().unwrap(),market).await?;
+                // A saved cover URL is usable without reauthenticating. A
+                // missing summary obtains its own valid session when needed.
+                let info=crate::subscriber_metadata::album_info(db,&http,album,"",market).await?;
                 let Some(cover) = info.cover else { continue };
                 let Some(bytes) =
                     crate::stream_download::fetch_cover_art(&http, &cover, 1280).await
@@ -1383,21 +1434,24 @@ pub async fn execute(
         let mut prepared = Vec::new();
         let mut albums = Vec::new();
         let mut seen_albums = HashSet::new();
+        let selected_paths: Vec<_> = indexed.iter().filter(|file| ids.is_empty() || ids.contains(&file.path)).map(|file|file.path.as_str()).collect();
+        let link_ids = metadata_link_ids(db,&selected_paths,market,cancel.as_ref()).await?;
         for file in indexed.iter().filter(|f| ids.is_empty() || ids.contains(&f.path)) {
             if cancel.load(Ordering::Relaxed) { break; }
-            let detail = db.get_detail(&json!({"path":file.path,"market":market})).await?;
+            let linked = link_ids.get(&file.path).cloned().unwrap_or(Value::Null);
             let tags = workflows::extract_tags_map(&file.metadata);
-            if let Some(album) = args["album_id"].as_str().or(detail["linked_ids"]["album_id"].as_str()).or_else(||tags.get("tidal_album_id").map(String::as_str)) {
+            if let Some(album) = args["album_id"].as_str().or(linked["album_id"].as_str()).or_else(||tags.get("tidal_album_id").map(String::as_str)) {
                 if seen_albums.insert(album.to_owned()) { albums.push(album.to_owned()); }
             }
             // Retain only IDs, not the full candidate/metadata payload for every file.
-            prepared.push((file,json!({"linked_ids":detail["linked_ids"]})));
+            prepared.push((file,json!({"linked_ids":linked})));
             if prepared.len() % 100 == 0 { state.progress_for(kind,&format!("Preparing metadata · {} files checked for cached DJ data",prepared.len())); }
         }
         let album_metadata = if kind == "metadata" {
             crate::subscriber_metadata::prefetch(db, &http, albums, market, cancel.clone(), |message| state.progress_for(kind,message)).await?
         } else { std::collections::HashMap::new() };
         let total_files=prepared.len();
+        let mut release_cache: std::collections::HashMap<String, crate::tidal::TidalRelease> = Default::default();
         for (position, (file, detail)) in prepared.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) { break; }
             let tags = workflows::extract_tags_map(&file.metadata);
@@ -1406,10 +1460,13 @@ pub async fn execute(
                 .or(detail["linked_ids"]["album_id"].as_str())
                 .or_else(|| tags.get("tidal_album_id").map(String::as_str));
             let Some(album) = album else { continue };
-            state.progress_for(kind, &format!("Checking missing metadata · {position}/{total_files} files · {} — {} · {} · release ID {album}", tags.get("albumartist").or(tags.get("artist")).map(String::as_str).unwrap_or("Unknown artist"), tags.get("title").map(String::as_str).unwrap_or("Untitled track"), tags.get("album").map(String::as_str).unwrap_or("Unknown release")));
-            let value = release(db, album, market, false).await?;
-            let mut rel: crate::tidal::TidalRelease =
-                serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+            state.progress_for(kind, &format!("Checking missing metadata · {}/{total_files} files · {} — {} · {} · release ID {album}",position+1, tags.get("albumartist").or(tags.get("artist")).map(String::as_str).unwrap_or("Unknown artist"), tags.get("title").map(String::as_str).unwrap_or("Untitled track"), tags.get("album").map(String::as_str).unwrap_or("Unknown release")));
+            let mut rel = if let Some(saved) = release_cache.get(album) { saved.clone() } else {
+                let value = release_with_cancel(db,album,market,false,cancel.clone()).await?;
+                let saved: crate::tidal::TidalRelease = serde_json::from_value(value).map_err(|e|e.to_string())?;
+                release_cache.insert(album.to_owned(),saved.clone());
+                saved
+            };
             let track_id = detail["linked_ids"]["track_id"]
                 .as_str()
                 .or_else(|| tags.get("tidal_track_id").map(String::as_str));
@@ -1469,6 +1526,7 @@ pub async fn execute(
                 let stored = publish_track_enrichment(db,&rel.id,market,&track).await?;
                 rel = serde_json::from_value(stored).map_err(|e|e.to_string())?;
                 track = rel.tracks.iter().find(|current|current.id == track.id).cloned().ok_or("Recording no longer in saved release")?;
+                release_cache.insert(album.to_owned(),rel.clone());
             }
             let mut changes = crate::enrichment::compute_missing_tags(&tags, &rel, &track);
             // Page ownership is not a reliable performer or album-artist credit.
@@ -1639,6 +1697,112 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_preparation_reads_only_chosen_ids_in_the_requested_market() {
+        let dir=std::env::temp_dir().join(format!("metadata-links-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let conn=db.connect().unwrap();
+        let selected=json!({"album_id":"12","track_id":"121"});
+        let payload=json!({"ids":selected,"placements":[{"album_id":"13","track_id":"131"}],"catalogue_options":[{"id":"99","track_id":"991"}]});
+        for (path,market,raw) in [("/chosen.flac","GB",payload.to_string()),("/chosen.flac","US",json!({"ids":{"album_id":"14","track_id":"141"}}).to_string()),("/other.flac","GB",payload.to_string()),("/bad.flac","GB","broken legacy payload".into())] {
+            conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES(?,?,'',?)",(path,market,raw)).await.unwrap();
+        }
+        let cancel=AtomicBool::new(false);
+        let result=metadata_link_ids(&db,&["/chosen.flac","/bad.flac","/missing.flac"],"GB",&cancel).await.unwrap();
+        assert_eq!(result.len(),1);
+        assert_eq!(result["/chosen.flac"],selected,"Alternative editions must not silently replace the selected recording");
+        cancel.store(true,Ordering::Relaxed);
+        assert!(metadata_link_ids(&db,&["/chosen.flac"],"GB",&cancel).await.unwrap().is_empty());
+        drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Explicit local cache benchmark; synthetic records only, no audio or API access"]
+    async fn metadata_preparation_benchmark() {
+        let dir=std::env::temp_dir().join(format!("metadata-speed-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let conn=db.connect().unwrap();
+        let paths: Vec<_>=(0..200).map(|i|format!("/synthetic/Release/{i:02} - Track.flac")).collect();
+        let ids=json!({"album_id":"10","track_id":"101"});
+        let alternatives: Vec<_>=(10..18).map(|i|json!({"album_id":i.to_string(),"track_id":format!("{i}1")})).collect();
+        let link=json!({"ids":ids,"placements":alternatives,"catalogue_options":alternatives});
+        conn.execute("BEGIN IMMEDIATE",()).await.unwrap();
+        for path in &paths {
+            conn.execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES(?,'/synthetic',1,1,'{}',1)",(path.as_str(),)).await.unwrap();
+            conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES(?,'GB','',?)",(path.as_str(),link.to_string())).await.unwrap();
+        }
+        conn.execute("COMMIT",()).await.unwrap();
+        let start=std::time::Instant::now();
+        for path in &paths {
+            assert_eq!(db.get_detail(&json!({"path":path,"market":"GB"})).await.unwrap()["linked_ids"],ids);
+        }
+        let before=start.elapsed();
+        let start=std::time::Instant::now();
+        let selected: Vec<_>=paths.iter().map(String::as_str).collect();
+        let after=metadata_link_ids(&db,&selected,"GB",&AtomicBool::new(false)).await.unwrap();
+        let elapsed=start.elapsed();
+        assert_eq!(after.len(),paths.len());
+        assert!(after.values().all(|value|value==&ids));
+        println!("files={} full_match_view_ms={} chosen_ids_batch_ms={} improvement={:.1}x",paths.len(),before.as_millis(),elapsed.as_millis(),before.as_secs_f64()/elapsed.as_secs_f64());
+        drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_waiter_leaves_the_cache_owner_running() {
+        let gate=release_gate(format!("cancel-test:{}",uuid::Uuid::new_v4()));
+        let owner=gate.clone().lock_owned().await;
+        let cancel=Arc::new(AtomicBool::new(false));
+        let worker_cancel=cancel.clone();
+        let worker_gate=gate.clone();
+        let task=tokio::spawn(async move { release_guard(worker_gate,worker_cancel.as_ref()).await.map(|_|()) });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cancel.store(true,Ordering::Relaxed);
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_millis(300),task).await.unwrap().unwrap().unwrap_err(),"Cancelled");
+        assert!(gate.try_lock().is_err(),"Cancelling a waiter cannot cancel or unlock the cache owner");
+        drop(owner);
+        assert!(gate.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn mqa_replacement_queue_deduplicates_recordings_and_never_changes_local_audio() {
+        let dir=std::env::temp_dir().join(format!("mqa-queue-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_>=(0..2).map(|index|dir.join(format!("track-{index}.flac"))).collect();
+        for path in &paths { std::fs::write(path,crate::stream_download::MINIMAL_FLAC).unwrap(); }
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let cancel=Arc::new(AtomicBool::new(false));
+        crate::scanner::scan_library(&db,&dir,cancel.clone(),|_|{}).await.unwrap();
+        db.set_preference("account-disconnected",&json!(true)).await.unwrap();
+        db.set_preference("tag-review:GB:10",&json!({"id":"10","title":"Release","artist":"Main","tracks_loaded":false,"discovery_checked_at":chrono::Utc::now().timestamp()})).await.unwrap();
+        db.set_preference("subscriber-items:GB:10",&json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":101,"title":"Track","trackNumber":1,"volumeNumber":1,"credits":[]}]})).await.unwrap();
+        let root=dir.to_string_lossy();
+        let indexed=files(&db,&root).await.unwrap();
+        for file in &indexed {
+            db.choose_track_link(&json!({"path":file.path,"album_id":"10","track_id":"101","market":"GB"})).await.unwrap();
+            db.set_preference(&format!("mqa-audit:{}",file.path),&json!({"size":file.size,"mtime":file.mtime,"result":{"detected":true}})).await.unwrap();
+        }
+        let before: Vec<_>=paths.iter().map(|path|std::fs::read(path).unwrap()).collect();
+        let backend=Arc::new(Backend::new());
+        let args=json!({"root":root,"ids":paths});
+        assert_eq!(execute(&db,&backend,"queue_mqa",&args,cancel).await.unwrap()["releases"],1);
+        let conn=db.connect().unwrap();
+        let mut rows=conn.query("SELECT payload FROM queue WHERE id='10'",()).await.unwrap();
+        let queued: Value=serde_json::from_str(&rows.next().await.unwrap().unwrap().get::<String>(0).unwrap()).unwrap();
+        assert_eq!(queued["selected_tracks"].as_array().unwrap().len(),1);
+        assert_eq!(queued["selected_tracks"][0]["id"],"101");
+        assert_eq!(queued["redownload"],true,"Replacement downloads must bypass skip-existing");
+        assert_eq!(queued["replacement_audit"]["root"],json!(root));
+        assert_eq!(queued["replacement_audit"]["source_paths"]["101"].as_array().unwrap().len(),2,"Every approved duplicate copy must have a replacement destination");
+        assert!(paths.iter().all(|path|queued["replacement_audit"]["source_paths"]["101"].as_array().unwrap().contains(&json!(path))));
+        drop(rows);
+        assert_eq!(before,paths.iter().map(|path|std::fs::read(path).unwrap()).collect::<Vec<_>>());
+        conn.execute("DELETE FROM queue",()).await.unwrap();
+        assert!(execute(&db,&backend,"queue_mqa",&args,Arc::new(AtomicBool::new(true))).await.unwrap_err().contains("Cancelled"));
+        let mut rows=conn.query("SELECT COUNT(*) FROM queue",()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),0);
+        drop(rows);drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn availability_job_reuses_saved_checks_and_old_metadata_cannot_revive_a_withdrawn_release() {

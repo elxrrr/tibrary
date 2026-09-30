@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { compactProgress, workload, groupActivity } from "./ActivityView";
+import { compactProgress, workload, groupActivity, groupDownloads, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
 import { mergeJob } from "./api";
 
 it("preserves completion, cancellation and newer progress when request replies arrive late", () => {
@@ -49,4 +49,46 @@ it("keeps completed job details grouped separately from unrelated messages", () 
   expect(result.groups[0].entries).toHaveLength(3);
   expect(result.groups[0].status).toBe("complete");
   expect(result.standalone).toHaveLength(1);
+});
+
+it("routes all details and errors by the owning job rather than incidental message words", () => {
+  const at = "2026-09-30T12:00:00Z";
+  expect(streamFor({at,message:"Download track details failed",category:"error",job_kind:"discography"})).toBe("online");
+  expect(streamFor({at,message:"Online title applied",category:"online",job_kind:"apply"})).toBe("local");
+  expect(streamFor({at,message:"Catalogue request failed",category:"error",job_kind:"download"})).toBe("downloads");
+});
+
+it("keeps observed details through empty snapshots, late progress and deliberate channel clears", () => {
+  const initial = {at:"2026-09-30T12:00:00Z",message:"Started",job_id:"refresh",job_kind:"discography",job_status:"running"};
+  const progress = {...initial,at:"2026-09-30T12:00:01Z",message:"Artist 2 of 10",progress_id:"refresh"};
+  const advanced = {...progress,at:"2026-09-30T12:00:02Z",message:"Artist 3 of 10"};
+  let rows = mergeActivitySnapshot([initial,advanced],[]);
+  expect(rows).toHaveLength(2);
+  rows = mergeActivitySnapshot(rows,[progress]);
+  expect(rows.find(row=>row.progress_id)?.message).toBe(advanced.message);
+  const finished = {...initial,at:"2026-09-30T12:00:03Z",message:"Finished",job_status:"complete"};
+  rows = mergeActivitySnapshot(rows,[finished]);
+  expect(rows.every(row=>!row.progress_id)).toBe(true);
+  expect(groupActivity([...rows,progress]).groups[0].status).toBe("complete");
+  expect(mergeActivitySnapshot(rows,[],[0,0,0],[1,0,0])).toEqual([]);
+  expect(mergeActivitySnapshot([],rows,[1,0,0],[0,0,0])).toEqual([]);
+});
+
+it("retains previous job summaries when one verbose job exceeds the recent detail limit", () => {
+  const old = {at:"2026-09-30T10:00:00Z",message:"Files checked",job_id:"old",job_kind:"scan",job_status:"complete"};
+  const details = Array.from({length:1100},(_,i)=>({at:new Date(Date.parse("2026-09-30T12:00:00Z")+i*1000).toISOString(),message:`File ${i}`,job_id:"new",job_kind:"scan",job_status:"running"}));
+  const rows = mergeActivitySnapshot([old],details);
+  expect(rows).toHaveLength(1001);
+  expect(groupActivity(rows).groups.map(group=>group.id)).toEqual(["new","old"]);
+});
+
+it("nests releases under their download job and prevents late snapshots regressing transfer state", () => {
+  const job={id:"download-one",kind:"download",status:"running",message:"Downloading two releases",started:1};
+  const items=[{id:"a",kind:"batch",release_id:"r1",job_id:job.id,status:"running"},{id:"b",kind:"batch",release_id:"r2",job_id:job.id,status:"running"},{id:"c",kind:"track",release_id:"r1",job_id:job.id,status:"running"}];
+  expect(groupDownloads(groupActivity([],job).groups,items,job)).toHaveLength(1);
+  expect(groupDownloads([],items)).toHaveLength(1);
+  const current={track:{id:"a",status:"complete",bytes:1024,updated_at:3}};
+  expect(mergeDownloadMonitor(current,{track:{id:"a",status:"running",bytes:512,updated_at:2}})).toEqual(current);
+  const monitor={old:{id:"old",kind:"batch",job_id:"previous",total_tracks:20,completed_tracks:20},current:{id:"new",kind:"batch",job_id:job.id,total_tracks:4,completed_tracks:1}};
+  expect(workload(job,monitor,2000)?.percent).toBe(25);
 });

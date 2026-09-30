@@ -24,6 +24,27 @@ pub struct ApplyResult {
     pub errors: Vec<String>,
 }
 
+// Keep the original until its new path and tags have been saved in the index.
+// Any filesystem, metadata or database error restores the original immediately.
+struct FilePublication {
+    source: PathBuf,
+    target: PathBuf,
+    backup: PathBuf,
+    published: bool,
+    committed: bool,
+}
+impl Drop for FilePublication {
+    fn drop(&mut self) {
+        if self.committed { return; }
+        if self.published { let _ = fs::remove_file(&self.target); }
+        if self.backup.exists() {
+            if let Err(error) = fs::rename(&self.backup, &self.source) {
+                eprintln!("Original file retained at {}: {error}", self.backup.display());
+            }
+        }
+    }
+}
+
 fn mtime_ns(m: &fs::Metadata) -> i64 {
     match m.modified() {
         Ok(t) => match t.duration_since(UNIX_EPOCH) {
@@ -181,10 +202,18 @@ pub async fn apply_file_item(
             .and_then(|s| s.to_str())
             .unwrap_or("flac")
     ));
-    let publish = (|| -> Result<(), String> {
-        fs::copy(&source_path, &staged).map_err(|e| e.to_string())?;
-        write_tags(&staged, &item.tags)?;
-        if let Some(artwork) = &item.artwork {
+    let source = source_path.clone();
+    let target = final_path.clone();
+    let edits = item.clone();
+    let (mut publication, meta, fs_meta) = tokio::task::spawn_blocking(move || {
+        let backup = source.parent().ok_or("Invalid source path")?.join(format!(
+            ".tibrary-original-{}.{}", uuid::Uuid::new_v4(),
+            source.extension().and_then(|s| s.to_str()).unwrap_or("flac")));
+        let mut publication = FilePublication { source: source.clone(), target: target.clone(), backup, published: false, committed: false };
+        let result = (|| -> Result<_, String> {
+        fs::copy(&source, &staged).map_err(|e| e.to_string())?;
+        write_tags(&staged, &edits.tags)?;
+        if let Some(artwork) = &edits.artwork {
             use lofty::{
                 file::{AudioFile, TaggedFileExt},
                 ogg::OggPictureStorage,
@@ -228,26 +257,27 @@ pub async fn apply_file_item(
                     .map_err(|e| e.to_string())?;
             }
         }
-        read_audio_metadata(&staged)?;
-        let current = fs::metadata(&source_path).map_err(|e| e.to_string())?;
+        let meta = read_audio_metadata(&staged)?;
+        let current = fs::metadata(&source).map_err(|e| e.to_string())?;
         if current.len() != before.len() || mtime_ns(&current) != mtime_ns(&before) {
             return Err("File changed during operation; refresh the preview".into());
         }
-        if final_path == source_path {
-            fs::rename(&staged, &final_path).map_err(|e| e.to_string())?;
+        if target == source {
+            fs::rename(&source, &publication.backup).map_err(|e| e.to_string())?;
+            fs::rename(&staged, &target).map_err(|e| e.to_string())?;
+            publication.published = true;
         } else {
             // An atomic no-overwrite publication; collisions never replace another track.
-            fs::hard_link(&staged, &final_path).map_err(|e| e.to_string())?;
-            fs::remove_file(&source_path).map_err(|e| e.to_string())?;
+            fs::hard_link(&staged, &target).map_err(|e| e.to_string())?;
+            publication.published = true;
+            fs::rename(&source, &publication.backup).map_err(|e| e.to_string())?;
         }
-        Ok(())
-    })();
-    let _ = fs::remove_file(&staged);
-    publish?;
-
-    // 3. Read metadata of final file
-    let meta = read_audio_metadata(&final_path)?;
-    let fs_meta = fs::metadata(&final_path).map_err(|e| e.to_string())?;
+        let fs_meta = fs::metadata(&target).map_err(|e| e.to_string())?;
+        Ok((meta, fs_meta))
+        })();
+        let _ = fs::remove_file(&staged);
+        result.map(|(meta, fs_meta)| (publication, meta, fs_meta))
+    }).await.map_err(|e| format!("File update worker stopped: {e}"))??;
     let size = fs_meta.len() as i64;
     let mtime = mtime_ns(&fs_meta);
     let meta_val = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
@@ -262,6 +292,11 @@ pub async fn apply_file_item(
         mtime,
     )
     .await?;
+
+    publication.committed = true;
+    if let Err(error) = fs::remove_file(&publication.backup) {
+        eprintln!("File updated; temporary original retained at {}: {error}", publication.backup.display());
+    }
 
     for (prefix, mut value) in preserved {
         value["size"] = serde_json::json!(size);
@@ -326,6 +361,67 @@ mod tests {
     use lofty::probe::Probe;
     use lofty::tag::ItemKey;
     use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn reviewed_move_preserves_audio_links_and_ignore_choices_and_rolls_back_database_errors() {
+        let temp = std::env::temp_dir().join(format!("file-integrity-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("original.flac");
+        let target = temp.join("Artist/Release (2025)/Disc 01/01.04 - Track.flac");
+        fs::write(&source, crate::stream_download::MINIMAL_FLAC).unwrap();
+        write_tags(&source, &HashMap::from([
+            ("title".into(), "Track".into()), ("albumartist".into(), "Artist".into()),
+            ("album".into(), "Release".into()), ("tracknumber".into(), "4".into()),
+            ("discnumber".into(), "1".into()), ("tracktotal".into(), "12".into()),
+            ("bpm".into(), "130".into()), ("initialkey".into(), "8A".into()),
+            ("custom_provenance".into(), "Keep this tag".into()),
+        ])).unwrap();
+        let original = fs::read(&source).unwrap();
+        // A simultaneous library scan must never index staged tag rewrites.
+        fs::write(temp.join(".tibrary-test.flac"), crate::stream_download::MINIMAL_FLAC).unwrap();
+        let db = TursoDb::open(temp.join("library.db")).await.unwrap();
+        let scan = crate::scanner::scan_library(&db, &temp, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| {}).await.unwrap();
+        assert_eq!(scan.read, 1);
+        let file = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap().remove(0);
+        db.save_track_link(&file.path, "GB", &serde_json::json!([0,0,file.size,file.mtime]).to_string(),
+            r#"{"status":"linked","ids":{"track_id":"1","album_id":"2"}}"#).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO ignored_local_files(path,ignored_at) VALUES(?,'saved choice')", (file.path.as_str(),)).await.unwrap();
+        let item = FileApplyItem { path: file.path.clone(), target: Some(target.display().to_string()), artwork: None,
+            tags: HashMap::from([("tracknumber".into(), "04".into()), ("discnumber".into(), "01".into())]) };
+        // Fault injection after local_files starts updating verifies both the
+        // database transaction and the original file are restored on failure.
+        conn.execute("ALTER TABLE track_links RENAME TO held_track_links", ()).await.unwrap();
+        assert!(apply_file_item(&db, temp.to_str().unwrap(), &item).await.is_err());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(!target.exists());
+        let files = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, file.path);
+        conn.execute("ALTER TABLE held_track_links RENAME TO track_links", ()).await.unwrap();
+        apply_file_item(&db, temp.to_str().unwrap(), &item).await.unwrap();
+        assert!(!source.exists());
+        let moved = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap().remove(0);
+        assert_eq!(moved.path, target.display().to_string());
+        let tags = crate::workflows::extract_tags_map(&moved.metadata);
+        for (key, value) in [("tracknumber","04"),("discnumber","01"),("bpm","130"),("initialkey","8A"),("custom_provenance","Keep this tag")] {
+            assert_eq!(tags.get(key).map(String::as_str), Some(value));
+        }
+        let mut rows = conn.query("SELECT path,stamp FROM track_links", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), moved.path);
+        assert!(crate::db::link_stamp_matches(&row.get::<String>(1).unwrap(), moved.size, moved.mtime));
+        drop(rows);
+        let mut ignored = conn.query("SELECT path,ignored_at FROM ignored_local_files", ()).await.unwrap();
+        let row = ignored.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), moved.path);
+        assert_eq!(row.get::<String>(1).unwrap(), "saved choice");
+        let samples = |path: &std::path::Path| claxon::FlacReader::open(path).unwrap().samples().collect::<Result<Vec<_>,_>>().unwrap();
+        let reference = temp.join("reference.flac");
+        fs::write(&reference, original).unwrap();
+        assert_eq!(samples(&reference), samples(&target));
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[tokio::test]
     async fn local_inspections_are_reused_and_follow_reviewed_tag_only_moves() {

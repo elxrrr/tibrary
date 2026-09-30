@@ -45,9 +45,10 @@ import {
   Job,
   AppState,
   mergeJob,
+  onlineKinds,
 } from "./api";
 import { DataTable, Column } from "./DataTable";
-import { ActivityView, streamFor } from "./ActivityView";
+import { ActivityView, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
 import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import "./style.css";
@@ -130,7 +131,6 @@ const organisationActions = [
   ],
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
-const onlineKinds = new Set(["link", "discography", "cached_releases", "check_availability", "release_artists", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
 const descriptions: Record<string, string> = {
   overview: "Your library, from local preparation to new music.",
   correct:
@@ -244,6 +244,13 @@ function App() {
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
   const [downloadMonitor, setDownloadMonitor] = useState<Record<string, Row>>({});
+  const activityEpochs = useRef([0,0,0]);
+  function mergeActivityEpochs(epochs?: number[]) {
+    const previous = activityEpochs.current;
+    const incoming = epochs || [0,0,0];
+    activityEpochs.current = previous.map((epoch,i)=>Math.max(epoch,incoming[i] || 0));
+    return {downloadsAccepted:(incoming[2] || 0) >= previous[2], downloadsCleared:(incoming[2] || 0) > previous[2]};
+  }
   const [clock, setClock] = useState(Date.now());
   useEffect(() => {
     if (!active(state?.job) && !active(state?.online_job) && !active(state?.download_job)) return;
@@ -294,7 +301,9 @@ function App() {
     try {
       const activeRoot = targetRoot !== undefined ? targetRoot : root;
       const s = await call<AppState>("state", activeRoot ? { root: activeRoot } : {});
-      setState(previous => previous ? {...s, job:mergeJob(previous.job,s.job), online_job:mergeJob(previous.online_job,s.online_job), download_job:mergeJob(previous.download_job,s.download_job)} : s);
+      const epochs = mergeActivityEpochs(s.activity_epochs);
+      setState(previous => previous ? {...s, logs:mergeActivitySnapshot(previous.logs,s.logs,previous.activity_epochs,s.activity_epochs), activity_epochs:[0,1,2].map(i=>Math.max(previous.activity_epochs?.[i] || 0,s.activity_epochs?.[i] || 0)), job:mergeJob(previous.job,s.job), online_job:mergeJob(previous.online_job,s.online_job), download_job:mergeJob(previous.download_job,s.download_job)} : s);
+      if (s.download_monitor && epochs.downloadsAccepted) setDownloadMonitor(old => mergeDownloadMonitor(epochs.downloadsCleared ? {} : old,s.download_monitor!));
       if (!activeRoot && s.roots.length > 0) {
         setRoot(s.roots[0].root);
       } else if (activeRoot && !s.roots.some((r) => r.root === activeRoot)) {
@@ -423,17 +432,17 @@ function App() {
     listen<any>("backend-event", ({ payload: p }) => {
       if (p.event === "download-monitor" && p.item) {
         const item = p.item as Row;
-        const key = item.kind === "batch" ? `batch:${item.release_id}` : `track:${item.release_id}:${item.id}`;
-        setDownloadMonitor((old) => ({ ...old, [key]: { ...old[key], ...item } }));
+        const jobId = item.job_id || stateRef.current?.download_job?.id || "saved-downloads";
+        const key = item.kind === "batch" ? `${jobId}:batch:${item.release_id}` : `${jobId}:track:${item.release_id}:${item.id}`;
+        setDownloadMonitor((old) => mergeDownloadMonitor(old,{[key]:{...item,job_id:jobId}}));
       }
       if (p.event === "progress" && p.download_job) {
         setState((s) => s ? { ...s, download_job: mergeJob(s.download_job,p.download_job) } : s);
       }
       if (p.event === "progress" && p.online_job) {
-        setState((s) => s ? { ...s, online_job: mergeJob(s.online_job,p.online_job), logs: [
-          ...s.logs.filter(log => log.progress_id !== p.online_job.id),
+        setState((s) => s ? { ...s, online_job: mergeJob(s.online_job,p.online_job), logs: mergeActivitySnapshot(s.logs,[
           {job_id:p.online_job.id, job_kind:p.online_job.kind, job_status:p.online_job.status, progress_id:p.online_job.id, at:new Date().toISOString(), message:p.message, category:"online", level:"info"}
-        ].slice(-1000)} : s);
+        ])} : s);
       }
       if (p.event === "progress" && !p.download_job && !p.online_job)
         setState((s) =>
@@ -441,8 +450,7 @@ function App() {
             ? {
                 ...s,
                 job: mergeJob(s.job,p.job),
-                logs: [
-                  ...s.logs.filter(log => !p.job?.id || log.progress_id !== p.job.id),
+                logs: mergeActivitySnapshot(s.logs,[
                   {
                     job_id: p.job?.id, job_kind: p.job?.kind, job_status: p.job?.status,
                     progress_id: p.job?.id,
@@ -451,7 +459,7 @@ function App() {
                     level: p.job?.status === "failed" ? "error" : p.level || "info",
                     category: p.category || (p.job?.kind ? (p.job.kind === "scan" ? "scan" : p.job.kind === "download" ? "download" : p.job.kind === "link" ? "linking" : p.job.kind.includes("duplicate") ? "cleanup" : "local") : undefined),
                   },
-                ].slice(-1000),
+                ]),
               }
             : s,
         );
@@ -479,7 +487,9 @@ function App() {
       try {
         const update = await call<any>("job.status");
         if (!disposed && (update.job || update.online_job || update.download_job)) {
-          setState(s => s ? {...s, ...update, job:mergeJob(s.job,update.job), online_job:mergeJob(s.online_job,update.online_job), download_job:mergeJob(s.download_job,update.download_job)} : s);
+          const epochs = mergeActivityEpochs(update.activity_epochs);
+          setState(s => s ? {...s, ...update, logs:mergeActivitySnapshot(s.logs,update.logs || [],s.activity_epochs,update.activity_epochs), activity_epochs:[0,1,2].map(i=>Math.max(s.activity_epochs?.[i] || 0,update.activity_epochs?.[i] || 0)), job:mergeJob(s.job,update.job), online_job:mergeJob(s.online_job,update.online_job), download_job:mergeJob(s.download_job,update.download_job)} : s);
+          if (update.download_monitor && epochs.downloadsAccepted) setDownloadMonitor(old=>mergeDownloadMonitor(epochs.downloadsCleared ? {} : old,update.download_monitor));
           if (![update.job, update.online_job, update.download_job].some(active)) await refresh();
         }
       } catch (e) { if (!disposed) notifyError(e); }
@@ -535,7 +545,6 @@ function App() {
   async function run(kind: string, args: any = {}) {
     setError("");
     setSubmitting(true);
-    if (kind === "download") setDownloadMonitor({});
     try {
       const j = await call<Job>("job.start", { kind, args: { root, ...args } });
       setState((s) => (s ? kind === "download" ? { ...s, download_job: mergeJob(s.download_job,j) } : onlineKinds.has(kind) ? { ...s, online_job: mergeJob(s.online_job,j) } : { ...s, job: mergeJob(s.job,j) } : s));
@@ -996,6 +1005,7 @@ function App() {
               className="primary"
               disabled={busy || !root}
               onClick={() => run(route, scope())}
+              title={route === "metadata" ? "Read verified recording links and shared cached metadata, then fetch missing release details, credits and available BPM/key data. This creates a preview; files change only after you review and apply it." : "Reuse cached cover information and artwork inspections, then fetch genuine high-resolution covers for linked releases. This creates a preview; files change only after you review and apply it."}
             >
               {route === "metadata"
                 ? "Find missing tags (online)"
@@ -1111,7 +1121,7 @@ function App() {
               className="primary"
               disabled={busy}
               onClick={() => run("discography", { detailed: true })}
-              title="Check linked artist release lists and fill new, changed or missing track details, credits, genres and DJ data. Complete unchanged data is reused. No audio is downloaded."
+              title="Check linked artist release lists, then fill new, changed or missing track lists, credits, genres and available BPM/key data. The first fill can take hours for a large library; complete unchanged details are reused. For a faster discovery check, choose More update options → Check release lists only. No audio is downloaded."
             >
               Update missing releases
             </button>
@@ -1134,7 +1144,7 @@ function App() {
             <details className="update-options">
               <summary>More update options</summary>
               <div className="update-options-menu">
-                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("discography");}} title="Check artist release lists and market availability without collecting additional track details.">Check release lists only</button>
+                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("discography");}} title="A faster discovery check: refresh linked artist release lists and market availability, reusing saved track details. New releases can appear before their full recommendation evidence is collected. No audio is downloaded.">Check release lists only</button>
                 <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("release_artists", { timeline });}} title="Fill missing album artist evidence for older saved releases; reuse existing checks.">Fill missing release artists</button>
                 <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("check_availability");}} title="Check all saved missing releases for your linked album artists. Recent market checks are reused; no audio is downloaded.">Check saved release availability</button>
                 <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("check_availability", {force:true});}} title="Request fresh market checks for all saved missing releases, including previously unavailable releases. Bypass cached availability checks; no audio is downloaded.">Recheck saved availability online</button>
@@ -2158,9 +2168,10 @@ function App() {
               onlineJob={state?.online_job}
               downloadJob={state?.download_job}
               onClear={async (stream) => {
-                await call("logs.clear", {stream});
-                if (stream === "downloads" && !active(state?.download_job)) setDownloadMonitor({});
-                setState(old => old ? {...old, logs: old.logs.filter(entry => streamFor(entry) !== stream)} : old);
+                const cleared = await call("logs.clear", {stream});
+                mergeActivityEpochs(cleared.activity_epochs);
+                if (stream === "downloads") setDownloadMonitor({});
+                setState(old => old ? {...old, activity_epochs:cleared.activity_epochs || old.activity_epochs, logs: old.logs.filter(entry => streamFor(entry) !== stream)} : old);
               }}
               onCancel={(kind) => call("job.cancel", {kind}).catch(notifyError)}
             />

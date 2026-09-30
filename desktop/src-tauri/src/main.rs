@@ -67,28 +67,54 @@ fn publish_catalogue_changes(
     }
 }
 
-fn is_online_job(kind: &str) -> bool {
-    matches!(
-        kind,
-        "link"
-            | "check_availability"
-            | "cached_releases"
-            | "release_artists"
-            | "discography"
-            | "release_details"
-            | "connections"
-            | "favourites"
-            | "match_artists"
-            | "metadata"
-            | "manual_candidate"
-            | "artwork"
-            | "check_replacements"
-            | "optimizations"
-            | "deep_review"
-            | "deep_preview"
-            | "connect_account"
-            | "connect_download"
-    )
+const ONLINE_JOB_KINDS: &[&str] = &[
+    "link", "check_availability", "cached_releases", "release_artists",
+    "discography", "release_details", "connections", "favourites",
+    "match_artists", "metadata", "manual_candidate", "artwork",
+    "check_replacements", "optimizations", "deep_review", "deep_preview",
+    "connect_account", "connect_download",
+];
+
+fn is_online_job(kind: &str) -> bool { ONLINE_JOB_KINDS.contains(&kind) }
+
+fn workflow_name(kind: &str) -> &'static str {
+    match kind {
+        "cached_releases" => "Recheck cached releases",
+        "check_availability" => "Check release availability",
+        "release_artists" => "Check release artists",
+        "preview" => "Review local changes",
+        "apply" => "Apply reviewed changes",
+        "mqa" => "MQA audit",
+        "release_details" => "Fetch track details and credits",
+        "connections" => "Test connection",
+        "favourites" => "Refresh favourite artists",
+        "match_artists" => "Match artists",
+        "metadata" => "Find missing tags",
+        "manual_candidate" => "Inspect a release match",
+        "artwork" => "Find artwork",
+        "optimizations" | "check_replacements" => "Check online replacements",
+        "local_duplicates" => "Check local duplicates",
+        "queue_replacements" => "Queue online replacements",
+        "queue_mqa" => "Queue MQA replacements",
+        "deep_review" => "Find release matches",
+        "deep_preview" => "Review release links",
+        "deep_apply" => "Save reviewed release links",
+        "review_consolidation" => "Review duplicate removal",
+        "consolidate" => "Remove reviewed duplicates",
+        _ => "Task",
+    }
+}
+
+fn workflow_outcome(kind: &str, value: &Value, cancelled: bool) -> String {
+    let mut message = format!("{} · {}", if cancelled { "Cancelled" } else { "Complete" }, workflow_name(kind));
+    for (key, label) in [("applied", "files updated"), ("completed", "items completed"),
+        ("linked", "tracks linked"), ("opportunities", "opportunities"),
+        ("releases", "releases queued"), ("artists", "artists checked"),
+        ("files", "files checked"), ("checked", "items checked")] {
+        if let Some(count) = value[key].as_u64() { message.push_str(&format!(" · {count} {label}")); break; }
+    }
+    if value["reused"] == true { message.push_str(" · saved analysis reused"); }
+    message
 }
 
 fn compare_table_cell(a: &Value, b: &Value, key: &str) -> std::cmp::Ordering {
@@ -112,6 +138,11 @@ fn compare_table_cell(a: &Value, b: &Value, key: &str) -> std::cmp::Ordering {
 }
 
 fn activity_stream(entry: &Value) -> &'static str {
+    // A job owns its channel. Words such as "download" in an online metadata
+    // message must not move its details into a different panel.
+    if let Some(kind) = entry["job_kind"].as_str().filter(|kind| !kind.is_empty()) {
+        return if kind == "download" { "downloads" } else if is_online_job(kind) { "online" } else { "local" };
+    }
     let category = entry["category"].as_str().unwrap_or("general");
     match category {
         "download" => return "downloads",
@@ -151,14 +182,45 @@ fn activity_stream_index(stream: &str) -> usize {
 }
 
 #[derive(Default)]
+struct ActivityStreamBuffer {
+    entries: Vec<Value>,
+    summaries: Vec<Value>,
+}
+
+impl ActivityStreamBuffer {
+    fn push(&mut self, entry: Value) {
+        if let Some(id) = entry["job_id"].as_str().filter(|id| !id.is_empty()) {
+            if let Some(index) = self.summaries.iter().position(|saved| saved["job_id"] == id) {
+                if self.summaries[index]["at"].as_str() <= entry["at"].as_str() {
+                    self.summaries.remove(index);
+                    self.summaries.push(entry.clone());
+                }
+            } else {
+                self.summaries.push(entry.clone());
+            }
+            if self.summaries.len() > 500 { self.summaries.remove(0); }
+        }
+        self.entries.push(entry);
+        if self.entries.len() > 1000 { self.entries.remove(0); }
+    }
+
+    fn snapshot(&self) -> Vec<Value> {
+        let mut entries = self.entries.clone();
+        let present: std::collections::HashSet<_> = entries.iter().filter_map(|entry| entry["job_id"].as_str()).map(str::to_owned).collect();
+        entries.extend(self.summaries.iter().filter(|entry| !present.contains(entry["job_id"].as_str().unwrap_or(""))).cloned());
+        entries
+    }
+}
+
+#[derive(Default)]
 pub struct ActivityBuffers {
-    online: Mutex<Vec<Value>>,
-    local: Mutex<Vec<Value>>,
-    downloads: Mutex<Vec<Value>>,
+    online: Mutex<ActivityStreamBuffer>,
+    local: Mutex<ActivityStreamBuffer>,
+    downloads: Mutex<ActivityStreamBuffer>,
 }
 
 impl ActivityBuffers {
-    fn buffer(&self, stream: &str) -> &Mutex<Vec<Value>> {
+    fn buffer(&self, stream: &str) -> &Mutex<ActivityStreamBuffer> {
         match stream {
             "online" => &self.online,
             "downloads" => &self.downloads,
@@ -167,38 +229,36 @@ impl ActivityBuffers {
     }
 
     fn push(&self, entry: Value) {
-        let mut entries = self.buffer(activity_stream(&entry)).lock().unwrap();
-        entries.push(entry);
-        if entries.len() > 1000 {
-            entries.remove(0);
-        }
+        self.buffer(activity_stream(&entry)).lock().unwrap().push(entry);
     }
 
     fn replace_progress(&self, id: &str, entry: Value) {
         let mut entries = self.buffer(activity_stream(&entry)).lock().unwrap();
         if let Some(existing) = entries
-            .iter_mut()
+            .entries.iter_mut()
             .find(|item| item["progress_id"].as_str() == Some(id))
         {
             *existing = entry;
         } else {
-            entries.push(entry);
+            entries.entries.push(entry);
         }
     }
 
     fn retain(&self, mut keep: impl FnMut(&Value) -> bool) {
         for stream in [&self.online, &self.local, &self.downloads] {
-            stream.lock().unwrap().retain(|entry| keep(entry));
+            let mut buffer = stream.lock().unwrap();
+            buffer.entries.retain(|entry| keep(entry));
+            buffer.summaries.retain(|entry| keep(entry));
         }
     }
 
     fn clear(&self, stream: &str) {
         if stream == "all" {
-            self.online.lock().unwrap().clear();
-            self.local.lock().unwrap().clear();
-            self.downloads.lock().unwrap().clear();
+            *self.online.lock().unwrap() = ActivityStreamBuffer::default();
+            *self.local.lock().unwrap() = ActivityStreamBuffer::default();
+            *self.downloads.lock().unwrap() = ActivityStreamBuffer::default();
         } else {
-            self.buffer(stream).lock().unwrap().clear();
+            *self.buffer(stream).lock().unwrap() = ActivityStreamBuffer::default();
         }
     }
 
@@ -211,9 +271,9 @@ impl ActivityBuffers {
 
     fn snapshot(&self) -> Vec<Value> {
         let mut entries = Vec::new();
-        entries.extend(self.online.lock().unwrap().iter().cloned());
-        entries.extend(self.local.lock().unwrap().iter().cloned());
-        entries.extend(self.downloads.lock().unwrap().iter().cloned());
+        entries.extend(self.online.lock().unwrap().snapshot());
+        entries.extend(self.local.lock().unwrap().snapshot());
+        entries.extend(self.downloads.lock().unwrap().snapshot());
         entries.sort_by(|a, b| a["at"].as_str().cmp(&b["at"].as_str()));
         entries
     }
@@ -227,6 +287,7 @@ pub struct Backend {
     pub online_job: Mutex<Option<Value>>,
     pub download_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub download_job: Mutex<Option<Value>>,
+    pub download_monitor: Mutex<HashMap<String, Value>>,
     quit_prompt: AtomicBool,
     quit_approved: AtomicBool,
     pub logs: ActivityBuffers,
@@ -258,6 +319,7 @@ impl Default for Backend {
             online_job: Mutex::new(None),
             download_cancel: Mutex::new(None),
             download_job: Mutex::new(None),
+            download_monitor: Mutex::new(HashMap::new()),
             quit_prompt: AtomicBool::new(false),
             quit_approved: AtomicBool::new(false),
             logs: ActivityBuffers::default(),
@@ -292,6 +354,33 @@ impl Backend {
 
     pub fn log(&self, msg: &str) {
         self.log_with_category(msg, "info", None);
+    }
+
+    pub fn log_for(&self, kind: &str, message: &str, level: &str) {
+        let (slot, category) = if kind == "download" { (&self.download_job, "download") }
+            else if is_online_job(kind) { (&self.online_job, "online") }
+            else { (&self.active_job, "local") };
+        let job = slot.lock().unwrap().clone().filter(|job| matches!(job["status"].as_str(), Some("running"|"cancelling")));
+        self.log_with_job(message, level, Some(category), job.as_ref());
+    }
+
+    fn activity_epochs(&self) -> Value {
+        json!(self.log_epochs.iter().map(|epoch| epoch.load(Ordering::SeqCst)).collect::<Vec<_>>())
+    }
+
+    async fn restore_activity(&self, db: &TursoDb) {
+        if !self.logs.snapshot().is_empty() { return; }
+        let before = self.activity_epochs();
+        if let Ok(saved) = db.load_activity_overview(500).await {
+            // A slow read must not replace logs from a newly started job, or
+            // restore a panel explicitly cleared while this read was pending.
+            for entry in saved {
+                let index = activity_stream_index(activity_stream(&entry));
+                if before[index] == json!(self.log_epochs[index].load(Ordering::SeqCst)) {
+                    self.logs.push(entry);
+                }
+            }
+        }
     }
 
     pub fn log_with_category(&self, msg: &str, level: &str, category: Option<&str>) {
@@ -353,7 +442,7 @@ impl Backend {
         // Persist to database if initialized and logging persistence is enabled
         if self.persist_logs.load(Ordering::SeqCst) {
             if let Some(db) = self.db.lock().unwrap().clone() {
-                let stream = activity_stream(&json!({"category":cat,"message":msg}));
+                let stream = activity_stream(&entry);
                 let index = activity_stream_index(stream);
                 let epoch = self.log_epochs[index].load(Ordering::SeqCst);
                 let epochs = self.log_epochs.clone();
@@ -372,21 +461,21 @@ impl Backend {
                 if start_writer {
                     tauri::async_runtime::spawn(async move {
                         loop {
-                            let next = {
+                            let batch: Vec<_> = {
                                 let mut queued = queue.lock().unwrap();
-                                let next = queued.pop_front();
-                                if next.is_none() { writer_active.store(false, Ordering::SeqCst); }
-                                next
+                                let count = queued.len().min(64);
+                                let batch = queued.drain(..count).collect();
+                                if count == 0 { writer_active.store(false, Ordering::SeqCst); }
+                                batch
                             };
-                            let Some((entry, index, epoch)) = next else { break; };
+                            if batch.is_empty() { break; }
                             let _guard = gate.lock().await;
-                            if epochs[index].load(Ordering::SeqCst) == epoch {
-                                if let Err(error) = db.log_activity_entry(&entry).await {
-                                    eprintln!("Could not save activity history: {error}");
-                                }
+                            let entries: Vec<_> = batch.iter().filter(|(_,index,epoch)| epochs[*index].load(Ordering::SeqCst) == *epoch).map(|(entry,_,_)| entry.clone()).collect();
+                            if let Err(error) = db.log_activity_entries(&entries).await {
+                                eprintln!("Could not save activity history: {error}");
                             }
-                            pending.fetch_sub(1, Ordering::SeqCst);
-                            completed.fetch_add(1, Ordering::SeqCst);
+                            pending.fetch_sub(batch.len() as u64, Ordering::SeqCst);
+                            completed.fetch_add(batch.len() as u64, Ordering::SeqCst);
                             flushed.notify_waiters();
                         }
                     });
@@ -529,6 +618,31 @@ impl Backend {
         *self.download_job.lock().unwrap() = Some(job);
     }
 
+    fn record_download_monitor(&self, id: &str, mut item: Value) -> Option<Value> {
+        let job = self.download_job.lock().unwrap().clone()?;
+        if job["id"] != id || !matches!(job["status"].as_str(), Some("running"|"cancelling")) { return None; }
+        item["job_id"] = json!(id);
+        item["job_kind"] = json!("download");
+        item["at"] = json!(chrono::Utc::now().to_rfc3339());
+        item["updated_at"] = json!(chrono::Utc::now().timestamp_millis());
+        let key = if item["kind"] == "batch" { format!("{id}:batch:{}", item["release_id"].as_str().unwrap_or("")) }
+            else { format!("{id}:track:{}:{}", item["release_id"].as_str().unwrap_or(""), item["id"].as_str().unwrap_or("")) };
+        let mut monitor = self.download_monitor.lock().unwrap();
+        let previous = monitor.get(&key).cloned().unwrap_or(json!({}));
+        let mut merged = previous.clone();
+        if let (Some(fields), Some(update)) = (merged.as_object_mut(), item.as_object()) { fields.extend(update.clone()); }
+        if monitor.len() >= 1000 && !monitor.contains_key(&key) {
+            if let Some(oldest) = monitor.iter().min_by_key(|(_,value)|value["at"].as_str().unwrap_or("")).map(|(key,_)|key.clone()) { monitor.remove(&oldest); }
+        }
+        monitor.insert(key, merged.clone());
+        drop(monitor);
+        if item["kind"] == "track" && item["status"] != previous["status"] && matches!(item["status"].as_str(), Some("complete"|"failed"|"already downloaded")) {
+            let outcome = match item["status"].as_str() { Some("complete")=>"Downloaded", Some("failed")=>"Download failed", _=>"Existing file retained" };
+            self.log_with_job(&format!("{outcome} · {} · release {} · track {}{}",item["title"].as_str().unwrap_or("Track"),item["release_id"].as_str().unwrap_or(""),item["id"].as_str().unwrap_or(""),item["error"].as_str().map(|error|format!(" · {error}")).unwrap_or_default()),if item["status"] == "failed" {"error"} else {"info"},Some("download"),Some(&job));
+        }
+        Some(merged)
+    }
+
     pub fn update_download_job(&self, mut job: Value) -> Value {
         let mut current=self.download_job.lock().unwrap();
         if let Some(saved)=current.as_ref() {
@@ -536,6 +650,9 @@ impl Backend {
         }
         let message=job["message"].as_str().unwrap_or("").to_owned();
         self.measure_progress(&mut job, &message);
+        if current.as_ref().and_then(|saved| saved["message"].as_str()) != Some(message.as_str()) {
+            self.log_with_job(&message, if message.to_lowercase().contains("failed") {"error"} else {"info"}, Some("download"), Some(&job));
+        }
         if self
             .download_cancel
             .lock()
@@ -562,8 +679,14 @@ impl Backend {
                 Some("download"), Some(&job),
             );
         }
-        *self.download_job.lock().unwrap() = Some(job);
+        *self.download_job.lock().unwrap() = Some(job.clone());
         *self.download_cancel.lock().unwrap() = None;
+        for item in self.download_monitor.lock().unwrap().values_mut().filter(|item| item["job_id"] == job["id"]) {
+            if matches!(item["status"].as_str(), Some("running"|"preparing"|"downloading"|"staged")) {
+                item["status"] = job["status"].clone();
+                item["updated_at"] = json!(chrono::Utc::now().timestamp_millis());
+            }
+        }
         self.view_cache.lock().unwrap().clear();
     }
 
@@ -651,7 +774,8 @@ impl Backend {
         let cancel_flag = self.active_job_cancel.lock().unwrap().clone();
         if let Some(flag) = cancel_flag {
             flag.store(true, Ordering::Relaxed);
-            self.log_with_category(cancel_msg, "warn", Some("general"));
+            let job = self.active_job.lock().unwrap().clone();
+            self.log_with_job(cancel_msg, "warn", Some("local"), job.as_ref());
             let mut lock = self.active_job.lock().unwrap();
             if let Some(active) = lock.as_mut() {
                 if let Some(obj) = active.as_object_mut() {
@@ -680,6 +804,8 @@ fn refresh_runtime_state(state: &Backend, snapshot: &mut Value) {
     snapshot["online_job"]=json!(state.online_job.lock().unwrap().clone());
     snapshot["download_job"]=json!(state.download_job.lock().unwrap().clone());
     snapshot["logs"]=json!(state.logs.snapshot());
+    snapshot["activity_epochs"] = state.activity_epochs();
+    snapshot["download_monitor"] = json!(state.download_monitor.lock().unwrap().clone());
     snapshot["auth_url"]=state.pending_pkce.lock().unwrap().as_ref()
         .map(|flow|json!(flow.login_url)).unwrap_or(Value::Null);
 }
@@ -748,7 +874,7 @@ async fn handle_rpc_uncached(
     let method = if method == "missing.rebuild" { args = json!({"kind":"cached_releases","args":args}); "job.start".to_string() } else { method };
     if method == "job.status" {
         return Ok(
-            json!({"job":state.active_job.lock().unwrap().clone(),"online_job":state.online_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.snapshot(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
+            json!({"job":state.active_job.lock().unwrap().clone(),"online_job":state.online_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.snapshot(),"activity_epochs":state.activity_epochs(),"download_monitor":state.download_monitor.lock().unwrap().clone(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
         );
     }
     if method == "table" || method == "detail" || method == "job.start" {
@@ -799,7 +925,7 @@ async fn handle_rpc_uncached(
         let id = uuid::Uuid::new_v4().to_string();
         let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.;
         let cancel = Arc::new(AtomicBool::new(false));
-        let initial = json!({"id":id,"kind":kind,"status":"running","message":format!("Started · {kind}"),"started":started});
+        let initial = json!({"id":id,"kind":kind,"status":"running","message":format!("Started · {}", workflow_name(&kind)),"started":started});
         if is_online_job(&kind) {
             state.start_online_job(initial.clone(), cancel.clone());
         } else {
@@ -826,7 +952,7 @@ async fn handle_rpc_uncached(
                     } else {
                         "complete"
                     },
-                    v["message"].as_str().map(str::to_owned).unwrap_or_else(|| format!("Finished · {kind}")),
+                    v["message"].as_str().map(str::to_owned).unwrap_or_else(|| workflow_outcome(&kind, &v, cancel.load(Ordering::Relaxed))),
                     v,
                 ),
                 Err(e) => (
@@ -1131,15 +1257,8 @@ async fn handle_rpc_uncached(
     // STATE & SETTINGS
     if method == "state" {
         let active = state.active_job.lock().unwrap().clone();
-        let mut logs = state.logs.snapshot();
-        if logs.is_empty() {
-            if let Ok(loaded) = db.load_activity_overview(500).await {
-                if !loaded.is_empty() {
-                    state.logs.load(loaded.clone());
-                    logs = loaded;
-                }
-            }
-        }
+        state.restore_activity(db).await;
+        let logs = state.logs.snapshot();
         let root = args.get("root").and_then(|v| v.as_str());
         let mut snapshot = db.get_state(active, &logs, root).await?;
         snapshot["catalogue_refresh"] = db.get_preference("catalogue-refresh-checkpoint").await?.unwrap_or(Value::Null);
@@ -1172,16 +1291,8 @@ async fn handle_rpc_uncached(
         return Ok(res);
     }
     if method == "logs" {
-        let mut logs = state.logs.snapshot();
-        if logs.is_empty() {
-            if let Ok(loaded) = db.load_activity_overview(500).await {
-                if !loaded.is_empty() {
-                    state.logs.load(loaded.clone());
-                    logs = loaded;
-                }
-            }
-        }
-        return Ok(json!(logs));
+        state.restore_activity(db).await;
+        return Ok(json!(state.logs.snapshot()));
     }
     if method == "logs.job" {
         let id = args["id"].as_str().ok_or("Missing job ID")?;
@@ -1205,7 +1316,8 @@ async fn handle_rpc_uncached(
             state.logs.clear(stream);
             db.clear_log_stream(stream).await?;
         }
-        return Ok(json!({ "cleared": true, "stream": stream }));
+        if stream == "all" || stream == "downloads" { state.download_monitor.lock().unwrap().clear(); }
+        return Ok(json!({ "cleared": true, "stream": stream, "activity_epochs":state.activity_epochs() }));
     }
 
     // TABLE ROUTES
@@ -2141,53 +2253,54 @@ async fn handle_rpc_uncached(
                             .await
                         {
                             backend_task
-                                .log(&format!("Could not save releases for {artist_id}: {e}"));
+                                .log_for("discography", &format!("Could not save releases for {artist_id}: {e}"), "error");
                             failure = Some(e);
                             break;
                         } else {
                             publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                             if detailed {
-                                let (reused,changed,cached_tracks) = match actions::recommendation_refresh_plan(&db_clone,&market,&catalogue.releases).await {
+                                let (reused, changed, _) = match actions::recommendation_refresh_plan(&db_clone, &market, &catalogue.releases).await {
                                     Ok(plan) => plan,
                                     Err(error) => { failure = Some(error); break; }
                                 };
-                                let pending: Vec<_> = catalogue.releases.iter().filter(|release| !reused.contains(&release.id)).collect();
+                                let pending: Vec<_> = catalogue.releases.iter().filter(|release| !reused.contains(&release.id)).cloned().collect();
                                 reused_details += reused.len();
-                                backend_task.progress_for("discography",&format!("Recommendation data · {name} · {} unchanged releases reused · {} new, changed or incomplete releases to check · track lists, credits and DJ tags",reused.len(),pending.len()));
+                                backend_task.progress_for("discography", &format!("Recommendation data · {name} · {} unchanged releases reused · {} new, changed or incomplete releases to check · track lists, credits and DJ tags", reused.len(), pending.len()));
                                 if !pending.is_empty() {
-                                    if let Ok(http)=network::client(20) {
-                                        // A changed release must not reuse its former track-list cache.
-                                        let missing = pending.iter().filter(|release| !changed.contains(&release.id) && !cached_tracks.contains(&release.id)).map(|release|release.id.clone()).collect();
-                                        if let Err(error)=subscriber_metadata::prefetch(&db_clone,&http,missing,&market,cancel_flag.clone(),|message|backend_task.progress_for("discography",&format!("{name} · {message}"))).await {
-                                            backend_task.log(&format!("Subscriber metadata cache: {error}"));
-                                        }
-                                    }
-                                    let stored: Vec<Value> = async {
-                                        let conn = db_clone.connect()?;
-                                        let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id=? AND market=?", (artist_id.as_str(), market.as_str())).await.map_err(|e|e.to_string())?;
-                                        let raw = rows.next().await.map_err(|e|e.to_string())?.and_then(|r|r.get::<String>(0).ok());
-                                        Ok::<_,String>(raw.and_then(|s|serde_json::from_str::<Value>(&s).ok()).and_then(|v|v["releases"].as_array().cloned()).unwrap_or_default())
-                                    }.await.unwrap_or_default();
-                                    for (index,release) in pending.iter().enumerate() {
+                                    // Each worker owns a complete enrichment pipeline and reads
+                                    // its summary through the shared indexed cache selector.
+                                    let pending_count = pending.len();
+                                    let mut releases = pending.into_iter();
+                                    let mut metadata = tokio::task::JoinSet::new();
+                                    let mut completed_details = 0;
+                                    loop {
                                         if cancel_flag.load(Ordering::Relaxed) { break; }
-                                        let message = format!("Updating recommendation data · {name} · {} · release {}/{} · {} unchanged reused",release.title,index+1,pending.len(),reused.len());
-                                        backend_task.progress_for("discography",&message);
-                                        let mut progress = prog_job.clone();
-                                        progress["message"] = json!(message);
-                                        backend_prog.update_online_job_progress(&message, progress);
-                                        let key = format!("tag-review:{market}:{}",release.id);
-                                        if db_clone.get_preference(&key).await.ok().flatten().is_none() {
-                                            if let Some(saved) = stored.iter().find(|r| r["id"] == release.id) {
-                                                if let Err(error) = db_clone.set_preference(&key,saved).await { failure = Some(error); break; }
+                                        while metadata.len() < network::METADATA_CONCURRENCY {
+                                            let Some(release) = releases.next() else { break; };
+                                            let worker_db = db_clone.clone();
+                                            let worker_market = market.clone();
+                                            let worker_cancel = cancel_flag.clone();
+                                            let force = changed.contains(&release.id);
+                                            metadata.spawn(async move {
+                                                let result = actions::release_with_cancel(&worker_db, &release.id, &worker_market, force, worker_cancel).await;
+                                                (release.title, result)
+                                            });
+                                        }
+                                        let Some(result) = metadata.join_next().await else { break; };
+                                        match result {
+                                            Ok((title, Ok(_))) => {
+                                                completed_details += 1;
+                                                checked_details += 1;
+                                                let message = format!("Recommendation details saved · {name} · {title} · {completed_details}/{pending_count} releases · {} unchanged reused · {checked}/{total} artists complete", reused.len());
+                                                backend_task.progress_for("discography", &message);
+                                                publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                                             }
+                                            Ok((title, Err(error))) => { failure = Some(format!("{name} — {title}: {error}")); break; }
+                                            Err(error) => { failure = Some(format!("Recommendation worker stopped: {error}")); break; }
                                         }
-                                        if let Err(error)=actions::release_with_cancel(&db_clone,&release.id,&market,changed.contains(&release.id),cancel_flag.clone()).await {
-                                            failure = Some(format!("{} — {}: {error}",name,release.title));
-                                            break;
-                                        }
-                                        checked_details += 1;
-                                        publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                                     }
+                                    metadata.abort_all();
+                                    while metadata.join_next().await.is_some() {}
                                 }
                                 if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
                             }
@@ -2210,7 +2323,7 @@ async fn handle_rpc_uncached(
                     }
                     Err(e) => {
                         backend_task
-                            .log(&format!("Could not refresh releases for {artist_id}: {e}"));
+                            .log_for("discography", &format!("Could not refresh releases for {artist_id}: {e}"), "error");
                         failure = Some(e);
                         break;
                     }
@@ -2537,6 +2650,8 @@ async fn handle_rpc_uncached(
             let backend_prog = backend_task.clone();
             let j_id_prog = j_id.clone();
             let app_monitor = app_clone.clone();
+            let backend_monitor = backend_task.clone();
+            let monitor_job_id = j_id.clone();
 
             let dl_res = downloads::DownloadManager::run_downloads(
                 &db_clone,
@@ -2544,13 +2659,6 @@ async fn handle_rpc_uncached(
                 cancel_flag.clone(),
                 &j_id,
                 move |msg| {
-                    let lower = msg.to_lowercase();
-                    if lower.contains("failed")
-                        || lower.contains("error")
-                        || lower.contains("unavailable")
-                    {
-                        backend_prog.log_with_category(&msg, "error", Some("download"));
-                    }
                     let prog_job = json!({
                         "id": j_id_prog.clone(),
                         "kind": "download",
@@ -2572,11 +2680,13 @@ async fn handle_rpc_uncached(
                     }
                 },
                 move |item| {
-                    if let Some(ref a) = app_monitor {
+                    if let Some(item) = backend_monitor.record_download_monitor(&monitor_job_id, item) {
+                      if let Some(ref a) = app_monitor {
                         let _ = a.emit(
                             "backend-event",
                             json!({"event":"download-monitor","item":item}),
                         );
+                      }
                     }
                 },
             )
@@ -2722,7 +2832,7 @@ async fn handle_rpc_uncached(
                 Ok(token) => {
                     crate::stream_download::save_token(db, &token).await?;
                     state.pending_pkce.lock().unwrap().take();
-                    state.log("Tidal account connected · download authorization ready");
+                    state.log_for("connect_account", "Streaming account connected · metadata and downloads ready", "info");
                     if let Some(app) = app_handle {
                         let _ = app.emit("backend-event", json!({ "event": "ready" }));
                         let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -2730,7 +2840,7 @@ async fn handle_rpc_uncached(
                     return Ok(json!(true));
                 }
                 Err(e) => {
-                    state.log(&format!("Failed to complete sign-in: {}", e));
+                    state.log_for("connect_account", &format!("Failed to complete sign-in: {e}"), "error");
                     return Err(e);
                 }
             }
@@ -3117,13 +3227,45 @@ mod activity_tests {
         buffers.push(serde_json::json!({"at":"2026-09-26T12:00:00Z","category":"scan","message":"Scanning downloads folder"}));
         buffers.push(serde_json::json!({"at":"2026-09-26T12:00:01Z","category":"online","message":"Searching catalogue"}));
         buffers.push(serde_json::json!({"at":"2026-09-26T12:00:02Z","category":"download","message":"Fetching track"}));
-        assert_eq!(buffers.local.lock().unwrap().len(), 1);
-        assert_eq!(buffers.online.lock().unwrap().len(), 1);
-        assert_eq!(buffers.downloads.lock().unwrap().len(), 1);
+        assert_eq!(buffers.local.lock().unwrap().entries.len(), 1);
+        assert_eq!(buffers.online.lock().unwrap().entries.len(), 1);
+        assert_eq!(buffers.downloads.lock().unwrap().entries.len(), 1);
         buffers.clear("local");
         assert_eq!(buffers.snapshot().len(), 2);
     }
     use super::*;
+    #[test]
+    fn workflow_summaries_describe_results_without_internal_action_codes() {
+        assert_eq!(workflow_outcome("local_duplicates", &json!({"opportunities":4,"reused":true}), false), "Complete · Check local duplicates · 4 opportunities · saved analysis reused");
+        assert_eq!(workflow_name("deep_apply"), "Save reviewed release links");
+        assert!(workflow_outcome("apply", &json!({"applied":2}), true).starts_with("Cancelled · Apply reviewed changes · 2 files updated"));
+    }
+
+    #[test]
+    fn activity_job_identity_survives_verbose_logs_and_download_monitor_updates() {
+        let backend = Backend::new();
+        backend.start_job(json!({"id":"local","kind":"correct","status":"running"}), Arc::new(AtomicBool::new(false)));
+        backend.start_online_job(json!({"id":"online","kind":"discography","status":"running"}), Arc::new(AtomicBool::new(false)));
+        backend.log_for("discography", "Download folder checked while reading credits", "error");
+        let logs = backend.logs.snapshot();
+        assert_eq!(logs.last().unwrap()["job_id"], "online");
+        assert_eq!(activity_stream(logs.last().unwrap()), "online");
+        backend.finish_online_job(json!({"id":"online","kind":"discography","status":"complete","message":"Credits cached"}));
+        backend.start_online_job(json!({"id":"verbose","kind":"discography","status":"running"}), Arc::new(AtomicBool::new(false)));
+        for index in 0..1100 { backend.log_for("discography", &format!("Saved release {index}"), "info"); }
+        assert!(backend.logs.snapshot().iter().any(|entry| entry["job_id"] == "online" && entry["job_status"] == "complete"));
+        assert!(backend.logs.online.lock().unwrap().entries.len() <= 1000);
+
+        backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}), Arc::new(AtomicBool::new(false)));
+        backend.record_download_monitor("download", json!({"kind":"track","release_id":"1","id":"2","title":"Track","status":"downloading","bytes":100})).unwrap();
+        let item = backend.record_download_monitor("download", json!({"kind":"track","release_id":"1","id":"2","status":"complete"})).unwrap();
+        assert_eq!(item["bytes"], 100);
+        assert_eq!(item["job_id"], "download");
+        assert!(item["updated_at"].is_i64());
+        backend.finish_download_job(json!({"id":"download","kind":"download","status":"complete","message":"Downloaded"}));
+        assert!(backend.record_download_monitor("download", json!({"kind":"track","id":"2","status":"downloading"})).is_none());
+    }
+
     #[test]
     fn download_and_local_jobs_have_independent_cancellation() {
         let backend = Backend::new();

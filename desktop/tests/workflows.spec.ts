@@ -990,3 +990,96 @@ test("local activity keeps its layout and expanded live row stable during update
   await expect(panel.locator(".batch-toggle")).toHaveAttribute("aria-expanded","true");
   await expect(panel.getByRole("button",{name:/saved history|more details/})).toHaveCount(0);
 });
+
+test("activity keeps each job in its channel and nests parallel downloads through empty snapshots", async ({page}) => {
+  const started=Date.now()/1000;
+  const local={id:"group-local",kind:"apply",status:"running",message:"Updating local tags",started,completed:1,total:5};
+  const online={id:"group-online",kind:"discography",status:"running",message:"Artist 2 of 10 — release details",started,completed:2,total:10};
+  const download={id:"group-download",kind:"download",status:"running",message:"Downloading two releases",started,completed:0,total:2};
+  const logs=[
+    {at:new Date().toISOString(),message:"Applied an online title to a local file",category:"online",job_id:local.id,job_kind:local.kind,job_status:"running"},
+    {at:new Date().toISOString(),message:"Download track details for an artist",category:"error",job_id:online.id,job_kind:online.kind,job_status:"running"},
+    {at:new Date().toISOString(),message:"Transfer started",category:"general",job_id:download.id,job_kind:download.kind,job_status:"running"},
+  ];
+  const monitor=Object.fromEntries([1,2].flatMap(n=>[
+    [`${download.id}:batch:r${n}`,{id:`r${n}`,kind:"batch",job_id:download.id,release_id:`r${n}`,artist:"Artist",release:`Release ${n}`,status:"running",total_tracks:1}],
+    [`${download.id}:track:r${n}:t${n}`,{id:`t${n}`,kind:"track",job_id:download.id,release_id:`r${n}`,title:`Track ${n}`,status:"running",index:1,total_tracks:1,percent:25,bytes:1024,updated_at:started}],
+  ]));
+  let empty=false, emptyReplies=0, snapshots=0;
+  const epochs=[0,0,0];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if (request.method === "logs.clear") {
+      epochs[request.args.stream === "online" ? 0 : request.args.stream === "downloads" ? 2 : 1]++;
+      return route.fulfill({json:{result:{cleared:true,activity_epochs:epochs}}});
+    }
+    if (request.method === "logs.job") return route.fulfill({json:{result:logs.filter(entry=>entry.job_id===request.args.id)}});
+    const response=await rpc(request.method,request.args);
+    if (["state","job.status"].includes(request.method) && response.result) {
+      Object.assign(response.result,{job:local,online_job:online,download_job:download,activity_epochs:[0,0,0],logs:empty?[]:logs,download_monitor:empty?{}:monitor});
+      if (empty) emptyReplies++;
+      snapshots++;
+    }
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
+  for (const name of ["Online actions","Local actions","Downloads"]) {
+    const panel=page.getByRole("region",{name,exact:true});
+    await expect(panel.locator(".job-toggle")).toHaveCount(1);
+    await panel.locator(".job-toggle").click();
+  }
+  const localPanel=page.getByRole("region",{name:"Local actions",exact:true});
+  const onlinePanel=page.getByRole("region",{name:"Online actions",exact:true});
+  const downloadPanel=page.getByRole("region",{name:"Downloads",exact:true});
+  await expect(localPanel.locator(".batch-children")).toContainText(logs[0].message);
+  await expect(onlinePanel.locator(".batch-children")).toContainText(logs[1].message);
+  await expect(downloadPanel.locator(".download-job-details .release-toggle")).toHaveCount(2);
+  await expect(downloadPanel.locator(".download-row")).toHaveCount(2);
+  empty=true;
+  await expect.poll(()=>emptyReplies).toBeGreaterThan(0);
+  await expect(localPanel.locator(".log-row")).toContainText(logs[0].message);
+  await expect(onlinePanel.locator(".log-row")).toContainText(logs[1].message);
+  await expect(downloadPanel.locator(".download-row")).toHaveCount(2);
+  await expect(downloadPanel.locator(".job-toggle")).toHaveAttribute("aria-expanded","true");
+  // A slow, old snapshot arriving after Clear must not restore its archived
+  // rows or transfer monitor. Active job headers can remain available.
+  empty=false;
+  await onlinePanel.getByRole("button",{name:"Clear online actions",exact:true}).click();
+  await downloadPanel.getByRole("button",{name:"Clear downloads",exact:true}).click();
+  const afterClear=snapshots;
+  await expect.poll(()=>snapshots).toBeGreaterThan(afterClear);
+  await expect(onlinePanel.locator(".job-toggle")).toHaveAttribute("aria-expanded","false");
+  await expect(onlinePanel.locator(".log-row")).toHaveCount(0);
+  await downloadPanel.locator(".job-toggle").click();
+  await expect(downloadPanel.locator(".download-row")).toHaveCount(0);
+});
+
+test("expanded saved job history appends pages and searches archived details without disappearing", async ({page}) => {
+  const entries=Array.from({length:1002},(_,i)=>({at:new Date(Date.parse("2026-09-30T12:00:00Z")+i*1000).toISOString(),message:`Checked recording ${i+1}`,category:"online",job_id:"archive-refresh",job_kind:"discography",job_status:i===1001?"complete":"running"}));
+  const offsets:number[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if (request.method === "logs.job" && request.args.id === "archive-refresh") {
+      offsets.push(request.args.offset || 0);
+      return route.fulfill({json:{result:entries.slice(request.args.offset || 0,(request.args.offset || 0)+1000)}});
+    }
+    const response=await rpc(request.method,request.args);
+    if (request.method === "state" && response.result) Object.assign(response.result,{job:null,online_job:{id:"archive-refresh",kind:"discography",status:"complete",message:"Release refresh complete",started:1,historical:true},download_job:null,logs:[entries[1001]],download_monitor:{},activity_epochs:[0,0,0]});
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
+  const panel=page.getByRole("region",{name:"Online actions",exact:true});
+  await panel.locator(".job-toggle").click();
+  await expect(panel.locator(".log-row")).toHaveCount(1001);
+  await panel.locator(".activity-log").evaluate(element=>{element.scrollTop=element.scrollHeight;});
+  await expect(panel.locator(".log-row")).toHaveCount(1002);
+  expect(offsets).toEqual([0,1000]);
+  await panel.getByRole("searchbox").fill("Checked recording 1001");
+  await expect(panel.locator(".job-toggle")).toBeVisible();
+  await expect(panel.locator(".log-row")).toHaveCount(1);
+  await expect(panel.locator(".log-row")).toContainText("Checked recording 1001");
+  await panel.getByRole("searchbox").fill("");
+  await expect(panel.locator(".log-row")).toHaveCount(1002);
+});

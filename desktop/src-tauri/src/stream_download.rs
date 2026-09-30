@@ -790,6 +790,27 @@ pub fn parse_mpd_manifest(xml: &str) -> Result<Vec<String>, String> {
 // AUDIO DOWNLOAD ENGINE
 // ============================================================================
 
+struct PartialAudioFile(Option<PathBuf>);
+impl Drop for PartialAudioFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 { let _ = fs::remove_file(path); }
+    }
+}
+
+async fn cancellable_audio_read<T>(
+    pending: impl std::future::Future<Output = Result<T, reqwest::Error>>,
+    cancel: &AtomicBool,
+) -> Result<T, String> {
+    tokio::pin!(pending);
+    loop {
+        if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
+        tokio::select! {
+            result = &mut pending => return result.map_err(|e| e.to_string()),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+        }
+    }
+}
+
 /// Downloads audio stream segments into destination file, handling decryption if needed.
 pub async fn download_stream(
     http: &reqwest::Client,
@@ -799,15 +820,16 @@ pub async fn download_stream(
     progress_cb: &(dyn Fn(u8, u64, Option<u64>) + Send + Sync),
     segment_concurrency: usize,
 ) -> Result<(), String> {
-    if dest_path.exists() {
-        let _ = fs::remove_file(dest_path);
-    }
-
+    if cancel_flag.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
+    if stream_info.urls.is_empty() { return Err("Audio stream contains no download URLs".into()); }
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let mut dest_file = File::create(dest_path).map_err(|e| e.to_string())?;
+    let mut partial_file = PartialAudioFile(None);
+    let mut dest_file = fs::OpenOptions::new().write(true).create_new(true).open(dest_path)
+        .map_err(|e| format!("Could not create staged audio file: {e}"))?;
+    partial_file.0 = Some(dest_path.to_path_buf());
     let total_urls = stream_info.urls.len();
 
     // Key and nonce for stream decryption if needed
@@ -884,25 +906,22 @@ pub async fn download_stream(
         }
 
         let segment_length = res.content_length();
-        let mut seg_bytes = Vec::new();
-        while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        let mut segment_bytes = 0u64;
+        while let Some(chunk) = cancellable_audio_read(res.chunk(), cancel_flag.as_ref()).await? {
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = fs::remove_file(dest_path);
                 return Err("Download cancelled".to_string());
             }
-            seg_bytes.extend_from_slice(&chunk);
+            dest_file.write_all(&chunk).map_err(|e| format!("Failed writing audio: {e}"))?;
+            segment_bytes += chunk.len() as u64;
             downloaded_bytes_total += chunk.len() as u64;
             let segment_fraction = segment_length
                 .filter(|length| *length > 0)
-                .map(|length| (seg_bytes.len() as f64 / length as f64).min(1.0))
+                .map(|length| (segment_bytes as f64 / length as f64).min(1.0))
                 .unwrap_or(0.0);
             let pct = (((idx as f64 + segment_fraction) / total_urls.max(1) as f64) * 100.0) as u8;
             progress_cb(pct, downloaded_bytes_total, if total_urls == 1 { segment_length } else { None });
         }
-
-        dest_file
-            .write_all(&seg_bytes)
-            .map_err(|e| format!("Failed writing segment to file: {}", e))?;
 
         let pct = (((idx + 1) as f64 / total_urls as f64) * 100.0).min(100.0) as u8;
         progress_cb(pct, downloaded_bytes_total, if total_urls == 1 { segment_length } else { None });
@@ -919,6 +938,7 @@ pub async fn download_stream(
         fs::write(dest_path, &all_bytes).map_err(|e| e.to_string())?;
     }
 
+    partial_file.0 = None;
     Ok(())
 }
 
@@ -938,7 +958,7 @@ fn spawn_audio_segment(
         if !response.status().is_success() { return Err(format!("Segment {index}: HTTP {}", response.status())); }
         let mut response = response;
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        while let Some(chunk) = cancellable_audio_read(response.chunk(), cancel.as_ref()).await? {
             if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
             bytes.extend_from_slice(&chunk);
         }
@@ -1443,72 +1463,112 @@ pub fn format_download_path(template: &str, meta: &TrackDownloadMeta, extension:
 /// Publishes downloaded files safely into target root.
 /// Existing files with identical content are safely acknowledged;
 /// different existing files result in an error to avoid data loss.
-pub fn publish_staged_files(stage_dir: &Path, target_root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut published = Vec::new();
-
-    fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                walk_files(&path, out)?;
-            } else if path.is_file() {
-                out.push(path);
-            }
+fn staged_files(stage_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_symlink() { return Err("Staged downloads cannot contain symbolic links".into()); }
+            if kind.is_dir() { walk(&entry.path(), out)?; }
+            else if kind.is_file() { out.push(entry.path()); }
         }
         Ok(())
     }
+    let mut files = Vec::new();
+    walk(stage_dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
 
-    let mut staged_files = Vec::new();
-    walk_files(stage_dir, &mut staged_files).map_err(|e| e.to_string())?;
-
-    for src in staged_files {
-        let rel = src
-            .strip_prefix(stage_dir)
-            .map_err(|e| format!("Staged file not within stage dir: {}", e))?;
-        let dst = target_root.join(rel);
-
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-
-        if dst.exists() {
-            // Check SHA-256
-            let src_bytes = fs::read(&src).map_err(|e| e.to_string())?;
-            let dst_bytes = fs::read(&dst).map_err(|e| e.to_string())?;
-            if sha256_digest(&src_bytes) == sha256_digest(&dst_bytes) {
-                published.push(dst);
-                continue;
-            } else {
-                return Err(format!(
-                    "Destination already exists with different contents: {}",
-                    dst.display()
-                ));
-            }
-        }
-
-        // Try hardlink first, then rename/move
-        if fs::hard_link(&src, &dst).is_err() {
-            fs::copy(&src, &dst).map_err(|e| e.to_string())?;
-        }
-        published.push(dst);
+fn validate_publish_path(destination: &Path, target_root: &Path) -> Result<(), String> {
+    let relative = destination.strip_prefix(target_root).map_err(|e| e.to_string())?;
+    if relative.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Err("Download destination must remain within its configured folder".into());
     }
+    if fs::symlink_metadata(destination).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err("Download destination cannot be a symbolic link".into());
+    }
+    let root = fs::canonicalize(target_root).map_err(|e| e.to_string())?;
+    let ancestor = destination.parent().and_then(|parent| parent.ancestors().find(|part| part.exists()))
+        .ok_or("Invalid download destination")?;
+    if !fs::canonicalize(ancestor).map_err(|e| e.to_string())?.starts_with(root) {
+        return Err("Download destination resolves outside its configured folder".into());
+    }
+    Ok(())
+}
 
+fn audio_file_digest(path: &Path) -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 { break; }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize().into())
+}
+
+pub fn publish_staged_files(stage_dir: &Path, target_root: &Path) -> Result<Vec<PathBuf>, String> {
+    fs::create_dir_all(target_root).map_err(|e| e.to_string())?;
+    let sources = staged_files(stage_dir)?;
+    let mut plan = Vec::with_capacity(sources.len());
+    // Check the complete release before publishing its first track. Existing
+    // identical files are reused, while every other collision leaves it intact.
+    for src in sources {
+        let relative = src.strip_prefix(stage_dir).map_err(|e| e.to_string())?;
+        let dst = target_root.join(relative);
+        validate_publish_path(&dst, target_root)?;
+        let exists = dst.exists();
+        if exists && (fs::metadata(&src).map_err(|e| e.to_string())?.len() != fs::metadata(&dst).map_err(|e| e.to_string())?.len()
+            || audio_file_digest(&src)? != audio_file_digest(&dst)?) {
+            return Err(format!("Destination already exists with different contents: {}", dst.display()));
+        }
+        plan.push((src, dst, exists));
+    }
+    let mut published = Vec::with_capacity(plan.len());
+    let mut created = Vec::new();
+    let result = (|| -> Result<(), String> {
+        for (src, dst, exists) in plan {
+            if !exists {
+                if let Some(parent) = dst.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+                validate_publish_path(&dst, target_root)?;
+                if fs::hard_link(&src, &dst).is_err() {
+                    // create_new also protects a destination created after the
+                    // preflight check; fs::copy would overwrite it.
+                    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&dst)
+                        .map_err(|e| e.to_string())?;
+                    created.push(dst.clone());
+                    let mut input = File::open(&src).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+                    output.flush().map_err(|e| e.to_string())?;
+                } else { created.push(dst.clone()); }
+            }
+            published.push(dst);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for path in created.iter().rev() { let _ = fs::remove_file(path); }
+        return Err(format!("Download publication stopped; newly published files removed: {error}"));
+    }
     Ok(published)
 }
 
 /// Replace only the requested staged files. Previous copies remain recoverable beside the
 /// destination until the caller moves them to Trash after a successful publish.
 pub fn publish_redownloaded_files(stage_dir: &Path, target_root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
-    fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.is_dir() { collect(&path, out)?; } else if path.is_file() { out.push(path); }
+    fs::create_dir_all(target_root).map_err(|e| e.to_string())?;
+    let sources = staged_files(stage_dir)?;
+    for source in &sources {
+        let relative = source.strip_prefix(stage_dir).map_err(|e| e.to_string())?;
+        let destination = target_root.join(relative);
+        validate_publish_path(&destination, target_root)?;
+        if destination.exists() && !destination.is_file() {
+            return Err("Redownload destination is not an audio file".into());
         }
-        Ok(())
     }
-    let mut sources = Vec::new();
-    collect(stage_dir, &mut sources).map_err(|e| e.to_string())?;
     let backup_dir = target_root.join(format!(".tibrary-redownload-backup-{}", uuid::Uuid::new_v4()));
     let mut published = Vec::new();
     let mut backups = Vec::new();
@@ -1570,13 +1630,7 @@ fn extract_query_param(url_str: &str, param: &str) -> Option<String> {
     None
 }
 
-fn sha256_digest(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
-}
 
-/// Inspects file header magic bytes to detect actual audio container format.
 pub fn detect_audio_extension(bytes: &[u8], fallback: &str) -> String {
     if bytes.len() >= 4 && &bytes[0..4] == b"fLaC" {
         return ".flac".to_string();
@@ -1897,6 +1951,74 @@ mod tests {
         assert!(err.contains("Destination already exists with different contents"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn release_collision_does_not_publish_a_partial_release_or_follow_symlinks() {
+        let temp = std::env::temp_dir().join(format!("publish-collision-{}", uuid::Uuid::new_v4()));
+        let stage = temp.join("stage");
+        let library = temp.join("library");
+        fs::create_dir_all(stage.join("Artist/Release")).unwrap();
+        fs::create_dir_all(library.join("Artist/Release")).unwrap();
+        fs::write(stage.join("Artist/Release/01.flac"), MINIMAL_FLAC).unwrap();
+        fs::write(stage.join("Artist/Release/02.flac"), MINIMAL_FLAC).unwrap();
+        fs::write(library.join("Artist/Release/02.flac"), b"existing audio").unwrap();
+        assert!(publish_staged_files(&stage, &library).is_err());
+        assert!(!library.join("Artist/Release/01.flac").exists());
+        assert_eq!(fs::read(library.join("Artist/Release/02.flac")).unwrap(), b"existing audio");
+        assert!(stage.join("Artist/Release/01.flac").exists());
+        #[cfg(unix)] {
+            let outside = temp.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            fs::remove_dir_all(library.join("Artist")).unwrap();
+            std::os::unix::fs::symlink(&outside, library.join("Artist")).unwrap();
+            assert!(publish_staged_files(&stage, &library).is_err());
+            assert!(publish_redownloaded_files(&stage, &library).is_err());
+            assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_audio_body_can_be_cancelled_and_removes_partial_files() {
+        use std::io::Read;
+        for concurrency in [1, 2] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut workers = Vec::new();
+                for _ in 0..concurrency {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    workers.push(std::thread::spawn(move || {
+                        let mut request = [0u8; 1024];
+                        socket.read(&mut request).unwrap();
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").unwrap();
+                        std::thread::sleep(Duration::from_secs(1));
+                        let _ = socket.write_all(&[0u8; 100]);
+                    }));
+                }
+                for worker in workers { worker.join().unwrap(); }
+            });
+            let destination = std::env::temp_dir().join(format!("cancel-audio-{}", uuid::Uuid::new_v4()));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stream = PlaybackStreamInfo { urls: (0..concurrency).map(|n| format!("http://{address}/{n}")).collect(),
+                codec: "FLAC".into(), mime_type: "audio/flac".into(), is_encrypted: false, security_token: None,
+                bit_depth: None, sample_rate: None, album_replay_gain: None, album_peak_amplitude: None,
+                track_replay_gain: None, track_peak_amplitude: None };
+            let stop = async { tokio::time::sleep(Duration::from_millis(150)).await; cancel.store(true, Ordering::Relaxed); };
+            let http = reqwest::Client::new();
+            let download = download_stream(&http, &stream, &destination, &cancel, &|_,_,_| {}, concurrency);
+            let (result, ()) = tokio::join!(tokio::time::timeout(Duration::from_millis(700), download), stop);
+            assert!(result.expect("Cancellation waited for the stalled response body").unwrap_err().contains("cancelled"));
+            assert!(!destination.exists());
+            server.join().unwrap();
+            // Existing audio can never be removed by the staging downloader.
+            fs::write(&destination, MINIMAL_FLAC).unwrap();
+            cancel.store(false, Ordering::Relaxed);
+            assert!(download_stream(&http, &stream, &destination, &cancel, &|_,_,_| {}, concurrency).await.is_err());
+            assert_eq!(fs::read(&destination).unwrap(), MINIMAL_FLAC);
+            fs::remove_file(destination).unwrap();
+        }
     }
 
     #[test]

@@ -22,6 +22,16 @@ impl Drop for StagingDirectory {
     }
 }
 
+// JoinHandle drops detach tasks. Keep independent abort handles until the whole
+// release finishes so every error/cancellation path stops pending transfers too.
+#[derive(Default)]
+struct DownloadTasks(Vec<tokio::task::AbortHandle>);
+impl Drop for DownloadTasks {
+    fn drop(&mut self) {
+        for task in &self.0 { task.abort(); }
+    }
+}
+
 fn preliminary_meta(track: &TidalAlbumTrack, album_id: &str, album: &str, album_artist: &str, track_total: u32, disc_total: u32, date: &Option<String>) -> TrackDownloadMeta {
     TrackDownloadMeta {
         track_id: track.id.clone(), album_id: album_id.to_string(), title: track.title.clone(),
@@ -48,6 +58,68 @@ fn existing_audio_path(output: &Path, destination: Option<&Value>, template: &st
 
 fn nonempty_file(path: &Path) -> bool {
     path.is_file() && path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false)
+}
+
+fn preserve_existing_dj_tags(replacement: &Path, previous: &[PathBuf], explicit_replacement: bool) -> Result<(), String> {
+    let fresh = crate::scanner::read_audio_metadata(replacement)?;
+    let valid_bpm = |value: Option<&str>| value.and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let mut updates = std::collections::HashMap::new();
+    let mut needs_bpm = valid_bpm(fresh.bpm.as_deref()).is_none();
+    let mut needs_key = fresh.musical_key.as_deref().and_then(crate::musical_keys::camelot_key).is_none();
+    if !needs_bpm && !needs_key && !explicit_replacement { return Ok(()); }
+    for path in previous {
+        let old = match crate::scanner::read_audio_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if explicit_replacement => return Err(format!("Could not verify replacement source {}: {error}", path.display())),
+            Err(_) => continue,
+        };
+        let old_isrc = crate::release_matching::clean_isrc(old.isrc.as_deref());
+        let new_isrc = crate::release_matching::clean_isrc(fresh.isrc.as_deref());
+        let same_id = old.tidal_track_id.as_deref().filter(|id| !id.is_empty())
+            .is_some_and(|id| fresh.tidal_track_id.as_deref() == Some(id));
+        let same_isrc = old_isrc.as_ref().filter(|isrc| isrc.len() == 12)
+            .is_some_and(|isrc| new_isrc.as_ref() == Some(isrc));
+        let same_recording = (same_id || same_isrc || explicit_replacement) && crate::release_matching::recording_matches(
+            &old.title, old.duration, old.isrc.as_deref(), &fresh.title, fresh.duration,
+            fresh.isrc.as_deref(), true);
+        if !same_recording {
+            if explicit_replacement { return Err(format!("Replacement recording differs from {}; review its release link", path.display())); }
+            continue;
+        }
+        if needs_bpm {
+            if let Some(bpm) = valid_bpm(old.bpm.as_deref()) {
+                updates.insert("bpm".into(), bpm.to_string());
+                needs_bpm = false;
+            }
+        }
+        if needs_key {
+            if let Some(key) = old.musical_key.as_deref().and_then(crate::musical_keys::camelot_key) {
+                updates.insert("initialkey".into(), key);
+                needs_key = false;
+            }
+        }
+        if !needs_bpm && !needs_key && !explicit_replacement { break; }
+    }
+    crate::tag_writer::write_tags(replacement, &updates)
+}
+
+fn replacement_sources(release: &Value, track: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
+    if release["replacement_audit"]["root"].as_str().is_none() { return Ok(Vec::new()); }
+    let saved = &release["replacement_audit"]["source_paths"][track];
+    let mut paths: Vec<_> = if let Some(path) = saved.as_str() { vec![PathBuf::from(path)] }
+        else { saved.as_array().into_iter().flatten().filter_map(Value::as_str).map(PathBuf::from).collect() };
+    paths.sort(); paths.dedup();
+    if paths.is_empty() { return Err("Replacement selection no longer contains this track's source files; review the queue".into()); }
+    let canonical_root = fs::canonicalize(root).map_err(|e| e.to_string())?;
+    for path in &paths {
+        if !path.starts_with(root) || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+            || !fs::symlink_metadata(path).map_err(|e|format!("Replacement source {}: {e}",path.display()))?.file_type().is_file()
+            || !fs::canonicalize(path).map_err(|e| e.to_string())?.starts_with(&canonical_root) {
+            return Err("Replacement source must be an existing file within the selected library".into());
+        }
+    }
+    Ok(paths)
 }
 
 pub struct DownloadManager;
@@ -251,7 +323,12 @@ impl DownloadManager {
             ));
 
             let destination = release.get("existing_destination");
-            let item_output = if let Some(dest) = destination {
+            let item_output = if let Some(root) = release["replacement_audit"]["root"].as_str() {
+                if !roots.iter().any(|library| library.root == root) || !Path::new(root).is_dir() {
+                    return Err("Replacement library is offline or no longer registered".into());
+                }
+                PathBuf::from(root)
+            } else if let Some(dest) = destination {
                 let r_str = dest.get("root").and_then(|v| v.as_str()).unwrap_or("");
                 let requested = if r_str.starts_with('~') {
                     home_dir.join(r_str.trim_start_matches("~/"))
@@ -347,6 +424,9 @@ impl DownloadManager {
                 progress_cb("No tracks to download for this release".to_string());
                 continue;
             }
+            for track in &tracks {
+                replacement_sources(release, &track.id, &item_output)?;
+            }
 
             // Staging directory inside target root
             let work_id = uuid::Uuid::new_v4();
@@ -372,6 +452,7 @@ impl DownloadManager {
             monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":0,"status":"running"}));
             let mut relative_track_filenames = Vec::new();
             let mut existing_published_files = Vec::new();
+            let mut replacement_moves = std::collections::HashMap::<PathBuf, PathBuf>::new();
             let mut album_dir_opt: Option<PathBuf> = None;
 
             // Fetch audio concurrently, then publish the complete release only after every
@@ -381,6 +462,7 @@ impl DownloadManager {
             let provider_segment_concurrency = provider.get("segment_concurrency").and_then(Value::as_u64).unwrap_or(2).clamp(1, 4) as usize;
             let permits = Arc::new(tokio::sync::Semaphore::new(parallel));
             let mut prefetch = Vec::with_capacity(total_tracks);
+            let mut pending_downloads = DownloadTasks::default();
             for (idx, track) in tracks.iter().enumerate() {
                 let track_total = all_tracks.iter().filter(|other| other.volume_number == track.volume_number).count() as u32;
                 let disc_total = album_info.number_of_volumes.unwrap_or(1) as u32;
@@ -403,7 +485,7 @@ impl DownloadManager {
                 let log = progress_cb.clone();
                 let permits = permits.clone();
                 let release_id = ident.clone();
-                prefetch.push(Some(tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let _permit = permits.acquire_owned().await.map_err(|e| e.to_string())?;
                     if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
                     if idx > 0 { tokio::time::sleep(Duration::from_millis(350 * (idx % parallel) as u64)).await; }
@@ -430,7 +512,9 @@ impl DownloadManager {
                     let segment_concurrency = provider_segment_concurrency;
                     download_stream(&http, &stream, &source, &cancel, &progress, segment_concurrency).await?;
                     Ok::<_, String>((stream, source))
-                })));
+                });
+                pending_downloads.0.push(task.abort_handle());
+                prefetch.push(Some(task));
             }
 
             for (idx, track) in tracks.iter().enumerate() {
@@ -491,7 +575,14 @@ impl DownloadManager {
                     }
                 }
 
-                let result = prefetch[idx].take().expect("active track has a download task").await;
+                let Some(task) = prefetch[idx].take() else {
+                    // An external editor may remove a file after the preflight
+                    // skip decision. Leave the release queued for a fresh retry.
+                    progress_cb(format!("Existing file changed during download · {} · retry this release", track.title));
+                    all_tracks_ok = false;
+                    break;
+                };
+                let result = task.await;
                 let (stream_info, mut staged_source) = match result {
                     Ok(Ok(audio)) => audio,
                     Ok(Err(error)) => {
@@ -605,7 +696,18 @@ impl DownloadManager {
                 let tag_path = staged_source.clone();
                 let tag_meta = meta.clone();
                 let tag_cover = cover_data.clone();
-                let tag_result = tokio::task::spawn_blocking(move || apply_audio_tags(&tag_path, &tag_meta, tag_cover.as_deref()))
+                let previous_path = existing_audio_path(&item_output, destination, template, &meta);
+                let source_paths = replacement_sources(release, &track.id, &item_output)?;
+                let explicit_replacement = !source_paths.is_empty();
+                let previous_files = if explicit_replacement { source_paths.clone() }
+                    else if release["redownload"] == true || release.get("replacement_audit").is_some() {
+                    vec![previous_path.clone(), previous_path.with_extension("m4a")]
+                } else { Vec::new() };
+                let tag_result = tokio::task::spawn_blocking(move || {
+                    apply_audio_tags(&tag_path, &tag_meta, tag_cover.as_deref())?;
+                    if !previous_files.is_empty() && !explicit_replacement { preserve_existing_dj_tags(&tag_path, &previous_files, false)?; }
+                    Ok::<_, String>(())
+                })
                     .await.map_err(|e| format!("Tag worker stopped: {e}"))?;
                 if let Err(e) = tag_result {
                     progress_cb(format!("Tagging failed for {}: {}", track.title, e));
@@ -615,7 +717,10 @@ impl DownloadManager {
                 }
 
                 // Determine final relative path
-                let target_path_in_stage = if let Some(dest) = destination {
+                let target_path_in_stage = if let Some(source) = source_paths.first() {
+                    stage_dir.join(source.strip_prefix(&item_output).map_err(|e| e.to_string())?)
+                        .with_extension(detected_ext.trim_start_matches('.'))
+                } else if let Some(dest) = destination {
                     let rel_album = dest
                         .get("album_relative")
                         .and_then(|v| v.as_str())
@@ -654,6 +759,27 @@ impl DownloadManager {
                 }
                 fs::rename(&staged_source, &target_path_in_stage)
                     .map_err(|e| format!("Could not stage downloaded track: {e}"))?;
+                let mut replacement_files = Vec::new();
+                for source in &source_paths {
+                    let relative = source.strip_prefix(&item_output).map_err(|e| e.to_string())?;
+                    let copy = stage_dir.join(relative).with_extension(detected_ext.trim_start_matches('.'));
+                    if copy != target_path_in_stage {
+                        if let Some(parent) = copy.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+                        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&copy).map_err(|e| e.to_string())?;
+                        let mut input = fs::File::open(&target_path_in_stage).map_err(|e| e.to_string())?;
+                        std::io::copy(&mut input, &mut output).map_err(|e| format!("Could not stage every selected replacement: {e}"))?;
+                    }
+                    replacement_moves.insert(item_output.join(copy.strip_prefix(&stage_dir).map_err(|e|e.to_string())?), source.clone());
+                    replacement_files.push((copy, source.clone()));
+                }
+                if !replacement_files.is_empty() {
+                    tokio::task::spawn_blocking(move || {
+                        for (replacement, source) in replacement_files {
+                            preserve_existing_dj_tags(&replacement, &[source], true)?;
+                        }
+                        Ok::<_, String>(())
+                    }).await.map_err(|e| format!("Replacement verification worker stopped: {e}"))??;
+                }
 
                 // Companion .lrc file if requested
                 if lyrics_file {
@@ -741,6 +867,51 @@ impl DownloadManager {
                 let name = folder.as_os_str().to_string_lossy();
                 if name.starts_with(".tibrary-redownload-backup-") { Some(item_output.join(folder.as_os_str())) } else { None }
             });
+            published.extend(existing_published_files);
+            let _ = fs::remove_dir_all(&stage_dir);
+
+            // Keep previous copies until all new audio has been indexed. Moves
+            // between extensions also migrate saved links and ignore choices.
+            let mut index_ok = true;
+            for path in &published {
+                let Some(library) = roots.iter().filter(|library| path.starts_with(&library.root))
+                    .max_by_key(|library| library.root.len()) else { continue; };
+                if !path.extension().and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| crate::scanner::AUDIO_EXTS.contains(&extension.to_ascii_lowercase().as_str())) { continue; }
+                let audio_path = path.clone();
+                let inspection = tokio::task::spawn_blocking(move || {
+                    let meta = crate::scanner::read_audio_metadata(&audio_path)?;
+                    let stat = fs::metadata(&audio_path).map_err(|e| e.to_string())?;
+                    let mtime = stat.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64).unwrap_or(0);
+                    Ok::<_, String>((serde_json::to_value(meta).map_err(|e|e.to_string())?, stat.len() as i64, mtime))
+                }).await.map_err(|e|e.to_string()).and_then(|result| result);
+                let source = replacement_moves.get(path).unwrap_or(path);
+                let update = match inspection {
+                    Ok((metadata, size, mtime)) => db.apply_file_update(&source.to_string_lossy(), &path.to_string_lossy(), &library.root, &metadata, size, mtime).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = update {
+                    index_ok = false;
+                    progress_cb(format!("Audio saved; local index update needs retry · {} · {error}. Use Check local changes.", path.display()));
+                }
+            }
+            if index_ok {
+                let now_iso = chrono::Utc::now().to_rfc3339();
+                if let Err(error) = conn.execute(
+                    "UPDATE queue SET decision = 'downloaded', approved = 0, updated = ? WHERE id = ?",
+                    (now_iso.as_str(), ident.as_str()),
+                ).await {
+                    index_ok = false;
+                    progress_cb(format!("Audio saved; queue update needs retry · {release_title} · {error}"));
+                }
+            }
+            if !index_ok {
+                failed_count += 1;
+                progress_cb(format!("Saved audio requires an index retry · {release_title} · previous copies retained"));
+                monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"status":"failed","error":"Audio saved; index or queue update needs retry"}));
+                continue;
+            }
             let mut retained_previous = false;
             for old in previous_files {
                 if let Err(error) = crate::duplicates::trash_file_or_directory(&old.to_string_lossy()).await {
@@ -750,49 +921,6 @@ impl DownloadManager {
             }
             if !retained_previous {
                 if let Some(folder) = backup_root { let _ = fs::remove_dir_all(folder); }
-            }
-            published.extend(existing_published_files);
-
-            let _ = fs::remove_dir_all(&stage_dir);
-
-            // Update DB queue
-            let now_iso = chrono::Utc::now().to_rfc3339();
-            let _ = conn
-                .execute(
-                    "UPDATE queue SET decision = 'downloaded', approved = 0, updated = ? WHERE id = ?",
-                    (now_iso.as_str(), ident.as_str()),
-                )
-                .await;
-
-            // Index into local_files
-            for p in published {
-                let p_str = p.to_string_lossy().to_string();
-                for r in &roots {
-                    let r_path = Path::new(&r.root);
-                    if p.starts_with(r_path) {
-                        if let Ok(file_meta) = fs::metadata(&p) {
-                            let size = file_meta.len() as i64;
-                            let mtime = file_meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_nanos() as i64)
-                                .unwrap_or(0);
-
-                            if let Ok(meta_obj) = crate::scanner::read_audio_metadata(&p) {
-                                let meta_str = serde_json::to_string(&meta_obj).unwrap_or_default();
-                                match conn.execute(
-                                    "INSERT OR REPLACE INTO local_files (path, root, size, mtime, metadata, present) VALUES (?, ?, ?, ?, ?, 1)",
-                                    (p_str.as_str(), r.root.as_str(), size, mtime, meta_str.as_str()),
-                                ).await {
-                                    Ok(_) => db.note_local_change(),
-                                    Err(error) => progress_cb(format!("Audio saved; local index update needs retry · {} · {error}. Use Check local changes.", p.display())),
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
             }
 
             processed_tracks+=total_tracks;
@@ -815,6 +943,66 @@ impl DownloadManager {
 #[cfg(test)]
 mod live_tests {
     use super::*;
+
+    #[test]
+    fn replacements_preserve_missing_dj_values_only_for_the_same_recording() {
+        let temp = std::env::temp_dir().join(format!("replacement-dj-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let old = temp.join("old.flac");
+        let replacement = temp.join("new.flac");
+        let identity = std::collections::HashMap::from([
+            ("title".into(), "Track".into()), ("isrc".into(), "GBAYE9900001".into()),
+        ]);
+        for path in [&old, &replacement] {
+            fs::write(path, stream_download::MINIMAL_FLAC).unwrap();
+            crate::tag_writer::write_tags(path, &identity).unwrap();
+        }
+        crate::tag_writer::write_tags(&old, &std::collections::HashMap::from([
+            ("bpm".into(),"127.5".into()), ("initialkey".into(),"A minor".into()),
+        ])).unwrap();
+        preserve_existing_dj_tags(&replacement, &[old.clone()], false).unwrap();
+        let metadata = crate::scanner::read_audio_metadata(&replacement).unwrap();
+        assert_eq!(metadata.bpm.as_deref(), Some("127.5"));
+        assert_eq!(metadata.musical_key.as_deref(), Some("8A"));
+        crate::tag_writer::write_tags(&replacement, &std::collections::HashMap::from([
+            ("bpm".into(),"133".into()), ("initialkey".into(),"9A".into()),
+        ])).unwrap();
+        preserve_existing_dj_tags(&replacement, &[old.clone()], false).unwrap();
+        assert_eq!(crate::scanner::read_audio_metadata(&replacement).unwrap().bpm.as_deref(), Some("133"));
+        for (title, isrc) in [("Track (Extended Mix)", "GBAYE9900001"), ("Track", "GBAYE9900002")] {
+            crate::tag_writer::write_tags(&replacement, &std::collections::HashMap::from([
+                ("title".into(),title.into()), ("isrc".into(),isrc.into()),
+                ("bpm".into(),"".into()), ("initialkey".into(),"".into()),
+            ])).unwrap();
+            assert!(preserve_existing_dj_tags(&replacement, &[old.clone()], true).is_err());
+            preserve_existing_dj_tags(&replacement, &[old.clone()], false).unwrap();
+            let metadata = crate::scanner::read_audio_metadata(&replacement).unwrap();
+            assert!(metadata.bpm.is_none());
+            assert!(metadata.musical_key.is_none());
+        }
+        let other = temp.join("second.flac");
+        fs::copy(&old, &other).unwrap();
+        let release = json!({"replacement_audit":{"root":temp,"source_paths":{"1":[old,other]}}});
+        assert_eq!(replacement_sources(&release, "1", &temp).unwrap().len(), 2);
+        assert!(replacement_sources(&release, "missing", &temp).is_err());
+        let unsafe_release = json!({"replacement_audit":{"root":temp,"source_paths":{"1":[temp.join("../outside.flac")]}}});
+        assert!(replacement_sources(&unsafe_release, "1", &temp).is_err());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_errors_abort_detached_and_awaited_download_workers() {
+        let mut pending = DownloadTasks::default();
+        let waiting = tokio::spawn(std::future::pending::<()>());
+        let detached = tokio::spawn(std::future::pending::<()>());
+        pending.0.extend([waiting.abort_handle(), detached.abort_handle()]);
+        let detached_state = detached.abort_handle();
+        drop(detached);
+        drop(pending);
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(detached_state.is_finished());
+    }
     #[tokio::test]
     #[ignore = "Uses the saved account and downloads one release to a temporary folder"]
     async fn isolated_one_track_download() {
@@ -952,5 +1140,32 @@ async fn live_subscriber_download_pipeline() {
     assert!(!duplicate.exists());
     assert!(Path::new(&target).exists());
     assert_eq!(db.get_local_files_page(Some(&root),100,0).await.unwrap().1,1);
-    println!("Download, replacement, metadata, queue, scan, linking, number repair, organisation and reviewed duplicate removal passed in {}",dir.display());
+    // MQA replacements must replace every selected copy at its existing path,
+    // using one fetched recording, rather than skipping it as already present.
+    let second = output.join("Second copy").join("07 - Hope.flac");
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::copy(&target, &second).unwrap();
+    for (path,key) in [(Path::new(&target),"12A"),(second.as_path(),"6A")] {
+        crate::tag_writer::write_tags(path,&std::collections::HashMap::from([("initialkey".into(),key.into())])).unwrap();
+    }
+    crate::scanner::scan_library(&db,&output,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+    let local=db.get_local_files_page(Some(&root),100,0).await.unwrap().0;
+    for file in &local {
+        db.save_track_link(&file.path,"GB",&json!([0,0,file.size,file.mtime]).to_string(),
+            &json!({"status":"linked","ids":{"album_id":"140303440","track_id":"140303447"}}).to_string()).await.unwrap();
+        db.set_preference(&format!("mqa-audit:{}",file.path),&json!({"size":file.size,"mtime":file.mtime,"result":{"detected":true}})).await.unwrap();
+    }
+    let queued=crate::actions::execute(&db,&backend,"queue_mqa",&json!({"root":root,"ids":[target,second]}),Arc::new(AtomicBool::new(false))).await.unwrap();
+    assert_eq!(queued["releases"],1);
+    let count=DownloadManager::run_downloads(&db,None,Arc::new(AtomicBool::new(false)),"test-mqa",|line|println!("{line}"),|_|{}).await.unwrap();
+    assert_eq!(count,1);
+    for (path,key) in [(Path::new(&target),"12A"),(second.as_path(),"6A")] {
+        let replaced=crate::scanner::read_audio_metadata(path).unwrap();
+        assert!((replaced.duration-metadata.duration).abs()<0.01);
+        assert_eq!(replaced.musical_key.as_deref(),Some(key));
+        assert_eq!(replaced.tidal_track_id.as_deref(),Some("140303447"));
+    }
+    assert_eq!(db.get_local_files_page(Some(&root),100,0).await.unwrap().1,2);
+    assert_eq!(db.get_stats("GB",Some(&root)).await.unwrap().linked_tracks,2);
+    println!("Download, multi-copy MQA replacement, metadata, queue, scan, linking, number repair, organisation and reviewed duplicate removal passed in {}",dir.display());
 }

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 export type Row = { id: string; [key: string]: any };
+export const onlineKinds = new Set(["link", "discography", "cached_releases", "check_availability", "release_artists", "release_details", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
 export type Job = {
   id: string;
   kind: string;
@@ -25,6 +26,8 @@ export type AppState = {
   online_job?: Job | null;
   catalogue_refresh?: { ids: string[]; completed: string[]; market: string; detailed: boolean; status: string };
   download_job?: Job | null;
+  download_monitor?: Record<string, Row>;
+  activity_epochs?: number[];
   logs: { at: string; message: string; level?: string; category?: string; progress_id?: string; job_id?: string; job_kind?: string; job_status?: string }[];
   settings: { market: string; theme: string };
   connections: any;

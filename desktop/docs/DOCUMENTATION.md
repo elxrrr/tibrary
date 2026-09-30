@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.2** · [Setup and screenshots](../../README.md)
+Version **0.9.3** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -23,6 +23,8 @@ Track/disc matching treats `01` and `1` equally. Number corrections use padded t
 Duplicate removal uses the system Trash and preserves the chosen keeper. MQA signals are audit evidence; replacement is a separate action. Review proposed changes before applying them.
 
 Files changed through the app update its index and dependent views. After editing or moving files in another application, use **Check local changes** from Overview. It reads tags only for added or changed files and records removals. Keep the database: it holds links, cached metadata and saved decisions.
+
+Reviewed moves keep their links and ignore choices; equivalent number formatting does not invalidate a recording link. Scans exclude temporary working audio files. If a file/tag update cannot be indexed, the original path and tags are restored.
 
 ### Linking and recommendations
 
@@ -54,6 +56,8 @@ All online workflows use one subscriber connection. Refreshes keep up to three a
 
 Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
 
+The first recommendation-data fill can take hours for a large library. **Check release lists only** provides a lighter discovery check; full updates fill missing recommendation evidence. Recommendation updates keep up to three complete release-detail checks in flight. Local tag/artwork preparation reads chosen links in one batch and reuses each release within the job. A bounded live check of three releases took 1.07 seconds serially and 0.83 seconds with three workers, without rate-limit errors; large refreshes depend on the amount of uncached data and service response times. More audio download connections do not raise the metadata request limit.
+
 Availability is shared across artist, metadata and release checks for the selected market. Direct release checks are reused for seven days when available, one day when unavailable, and one hour when inconclusive. Artist-list flags are stored separately: they cannot restore a release that a direct check found unavailable. Older cached positives receive a direct check when you use **Check availability**; completed checks are reused. Confirmed unavailable releases leave the default Missing releases view but remain inspectable through **Unavailable**. Timeouts and rate-limit errors (HTTP 429) never mark a release unavailable. Use **Recheck saved availability online** to bypass these checks without resetting the database or rereading track details.
 
 If upstream tags change without changing a release's summary, use its manual detail refresh. Failed optional genre/replacement lookups retry after a cooldown while retaining the saved track credits; successful empty fields do not trigger repeated checks.
@@ -64,13 +68,15 @@ BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. M
 
 ### Downloads and activity
 
-Choose the destination, template and audio options in General. Approve releases or individual tracks in the queue before starting a download. Videos are excluded. Download progress is separate from local work.
+Choose the destination, template and audio options in General. Approve releases or individual tracks in the queue before starting a download. Videos are excluded. Download progress is separate from local work. Stalled transfers can be cancelled; failed transfers remove their partial files. Downloads publish only after the release has been staged and destination collisions checked. File moves and tag updates keep an original until the database update succeeds. Replacements retain valid existing BPM/key tags when the matching recording has no new values.
+
+MQA replacements use the selected library's existing file paths, including multiple copies of a recording. Previous copies stay recoverable until the replacement audio and queue status are indexed. Recording, mix and duration conflicts stop the replacement for review.
 
 **Export** saves a plain-text list of media URLs, one per line, for an external downloader. Whole approved releases produce album URLs; individually approved tracks produce track URLs. Unapproved and empty selections are omitted. Tidaler accepts this list with `tidaler dl --list acquisition-queue.txt`.
 
 In Downloaded releases, checked releases or tracks limit the export without changing the saved queue. With no checked items, the export uses the saved completed-download selections.
 
-Activity shows item counts, percentage and a smoothed ETA where measurable; discovery remains indeterminate until the total is known. Each job has an expandable history that loads automatically. Activity is saved by default: job summaries return after reopening, and expanding them loads their saved details. **Save activity logs** must remain enabled to retain history; clearing a panel removes its saved entries.
+Activity shows item counts, percentage and a smoothed ETA where measurable; discovery remains indeterminate until the total is known. Each channel shows one expandable group per job. Parallel download releases and tracks stay inside their download job; status updates retain the existing rows. Expanded running jobs append saved details automatically, and older history loads as you scroll. Activity is saved by default: job summaries return after reopening, and expanding them loads their saved details. **Save activity logs** must remain enabled to retain history; clearing a panel removes its saved entries.
 
 Closing during downloads asks whether to keep downloading or stop and quit. Completed downloads remain. Interrupted catalogue refreshes retain their checkpoints; explicitly cancelled jobs stay cancelled. File mutations are not automatically replayed.
 
@@ -107,6 +113,8 @@ npm --prefix desktop run test:e2e
 
 WebKit tests use the debug Rust executable with temporary databases and files. Authenticated live download tests are ignored by default and must be run deliberately with disposable destinations. Passing automated tests does not verify every live catalogue item or native macOS interaction.
 
+Optional focused benchmarks: `metadata_preparation_benchmark -- --ignored --nocapture` uses synthetic database records; `live_metadata_concurrency -- --ignored --nocapture` makes seven read-only credited-release requests through the saved subscriber connection. Add either filter after the Rust test command above. Stop live benchmarking if the service starts throttling.
+
 To refresh the documentation screenshots:
 
 ```sh
@@ -126,4 +134,4 @@ codesign --verify --deep --strict desktop/src-tauri/target/release/bundle/macos/
 
 The editable app icon is `desktop/icon.svg`; platform icon files are in `desktop/src-tauri/icons/`. Regenerate them with the Tauri icon command when the artwork changes.
 
-Before distributing an updated app build, increment the patch version (for example, `0.9.1` → `0.9.2`) in `desktop/package.json`, `desktop/package-lock.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/Cargo.lock` and `desktop/src-tauri/tauri.conf.json`. Keep these versions identical; the sidebar reads the package version automatically. Run the checks, refresh screenshots, commit and tag the tested revision. GitHub releases publish source only; do not attach the locally built app or installers. The local build is ad-hoc signed, not notarised.
+Before distributing an updated app build, increment the patch version (for example, `0.9.2` → `0.9.3`) in `desktop/package.json`, `desktop/package-lock.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/Cargo.lock` and `desktop/src-tauri/tauri.conf.json`. Keep these versions identical; the sidebar reads the package version automatically. Run the checks, refresh screenshots, commit and tag the tested revision. GitHub releases publish source only; do not attach the locally built app or installers. The local build is ad-hoc signed, not notarised.
