@@ -49,11 +49,3 @@ export function TagChanges({ changes, current }: { changes: any; current?: any }
     {Object.entries(changes).map(([key, value]) => <tr key={key}><th scope="row">{metadataLabel(key)}</th><td>{readable(current?.[key])}</td><td>{readable(value)}</td></tr>)}
   </tbody></table></div>;
 }
-
-export function ExportSummary({ content }: { content: string }) {
-  let rows: any[] = [];
-  try { const value = JSON.parse(content); if (Array.isArray(value)) rows=value; } catch { return <p>Export is ready to save.</p>; }
-  return <div className="metadata-table"><table aria-label="Exported releases"><thead><tr><th>Artist</th><th>Release</th><th>Date</th><th>Release ID</th><th>Selection</th></tr></thead><tbody>
-    {rows.map((row,index)=><tr key={row.id || index}><td>{row.release?.artist}</td><td>{row.release?.title}</td><td>{row.release?.date}</td><td>{row.id}</td><td>{row.approved ? "Approved" : "Not approved"}</td></tr>)}
-  </tbody></table></div>;
-}

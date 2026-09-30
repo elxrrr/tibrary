@@ -191,11 +191,19 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
   await expect(childBox).toBeChecked();
   await childBox.uncheck();
   await expect(parent).toHaveJSProperty("indeterminate", true);
+  await expect.poll(async () => (await rpc("queue.export",{format:"text"})).result?.text)
+    .toBe("https://tidal.com/track/91000101\nhttps://tidal.com/track/91000102\n");
+  await page.getByRole("button",{name:"Export",exact:true}).click();
+  await expect(page.getByRole("textbox",{name:"Download links"})).toHaveValue("https://tidal.com/track/91000101\nhttps://tidal.com/track/91000102\n");
+  await expect(page.getByRole("dialog")).not.toContainText("JSON");
+  await page.getByRole("button",{name:"Close",exact:true}).click();
   await page.getByRole("button", { name: "Coverage", exact: true }).click();
   await expect(childBox).toBeVisible();
   await expect(childBox).not.toBeChecked();
   await parent.check();
   await expect(childBox).toBeChecked();
+  await expect.poll(async () => (await rpc("queue.export",{format:"text"})).result?.text)
+    .toBe("https://tidal.com/album/910001\n");
   await parent.uncheck();
   await expect(childBox).not.toBeChecked();
   await page
@@ -208,6 +216,16 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
     .click();
   await expect(parent).not.toBeChecked();
   await expect(page.getByRole("alert")).toHaveCount(0);
+  // Completed-release choices are transient; exporting them must not alter the
+  // original queue approval or expand a single-track choice to the whole album.
+  await rpc("queue.decision",{ids:["910001"],decision:"downloaded"});
+  await page.locator("aside").getByRole("button",{name:"Downloaded releases",exact:true}).click();
+  const downloadedExpander = page.getByRole("button",{name:/^(Expand|Collapse) Blue Hours$/});
+  await expect(downloadedExpander).toBeVisible();
+  if (await downloadedExpander.getAttribute("aria-expanded") !== "true") await downloadedExpander.click();
+  await page.getByRole("checkbox",{name:"Select track First Light",exact:true}).check();
+  await page.getByRole("button",{name:"Export",exact:true}).click();
+  await expect(page.getByRole("textbox",{name:"Download links"})).toHaveValue("https://tidal.com/track/91000100\n");
 });
 test("multiple file context action affects only selected files", async ({
   page,
@@ -694,6 +712,13 @@ test("General contains connection and separate template/audio cards; artist revi
   await expect(sidebar.getByRole("button",{name:"Connections",exact:true})).toHaveCount(0);
   await expect(sidebar.getByRole("button",{name:"Downloads & files",exact:true})).toHaveCount(0);
   await expect(page.getByRole("heading",{name:"Connection",exact:true})).toBeVisible();
+  const connection = page.locator("#connection-settings");
+  const connectBox = await connection.getByRole("button",{name:"Connect account",exact:true}).boundingBox();
+  const testBox = await connection.getByRole("button",{name:"Test connections",exact:true}).boundingBox();
+  expect(Math.abs(connectBox!.y - testBox!.y)).toBeLessThanOrEqual(1);
+  const referenceHeight = (await page.locator(".template-reference").boundingBox())!.height;
+  const inputHeight = (await page.getByLabel("Folder template",{exact:true}).boundingBox())!.height;
+  expect(Math.abs(referenceHeight - inputHeight)).toBeLessThanOrEqual(2);
   await page.getByText("Template reference & tag variables",{exact:true}).click();
   await expect(page.locator(".template-token")).toHaveCount(9);
   await expect(page.locator(".template-reference")).not.toContainText("Default:");
@@ -712,6 +737,29 @@ test("General contains connection and separate template/audio cards; artist revi
   await page.getByRole("menuitem",{name:"Unlink selected artists"}).click();
   await expect(page.locator("tbody tr")).toContainText("Unresolved");
   expect((await rpc("turso.stats",{root:join(folder,"music")})).result.track_count).toBe(2);
+});
+
+test("favourite artist states have distinct theme-aware colours", async ({page}) => {
+  await page.route("**/__test_rpc", async route => {
+    const request = route.request().postDataJSON();
+    if (request.method === "table" && request.args.route === "favourites") {
+      await route.fulfill({json:{result:{total:3,rows:[
+        {id:"1",artist:"Local Artist",status:"Local only",tracks:2},
+        {id:"2",artist:"Owned Artist",status:"In library",tracks:3},
+        {id:"3",artist:"New Artist",status:"Missing locally",tracks:0},
+      ]}}});
+    } else await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Favourite artists",exact:true}).click();
+  await expect(page.locator(".badge")).toHaveCount(3);
+  for (const theme of ["light","dark"]) {
+    await page.evaluate(theme => {document.documentElement.dataset.theme=theme},theme);
+    const colours = await page.locator(".badge").evaluateAll(elements => elements.map(el => getComputedStyle(el).color));
+    const muted = await page.locator(".badge").first().evaluate(el => getComputedStyle(el).getPropertyValue("--muted"));
+    expect(new Set(colours).size).toBe(3);
+    expect(colours.every(colour => colour !== muted)).toBe(true);
+  }
 });
 
 test("completed job activity stays grouped with persistent per-item details", async ({page}) => {

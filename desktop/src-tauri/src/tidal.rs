@@ -84,6 +84,9 @@ pub struct TidalRelease {
     #[serde(default, deserialize_with = "nullable_vec")]
     pub audio_modes: Vec<String>,
     pub media_metadata: Value,
+    /// The artist-list summary which last described this release, excluding
+    /// request timestamps and availability. Stable credits need no repeat fetch.
+    pub summary_fingerprint: Option<String>,
 }
 
 fn nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -447,6 +450,7 @@ impl TidalClient {
                 .as_array()
                 .or_else(|| payload["items"].as_array())
                 .ok_or("Invalid release summaries")?;
+            let mut summaries = Vec::new();
             for item in items {
                 let id = resource_id(&item["id"]);
                 if !batch.contains(&id) {
@@ -454,34 +458,43 @@ impl TidalClient {
                 }
                 let mut item = item.clone();
                 item["checked_at"] = json!(now);
-                self.cache_summary(&item, market).await?;
+                summaries.push(item.clone());
                 raw.push(item);
             }
+            self.cache_summaries(&summaries,market).await?;
         }
         Ok(album_resources(&raw))
     }
 
+    #[cfg(test)]
     async fn cache_summary(&self, raw: &Value, market: &str) -> Result<(), String> {
-        let id = resource_id(&raw["id"]);
-        self.db
-            .set_preference(&format!("subscriber-summary:{market}:{id}"), raw)
-            .await?;
-        let ids: Vec<_> = album_artists(raw)
-            .iter()
-            .map(|a| resource_id(&a["id"]))
-            .collect();
-        if !ids.is_empty() {
-            self.db.set_preference(&format!("release-artists:{market}:{id}"),&json!({"ids":ids,"names":album_artists(raw).iter().map(|a|a["name"].clone()).collect::<Vec<_>>(),"checked_at":raw["checked_at"],"source":"subscriber album credits"})).await?;
-        }
-        if let Some(available) = subscriber_available(raw) {
-            self.db
-                .set_preference(
-                    &format!("release-live:{market}:{id}"),
-                    &json!({"available":available,"checked_at":raw["checked_at"]}),
-                )
-                .await?;
-        }
-        Ok(())
+        self.cache_summaries(std::slice::from_ref(raw),market).await
+    }
+
+    async fn cache_summaries(&self, values: &[Value], market: &str) -> Result<(), String> {
+        if values.is_empty() { return Ok(()); }
+        let conn = self.db.connect()?;
+        conn.execute("BEGIN IMMEDIATE",()).await.map_err(|error|error.to_string())?;
+        let result = async {
+            for raw in values {
+                let id = resource_id(&raw["id"]);
+                conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("subscriber-summary:{market}:{id}"),raw.to_string())).await.map_err(|error|error.to_string())?;
+                let artists = album_artists(raw);
+                let ids: Vec<_> = artists.iter().map(|artist|resource_id(&artist["id"])).collect();
+                if !ids.is_empty() {
+                    let value=json!({"ids":ids,"names":artists.iter().map(|artist|artist["name"].clone()).collect::<Vec<_>>(),"checked_at":raw["checked_at"],"source":"subscriber album credits"});
+                    conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("release-artists:{market}:{id}"),value.to_string())).await.map_err(|error|error.to_string())?;
+                }
+                if let Some(available) = subscriber_available(raw) {
+                    let value=json!({"available":available,"checked_at":raw["checked_at"]});
+                    conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("release-live:{market}:{id}"),value.to_string())).await.map_err(|error|error.to_string())?;
+                }
+            }
+            conn.execute("COMMIT",()).await.map_err(|error|error.to_string())?;
+            Ok::<_,String>(())
+        }.await;
+        if result.is_err() { let _=conn.execute("ROLLBACK",()).await; }
+        result
     }
 
     /// Optional catalogue fields are accessible with the same subscriber token.
@@ -721,6 +734,16 @@ impl TidalClient {
         market: &str,
         detailed: bool,
     ) -> Result<TidalCatalogue, String> {
+        self.get_artist_catalogue_with_discovery(artist_id,market,detailed,true).await
+    }
+
+    pub(crate) async fn get_artist_catalogue_with_discovery(
+        &mut self,
+        artist_id: &str,
+        market: &str,
+        detailed: bool,
+        enrich_discovery: bool,
+    ) -> Result<TidalCatalogue, String> {
         if artist_id.is_empty() || !artist_id.bytes().all(|b| b.is_ascii_digit()) {
             return Err("Invalid artist ID".into());
         }
@@ -734,6 +757,7 @@ impl TidalClient {
             vec!["", "EPSANDSINGLES"]
         };
         let mut releases = Vec::new();
+        let mut summaries = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for filter in filters {
             let params = if filter.is_empty() {
@@ -750,7 +774,7 @@ impl TidalClient {
                     continue;
                 }
                 raw["checked_at"] = json!(Utc::now().timestamp());
-                self.cache_summary(&raw, market).await?;
+                summaries.push(raw.clone());
                 let mut release = release_from_subscriber(&raw, artist_id);
                 if detailed {
                     release.tracks = self.get_release_details(&id, market).await?;
@@ -760,8 +784,12 @@ impl TidalClient {
                 releases.push(release);
             }
         }
-        let ids = releases.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
-        let extra = self.discovery(&ids, market, false).await?;
+        self.cache_summaries(&summaries,market).await?;
+        let extra = if enrich_discovery {
+            let (reused, _, _) = crate::actions::recommendation_refresh_plan(&self.db,market,&releases).await?;
+            let ids = releases.iter().filter(|r| !reused.contains(&r.id)).map(|r|r.id.clone()).collect::<Vec<_>>();
+            self.discovery(&ids,market,false).await?
+        } else { std::collections::HashMap::new() };
         for release in &mut releases {
             if let Some(fields) = extra.get(&release.id) {
                 let mut value = serde_json::to_value(&*release).map_err(|e| e.to_string())?;
@@ -1207,7 +1235,7 @@ fn album_resources(items: &[Value]) -> Value {
     json!({"data":data,"included":included,"source":"subscriber"})
 }
 
-fn release_from_subscriber(raw: &Value, artist_id: &str) -> TidalRelease {
+pub(crate) fn release_from_subscriber(raw: &Value, artist_id: &str) -> TidalRelease {
     let artists = album_artists(raw);
     let resources = album_resources(&[raw.clone()]);
     let data = &resources["data"][0];
@@ -1250,9 +1278,31 @@ fn release_from_subscriber(raw: &Value, artist_id: &str) -> TidalRelease {
         official: raw["official"].as_bool(),
         secondary_types: string_list(raw.get("secondaryTypes")),
         release_group_id: raw["releaseGroupId"].as_str().map(str::to_owned),
+        summary_fingerprint: Some(summary_fingerprint(raw)),
         // No claim about genres/replacements/official status when not supplied.
         ..Default::default()
     }
+}
+
+pub(crate) fn summary_fingerprint(raw: &Value) -> String {
+    use sha2::{Digest,Sha256};
+    // Membership, recording counts, edition, primary credits or tagging changes
+    // invalidate details. Availability is live and saved separately; it must not
+    // make a stable track-credit snapshot expire.
+    let mut fields = serde_json::Map::new();
+    for key in ["title","version","releaseDate","originalReleaseDate","type",
+        "audioQuality","audioModes","explicit"] {
+        fields.insert(key.to_owned(),raw[key].clone());
+    }
+    fields.insert("id".into(),json!(resource_id(&raw["id"])));
+    fields.insert("upc".into(),json!(resource_id(&raw["upc"])));
+    for key in ["numberOfTracks","numberOfVideos","numberOfVolumes"] {
+        fields.insert(key.into(),json!(raw[key].as_u64().unwrap_or(if key == "numberOfVolumes" {1} else {0})));
+    }
+    fields.insert("artists".into(),json!(album_artists(raw).iter().map(|artist|json!({"id":resource_id(&artist["id"]),"name":artist["name"].as_str().unwrap_or("")})).collect::<Vec<_>>()));
+    fields.insert("label".into(),json!(raw["label"].as_str().or(raw["label"]["name"].as_str()).unwrap_or("")));
+    fields.insert("copyright".into(),json!(raw["copyright"].as_str().or(raw["copyright"]["text"].as_str()).unwrap_or("")));
+    format!("{:x}",Sha256::digest(Value::Object(fields).to_string().as_bytes()))
 }
 
 #[cfg(test)]

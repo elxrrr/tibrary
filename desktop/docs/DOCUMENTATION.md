@@ -39,13 +39,18 @@ A release is marked superseded only when cached evidence shows a newer available
 | Action | When to use it |
 | --- | --- |
 | Update library on Overview | Local files or tags changed outside Tibrary. |
-| Update recommendation data | Collect missing release details, credits and available DJ metadata. |
+| Check for new releases | Refresh artist release lists in the selected market; reuse saved details. |
+| Update recommendation data | Collect details only for new, changed or incomplete releases. |
 | Check release artists | Fill album artist evidence for older cached releases. |
 | Recheck cached releases | Recalculate ownership and recommendations from saved data, without API requests. |
 | Refresh track details and credits | Refresh metadata for a particular release. |
 | Recheck availability | Request a fresh market-availability check. |
 
-All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Recent artist names and track credits are reused for 30 days, while release lists are checked for new music. Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
+All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete recommendation details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
+
+Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
+
+If upstream tags change without changing a release's summary, use its manual detail refresh. Failed optional genre/replacement lookups retry after a cooldown while retaining the saved track credits; successful empty fields do not trigger repeated checks.
 
 BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. Missing fields are not invented. Missing-tag previews preserve existing tags. No developer credentials or database reset are needed.
 
@@ -53,7 +58,11 @@ BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. M
 
 Choose the destination, template and audio options in General. Approve releases or individual tracks in the queue before starting a download. Videos are excluded. Download progress is separate from local work.
 
-Activity shows item counts, percentage and a smoothed ETA where measurable; discovery remains indeterminate until the total is known. Each job has an expandable history that loads automatically. Save activity logs must be enabled to retain history across restarts.
+**Export** saves a plain-text list of media URLs, one per line, for an external downloader. Whole approved releases produce album URLs; individually approved tracks produce track URLs. Unapproved and empty selections are omitted. Tidaler accepts this list with `tidaler dl --list acquisition-queue.txt`.
+
+In Downloaded releases, checked releases or tracks limit the export without changing the saved queue. With no checked items, the export uses the saved completed-download selections.
+
+Activity shows item counts, percentage and a smoothed ETA where measurable; discovery remains indeterminate until the total is known. Each job has an expandable history that loads automatically. Activity is saved by default: job summaries return after reopening, and expanding them loads their saved details. **Save activity logs** must remain enabled to retain history; clearing a panel removes its saved entries.
 
 Closing during downloads asks whether to keep downloading or stop and quit. Completed downloads remain. Interrupted catalogue refreshes retain their checkpoints; explicitly cancelled jobs stay cancelled. File mutations are not automatically replayed.
 

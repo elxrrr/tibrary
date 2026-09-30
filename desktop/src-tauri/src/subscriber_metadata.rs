@@ -348,18 +348,18 @@ pub async fn prefetch(
     }
     let total = seen.len();
     if pending.is_empty() {
-        progress(&format!("Album metadata · {total} cached releases reused"));
+        progress(&format!("Track details and credits · {total} cached releases reused · no metadata download needed"));
         return Ok(result);
     }
     let _token = match crate::stream_download::get_valid_token(db, http).await {
         Ok(token) => token,
         Err(_) => {
-            progress("Album metadata · subscriber connection unavailable; using catalogue and cached data");
+            progress("Track details and credits · account connection unavailable; saved data retained");
             return Ok(result);
         }
     };
     progress(&format!(
-        "Album metadata · {} cached · {} releases to check",
+        "Track details and credits · {} cached releases reused · {} releases to fetch · positions, ISRC, contributors and available BPM/key",
         result.len(),
         pending.len()
     ));
@@ -388,13 +388,13 @@ pub async fn prefetch(
         match task {
             Ok(Ok((id, value))) => {
                 progress(&format!(
-                    "Album metadata · {completed}/{total} · release {id} cached"
+                    "Track details and credits · {completed}/{total} releases ready · release {id} cached"
                 ));
                 result.insert(id, value);
             }
             Ok(Err(error)) => {
                 progress(&format!(
-                    "Album metadata · {completed}/{total} · {error}; saved data retained"
+                    "Track details and credits · {completed}/{total} releases checked · {error}; saved data retained"
                 ));
                 if ["HTTP 429", "HTTP 401", "HTTP 403", "cooldown", "deadline"]
                     .iter()
@@ -405,7 +405,7 @@ pub async fn prefetch(
                 }
             }
             Err(_) => progress(&format!(
-                "Album metadata · {completed}/{total} · worker stopped"
+                "Track details and credits · {completed}/{total} releases checked · worker stopped"
             )),
         }
     }

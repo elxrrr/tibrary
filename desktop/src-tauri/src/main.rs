@@ -7,7 +7,7 @@ mod progress;
 mod subscriber_metadata;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::Write,
     process::Command,
     sync::{
@@ -210,6 +210,12 @@ pub struct Backend {
     pub logs: ActivityBuffers,
     pub log_epochs: Arc<[AtomicU64; 3]>,
     pub log_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    log_pending: Arc<AtomicU64>,
+    log_scheduled: Arc<AtomicU64>,
+    log_completed: Arc<AtomicU64>,
+    log_flushed: Arc<tokio::sync::Notify>,
+    log_write_queue: Arc<Mutex<VecDeque<(Value, usize, u64)>>>,
+    log_writer_active: Arc<AtomicBool>,
     pub previews: Mutex<HashMap<String, Value>>,
     progress_estimates: Mutex<progress::Progress>,
     progress_clock: std::time::Instant,
@@ -235,6 +241,12 @@ impl Default for Backend {
             logs: ActivityBuffers::default(),
             log_epochs: Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]),
             log_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            log_pending: Arc::new(AtomicU64::new(0)),
+            log_scheduled: Arc::new(AtomicU64::new(0)),
+            log_completed: Arc::new(AtomicU64::new(0)),
+            log_flushed: Arc::new(tokio::sync::Notify::new()),
+            log_write_queue: Arc::new(Mutex::new(VecDeque::new())),
+            log_writer_active: Arc::new(AtomicBool::new(false)),
             previews: Mutex::new(HashMap::new()),
             progress_estimates: Mutex::new(progress::Progress::default()),
             progress_clock: std::time::Instant::now(),
@@ -324,13 +336,58 @@ impl Backend {
                 let epoch = self.log_epochs[index].load(Ordering::SeqCst);
                 let epochs = self.log_epochs.clone();
                 let gate = self.log_persist_gate.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _guard = gate.lock().await;
-                    if epochs[index].load(Ordering::SeqCst) == epoch {
-                        let _ = db.log_activity_entry(&entry).await;
-                    }
-                });
+                let pending = self.log_pending.clone();
+                let completed = self.log_completed.clone();
+                let flushed = self.log_flushed.clone();
+                let queue = self.log_write_queue.clone();
+                let writer_active = self.log_writer_active.clone();
+                let mut queued = queue.lock().unwrap();
+                pending.fetch_add(1, Ordering::SeqCst);
+                self.log_scheduled.fetch_add(1, Ordering::SeqCst);
+                queued.push_back((entry, index, epoch));
+                let start_writer = !writer_active.swap(true, Ordering::SeqCst);
+                drop(queued);
+                if start_writer {
+                    tauri::async_runtime::spawn(async move {
+                        loop {
+                            let next = {
+                                let mut queued = queue.lock().unwrap();
+                                let next = queued.pop_front();
+                                if next.is_none() { writer_active.store(false, Ordering::SeqCst); }
+                                next
+                            };
+                            let Some((entry, index, epoch)) = next else { break; };
+                            let _guard = gate.lock().await;
+                            if epochs[index].load(Ordering::SeqCst) == epoch {
+                                if let Err(error) = db.log_activity_entry(&entry).await {
+                                    eprintln!("Could not save activity history: {error}");
+                                }
+                            }
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            flushed.notify_waiters();
+                        }
+                    });
+                }
             }
+        }
+    }
+
+    async fn flush_activity(&self) {
+        // Wait only for entries queued before this call; a running job can
+        // continue logging without holding its history view open indefinitely.
+        let target = self.log_scheduled.load(Ordering::SeqCst);
+        let wait = async {
+            loop {
+                let notified = self.log_flushed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.log_completed.load(Ordering::SeqCst) >= target { return; }
+                notified.await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), wait).await.is_err() {
+            eprintln!("Activity history is still saving after 10 seconds; continuing without blocking the application");
         }
     }
 
@@ -999,7 +1056,7 @@ async fn handle_rpc_uncached(
         let active = state.active_job.lock().unwrap().clone();
         let mut logs = state.logs.snapshot();
         if logs.is_empty() {
-            if let Ok(loaded) = db.load_recent_logs(500).await {
+            if let Ok(loaded) = db.load_activity_overview(500).await {
                 if !loaded.is_empty() {
                     state.logs.load(loaded.clone());
                     logs = loaded;
@@ -1048,7 +1105,7 @@ async fn handle_rpc_uncached(
     if method == "logs" {
         let mut logs = state.logs.snapshot();
         if logs.is_empty() {
-            if let Ok(loaded) = db.load_recent_logs(500).await {
+            if let Ok(loaded) = db.load_activity_overview(500).await {
                 if !loaded.is_empty() {
                     state.logs.load(loaded.clone());
                     logs = loaded;
@@ -1059,7 +1116,7 @@ async fn handle_rpc_uncached(
     }
     if method == "logs.job" {
         let id = args["id"].as_str().ok_or("Missing job ID")?;
-        let _guard = state.log_persist_gate.lock().await;
+        state.flush_activity().await;
         return Ok(json!(db.job_activity(id, args["offset"].as_u64().unwrap_or(0) as usize).await?));
     }
     if method == "logs.clear" {
@@ -1577,7 +1634,16 @@ async fn handle_rpc_uncached(
             .and_then(|v| v.as_str())
             .unwrap_or("json");
         let decision = args.get("decision").and_then(|v| v.as_str());
-        let text = db.queue_export(format, decision).await?;
+        let selection: Option<HashMap<String, Option<Vec<String>>>> = args.get("selection")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone())
+                .map_err(|e| format!("Invalid export selection: {e}")))
+            .transpose()?;
+        let text = if let Some(selection) = selection.as_ref() {
+            db.queue_export_selection(format, decision, Some(selection)).await?
+        } else {
+            db.queue_export(format, decision).await?
+        };
         return Ok(json!({ "text": text }));
     }
 
@@ -1914,7 +1980,7 @@ async fn handle_rpc_uncached(
             "id": job_id,
             "kind": "discography",
             "status": "running",
-            "message": format!("Refreshing releases · {}/{} artists · {} · {}", completed.len(), total, market, if detailed { "release and track details" } else { "release list" }),
+            "message": format!("Checking release lists · {}/{} artists · {} · {}", completed.len(), total, market, if detailed { "new or changed track details and credits" } else { "new releases and market availability" }),
             "completed": completed.len(), "total": total,
             "started": started,
             "result": null
@@ -1931,6 +1997,8 @@ async fn handle_rpc_uncached(
         tauri::async_runtime::spawn(async move {
             let mut completed = completed;
             let mut checked = completed.len();
+            let mut reused_details = 0usize;
+            let mut checked_details = 0usize;
             let mut failure: Option<String> = None;
             let backend_prog = backend_task.clone();
 
@@ -1947,7 +2015,7 @@ async fn handle_rpc_uncached(
                     let name = names.get(&artist_id).unwrap_or(&artist_id);
                     backend_task.progress_for("discography", &format!("Checking release list · {name} · {checked}/{total} artists saved · {market}"));
                     fetches.spawn(async move {
-                        let result = worker.get_artist_catalogue(&artist_id, &worker_market, false).await;
+                        let result = worker.get_artist_catalogue_with_discovery(&artist_id, &worker_market, false, detailed).await;
                         (artist_id, result)
                     });
                 }
@@ -1958,7 +2026,7 @@ async fn handle_rpc_uncached(
                 };
                 if cancel_flag.load(Ordering::Relaxed) { break; }
                 let name = names.get(&artist_id).map(String::as_str).unwrap_or(&artist_id);
-                let msg = format!("Refreshing releases · {checked}/{total} artists complete · {name} · artist ID {artist_id} · {market} · {}", if detailed { "release and track details" } else { "release list" });
+                let msg = format!("Refreshing releases · {checked}/{total} artists complete · {name} · artist ID {artist_id} · {market} · {}", if detailed { "new or changed track details and credits" } else { "new releases and market availability" });
                 let prog_job = json!({
                     "id": j_id.clone(),
                     "kind": "discography",
@@ -1992,34 +2060,45 @@ async fn handle_rpc_uncached(
                             break;
                         } else {
                             if detailed {
-                                if let Ok(http)=network::client(20) {
-                                    if let Err(error)=subscriber_metadata::prefetch(&db_clone,&http,catalogue.releases.iter().map(|r|r.id.clone()).collect(),&market,cancel_flag.clone(),|message|backend_task.progress_for("discography",&format!("{name} · {message}"))).await {
-                                        backend_task.log(&format!("Subscriber metadata cache: {error}"));
-                                    }
-                                }
-                                // Read this artist's merged snapshot once instead of searching
-                                // every cached artist again for each release.
-                                let stored: Vec<Value> = async {
-                                    let conn = db_clone.connect()?;
-                                    let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id=? AND market=?", (artist_id.as_str(), market.as_str())).await.map_err(|e|e.to_string())?;
-                                    let raw = rows.next().await.map_err(|e|e.to_string())?.and_then(|r|r.get::<String>(0).ok());
-                                    Ok::<_,String>(raw.and_then(|s|serde_json::from_str::<Value>(&s).ok()).and_then(|v|v["releases"].as_array().cloned()).unwrap_or_default())
-                                }.await.unwrap_or_default();
-                                for (index, release) in catalogue.releases.iter().enumerate() {
-                                    if cancel_flag.load(Ordering::Relaxed) { break; }
-                                    let message = format!("Updating recommendation data · {name} · {} · release {}/{} · cached details first", release.title, index + 1, catalogue.releases.len());
-                                    let mut progress = prog_job.clone();
-                                    progress["message"] = json!(message);
-                                    backend_prog.update_online_job_progress(&message, progress);
-                                    let key = format!("tag-review:{market}:{}", release.id);
-                                    if db_clone.get_preference(&key).await.ok().flatten().is_none() {
-                                        if let Some(saved) = stored.iter().find(|r| r["id"] == release.id) {
-                                            if let Err(error) = db_clone.set_preference(&key, saved).await { failure = Some(error); break; }
+                                let (reused,changed,cached_tracks) = match actions::recommendation_refresh_plan(&db_clone,&market,&catalogue.releases).await {
+                                    Ok(plan) => plan,
+                                    Err(error) => { failure = Some(error); break; }
+                                };
+                                let pending: Vec<_> = catalogue.releases.iter().filter(|release| !reused.contains(&release.id)).collect();
+                                reused_details += reused.len();
+                                backend_task.progress_for("discography",&format!("Recommendation data · {name} · {} unchanged releases reused · {} new, changed or incomplete releases to check · track lists, credits and DJ tags",reused.len(),pending.len()));
+                                if !pending.is_empty() {
+                                    if let Ok(http)=network::client(20) {
+                                        // A changed release must not reuse its former track-list cache.
+                                        let missing = pending.iter().filter(|release| !changed.contains(&release.id) && !cached_tracks.contains(&release.id)).map(|release|release.id.clone()).collect();
+                                        if let Err(error)=subscriber_metadata::prefetch(&db_clone,&http,missing,&market,cancel_flag.clone(),|message|backend_task.progress_for("discography",&format!("{name} · {message}"))).await {
+                                            backend_task.log(&format!("Subscriber metadata cache: {error}"));
                                         }
                                     }
-                                    if let Err(error) = actions::release_with_cancel(&db_clone, &release.id, &market, false, cancel_flag.clone()).await {
-                                        failure = Some(format!("{} — {}: {error}", name, release.title));
-                                        break;
+                                    let stored: Vec<Value> = async {
+                                        let conn = db_clone.connect()?;
+                                        let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id=? AND market=?", (artist_id.as_str(), market.as_str())).await.map_err(|e|e.to_string())?;
+                                        let raw = rows.next().await.map_err(|e|e.to_string())?.and_then(|r|r.get::<String>(0).ok());
+                                        Ok::<_,String>(raw.and_then(|s|serde_json::from_str::<Value>(&s).ok()).and_then(|v|v["releases"].as_array().cloned()).unwrap_or_default())
+                                    }.await.unwrap_or_default();
+                                    for (index,release) in pending.iter().enumerate() {
+                                        if cancel_flag.load(Ordering::Relaxed) { break; }
+                                        let message = format!("Updating recommendation data · {name} · {} · release {}/{} · {} unchanged reused",release.title,index+1,pending.len(),reused.len());
+                                        backend_task.progress_for("discography",&message);
+                                        let mut progress = prog_job.clone();
+                                        progress["message"] = json!(message);
+                                        backend_prog.update_online_job_progress(&message, progress);
+                                        let key = format!("tag-review:{market}:{}",release.id);
+                                        if db_clone.get_preference(&key).await.ok().flatten().is_none() {
+                                            if let Some(saved) = stored.iter().find(|r| r["id"] == release.id) {
+                                                if let Err(error) = db_clone.set_preference(&key,saved).await { failure = Some(error); break; }
+                                            }
+                                        }
+                                        if let Err(error)=actions::release_with_cancel(&db_clone,&release.id,&market,changed.contains(&release.id),cancel_flag.clone()).await {
+                                            failure = Some(format!("{} — {}: {error}",name,release.title));
+                                            break;
+                                        }
+                                        checked_details += 1;
                                     }
                                 }
                                 if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
@@ -2065,10 +2144,11 @@ async fn handle_rpc_uncached(
             } else if let Some(error) = failure {
                 format!("Refresh stopped after {checked} artists; cached results retained. {error}")
             } else {
-                format!(
-                    "Refresh release list · finished; {} artists checked",
-                    checked
-                )
+                if detailed {
+                    format!("Recommendation update complete · {checked} artists checked · {reused_details} unchanged releases reused · {checked_details} new, changed or incomplete releases updated")
+                } else {
+                    format!("Release-list check complete · {checked} artists checked · new releases and {market} availability saved · existing track details retained")
+                }
             };
 
             let checkpoint_status = if is_cancelled && backend_task.quit_prompt.load(Ordering::SeqCst) { "running" } else { status };
@@ -2081,7 +2161,7 @@ async fn handle_rpc_uncached(
                 "message": message,
                 "started": started,
                 "finished": finished_at,
-                "result": json!({ "checked": checked })
+                "result": json!({ "checked": checked, "reused_details":reused_details, "checked_details":checked_details })
             });
 
             backend_task.finish_online_job(final_job.clone());
@@ -2656,7 +2736,7 @@ fn main() {
             let turso_db = TursoDb::open(&db_path).await.expect("Failed to open DB");
             let backend = Arc::new(Backend::new());
             backend.set_db(Arc::new(turso_db.clone()));
-            if let Ok(loaded) = turso_db.load_recent_logs(500).await {
+            if let Ok(loaded) = turso_db.load_activity_overview(500).await {
                 if !loaded.is_empty() {
                     backend.logs.load(loaded);
                 }
@@ -2685,6 +2765,7 @@ fn main() {
                 let _ = writeln!(stdout, "{}", out);
                 let _ = stdout.flush();
             }
+            backend.flush_activity().await;
         });
         return;
     }
@@ -2718,7 +2799,7 @@ fn main() {
             backend
                 .persist_logs
                 .store(persist, std::sync::atomic::Ordering::SeqCst);
-            if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
+            if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_activity_overview(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
                         &format!(
@@ -2761,13 +2842,22 @@ fn main() {
             let backend = app.state::<Arc<Backend>>().inner().clone();
             if backend.quit_approved.load(Ordering::SeqCst) { return; }
             let active_download = backend.download_cancel.lock().unwrap().is_some();
-            if !active_download && !backend.active_job_cancel.lock().unwrap().is_some() && !backend.online_cancel.lock().unwrap().is_some() && !backend.quit_prompt.load(Ordering::SeqCst) { return; }
+            let active_task = active_download || backend.active_job_cancel.lock().unwrap().is_some() || backend.online_cancel.lock().unwrap().is_some();
             match event {
                 tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => api.prevent_close(),
                 tauri::RunEvent::ExitRequested { api, .. } => api.prevent_exit(),
                 _ => return,
             }
             if backend.quit_prompt.swap(true, Ordering::SeqCst) { return; }
+            if !active_task {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    backend.flush_activity().await;
+                    backend.quit_approved.store(true, Ordering::SeqCst);
+                    handle.exit(0);
+                });
+                return;
+            }
             use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
             let handle = app.clone();
             app.dialog().message(if active_download { "Downloads are still running. Stop active tasks and quit? Completed tracks will be kept; unfinished tracks remain in the queue." } else { "A task is still running. Stop active tasks and quit? File changes already completed will be kept." })
@@ -2785,6 +2875,7 @@ fn main() {
                         while backend.download_cancel.lock().unwrap().is_some() || backend.active_job_cancel.lock().unwrap().is_some() || backend.online_cancel.lock().unwrap().is_some() {
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
+                        backend.flush_activity().await;
                         backend.quit_approved.store(true, Ordering::SeqCst);
                         handle.exit(0);
                     });
@@ -2794,6 +2885,44 @@ fn main() {
 
 #[cfg(test)]
 mod activity_tests {
+    #[tokio::test]
+    async fn saved_activity_survives_restart_and_verbose_jobs_without_crowding_other_streams() {
+        let dir = std::env::temp_dir().join(format!("activity-restart-{}", uuid::Uuid::new_v4()));
+        let db = Arc::new(TursoDb::open(dir.join("db")).await.unwrap());
+        let backend = Backend::new();
+        backend.set_db(db.clone());
+        backend.start_job(json!({"id":"local","kind":"scan","status":"running","message":"Reading local tags"}), Arc::new(AtomicBool::new(false)));
+        backend.finish_job(json!({"id":"local","kind":"scan","status":"complete","message":"Local tags checked"}));
+        backend.start_download_job(json!({"id":"download","kind":"download","status":"running","message":"Download started"}), Arc::new(AtomicBool::new(false)));
+        backend.finish_download_job(json!({"id":"download","kind":"download","status":"complete","message":"Download complete"}));
+        backend.start_online_job(json!({"id":"online","kind":"discography","status":"running","message":"Refresh started"}), Arc::new(AtomicBool::new(false)));
+        for index in 0..650 {
+            backend.log_with_category(&format!("Checked artist {index}"), "info", Some("online"));
+        }
+        backend.finish_online_job(json!({"id":"online","kind":"discography","status":"complete","message":"Release refresh complete"}));
+        tokio::time::timeout(std::time::Duration::from_secs(20), backend.flush_activity()).await.unwrap();
+        assert_eq!(backend.log_pending.load(Ordering::SeqCst), 0);
+        drop(backend);
+        drop(db);
+
+        let reopened = TursoDb::open(dir.join("db")).await.unwrap();
+        let summaries = reopened.load_activity_overview(500).await.unwrap();
+        assert_eq!(summaries.len(), 3);
+        for (id, message) in [("local", "Local tags checked"), ("download", "Download complete"), ("online", "Release refresh complete")] {
+            let entry = summaries.iter().find(|entry| entry["job_id"] == id).unwrap();
+            assert_eq!(entry["job_status"], "complete");
+            assert_eq!(entry["message"], message);
+        }
+        let history = reopened.job_activity("online", 0).await.unwrap();
+        assert_eq!(history.len(), 652);
+        assert_eq!(history.first().unwrap()["message"], "Refresh started");
+        assert_eq!(history.last().unwrap()["message"], "Release refresh complete");
+        reopened.clear_log_stream("online").await.unwrap();
+        assert_eq!(reopened.load_activity_overview(500).await.unwrap().len(), 2);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "Read-only live catalogue refresh, metadata, cancellation and resume using a disposable database"]
     async fn live_catalogue_refresh_pipeline() {
@@ -2820,6 +2949,10 @@ mod activity_tests {
             let job=wait(&backend).await;
             assert_eq!(job["status"],"complete","{job}");
             assert_eq!(job["result"]["checked"],ids.len());
+            if label == "warm recommendation metadata" {
+                assert_eq!(job["result"]["checked_details"],0,"Unchanged complete details must not be fetched again: {job}");
+                assert!(job["result"]["reused_details"].as_u64().unwrap() > 0);
+            }
             let saved=db.get_preference("catalogue-refresh-checkpoint").await.unwrap().unwrap();
             assert_eq!(saved["completed"].as_array().unwrap().len(),ids.len());
             println!("{label}: {} artists, {} ms",ids.len(),start.elapsed().as_millis());

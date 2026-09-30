@@ -12,6 +12,9 @@ use std::{
     },
 };
 
+// Bump when a future recommendation field requires another upstream lookup.
+const RECOMMENDATION_SCHEMA: u32 = 1;
+
 pub fn handles(kind: &str) -> bool {
     matches!(
         kind,
@@ -99,6 +102,80 @@ pub(crate) fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
     gate
 }
 
+/// A normal catalogue refresh checks live release lists, then enriches only the
+/// new, changed or incomplete releases. Explicit release refreshes still force
+/// an API read when a user wants to recheck tags on an unchanged recording.
+pub(crate) async fn recommendation_refresh_plan(
+    db: &TursoDb,
+    market: &str,
+    releases: &[crate::tidal::TidalRelease],
+) -> Result<(HashSet<String>, HashSet<String>, HashSet<String>), String> {
+    let ids: Vec<_> = releases.iter().map(|release| &release.id).collect();
+    let conn = db.connect()?;
+    let mut rows = conn.query(
+        "SELECT key,payload FROM app_preferences WHERE key IN (SELECT 'tag-review:' || ? || ':' || value FROM json_each(?))",
+        (market, json!(ids).to_string()),
+    ).await.map_err(|error|error.to_string())?;
+    let mut saved = std::collections::HashMap::new();
+    let prefix = format!("tag-review:{market}:");
+    while let Some(row) = rows.next().await.map_err(|error|error.to_string())? {
+        let key: String = row.get(0).map_err(|error|error.to_string())?;
+        let payload: String = row.get(1).map_err(|error|error.to_string())?;
+        if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+            saved.insert(key.trim_start_matches(&prefix).to_owned(),value);
+        }
+    }
+    let mut reused = HashSet::new();
+    let mut changed = HashSet::new();
+    let mut cached_tracks = HashSet::new();
+    for release in releases {
+        let Some(prior) = saved.get(&release.id) else { continue; };
+        let Some(fingerprint) = release.summary_fingerprint.as_deref() else { continue; };
+        if prior["recommendation_snapshot"]["summary_fingerprint"].as_str().is_some_and(|old|old != fingerprint) {
+            changed.insert(release.id.clone());
+        } else if recommendation_tracks_current(prior,fingerprint) {
+            cached_tracks.insert(release.id.clone());
+            if prior["recommendation_snapshot"]["optional_status"] == "complete"
+                || prior["recommendation_snapshot"]["optional_retry_after"].as_i64().is_some_and(|until|until > chrono::Utc::now().timestamp()) {
+                reused.insert(release.id.clone());
+            }
+        }
+    }
+    Ok((reused,changed,cached_tracks))
+}
+
+fn recommendation_tracks_current(value: &Value, fingerprint: &str) -> bool {
+    value["recommendation_snapshot"]["schema"] == RECOMMENDATION_SCHEMA
+        && value["recommendation_snapshot"]["summary_fingerprint"] == fingerprint
+        && value["tracks_loaded"] == true && value["track_metadata_source"] == "subscriber"
+        // A checked, empty credit list or unavailable BPM/key is complete.
+        && value["tracks"].as_array().is_some_and(|tracks| !tracks.is_empty() && tracks.iter().all(|track|track["credits_complete"] == true))
+}
+
+fn summary_change_requires_track_refresh(reused_tracks: bool, before: Option<&Value>, after: Option<&Value>) -> bool {
+    reused_tracks && before.zip(after).is_some_and(|(before,after)|crate::tidal::summary_fingerprint(before) != crate::tidal::summary_fingerprint(after))
+}
+
+async fn record_recommendation_snapshot(db: &TursoDb, value: &mut Value, market: &str, summary: Option<&Value>, optional_complete: bool) -> Result<(), String> {
+    if let Some(summary) = summary {
+        let fresh = serde_json::to_value(crate::tidal::release_from_subscriber(&summary,"")).map_err(|error|error.to_string())?;
+        // An edition/title/primary-credit change must not be overwritten by the
+        // earlier tag-review snapshot when fresh track details are published.
+        for field in ["artist","title","date","type","copyright","label","quality","upc","original_release_date","artist_credits","audio_modes","media_metadata","summary_fingerprint"] {
+            if !fresh[field].is_null() && !fresh[field].as_str().is_some_and(str::is_empty) && !fresh[field].as_array().is_some_and(Vec::is_empty) {
+                value[field]=fresh[field].clone();
+            }
+        }
+        let retry_after = if optional_complete {Value::Null} else {
+            db.get_preference(&format!("subscriber-discovery-paused:{market}")).await?
+                .and_then(|paused|paused["until"].as_i64()).filter(|until|*until > chrono::Utc::now().timestamp())
+                .map(|until|json!(until)).unwrap_or_else(||json!(chrono::Utc::now().timestamp()+3600))
+        };
+        value["recommendation_snapshot"] = json!({"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":crate::tidal::summary_fingerprint(&summary),"checked_at":chrono::Utc::now().timestamp(),"optional_status":if optional_complete {"complete"} else {"retry"},"optional_retry_after":retry_after});
+    }
+    Ok(())
+}
+
 pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Result<Value, String> {
     release_with_cancel(db,id,market,force,Arc::new(AtomicBool::new(false))).await
 }
@@ -118,12 +195,23 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
                 .await?
         }
     };
+    let summary = db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
+    let force = force || value["recommendation_snapshot"]["schema"].as_u64().is_some_and(|schema|schema != u64::from(RECOMMENDATION_SCHEMA)) || summary.as_ref().is_some_and(|summary| {
+        value["recommendation_snapshot"]["summary_fingerprint"].as_str().is_some_and(|prior| prior != crate::tidal::summary_fingerprint(summary))
+    });
     if !force && value["subscriber_discovery_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at))) && value["tracks_loaded"] == true && value["track_metadata_source"] == "subscriber"
-        && value["track_metadata_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at))) {
+        && value["track_metadata_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at)))
+        && value["tracks"].as_array().is_some_and(|tracks| !tracks.is_empty() && tracks.iter().all(|track|track["credits_complete"] == true))
+        && (value["recommendation_snapshot"]["schema"] != RECOMMENDATION_SCHEMA || value["recommendation_snapshot"]["optional_status"] == "complete") {
+        if value["recommendation_snapshot"]["schema"] != RECOMMENDATION_SCHEMA {
+            record_recommendation_snapshot(db,&mut value,market,summary.as_ref(),true).await?;
+            return publish_release(db,id,market,value).await;
+        }
         return Ok(value);
     }
     let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
-    let mut tracks = {
+    let mut reuse_tracks = !force && summary.as_ref().is_some_and(|summary|recommendation_tracks_current(&value,&crate::tidal::summary_fingerprint(summary)));
+    let mut tracks = if reuse_tracks { old_tracks.clone() } else {
         let http=crate::network::client(20)?;
         match crate::subscriber_metadata::load(db,&http,id,market,cancel.clone(),force).await {
             Ok(raw)=>crate::subscriber_metadata::tracks(&raw)?,
@@ -165,12 +253,26 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
     let mut client=crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
     let optional=client.discovery(&[id.to_owned()],market,force).await?;
     if let Some(fields)=optional.get(id) { crate::tidal::merge_discovery(&mut value,fields); }
+    let current_summary=db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
+    if summary_change_requires_track_refresh(reuse_tracks,summary.as_ref(),current_summary.as_ref()) {
+        // A standalone metadata check can discover a changed edition while
+        // refreshing its expired summary. Never stamp that new summary onto an
+        // older credited track list; validate its current audio membership first.
+        let http=crate::network::client(20)?;
+        let raw=crate::subscriber_metadata::load(db,&http,id,market,cancel.clone(),true).await?;
+        tracks=crate::subscriber_metadata::tracks(&raw)?;
+        crate::subscriber_metadata::supplement(&mut tracks,&old_tracks);
+        reuse_tracks=false;
+    }
     value["track_metadata_source"]=json!("subscriber");
-    value["track_metadata_checked_at"]=json!(chrono::Utc::now().timestamp());
+    if !reuse_tracks { value["track_metadata_checked_at"]=json!(chrono::Utc::now().timestamp()); }
     value["metadata_note"]=if optional.contains_key(id) {Value::Null} else {json!("Track details saved; optional catalogue fields unavailable, saved values retained.")};
     value["tracks"] = serde_json::to_value(&tracks).map_err(|e| e.to_string())?;
     value["tracks_loaded"] = json!(true);
     value["track_count"] = json!(tracks.len());
+    // Pin the exact summary paired with this track list. A concurrent catalogue
+    // write after this point will produce a different fingerprint on the next check.
+    record_recommendation_snapshot(db,&mut value,market,current_summary.as_ref(),optional.contains_key(id)).await?;
     publish_release(db, id, market, value).await
 }
 
@@ -1463,6 +1565,59 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn recommendation_refresh_reuses_complete_unchanged_snapshots_and_rechecks_deltas() {
+        let dir=std::env::temp_dir().join(format!("recommendation-delta-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let summary=json!({"id":10,"title":"Release","numberOfTracks":2,"artist":{"id":4,"name":"Main"},"label":{"name":"Label"},"checked_at":1,"allowStreaming":true,"streamReady":true});
+        let fingerprint=crate::tidal::summary_fingerprint(&summary);
+        let mut reshaped=summary.clone();
+        reshaped["id"]=json!("10"); reshaped["artist"]["picture"]=json!("changed-artwork");
+        reshaped["label"]=json!("Label"); reshaped["numberOfVolumes"]=json!(1);
+        reshaped["checked_at"]=json!(chrono::Utc::now().timestamp()); reshaped["streamReady"]=json!(false);
+        assert_eq!(fingerprint,crate::tidal::summary_fingerprint(&reshaped));
+        let saved=json!({"id":"10","tracks_loaded":true,"track_metadata_source":"subscriber","track_metadata_checked_at":1,"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":fingerprint,"optional_status":"complete"},"tracks":[{"id":"101","credits_complete":true,"credits":[],"bpm":null,"key":null}]});
+        db.set_preference("tag-review:GB:10",&saved).await.unwrap();
+        let release=crate::tidal::TidalRelease{id:"10".into(),summary_fingerprint:Some(fingerprint.clone()),..Default::default()};
+        let new=crate::tidal::TidalRelease{id:"11".into(),summary_fingerprint:Some("new".into()),..Default::default()};
+        let (reused,changed,_)=recommendation_refresh_plan(&db,"GB",&[release.clone(),new]).await.unwrap();
+        assert_eq!(reused,HashSet::from(["10".into()])); assert!(changed.is_empty());
+        let mut changed_summary=summary.clone(); changed_summary["numberOfTracks"]=json!(3);
+        assert!(summary_change_requires_track_refresh(true,Some(&summary),Some(&changed_summary)),"Refreshing an expired summary cannot retain an old credited track list");
+        assert!(!summary_change_requires_track_refresh(true,Some(&summary),Some(&reshaped)),"Equivalent endpoint shapes must not cause extra track fetches");
+        assert!(!summary_change_requires_track_refresh(false,Some(&summary),Some(&changed_summary)));
+        let changed_release=crate::tidal::TidalRelease{summary_fingerprint:Some(crate::tidal::summary_fingerprint(&changed_summary)),..release.clone()};
+        let (reused,changed,_)=recommendation_refresh_plan(&db,"GB",&[changed_release]).await.unwrap();
+        assert!(reused.is_empty()); assert_eq!(changed,HashSet::from(["10".into()]));
+        let mut incomplete=saved.clone(); incomplete["tracks"][0]["credits_complete"]=json!(false);
+        db.set_preference("tag-review:GB:10",&incomplete).await.unwrap();
+        assert!(recommendation_refresh_plan(&db,"GB",&[release.clone()]).await.unwrap().0.is_empty());
+        db.set_preference("tag-review:GB:10",&saved).await.unwrap();
+        let mut deferred = saved.clone();
+        deferred["recommendation_snapshot"]["optional_status"]=json!("retry");
+        deferred["recommendation_snapshot"]["optional_retry_after"]=json!(chrono::Utc::now().timestamp()+3600);
+        db.set_preference("tag-review:GB:10",&deferred).await.unwrap();
+        assert!(recommendation_refresh_plan(&db,"GB",&[release.clone()]).await.unwrap().0.contains("10"));
+        deferred["recommendation_snapshot"]["optional_retry_after"]=json!(1);
+        db.set_preference("tag-review:GB:10",&deferred).await.unwrap();
+        let (reused,_,cached_tracks)=recommendation_refresh_plan(&db,"GB",&[release.clone()]).await.unwrap();
+        assert!(reused.is_empty()); assert!(cached_tracks.contains("10"),"Retry optional fields without refetching complete credits");
+        // The legacy shortcut must consume the richer saved response, rather
+        // than returning an incomplete tag-review row without rechecking it.
+        incomplete["subscriber_discovery_checked_at"]=json!(chrono::Utc::now().timestamp());
+        incomplete["track_metadata_checked_at"]=json!(chrono::Utc::now().timestamp());
+        db.set_preference("tag-review:GB:10",&incomplete).await.unwrap();
+        db.set_preference("subscriber-summary:GB:10",&reshaped).await.unwrap();
+        db.set_preference("subscriber-items:GB:10",&json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":101,"title":"Track","isrc":"ABC","trackNumber":1,"volumeNumber":1,"credits":[]}]})).await.unwrap();
+        db.set_preference("subscriber-discovery:GB:10",&json!({"checked_at":chrono::Utc::now().timestamp(),"genres":[],"replacement_id":null})).await.unwrap();
+        let repaired=super::release(&db,"10","GB",false).await.unwrap();
+        assert_eq!(repaired["tracks"][0]["credits_complete"],true);
+        assert_eq!(repaired["recommendation_snapshot"]["optional_status"],"complete");
+        assert_eq!(repaired["label"],"Label");
+        db.set_preference("tag-review:GB:10",&saved).await.unwrap();
+        assert!(recommendation_refresh_plan(&db,"US",&[release]).await.unwrap().0.is_empty());
+        drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
     #[tokio::test]
     async fn release_index_backfills_and_preserves_shared_releases_queue_and_markets() {
         let dir = std::env::temp_dir().join(format!("release-index-{}",uuid::Uuid::new_v4()));

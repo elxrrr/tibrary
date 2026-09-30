@@ -212,6 +212,7 @@ impl TursoDb {
         }
         drop(columns);
         if !has_context { conn.execute("ALTER TABLE activity_logs ADD COLUMN job_context TEXT", ()).await.map_err(|e|e.to_string())?; }
+        conn.execute("CREATE INDEX IF NOT EXISTS activity_job_history ON activity_logs(json_extract(job_context,'$.job_id'),id)", ()).await.map_err(|e|e.to_string())?;
         Ok(())
     }
 
@@ -305,6 +306,32 @@ impl TursoDb {
         }
         logs.reverse();
         Ok(logs)
+    }
+
+    /// Restore the latest summary of each saved job, instead of letting one
+    /// verbose refresh crowd all previous jobs out of the startup history.
+    pub async fn load_activity_overview(&self, per_stream: usize) -> Result<Vec<Value>, String> {
+        let conn = self.connect()?;
+        let mut rows = conn.query(
+            "SELECT at,message,level,category,job_context FROM activity_logs WHERE id IN (SELECT MAX(id) FROM activity_logs GROUP BY CASE WHEN json_extract(job_context,'$.job_id') IS NOT NULL AND json_extract(job_context,'$.job_id') != '' THEN 'job:' || json_extract(job_context,'$.job_id') ELSE 'entry:' || id END) ORDER BY id DESC",
+            (),
+        ).await.map_err(|e|e.to_string())?;
+        let mut entries = Vec::new();
+        let mut counts = [0usize; 3];
+        while let Some(row) = rows.next().await.map_err(|e|e.to_string())? {
+            let mut entry: Value = row.get::<String>(4).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(json!({}));
+            for (index, key) in ["at","message","level","category"].iter().enumerate() {
+                entry[*key] = json!(row.get::<String>(index).unwrap_or_default());
+            }
+            let index = crate::activity_stream_index(crate::activity_stream(&entry));
+            if counts[index] < per_stream {
+                counts[index] += 1;
+                entries.push(entry);
+            }
+            if counts.iter().all(|count| *count >= per_stream) { break; }
+        }
+        entries.reverse();
+        Ok(entries)
     }
 
     pub async fn job_activity(&self, job_id: &str, offset: usize) -> Result<Vec<Value>, String> {
@@ -3022,6 +3049,15 @@ impl TursoDb {
         format: &str,
         decision: Option<&str>,
     ) -> Result<String, String> {
+        self.queue_export_selection(format, decision, None).await
+    }
+
+    pub async fn queue_export_selection(
+        &self,
+        format: &str,
+        decision: Option<&str>,
+        selection: Option<&HashMap<String, Option<Vec<String>>>>,
+    ) -> Result<String, String> {
         let dec = decision.unwrap_or("queued");
         let conn = self.connect()?;
         let mut stmt = conn
@@ -3033,19 +3069,93 @@ impl TursoDb {
             .map_err(|e| e.to_string())?;
 
         let mut items = Vec::new();
+        let mut remaining: HashSet<String> = selection.map(|scope| scope.keys().cloned().collect()).unwrap_or_default();
         while let Some(row) = stmt.next().await.map_err(|e| e.to_string())? {
             let id: String = row.get(0).map_err(|e| e.to_string())?;
+            let scoped = selection.and_then(|scope| scope.get(&id));
+            if selection.is_some() && scoped.is_none() {
+                continue;
+            }
+            remaining.remove(&id);
             let payload_str: Option<String> = row.get(1).ok().flatten();
             let approved: i64 = row.get(2).unwrap_or(0);
-            if let Some(p) = payload_str
+            if let Some(mut p) = payload_str
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
             {
-                items.push((id, p, approved != 0));
+                if let Some(choice) = scoped {
+                    if !p.is_object() {
+                        return Err(format!("Release {id} has incomplete cached metadata"));
+                    }
+                    if let Some(ids) = choice {
+                        let cached: HashSet<String> = p.get("tracks").and_then(Value::as_array).into_iter().flatten()
+                            .chain(p.get("selected_tracks").and_then(Value::as_array).into_iter().flatten())
+                            .filter_map(|track| track.get("id"))
+                            .filter_map(|value| match value {
+                                Value::String(value) => Some(value.trim().to_string()),
+                                Value::Number(value) => Some(value.to_string()),
+                                _ => None,
+                            }).collect();
+                        if ids.iter().any(|track_id| !cached.contains(track_id)) {
+                            return Err(format!("Some selected tracks are no longer in release {id}; refresh its details"));
+                        }
+                        p["selected_tracks"] = json!(ids.iter().map(|track_id| json!({"id":track_id})).collect::<Vec<_>>());
+                    } else {
+                        p["selected_tracks"] = Value::Null;
+                    }
+                    // Explicit whole-release selection must override historic or
+                    // legacy partial selections without changing the saved queue.
+                    p["selected_track_ids"] = Value::Null;
+                }
+                items.push((id, p, approved != 0 || (dec == "downloaded" && scoped.is_some())));
+            } else if scoped.is_some() {
+                return Err(format!("Release {id} has incomplete cached metadata"));
             }
         }
+        if !remaining.is_empty() {
+            return Err("Some selected releases are no longer in this list; refresh it before exporting".into());
+        }
 
-        if format == "csv" {
+        if matches!(format, "text" | "txt") {
+            // The external downloader accepts one media URL per line. Preserve
+            // the exact saved approval state: an empty selection exports nothing,
+            // while a whole release exports its album URL rather than every track.
+            let mut lines = Vec::new();
+            let mut seen = HashSet::new();
+            for (id, release, approved) in items {
+                if !approved {
+                    continue;
+                }
+                let selected = release.get("selected_tracks").and_then(Value::as_array)
+                    .or_else(|| release.get("selected_track_ids").and_then(Value::as_array));
+                if let Some(tracks) = selected {
+                    for track in tracks {
+                        let raw_id = track.get("id").unwrap_or(track);
+                        let track_id = match raw_id {
+                            Value::String(value) => value.trim().to_string(),
+                            Value::Number(value) => value.to_string(),
+                            _ => return Err(format!("Release {id} contains a selected track with no valid ID")),
+                        };
+                        if track_id.is_empty() || !track_id.chars().all(|c| c.is_ascii_digit()) {
+                            return Err(format!("Release {id} contains a selected track with an invalid ID"));
+                        }
+                        let url = format!("https://tidal.com/track/{track_id}");
+                        if seen.insert(url.clone()) {
+                            lines.push(url);
+                        }
+                    }
+                } else {
+                    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+                        return Err(format!("Release {id} has an invalid online ID"));
+                    }
+                    let url = format!("https://tidal.com/album/{id}");
+                    if seen.insert(url.clone()) {
+                        lines.push(url);
+                    }
+                }
+            }
+            Ok(if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) })
+        } else if format == "csv" {
             let mut csv = String::from("Artist,Release,Year,Type,Tracks,ID,URL\n");
             for (id, rel, _) in items {
                 let artist = rel.get("artist").and_then(|v| v.as_str()).unwrap_or("");
@@ -4611,6 +4721,57 @@ with sqlite3.connect('{db}') as db:
             .unwrap();
         assert!(link_stmt.next().await.unwrap().is_some());
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn text_queue_export_preserves_release_track_and_approval_selection() {
+        let temp_dir = std::env::temp_dir().join(format!("tibrary_text_export_{}", uuid::Uuid::new_v4()));
+        let store = TursoDb::open(&temp_dir.join("export.sqlite3")).await.unwrap();
+        let conn = store.connect().unwrap();
+        for (id, approved, decision, payload) in [
+            ("100", 1, "queued", json!({"title":"Whole release","selected_tracks":null})),
+            ("200", 1, "queued", json!({"title":"Partial release","tracks":[{"id":"2001"},{"id":"2002"}],
+                "selected_tracks":[{"id":2001},{"id":"2002"},{"id":"2001"}]})),
+            ("300", 0, "queued", json!({"title":"Unapproved","selected_tracks":null})),
+            ("400", 1, "queued", json!({"title":"Nothing selected","selected_tracks":[]})),
+            ("500", 1, "queued", json!({"title":"Legacy selection","selected_track_ids":["2001","5001"]})),
+            ("600", 1, "downloaded", json!({"title":"Downloaded selection","tracks":[{"id":"6001"},{"id":6002}],
+                "selected_tracks":[{"id":"6001"}]})),
+            ("700", 0, "downloaded", json!({"title":"Completed unapproved","tracks":[{"id":"7001"}],"selected_tracks":null})),
+        ] {
+            conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES(?,?,?,?)",
+                (id, payload.to_string(), approved, decision)).await.unwrap();
+        }
+        let expected = "https://tidal.com/album/100\nhttps://tidal.com/track/2001\nhttps://tidal.com/track/2002\nhttps://tidal.com/track/5001\n";
+        assert_eq!(store.queue_export("text", None).await.unwrap(), expected);
+        assert_eq!(store.queue_export("txt", None).await.unwrap(), expected);
+        assert_eq!(store.queue_export("text", Some("downloaded")).await.unwrap(), "https://tidal.com/track/6001\n");
+        assert!(store.queue_export("json", None).await.unwrap().contains("Unapproved"));
+        assert!(store.queue_export("csv", None).await.unwrap().contains("Partial release"));
+
+        // Downloaded checkboxes are transient. Export those exact choices, including
+        // completed rows whose old queue approval is no longer relevant.
+        let scope = HashMap::from([("600".into(), Some(vec!["6002".into()])), ("700".into(), None)]);
+        assert_eq!(store.queue_export_selection("text", Some("downloaded"), Some(&scope)).await.unwrap(),
+            "https://tidal.com/track/6002\nhttps://tidal.com/album/700\n");
+        assert_eq!(store.queue_export_selection("text", Some("downloaded"), Some(&HashMap::from([("600".into(), None)]))).await.unwrap(),
+            "https://tidal.com/album/600\n");
+        assert_eq!(store.queue_export_selection("text", Some("downloaded"), Some(&HashMap::from([("700".into(), Some(vec!["7001".into()]))]))).await.unwrap(),
+            "https://tidal.com/track/7001\n");
+        assert!(store.queue_export_selection("text", Some("downloaded"), Some(&HashMap::from([("600".into(), Some(vec!["7001".into()]))]))).await.is_err());
+        assert!(store.queue_export_selection("text", Some("downloaded"), Some(&HashMap::from([("999".into(), None)]))).await.is_err());
+        assert_eq!(store.queue_export_selection("text", None, Some(&HashMap::from([("300".into(), None)]))).await.unwrap(), "");
+        assert_eq!(store.queue_export_selection("text", Some("downloaded"), Some(&HashMap::new())).await.unwrap(), "");
+        assert_eq!(store.queue_export("text", Some("downloaded")).await.unwrap(), "https://tidal.com/track/6001\n");
+
+        // Parent approval/selection updates must be reflected immediately in export.
+        store.queue_select(&HashMap::from([("100".into(), Some(Vec::new())), ("200".into(), None)])).await.unwrap();
+        assert_eq!(store.queue_export("text", None).await.unwrap(),
+            "https://tidal.com/album/200\nhttps://tidal.com/track/2001\nhttps://tidal.com/track/5001\n");
+        store.queue_select(&HashMap::from([("200".into(), Some(vec!["2002".into()]))])).await.unwrap();
+        assert_eq!(store.queue_export("text", None).await.unwrap(),
+            "https://tidal.com/track/2002\nhttps://tidal.com/track/2001\nhttps://tidal.com/track/5001\n");
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

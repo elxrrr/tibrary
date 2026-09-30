@@ -1,4 +1,4 @@
-import { MetadataView, DownloadReview, TagChanges, ExportSummary } from "./MetadataView";
+import { MetadataView, DownloadReview, TagChanges } from "./MetadataView";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
@@ -635,17 +635,18 @@ function App() {
     try {
       const isDownloaded = targetRoute === "downloaded";
       const { text } = await call("queue.export", {
-        format: "json",
+        format: "text",
         decision: isDownloaded ? "downloaded" : "queued",
+        selection: isDownloaded && Object.keys(selectedReleases(selection)).length
+          ? selectedReleases(selection) : undefined,
       });
-      const content =
-        typeof text === "string" ? text : JSON.stringify(text, null, 2);
+      const content = typeof text === "string" ? text : "";
       setExportPreview({
         title: isDownloaded ? "Export downloaded releases" : "Export queue",
         content,
         filename: isDownloaded
-          ? "downloaded-releases.json"
-          : "acquisition-queue.json",
+          ? "downloaded-releases.txt"
+          : "acquisition-queue.txt",
       });
     } catch (e) {
       notifyError(e);
@@ -1099,11 +1100,12 @@ function App() {
               className="primary"
               disabled={busy}
               onClick={() => run("discography")}
+              title="Check release lists for your linked artists in the selected market. Saved track details and credits stay available; this does not download audio."
             >
-              Find new releases (online)
+              Check for new releases
             </button>
             <button disabled={busy} onClick={() => run("release_artists", { timeline })} title="Check album artist credits for this time range in small batches. Reuses saved credits and resumes unfinished checks when run again; no track downloads.">Check release artists</button>
-            <button disabled={busy} onClick={() => run("discography", { detailed: true })} title="Refresh linked artists, fill missing track lists, credits and genres, and reuse up-to-date cached details. Progress can be resumed.">Update recommendation data</button>
+            <button disabled={busy} onClick={() => run("discography", { detailed: true })} title="Check artist release lists, then fetch track lists, credits, genres and available DJ metadata only for new, changed or incomplete releases. Complete unchanged details are reused from the database.">Update recommendation data</button>
             {state?.catalogue_refresh && state.catalogue_refresh.status !== "complete" && state.catalogue_refresh.completed.length < state.catalogue_refresh.ids.length && !active(state.online_job) && (
               <button disabled={busy} onClick={() => run("discography", { ...state.catalogue_refresh, resume: true })}>
                 Resume refresh ({state.catalogue_refresh.completed.length}/{state.catalogue_refresh.ids.length})
@@ -1180,6 +1182,7 @@ function App() {
           </div>
         )}
         {toolbar()}
+        {route === "missing" && <p className="hint scan-explainer">Check for new releases updates artist release lists. Update recommendation data fills missing or changed track lists, credits, genres and DJ metadata. Saved details are reused; audio is downloaded from the queue.</p>}
         {route === "missing" && (
           <div className="filters secondary">
             <select
@@ -1636,7 +1639,6 @@ function App() {
               >
                 Disconnect account
               </button>
-            </div>
           <button className="connection-test" disabled={submitting || active(state?.online_job)} onClick={() => run("connections")}
             title={state?.online_job?.kind === "connections" && !active(state.online_job)
               ? Object.values(state?.diagnostics?.metrics || {}).map((metric: any) => metric.ok ? "Connected" : metric.message || "Needs attention").join(" · ") || state.online_job.message
@@ -1645,6 +1647,7 @@ function App() {
             {state?.online_job?.kind === "connections" && active(state.online_job) ? "Testing connections…" : "Test connections"}
             {state?.online_job?.kind === "connections" && !active(state.online_job) && <span className={state.online_job.status === "complete" && Object.values(state?.diagnostics?.metrics || {}).length > 0 && Object.values(state?.diagnostics?.metrics || {}).every((metric: any) => metric.ok) ? "connection-result ok" : "connection-result warning"} aria-label={state.online_job.status === "complete" && Object.values(state?.diagnostics?.metrics || {}).every((metric: any) => metric.ok) ? "Connection test passed" : "Connection test needs attention"}/>}
           </button>
+            </div>
           {diagnostics.length > 0 && <details className="connection-details"><summary>Connection details</summary>
             {Object.entries(state?.diagnostics?.metrics || {}).map(([key, metric]: [string, any]) => <p key={key}><strong>{key === "download" ? "Account and downloads" : key === "catalogue" ? "Catalogue" : key}</strong> · {metric.ok ? "Ready" : "Needs attention"}{metric.latency_ms != null ? ` · ${metric.latency_ms} ms` : ""}{metric.message ? ` · ${metric.message}` : ""}</p>)}
           </details>}
@@ -2503,11 +2506,13 @@ function App() {
           onClose={() => setExportPreview(null)}
         >
           <div className="modal-body">
-            <ExportSummary content={exportPreview.content}/>
-            <details><summary>Raw export data (JSON)</summary><pre>{exportPreview.content}</pre></details>
+            <p>One link per line, ready to use in an external downloader. Whole releases use release links; individually approved tracks use track links.</p>
+            {exportPreview.content ? <textarea className="export-links" aria-label="Download links" value={exportPreview.content} readOnly spellCheck={false}/>
+              : <p className="muted">No approved music to export.</p>}
           </div>
           <footer>
             <button
+              disabled={!exportPreview.content}
               onClick={() => {
                 navigator.clipboard.writeText(exportPreview.content);
                 setToast("Copied to clipboard");
@@ -2520,10 +2525,11 @@ function App() {
             </button>
             <button
               className="primary"
+              disabled={!exportPreview.content}
               onClick={async () => {
                 const path = await save({
                   defaultPath: exportPreview.filename,
-                  filters: [{ name: "JSON", extensions: ["json"] }],
+                  filters: [{ name: "Text", extensions: ["txt"] }],
                 });
                 if (path) {
                   await invoke("save_export", {

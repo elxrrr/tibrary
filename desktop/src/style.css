@@ -679,6 +679,18 @@ tr.child td {
   background: #4d95681b;
   color: color-mix(in srgb, var(--text) 45%, #43805b);
 }
+.badge.in-library {
+  background: color-mix(in srgb, #30a46c 16%, var(--card));
+  color: color-mix(in srgb, #30a46c 72%, var(--text));
+}
+.badge.missing-locally {
+  background: color-mix(in srgb, #c49024 16%, var(--card));
+  color: color-mix(in srgb, #c49024 72%, var(--text));
+}
+.badge.local-only {
+  background: color-mix(in srgb, #8b73cb 16%, var(--card));
+  color: color-mix(in srgb, #8b73cb 72%, var(--text));
+}
 .badge.potential,
 .badge.needs-choice,
 .badge.needs-review,
@@ -1381,12 +1393,12 @@ dialog p {
 .activity-status .job-progress-label { font-variant-numeric: tabular-nums; font-size: 12px; }
 
 /* Template help uses the same inset and spacing whether open or closed. */
-.template-reference { margin-top: 16px; overflow: hidden; }
-.template-reference > summary { padding: 12px 14px; cursor: pointer; }
+.template-reference { margin-top: 12px; padding: 0; overflow: hidden; }
+.template-reference > summary { min-height: 33px; line-height: 17px; padding: 7px 12px; cursor: pointer; list-style-position: inside; }
 .template-tokens { display: flex; flex-wrap: wrap; gap: 10px; padding: 4px 14px 14px; }
 .template-token { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--sidebar); }
 .template-token small { color: var(--muted); }
-#connection-settings .connection-test { margin-top: 12px; }
+.export-links { display: block; width: 100%; min-height: 240px; max-height: 50vh; resize: vertical; margin-top: 16px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--text); font: 12px/1.6 ui-monospace, monospace; }
 
 /* Sticky table cells must cover scrolled content, including inside dialogs. */
 :root { --table-header: #ececee; }
