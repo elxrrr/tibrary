@@ -47,7 +47,7 @@ npm --prefix desktop run tauri dev
 4. Browse **Complete library → Missing releases** and queue the music you want.
 5. Use **Update library** for missing tags, artwork and replacements.
 
-The catalogue cache is shared across workflows. Use **Update recommendation data** to collect missing online evidence, or **Recheck cached releases** to recalculate locally. Your database does not need resetting.
+Use **Check local changes** after editing files outside the app, and **Update missing releases** to discover new music and fill gaps in online metadata. Tools share their cached results; unchanged tags and complete release details are reused. Your database does not need resetting.
 
 ## Screenshots
 

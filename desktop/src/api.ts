@@ -50,6 +50,18 @@ export async function call<T = any>(
 }
 export const active = (job?: Job | null) =>
   !!job && ["running", "cancelling"].includes(job.status);
+// Native completion events and request replies can arrive in either order.
+// Keep each job moving forward, even when an older request finishes last.
+export function mergeJob(current: Job | null | undefined, incoming: Job | null | undefined): Job | null {
+  if (!incoming) return current || null;
+  if (!current) return incoming;
+  if (current.id !== incoming.id)
+    return (current.started || 0) > (incoming.started || 0) ? current : incoming;
+  if (!active(current) && active(incoming)) return current;
+  if (current.status === "cancelling" && incoming.status === "running") return current;
+  if (active(current) && active(incoming) && (current.progress_updated_at || 0) > (incoming.progress_updated_at || 0)) return current;
+  return incoming;
+}
 export const external = (url: string) => invoke("open_external", { url });
 export const reveal = (path: string) => invoke("reveal_file", { path });
 export const readable = (value: any): string =>

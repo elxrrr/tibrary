@@ -16,13 +16,13 @@ Version **0.9.1** · [Setup and screenshots](../../README.md)
 
 ### Local changes
 
-Select one correction or organisation operation, scan, then review the affected files before applying it. Tag corrections and folder moves are separate actions. Folder previews show current and proposed paths, including whitespace changes.
+Select one correction or organisation operation, then review the affected files before applying it. Previews use the shared local index and are reused until their inputs change. Tag corrections and folder moves are separate actions. Folder previews show current and proposed paths, including whitespace changes.
 
 Track/disc matching treats `01` and `1` equally. Number corrections use padded tags and flag impossible totals such as `04/1`. Consistent local or cached online evidence can supply replacement totals; ambiguous cases require review.
 
 Duplicate removal uses the system Trash and preserves the chosen keeper. MQA signals are audit evidence; replacement is a separate action. Review proposed changes before applying them.
 
-Files changed through the app update its index and dependent views. After editing or moving files in another application, update the library from Overview. Keep the database: it holds links, cached metadata and saved decisions.
+Files changed through the app update its index and dependent views. After editing or moving files in another application, use **Check local changes** from Overview. It reads tags only for added or changed files and records removals. Keep the database: it holds links, cached metadata and saved decisions.
 
 ### Linking and recommendations
 
@@ -38,19 +38,22 @@ A release is marked superseded only when cached evidence shows a newer available
 
 | Action | When to use it |
 | --- | --- |
-| Update library on Overview | Local files or tags changed outside Tibrary. |
-| Check for new releases | Refresh artist release lists in the selected market; reuse saved details. |
-| Update recommendation data | Collect details only for new, changed or incomplete releases. |
-| Check release artists | Fill album artist evidence for older cached releases. |
-| Recheck cached releases | Recalculate ownership and recommendations from saved data, without API requests. |
+| Check local changes | Update the shared index after editing files outside Tibrary; reuse unchanged tags. |
+| Update missing releases | Check linked artist release lists and fill new, changed or incomplete online details. |
+| More update options → Check release lists only | Check for new releases without collecting additional track details. |
+| More update options → Fill missing release artists | Fill album artist evidence for older cached releases. |
+| More update options → Recalculate saved results | Recalculate ownership and recommendations locally, without API requests. |
+| Reread all tags in General | Force a complete tag read if an external editor preserved file size and modification time. |
 | Refresh track details and credits | Refresh metadata for a particular release. |
 | Recheck availability | Request a fresh market-availability check. |
 
-All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete recommendation details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
+All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Metadata found during tagging, linking or downloading is shared with the other tools. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
 
 Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
 
 If upstream tags change without changing a release's summary, use its manual detail refresh. Failed optional genre/replacement lookups retry after a cooldown while retaining the saved track credits; successful empty fields do not trigger repeated checks.
+
+Navigating between pages does not start or cancel scans. Jobs finish in the background and publish their results to every relevant view. Cancellation retains completed checks. Artwork dimensions and MQA audits are cached per file; unchanged files are reused. Reviewed tag-only moves retain valid inspections, while artwork or relevant MQA tag changes invalidate the corresponding result. Local duplicate checks reuse the saved analysis until the indexed file manifest changes.
 
 BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. Missing fields are not invented. Missing-tag previews preserve existing tags. No developer credentials or database reset are needed.
 

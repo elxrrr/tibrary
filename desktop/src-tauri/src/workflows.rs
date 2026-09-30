@@ -3,8 +3,11 @@ use crate::musical_keys::key_changes;
 use crate::organisation::format_layout;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +21,67 @@ pub struct WorkflowRowPlan {
     pub changes: HashMap<String, String>,
     pub target: Option<String>,
     pub issues: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PlanScope {
+    database: PathBuf,
+    roots: Vec<String>,
+    action: String,
+}
+
+struct CachedPlan {
+    fingerprint: [u8; 32],
+    rows: Vec<WorkflowRowPlan>,
+    used: Instant,
+}
+
+// Only the latest plan for each operation is retained. These are derived views
+// of the shared index, so they do not need another durable copy of every tag.
+const MAX_CACHED_OPERATIONS: usize = 16;
+const MAX_CACHED_PLAN_ROWS: usize = 80_000;
+static PLAN_CACHE: OnceLock<Mutex<HashMap<PlanScope, CachedPlan>>> = OnceLock::new();
+
+fn plan_scope(db: &crate::db::TursoDb, rows: &[LocalFileRecord], action: &str) -> PlanScope {
+    let mut roots: Vec<_> = rows.iter().map(|row| row.root.as_str()).collect();
+    roots.sort_unstable();
+    roots.dedup();
+    PlanScope { database: db.path.clone(), roots: roots.into_iter().map(str::to_owned).collect(), action: action.to_owned() }
+}
+
+fn plan_fingerprint(rows: &[LocalFileRecord], template: Option<&str>, online_revision: Option<u64>) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(serde_json::to_vec(&(template, online_revision)).unwrap_or_default());
+    let mut ordered: Vec<_> = rows.iter().collect();
+    ordered.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    for row in ordered {
+        // Include metadata itself: other workflows may update the index without
+        // changing the on-disk file's size or timestamp.
+        digest.update(serde_json::to_vec(&(
+            &row.path, &row.root, row.size, row.mtime, row.present,
+            &row.error, &row.metadata,
+        )).unwrap_or_default());
+    }
+    digest.finalize().into()
+}
+
+fn cached_plan(scope: &PlanScope, fingerprint: &[u8; 32]) -> Option<Vec<WorkflowRowPlan>> {
+    let mut cache = PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let saved = cache.get_mut(scope).filter(|entry| &entry.fingerprint == fingerprint)?;
+    saved.used = Instant::now();
+    Some(saved.rows.clone())
+}
+
+fn save_plan(scope: PlanScope, fingerprint: [u8; 32], rows: &[WorkflowRowPlan]) {
+    if rows.len() > MAX_CACHED_PLAN_ROWS { return; }
+    let mut cache = PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    cache.insert(scope, CachedPlan { fingerprint, rows: rows.to_vec(), used: Instant::now() });
+    while cache.len() > MAX_CACHED_OPERATIONS
+        || cache.values().map(|entry| entry.rows.len()).sum::<usize>() > MAX_CACHED_PLAN_ROWS
+    {
+        let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.used).map(|(key, _)| key.clone()) else { break; };
+        cache.remove(&oldest);
+    }
 }
 
 pub fn extract_tags_map(metadata: &Option<Value>) -> HashMap<String, String> {
@@ -94,8 +158,15 @@ pub(crate) fn release_key(row: &LocalFileRecord, tags: &HashMap<String, String>)
 
 /// Uses the shared catalogue snapshot only: opening Correct tags never fetches online data.
 pub async fn plan_cached(db: &crate::db::TursoDb, rows: &[LocalFileRecord], action: &str, template: Option<&str>) -> Result<Vec<WorkflowRowPlan>, String> {
+    let scope = plan_scope(db, rows, action);
+    let online_revision = (action == "numbers").then(|| db.revision.load(std::sync::atomic::Ordering::SeqCst));
+    let fingerprint = plan_fingerprint(rows, template, online_revision);
+    if let Some(saved) = cached_plan(&scope, &fingerprint) { return Ok(saved); }
     let mut plans = plan_workflow(rows, action, template);
-    if action != "numbers" { return Ok(plans); }
+    if action != "numbers" {
+        save_plan(scope, fingerprint, &plans);
+        return Ok(plans);
+    }
     let market = db.get_settings().await?["general"]["market"].as_str().unwrap_or("GB").to_string();
     let conn = db.connect()?;
     let mut query = conn.query("SELECT payload FROM catalogue WHERE market=?", (market.as_str(),)).await.map_err(|e| e.to_string())?;
@@ -170,6 +241,10 @@ pub async fn plan_cached(db: &crate::db::TursoDb, rows: &[LocalFileRecord], acti
             plan.issues.retain(|i| !i.starts_with("tracktotal") && !i.starts_with("disctotal"));
             plan.issues.push(format!("Complete recording sequence verified against chosen release {}: use online Disc {:02}/{:02}, Track {:02}/{:02}; files stay in place",group.release.id,track.disc_number,discs,track.track_number,count));
         }
+    }
+    // A concurrent catalogue write must not publish an old plan as current.
+    if online_revision == Some(db.revision.load(std::sync::atomic::Ordering::SeqCst)) {
+        save_plan(scope, fingerprint, &plans);
     }
     Ok(plans)
 }
@@ -376,6 +451,38 @@ mod tests {
         assert_ne!(plans.iter().find(|p| p.path.ends_with("4.flac")).unwrap().changes.get("tracktotal").map(String::as_str), Some("12"));
     }
     #[tokio::test]
+    async fn unchanged_local_plans_are_reused_and_changed_tags_or_templates_invalidate() {
+        let dir = std::env::temp_dir().join(format!("tibrary-plan-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::TursoDb::open(&dir.join("test.sqlite")).await.unwrap();
+        let mut rows = vec![sample(1, 12)];
+        rows[0].metadata.as_mut().unwrap()["date"] = serde_json::json!("2024");
+        let first = plan_cached(&db, &rows, "organise", None).await.unwrap();
+        let scope = plan_scope(&db, &rows, "organise");
+        let cached_pointer = || PLAN_CACHE.get().unwrap().lock().unwrap()[&scope].rows.as_ptr() as usize;
+        let initial_pointer = cached_pointer();
+        // Unrelated online work changes the global revision but not this local plan.
+        db.bump_revision();
+        let second = plan_cached(&db, &rows, "organise", None).await.unwrap();
+        assert_eq!(first[0].target, second[0].target);
+        assert_eq!(cached_pointer(), initial_pointer, "unchanged plans should retain their cached allocation");
+
+        // Index metadata changes must invalidate even with the same mtime/size.
+        rows[0].metadata.as_mut().unwrap()["title"] = serde_json::json!("Different title");
+        let changed = plan_cached(&db, &rows, "organise", None).await.unwrap();
+        assert!(changed[0].target.as_deref().unwrap().contains("Different title"));
+        assert_ne!(cached_pointer(), initial_pointer);
+        let template = Some("{albumartist}/{album}/{tracknumber} - {title}");
+        let new_template = plan_cached(&db, &rows, "organise", template).await.unwrap();
+        assert!(!new_template[0].target.as_deref().unwrap().contains("(2024)"));
+        assert_ne!(changed[0].target, new_template[0].target);
+
+        rows[0].present = false;
+        assert!(plan_cached(&db, &rows, "organise", template).await.unwrap().is_empty());
+        PLAN_CACHE.get().unwrap().lock().unwrap().remove(&scope);
+        drop(db); std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
     async fn cached_exact_recordings_repair_totals_but_conflicting_editions_do_not() {
         let dir = std::env::temp_dir().join(format!("tibrary-numbers-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -402,6 +509,8 @@ mod tests {
         drop(linked);
         let mut other = release.clone(); other["id"] = serde_json::json!("other"); other["tracks"].as_array_mut().unwrap().pop();
         conn.execute("UPDATE catalogue SET payload=?", (serde_json::json!({"releases":[release,other]}).to_string(),)).await.unwrap();
+        // The production catalogue writer publishes a revision after committing.
+        db.bump_revision();
         let plans = plan_cached(&db, &[sample(1,1),sample(4,1)], "numbers", None).await.unwrap();
         assert!(plans.iter().all(|p| p.changes["tracktotal"] == "01"));
         drop(conn); drop(db); std::fs::remove_dir_all(dir).unwrap();

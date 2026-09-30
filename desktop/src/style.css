@@ -488,6 +488,33 @@ main {
 .card .toolbar {
   margin: 16px 0 0;
 }
+.update-options {
+  position: relative;
+  margin: 0;
+  padding: 0;
+  background: var(--card);
+}
+.update-options > summary {
+  padding: 7px 12px;
+  min-height: 33px;
+  line-height: 17px;
+  list-style-position: inside;
+}
+.update-options-menu {
+  position: absolute;
+  z-index: 25;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 245px;
+  display: grid;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--card);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+}
+.update-options-menu > button { text-align: left; justify-content: flex-start; }
 .action-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

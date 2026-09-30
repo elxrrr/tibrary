@@ -643,6 +643,25 @@ impl Backend {
     }
 }
 
+async fn preview_inputs(db: &TursoDb, operation: &str) -> Result<Value, String> {
+    Ok(json!({
+        "local_revision":db.local_revision.load(Ordering::SeqCst),
+        "catalogue_revision":if operation == "numbers" {Some(db.revision.load(Ordering::SeqCst))} else {None},
+        "template":if operation == "organise" {db.get_preference("organisation").await?.unwrap_or(Value::Null)["template"].clone()} else {Value::Null}
+    }))
+}
+
+fn refresh_runtime_state(state: &Backend, snapshot: &mut Value) {
+    // Database reads may finish after a worker. Always take live job state at
+    // response time so a slow dashboard read cannot resurrect a completed job.
+    if let Some(job)=state.active_job.lock().unwrap().clone() {snapshot["job"]=job;}
+    snapshot["online_job"]=json!(state.online_job.lock().unwrap().clone());
+    snapshot["download_job"]=json!(state.download_job.lock().unwrap().clone());
+    snapshot["logs"]=json!(state.logs.snapshot());
+    snapshot["auth_url"]=state.pending_pkce.lock().unwrap().as_ref()
+        .map(|flow|json!(flow.login_url)).unwrap_or(Value::Null);
+}
+
 async fn handle_rpc_call(
     app_handle: Option<&tauri::AppHandle>,
     state: &Arc<Backend>,
@@ -667,19 +686,7 @@ async fn handle_rpc_call(
         if let Some((rev, created, mut value)) = saved {
             if rev == revision && created.elapsed().as_secs() < 30 {
                 if method == "state" {
-                    if let Some(job) = state.active_job.lock().unwrap().clone() {
-                        value["job"] = job;
-                    }
-                    value["download_job"] = json!(state.download_job.lock().unwrap().clone());
-                    value["online_job"] = json!(state.online_job.lock().unwrap().clone());
-                    value["logs"] = json!(state.logs.snapshot());
-                    value["auth_url"] = state
-                        .pending_pkce
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|flow| json!(flow.login_url))
-                        .unwrap_or(Value::Null);
+                    refresh_runtime_state(state,&mut value);
                 }
                 return Ok(value);
             }
@@ -739,7 +746,7 @@ async fn handle_rpc_uncached(
             obj.entry("market").or_insert(json!(market));
         }
     }
-    let _dispatch = if method == "job.start" || method == "auth.reply" {
+    let _dispatch = if matches!(method.as_str(),"job.start"|"auth.reply"|"turso.tags.write"|"turso.scan"|"turso.discography") {
         Some(state.dispatch_gate.lock().await)
     } else {
         None
@@ -754,10 +761,19 @@ async fn handle_rpc_uncached(
         if occupied {
             return Err("A task in this section is already running. Wait for completion or cancel it first.".into());
         }
+        if matches!(kind,"link"|"match_artists"|"metadata"|"artwork"|"deep_review"|"deep_preview"|"manual_candidate")
+            && state.active_job.lock().unwrap().as_ref().is_some_and(|job|
+                matches!(job["status"].as_str(),Some("running"|"cancelling"))
+                && matches!(job["kind"].as_str(),Some("scan"|"apply"|"deep_apply"|"consolidate"))) {
+            return Err("The local index is being updated. This action will be available when it finishes.".into());
+        }
     }
     if method == "job.start" && actions::handles(args["kind"].as_str().unwrap_or("")) {
         let kind = args["kind"].as_str().unwrap().to_string();
         let input = args.get("args").cloned().unwrap_or_else(|| args.clone());
+        let preview_source = if kind == "preview" {Some(preview_inputs(db,input["action"].as_str().unwrap_or("dates")).await?)} else {None};
+        let action_root = input["root"].as_str().unwrap_or("").to_owned();
+        let local_revision = db.local_revision.load(Ordering::SeqCst);
         let id = uuid::Uuid::new_v4().to_string();
         let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -801,14 +817,22 @@ async fn handle_rpc_uncached(
                     Value::Null,
                 ),
             };
-            let library_mutated = status == "complete" && matches!(kind.as_str(), "apply" | "deep_apply" | "consolidate");
+            if let Some(preview_id) = value["preview_id"].as_str() {
+                let mut previews=backend.previews.lock().unwrap();
+                if let (Some(source),Some(p))=(preview_source,previews.get_mut(preview_id)) {p["source_inputs"]=source;}
+                let operation=previews.get(preview_id).map(|p|p["operation"].clone());
+                previews.retain(|key,p|key==preview_id || p["root"] != action_root || Some(&p["operation"]) != operation.as_ref());
+            }
+            let library_mutated = database.local_revision.load(Ordering::SeqCst) != local_revision
+                && matches!(kind.as_str(), "apply" | "deep_apply" | "consolidate");
+            if library_mutated {backend.previews.lock().unwrap().retain(|_,p|p["root"]!=action_root);}
             let finished = json!({"id":id,"kind":kind,"status":status,"message":message,"started":started,"finished":chrono::Utc::now().timestamp_millis() as f64/1000.,"result":value});
             if is_online_job(&kind) {
                 backend.finish_online_job(finished.clone());
             } else {
                 backend.finish_job(finished.clone());
             }
-            if kind != "cached_releases" { database.bump_revision(); }
+            if !matches!(kind.as_str(),"cached_releases"|"preview") && value["reused"] != true { database.bump_revision(); }
             let _ = database.set_preference("desktop-last-job", &finished).await;
             if let Some(app) = app {
                 let _ = app.emit(
@@ -915,6 +939,9 @@ async fn handle_rpc_uncached(
         return Ok(serde_json::to_value(catalogue).unwrap_or_default());
     }
     if method == "turso.tags.write" {
+        if state.active_job_cancel.lock().unwrap().is_some() {
+            return Err("A local task is already running. Wait for completion or cancel it first.".into());
+        }
         let path_str = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -929,8 +956,22 @@ async fn handle_rpc_uncached(
                 updates.insert(k.clone(), s.to_string());
             }
         }
-        tag_writer::write_tags(std::path::Path::new(path_str), &updates)?;
-        return Ok(json!({ "status": "ok", "updated": updates.len() }));
+        let conn=db.connect()?;
+        let mut registered=conn.query("SELECT root FROM local_files WHERE path=? AND present=1",(path_str,)).await.map_err(|e|e.to_string())?;
+        let root=registered.next().await.map_err(|e|e.to_string())?
+            .and_then(|row|row.get::<String>(0).ok()).ok_or("Index this file in a registered library before changing its tags")?;
+        drop(registered);
+        let count=updates.len();
+        let item=maintenance::FileApplyItem{path:path_str.to_owned(),target:None,artwork:None,tags:updates};
+        let database=db.clone();
+        let worker_root=root.clone();
+        let runtime=tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move ||runtime.block_on(maintenance::apply_file_item(&database,&worker_root,&item)))
+            .await.map_err(|e|format!("Tag worker failed: {e}"))??;
+        state.previews.lock().unwrap().retain(|_,p|p["root"]!=root);
+        state.view_cache.lock().unwrap().clear();
+        if let Some(app)=app_handle {let _=app.emit("backend-event",json!({"event":"library-mutated"}));}
+        return Ok(json!({ "status": "ok", "updated": count }));
     }
     if method == "turso.organisation.preview" {
         let root_str = args.get("root").and_then(|v| v.as_str()).unwrap_or("");
@@ -964,8 +1005,22 @@ async fn handle_rpc_uncached(
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing path".to_string())?;
-        let res = mqa::audit_file(std::path::Path::new(path_str));
-        return serde_json::to_value(res).map_err(|e| e.to_string());
+        let path=std::path::PathBuf::from(path_str);
+        let meta=std::fs::metadata(&path).map_err(|e|e.to_string())?;
+        let size=meta.len() as i64;
+        let mtime=meta.modified().map_err(|e|e.to_string())?.duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos() as i64;
+        let key=format!("mqa-audit:{path_str}");
+        if args["force"] != true {
+            if let Some(saved)=db.get_preference(&key).await?.filter(|saved|maintenance::valid_inspection(saved,size,mtime)) {
+                return Ok(saved["result"].clone());
+            }
+        }
+        let res=tokio::task::spawn_blocking(move ||mqa::audit_file(&path)).await.map_err(|e|format!("Audio audit worker failed: {e}"))?;
+        let value=serde_json::to_value(res).map_err(|e|e.to_string())?;
+        db.set_preference(&key,&json!({"size":size,"mtime":mtime,"result":value})).await?;
+        db.bump_revision();
+        state.view_cache.lock().unwrap().clear();
+        return Ok(value);
     }
     if method == "turso.enrichment.missing" {
         let local_tags_val = args
@@ -1066,15 +1121,7 @@ async fn handle_rpc_uncached(
         let root = args.get("root").and_then(|v| v.as_str());
         let mut snapshot = db.get_state(active, &logs, root).await?;
         snapshot["catalogue_refresh"] = db.get_preference("catalogue-refresh-checkpoint").await?.unwrap_or(Value::Null);
-        snapshot["online_job"] = json!(state.online_job.lock().unwrap().clone());
-        snapshot["download_job"] = json!(state.download_job.lock().unwrap().clone());
-        snapshot["auth_url"] = state
-            .pending_pkce
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|flow| json!(flow.login_url))
-            .unwrap_or(Value::Null);
+        refresh_runtime_state(state,&mut snapshot);
         return Ok(snapshot);
     }
     if method == "settings" {
@@ -1229,7 +1276,7 @@ async fn handle_rpc_uncached(
         } else {
             route
         };
-        let preview = {
+        let mut preview = {
             let previews = state.previews.lock().unwrap();
             args["preview_id"]
                 .as_str()
@@ -1244,6 +1291,10 @@ async fn handle_rpc_uncached(
                 })
                 .cloned()
         };
+        if matches!(route,"correct"|"organise") {
+            let source=preview_inputs(db,operation).await?;
+            preview=preview.filter(|p|p["source_inputs"]==source && p["root"]==args["root"] && p["operation"]==operation);
+        }
         let mut cached_rows = if let Some(ref p) = preview {
             p["rows"].as_array().cloned()
         } else if ["mqa", "local", "online"].contains(&route) {
@@ -1439,8 +1490,13 @@ async fn handle_rpc_uncached(
                     "release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":{},"target":null,"folder_operation":"No change",
                     "affected":false,"status":"No change","evidence":"No changes needed for this operation"}));
             }
-            state.previews.lock().unwrap().insert(preview_id.clone(), json!({"id":preview_id,
-                "created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":plans.len()}));
+            let source=preview_inputs(db,action).await?;
+            {
+                let mut previews=state.previews.lock().unwrap();
+                previews.retain(|_,p|p["root"]!=root || p["operation"]!=action);
+                previews.insert(preview_id.clone(), json!({"id":preview_id,
+                    "created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":plans.len(),"source_inputs":source}));
+            }
             if filter == Some("affected") {
                 rows.retain(|row| row["affected"] == true);
             }
@@ -1800,7 +1856,7 @@ async fn handle_rpc_uncached(
             "id": job_id,
             "kind": "scan",
             "status": "running",
-            "message": "Scanning files…",
+            "message": "Checking local changes · unchanged file tags will be reused",
             "started": started,
             "result": null
         });
@@ -1820,6 +1876,7 @@ async fn handle_rpc_uncached(
             let app_prog = app_clone.clone();
             let backend_prog = backend_task.clone();
 
+            let before_scan = db_clone.local_revision.load(Ordering::SeqCst);
             let scan_res = scanner::scan_library_with_options(
                 &db_clone,
                 &root_path,
@@ -1861,8 +1918,8 @@ async fn handle_rpc_uncached(
                         "Refresh local files · cancelled; completed results retained".to_string()
                     } else {
                         format!(
-                            "Refresh local files · finished; {} tags read · {} unchanged · {} missing",
-                            summary.read, summary.unchanged, summary.missing
+                            "Local index updated · {} tags read · {} unchanged reused · {} newly missing · {} restored",
+                            summary.read, summary.unchanged, summary.removed, summary.restored
                         )
                     };
                     (
@@ -1873,6 +1930,8 @@ async fn handle_rpc_uncached(
                             "read": summary.read,
                             "unchanged": summary.unchanged,
                             "missing": summary.missing,
+                            "removed": summary.removed,
+                            "restored": summary.restored,
                             "errors": summary.errors,
                         }),
                     )
@@ -1880,7 +1939,11 @@ async fn handle_rpc_uncached(
                 Err(e) => ("failed", format!("Scan failed: {}", e), json!(null)),
             };
 
-            let library_mutated = status == "complete" && (result_val["read"].as_u64().unwrap_or(0) > 0 || result_val["missing"].as_u64().unwrap_or(0) > 0);
+            let library_mutated = db_clone.local_revision.load(Ordering::SeqCst) != before_scan
+                || result_val["read"].as_u64().unwrap_or(0) > 0
+                || result_val["removed"].as_u64().unwrap_or(0) > 0
+                || result_val["restored"].as_u64().unwrap_or(0) > 0;
+            if library_mutated { backend_task.previews.lock().unwrap().retain(|_, p| p["root"].as_str() != root_path.to_str()); }
             let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
             let final_job = json!({
                 "id": j_id,
@@ -2885,6 +2948,50 @@ fn main() {
 
 #[cfg(test)]
 mod activity_tests {
+    #[test]
+    fn slow_state_reads_cannot_resurrect_completed_jobs() {
+        let backend=Backend::new();
+        let running=json!({"id":"local","kind":"local_duplicates","status":"running","message":"Checking local duplicates"});
+        backend.start_job(running.clone(),Arc::new(AtomicBool::new(false)));
+        let mut old_snapshot=json!({"job":running,"logs":[]});
+        backend.finish_job(json!({"id":"local","kind":"local_duplicates","status":"complete","message":"Local duplicates ready"}));
+        refresh_runtime_state(&backend,&mut old_snapshot);
+        assert_eq!(old_snapshot["job"]["status"],"complete");
+        assert_eq!(old_snapshot["logs"].as_array().unwrap().last().unwrap()["job_status"],"complete");
+        backend.start_job(json!({"id":"next","kind":"scan","status":"running"}),Arc::new(AtomicBool::new(false)));
+        refresh_runtime_state(&backend,&mut old_snapshot);
+        assert_eq!(old_snapshot["job"]["id"],"next");
+    }
+
+    #[tokio::test]
+    async fn local_preview_inputs_refresh_only_when_relevant_data_changes_and_gate_linking() {
+        let dir=std::env::temp_dir().join(format!("shared-preview-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let backend=Arc::new(Backend::new());
+        let root=dir.join("music").to_string_lossy().to_string();
+        let path=format!("{root}/Old.flac");
+        let metadata=json!({"albumartist":"Example","artist":"Example","album":"Release","title":"Track","date":"2020","tracknumber":"1","tracktotal":"1","discnumber":"1"}).to_string();
+        db.connect().unwrap().execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES(?,?,1,1,?,1)",(path.as_str(),root.as_str(),metadata.as_str())).await.unwrap();
+        let args=json!({"route":"organise","action":"organise","root":root,"limit":10,"filter":"affected"});
+        let first=handle_rpc_call(None,&backend,&db,"table".into(),args.clone()).await.unwrap();
+        assert!(first["preview_id"].as_str().is_some());
+        db.bump_revision(); // An unrelated online update must not discard local work.
+        let unchanged=handle_rpc_call(None,&backend,&db,"table".into(),args.clone()).await.unwrap();
+        assert_eq!(first["preview_id"],unchanged["preview_id"]);
+        db.set_preference("organisation",&json!({"template":"{albumartist}/{album}/{title}"})).await.unwrap();
+        db.bump_revision();
+        let changed=handle_rpc_call(None,&backend,&db,"table".into(),args.clone()).await.unwrap();
+        assert_ne!(first["preview_id"],changed["preview_id"]);
+        db.note_local_change();
+        let refreshed=handle_rpc_call(None,&backend,&db,"table".into(),args).await.unwrap();
+        assert_ne!(changed["preview_id"],refreshed["preview_id"]);
+        backend.start_job(json!({"id":"scan","kind":"scan","status":"running"}),Arc::new(AtomicBool::new(false)));
+        let error=handle_rpc_call(None,&backend,&db,"job.start".into(),json!({"kind":"link","args":{"root":root}})).await.unwrap_err();
+        assert!(error.contains("local index"));
+        backend.finish_job(json!({"id":"scan","kind":"scan","status":"complete"}));
+        drop(backend);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn saved_activity_survives_restart_and_verbose_jobs_without_crowding_other_streams() {
         let dir = std::env::temp_dir().join(format!("activity-restart-{}", uuid::Uuid::new_v4()));

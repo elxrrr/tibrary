@@ -66,6 +66,8 @@ pub struct ScanSummary {
     pub unchanged: usize,
     pub errors: usize,
     pub missing: usize,
+    pub removed: usize,
+    pub restored: usize,
     pub status: String,
 }
 
@@ -323,7 +325,7 @@ pub async fn scan_library_with_options(
             pending_writes.push((path_str, root_str.clone(), size, mtime, meta_json, err_str));
 
             if pending_writes.len() >= 64 {
-                flush_writes(&conn, &mut pending_writes).await?;
+                flush_writes(db, &conn, &mut pending_writes).await?;
             }
 
     }
@@ -331,7 +333,7 @@ pub async fn scan_library_with_options(
 
     // Flush any remaining writes
     if !pending_writes.is_empty() {
-        flush_writes(&conn, &mut pending_writes).await?;
+        flush_writes(db, &conn, &mut pending_writes).await?;
     }
 
     // Restore any files that reappeared
@@ -341,22 +343,27 @@ pub async fn scan_library_with_options(
             (p.as_str(),),
         )
         .await
-        .ok();
+        .map_err(|e| e.to_string())?;
+        summary.restored += 1;
+        db.note_local_change();
     }
 
     if summary.status != "cancelled" {
         summary.status = "complete".to_string();
         // Mark missing files that exist in DB for this root but were not seen
         let mut missing_count = 0;
-        for path_str in cached_files.keys() {
+        for (path_str, (_, _, _, was_present)) in &cached_files {
             if !seen_paths.contains(path_str) {
                 missing_count += 1;
+                if !was_present { continue; }
                 conn.execute(
                     "UPDATE local_files SET present = 0 WHERE path = ?",
                     (path_str.as_str(),),
                 )
                 .await
-                .ok();
+                .map_err(|e| e.to_string())?;
+                summary.removed += 1;
+                db.note_local_change();
             }
         }
         summary.missing = missing_count;
@@ -379,6 +386,7 @@ pub async fn scan_library_with_options(
 }
 
 async fn flush_writes(
+    db: &TursoDb,
     conn: &turso::Connection,
     pending: &mut Vec<PendingWrite>,
 ) -> Result<(), String> {
@@ -413,6 +421,9 @@ async fn flush_writes(
     conn.execute("COMMIT", ())
         .await
         .map_err(|e| e.to_string())?;
+    // Invalidate every derived view as soon as an indexed batch commits. This
+    // also covers cancellation/errors after a partially completed scan.
+    db.note_local_change();
     pending.clear();
     Ok(())
 }
@@ -443,6 +454,7 @@ mod tests {
             .expect("Failed to write flac fixture");
 
         let cancel = Arc::new(AtomicBool::new(false));
+        let initial_revision = store.revision.load(Ordering::SeqCst);
         let progress_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pm = progress_messages.clone();
 
@@ -455,6 +467,7 @@ mod tests {
         assert_eq!(summary.status, "complete");
         assert_eq!(summary.read, 1);
         assert_eq!(summary.unchanged, 0);
+        assert!(store.revision.load(Ordering::SeqCst) > initial_revision);
 
         // Verify row was stored in Turso
         let (files, total) = store
@@ -465,11 +478,13 @@ mod tests {
         assert_eq!(files[0].path, song_path.to_str().unwrap());
 
         // Re-scan: verify incremental skip (read=0, unchanged=1)
+        let unchanged_revision = store.revision.load(Ordering::SeqCst);
         let summary2 = scan_library(&store, &music_dir, cancel, |_| {})
             .await
             .expect("Second scan failed");
         assert_eq!(summary2.read, 0);
         assert_eq!(summary2.unchanged, 1);
+        assert_eq!(store.revision.load(Ordering::SeqCst), unchanged_revision);
         assert!(progress_messages.lock().unwrap().iter().any(|m|m.contains("0/1 files")));
         assert!(progress_messages.lock().unwrap().iter().any(|m|m.contains("1/1 files")));
         // A cancelled enumeration must not publish missing-file decisions.
@@ -479,9 +494,23 @@ mod tests {
         assert_eq!(store.get_local_files_page(None,10,0).await.unwrap().1,1);
         let final_scan=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
         assert_eq!(final_scan.missing,1);
+        assert_eq!(final_scan.removed,1);
+        assert!(store.revision.load(Ordering::SeqCst) > unchanged_revision);
         assert_eq!(store.get_local_files_page(None,10,0).await.unwrap().1,0);
-
-
+        let absent_revision = store.revision.load(Ordering::SeqCst);
+        let repeated=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+        assert_eq!(repeated.missing,1);
+        assert_eq!(repeated.removed,0);
+        assert_eq!(store.revision.load(Ordering::SeqCst),absent_revision);
+        // Reappearance can restore presence entirely from cached tags.
+        fs::write(&song_path,crate::stream_download::MINIMAL_FLAC).unwrap();
+        let current=fs::metadata(&song_path).unwrap();
+        store.connect().unwrap().execute("UPDATE local_files SET size=?,mtime=? WHERE path=?",(current.len() as i64,mtime_ns(&current),song_path.to_str().unwrap())).await.unwrap();
+        let restored=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+        assert_eq!(restored.read,0);
+        assert_eq!(restored.restored,1);
+        assert!(store.revision.load(Ordering::SeqCst)>absent_revision);
+        assert_eq!(store.get_local_files_page(None,10,0).await.unwrap().1,1);
         let _ = fs::remove_dir_all(temp_dir);
     }
 }

@@ -34,6 +34,72 @@ fn mtime_ns(m: &fs::Metadata) -> i64 {
     }
 }
 
+/// Local inspections share the library database, keyed by the indexed file stamp.
+pub(crate) async fn load_inspections(
+    db: &TursoDb,
+    prefix: &str,
+) -> Result<HashMap<String, serde_json::Value>, String> {
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query("SELECT key,payload FROM app_preferences WHERE key LIKE ?", (format!("{prefix}%"),))
+        .await.map_err(|e| e.to_string())?;
+    let mut saved = HashMap::new();
+    while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+        let key: String = row.get(0).map_err(|e| e.to_string())?;
+        let payload: String = row.get(1).map_err(|e| e.to_string())?;
+        if let (Some(path), Ok(value)) = (key.strip_prefix(prefix), serde_json::from_str(&payload)) {
+            saved.insert(path.to_string(), value);
+        }
+    }
+    Ok(saved)
+}
+
+pub(crate) fn valid_inspection(value: &serde_json::Value, size: i64, mtime: i64) -> bool {
+    value["size"].as_i64() == Some(size) && value["mtime"].as_i64() == Some(mtime)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ArtworkInspection {
+    pub front_covers: Vec<(u32, u32)>,
+}
+
+impl ArtworkInspection {
+    pub fn has_standard_cover(&self) -> bool {
+        self.front_covers.contains(&(1280, 1280))
+    }
+}
+
+/// Empty artwork is a successful inspection; read failures are never cached.
+pub(crate) async fn inspect_artwork(
+    db: &TursoDb,
+    file: &crate::db::LocalFileRecord,
+    saved: Option<&serde_json::Value>,
+    force: bool,
+) -> Result<(ArtworkInspection, bool), String> {
+    if !force {
+        if let Some(value) = saved.filter(|value| valid_inspection(value, file.size, file.mtime) && value["schema"] == 1) {
+            if let Ok(result) = serde_json::from_value(value["result"].clone()) {
+                return Ok((result, true));
+            }
+        }
+    }
+    let path = file.path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use lofty::{file::TaggedFileExt, picture::{PictureInformation, PictureType}};
+        let audio = lofty::probe::Probe::open(&path).map_err(|e| e.to_string())?
+            .options(lofty::config::ParseOptions::new().read_properties(false))
+            .read().map_err(|e| e.to_string())?;
+        let front_covers = audio.tags().iter().flat_map(|tag| tag.pictures())
+            .filter(|picture| picture.pic_type() == PictureType::CoverFront)
+            .filter_map(|picture| PictureInformation::from_picture(picture).ok())
+            .map(|info| (info.width, info.height)).collect();
+        Ok::<_, String>(ArtworkInspection { front_covers })
+    }).await.map_err(|e| e.to_string())??;
+    db.set_preference(&format!("artwork-inspection:{}", file.path),
+        &serde_json::json!({"schema":1,"size":file.size,"mtime":file.mtime,"result":result})).await?;
+    Ok((result, false))
+}
+
 pub async fn apply_file_item(
     db: &TursoDb,
     root: &str,
@@ -73,6 +139,22 @@ pub async fn apply_file_item(
         return Err("Destination already exists; no files changed".into());
     }
     let before = fs::metadata(&source_path).map_err(|e| e.to_string())?;
+    // These operations rewrite metadata/containers only; the audio is retained.
+    // Preserve inspections only when their evidence was unaffected by the edit.
+    let mqa_tags_changed = item.tags.keys().any(|key| {
+        let key = key.to_ascii_lowercase();
+        key.contains("mqa") || matches!(key.as_str(), "encoder" | "encodedby" | "originalsamplerate")
+    });
+    let mut preserved = Vec::new();
+    for (prefix, keep) in [("mqa-audit:", !mqa_tags_changed), ("artwork-inspection:", item.artwork.is_none())] {
+        if keep {
+            if let Some(value) = db.get_preference(&format!("{prefix}{}", item.path)).await? {
+                if valid_inspection(&value, before.len() as i64, mtime_ns(&before)) {
+                    preserved.push((prefix, value));
+                }
+            }
+        }
+    }
     let parent = final_path.parent().ok_or("Invalid destination")?;
     let ancestor = parent
         .ancestors()
@@ -181,6 +263,21 @@ pub async fn apply_file_item(
     )
     .await?;
 
+    for (prefix, mut value) in preserved {
+        value["size"] = serde_json::json!(size);
+        value["mtime"] = serde_json::json!(mtime);
+        if prefix == "mqa-audit:" {
+            value["result"]["path"] = serde_json::json!(final_path.display().to_string());
+        }
+        if let Err(error) = db.set_preference(&format!("{prefix}{}", final_path.display()), &value).await {
+            eprintln!("File updated; cached inspection will be repeated: {error}");
+        } else if source_path != final_path {
+            if let Ok(conn) = db.connect() {
+                let _ = conn.execute("DELETE FROM app_preferences WHERE key=?", (format!("{prefix}{}", item.path),)).await;
+            }
+        }
+    }
+
     Ok(final_path)
 }
 
@@ -229,6 +326,65 @@ mod tests {
     use lofty::probe::Probe;
     use lofty::tag::ItemKey;
     use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn local_inspections_are_reused_and_follow_reviewed_tag_only_moves() {
+        let temp = std::env::temp_dir().join(format!("local-inspection-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("original.flac");
+        fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+        let db = TursoDb::open(temp.join("library.db")).await.unwrap();
+        crate::scanner::scan_library(&db, &temp, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| {}).await.unwrap();
+        let file = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap().remove(0);
+        let (first, reused) = inspect_artwork(&db, &file, None, false).await.unwrap();
+        assert!(!reused);
+        assert!(!first.has_standard_cover());
+        let saved = db.get_preference(&format!("artwork-inspection:{}", file.path)).await.unwrap().unwrap();
+        // A reused inspection must not need to reopen the audio container.
+        let held = temp.join("held.flac");
+        fs::rename(&path, &held).unwrap();
+        assert_eq!(inspect_artwork(&db, &file, Some(&saved), false).await.unwrap(), (first.clone(), true));
+        assert!(inspect_artwork(&db, &file, Some(&saved), true).await.is_err());
+        let mut changed = file.clone();
+        changed.mtime += 1;
+        assert!(inspect_artwork(&db, &changed, Some(&saved), false).await.is_err());
+        fs::rename(&held, &path).unwrap();
+        let audit = serde_json::json!({"size":file.size,"mtime":file.mtime,"result":{"path":file.path,"detected":false,"status":"No signal found"}});
+        db.set_preference(&format!("mqa-audit:{}", file.path), &audit).await.unwrap();
+        let target = temp.join("moved.flac");
+        apply_file_item(&db, temp.to_str().unwrap(), &FileApplyItem {
+            path: file.path.clone(), target: Some(target.display().to_string()), artwork: None,
+            tags: HashMap::from([("title".into(), "New title".into())]),
+        }).await.unwrap();
+        let moved = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap().remove(0);
+        let saved = db.get_preference(&format!("artwork-inspection:{}", moved.path)).await.unwrap().unwrap();
+        assert!(valid_inspection(&saved, moved.size, moved.mtime));
+        assert_eq!(inspect_artwork(&db, &moved, Some(&saved), false).await.unwrap(), (first, true));
+        let audit = db.get_preference(&format!("mqa-audit:{}", moved.path)).await.unwrap().unwrap();
+        assert!(valid_inspection(&audit, moved.size, moved.mtime));
+        assert_eq!(audit["result"]["path"], serde_json::json!(moved.path));
+        assert!(db.get_preference(&format!("mqa-audit:{}", file.path)).await.unwrap().is_none());
+        use base64::Engine;
+        let cover = temp.join("cover.png");
+        fs::write(&cover, base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII=").unwrap()).unwrap();
+        apply_file_item(&db, temp.to_str().unwrap(), &FileApplyItem {
+            path: moved.path.clone(), target: None, artwork: Some(cover.display().to_string()), tags: HashMap::new(),
+        }).await.unwrap();
+        let updated = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap().remove(0);
+        let old_artwork = db.get_preference(&format!("artwork-inspection:{}", updated.path)).await.unwrap().unwrap();
+        assert!(!valid_inspection(&old_artwork, updated.size, updated.mtime), "Changing embedded artwork must invalidate its prior inspection");
+        let (artwork, reused) = inspect_artwork(&db, &updated, Some(&old_artwork), false).await.unwrap();
+        assert!(!reused);
+        assert_eq!(artwork.front_covers, vec![(1, 1)]);
+        apply_file_item(&db, temp.to_str().unwrap(), &FileApplyItem {
+            path: updated.path.clone(), target: None, artwork: None,
+            tags: HashMap::from([("encoder".into(), "MQA encoder".into())]),
+        }).await.unwrap();
+        let changed = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap().remove(0);
+        let old_audit = db.get_preference(&format!("mqa-audit:{}", changed.path)).await.unwrap().unwrap();
+        assert!(!valid_inspection(&old_audit, changed.size, changed.mtime), "Changing MQA evidence tags must invalidate its prior audit");
+        fs::remove_dir_all(&temp).unwrap();
+    }
 
     #[tokio::test]
     async fn test_apply_file_item() {

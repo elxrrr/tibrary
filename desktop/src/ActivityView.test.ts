@@ -1,5 +1,21 @@
 import { describe, it, expect } from "vitest";
 import { compactProgress, workload, groupActivity } from "./ActivityView";
+import { mergeJob } from "./api";
+
+it("preserves completion, cancellation and newer progress when request replies arrive late", () => {
+  const running={id:"one",kind:"scan",status:"running",message:"Checking files",started:100};
+  const complete={...running,status:"complete",finished:110};
+  expect(mergeJob(complete,running)).toBe(complete);
+  expect(mergeJob(complete,null)).toBe(complete);
+  const cancelling={...running,status:"cancelling"};
+  expect(mergeJob(cancelling,running)).toBe(cancelling);
+  expect(mergeJob(cancelling,complete)).toBe(complete);
+  const advanced={...running,completed:20,progress_updated_at:105};
+  expect(mergeJob(advanced,running)).toBe(advanced);
+  const next={...running,id:"two",started:120};
+  expect(mergeJob(complete,next)).toBe(next);
+  expect(mergeJob(next,complete)).toBe(next);
+});
 
 describe("catalogue refresh progress", () => {
   it("uses structured completed counts instead of numbers in activity text", () => {

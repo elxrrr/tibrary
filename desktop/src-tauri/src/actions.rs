@@ -199,22 +199,24 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
     let force = force || value["recommendation_snapshot"]["schema"].as_u64().is_some_and(|schema|schema != u64::from(RECOMMENDATION_SCHEMA)) || summary.as_ref().is_some_and(|summary| {
         value["recommendation_snapshot"]["summary_fingerprint"].as_str().is_some_and(|prior| prior != crate::tidal::summary_fingerprint(summary))
     });
-    if !force && value["subscriber_discovery_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at))) && value["tracks_loaded"] == true && value["track_metadata_source"] == "subscriber"
-        && value["track_metadata_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at)))
-        && value["tracks"].as_array().is_some_and(|tracks| !tracks.is_empty() && tracks.iter().all(|track|track["credits_complete"] == true))
-        && (value["recommendation_snapshot"]["schema"] != RECOMMENDATION_SCHEMA || value["recommendation_snapshot"]["optional_status"] == "complete") {
-        if value["recommendation_snapshot"]["schema"] != RECOMMENDATION_SCHEMA {
-            record_recommendation_snapshot(db,&mut value,market,summary.as_ref(),true).await?;
-            return publish_release(db,id,market,value).await;
-        }
+    let snapshot_current = summary.as_ref().is_some_and(|summary| recommendation_tracks_current(&value,&crate::tidal::summary_fingerprint(summary)));
+    if !force && snapshot_current
+        && (value["recommendation_snapshot"]["optional_status"] == "complete"
+            || value["recommendation_snapshot"]["optional_retry_after"].as_i64().is_some_and(|until| until > chrono::Utc::now().timestamp())) {
         return Ok(value);
     }
     let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
-    let mut reuse_tracks = !force && summary.as_ref().is_some_and(|summary|recommendation_tracks_current(&value,&crate::tidal::summary_fingerprint(summary)));
+    let mut reuse_tracks = !force && snapshot_current;
+    let mut track_fingerprint = None;
+    let mut unpaired_reused = false;
     let mut tracks = if reuse_tracks { old_tracks.clone() } else {
         let http=crate::network::client(20)?;
-        match crate::subscriber_metadata::load(db,&http,id,market,cancel.clone(),force).await {
-            Ok(raw)=>crate::subscriber_metadata::tracks(&raw)?,
+        match crate::subscriber_metadata::load_with_cache_status(db,&http,id,market,cancel.clone(),force).await {
+            Ok((raw,cached))=>{
+                track_fingerprint = raw["summary_fingerprint"].as_str().map(str::to_owned);
+                unpaired_reused = cached && track_fingerprint.is_none();
+                crate::subscriber_metadata::tracks(&raw)?
+            },
             Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
             Err(error) if value["tracks_loaded"] == true && !force => {
                 value["metadata_note"]=json!(format!("Saved metadata retained: {error}. Reconnect your account and retry if needed."));
@@ -250,11 +252,19 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
             fill_release_discovery(&mut client, &mut value, id, market, force).await;
         }
     }
-    let mut client=crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
-    let optional=client.discovery(&[id.to_owned()],market,force).await?;
+    let optional = match crate::tidal::TidalClient::from_db(db).await {
+        Ok(client) => match client.with_cancel(cancel.clone()).discovery(&[id.to_owned()],market,force).await {
+            Ok(fields) => fields,
+            Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
+            Err(_) => std::collections::HashMap::new(),
+        },
+        Err(_) => std::collections::HashMap::new(),
+    };
     if let Some(fields)=optional.get(id) { crate::tidal::merge_discovery(&mut value,fields); }
     let current_summary=db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
-    if summary_change_requires_track_refresh(reuse_tracks,summary.as_ref(),current_summary.as_ref()) {
+    if summary_change_requires_track_refresh(reuse_tracks,summary.as_ref(),current_summary.as_ref())
+        || (unpaired_reused && current_summary.is_some())
+        || track_fingerprint.as_ref().is_some_and(|pinned| current_summary.as_ref().is_some_and(|summary| crate::tidal::summary_fingerprint(summary) != *pinned)) {
         // A standalone metadata check can discover a changed edition while
         // refreshing its expired summary. Never stamp that new summary onto an
         // older credited track list; validate its current audio membership first.
@@ -303,17 +313,50 @@ fn apply_release_discovery(value: &mut Value, raw: &Value, id: &str) {
     }
 }
 
-async fn publish_release(
+pub(crate) async fn publish_release(
     db: &TursoDb,
     id: &str,
     market: &str,
     value: Value,
 ) -> Result<Value, String> {
+    publish_release_update(db,id,market,value,None).await
+}
+
+async fn publish_track_enrichment(db: &TursoDb, id: &str, market: &str, track: &crate::tidal::TidalTrack) -> Result<Value,String> {
+    let gate = release_gate(format!("{}:{market}:{id}",db.path.display()));
+    let _guard = gate.lock().await;
+    publish_release_update(db,id,market,Value::Null,Some(track)).await
+}
+
+async fn publish_release_update(
+    db: &TursoDb,
+    id: &str,
+    market: &str,
+    mut value: Value,
+    track_patch: Option<&crate::tidal::TidalTrack>,
+) -> Result<Value,String> {
     db.ensure_catalogue_release_index().await?;
     // Publish details to every catalogue reference and existing queue entry.
     let conn = db.connect()?;
     conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e|e.to_string())?;
     let result = async {
+        if let Some(incoming) = track_patch {
+            // Merge against the latest canonical recording inside the write
+            // transaction, preserving parallel updates to all other tracks.
+            let mut rows = conn.query("SELECT payload FROM app_preferences WHERE key=?",(format!("tag-review:{market}:{id}"),)).await.map_err(|e|e.to_string())?;
+            let saved = rows.next().await.map_err(|e|e.to_string())?.ok_or("Release metadata no longer cached; refresh it first")?;
+            value = serde_json::from_str(&saved.get::<String>(0).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            drop(rows);
+            let tracks = value["tracks"].as_array_mut().ok_or("Release track list no longer cached")?;
+            let target = tracks.iter_mut().find(|track| track["id"].as_str() == Some(&incoming.id)).ok_or("Recording no longer belongs to this release; refresh it first")?;
+            let mut current: crate::tidal::TidalTrack = serde_json::from_value(target.clone()).map_err(|e|e.to_string())?;
+            if current.isrc.as_ref().zip(incoming.isrc.as_ref()).is_some_and(|(a,b)|!a.eq_ignore_ascii_case(b)) { return Err("Recording identifier changed; saved metadata retained".to_owned()); }
+            crate::subscriber_metadata::supplement(std::slice::from_mut(&mut current),std::slice::from_ref(incoming));
+            current.copyright = current.copyright.or_else(||incoming.copyright.clone());
+            current.credits_complete |= incoming.credits_complete;
+            current.credits_checked_at = current.credits_checked_at.max(incoming.credits_checked_at);
+            *target = json!(current);
+        }
         conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("tag-review:{market}:{id}"),value.to_string())).await.map_err(|e|e.to_string())?;
         if let (Some(available), Some(checked_at)) = (value["available"].as_bool(),value["availability_checked_at"].as_i64()) {
             conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("release-live:{market}:{id}"),json!({"available":available,"checked_at":checked_at}).to_string())).await.map_err(|e|e.to_string())?;
@@ -370,11 +413,42 @@ async fn publish_release(
             .map_err(|e| e.to_string())?;
         }
         conn.execute("COMMIT", ()).await.map_err(|e|e.to_string())?;
-        Ok::<_,String>(())
+        Ok::<_,String>(value.clone())
     }.await;
     if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
-    result?;
+    let value = result?;
     db.bump_revision();
+    Ok(value)
+}
+
+/// A completed optional check may legitimately contain no BPM/key. Failures
+/// have a retry deadline and never become a permanent "not supplied" result.
+fn dj_check_reusable(value: &Value, now: i64) -> bool {
+    value.is_object() && (value["status"] != "retry" || value["retry_after"].as_i64().is_some_and(|until|until > now))
+}
+
+async fn check_dj_metadata(db: &TursoDb, http: &reqwest::Client, track: &str, market: &str, cancel: Arc<AtomicBool>) -> Result<Value,String> {
+    let key = format!("dj-check:{market}:{track}");
+    let gate = release_gate(format!("dj:{}:{market}:{track}",db.path.display()));
+    let _guard = gate.lock().await;
+    if let Some(saved) = db.get_preference(&key).await?.filter(|saved|crate::tidal::resource_id(&saved["id"]) == track && dj_check_reusable(saved,chrono::Utc::now().timestamp())) { return Ok(saved); }
+    let fetched = async {
+        let token = crate::stream_download::get_valid_token(db,http).await?;
+        let response = crate::network::get(http.get(format!("https://api.tidal.com/v1/tracks/{track}"))
+            .query(&[("countryCode",market)]).bearer_auth(token),std::time::Duration::from_millis(350),3,Some(cancel.as_ref()))
+            .await?.error_for_status().map_err(|e|e.to_string())?;
+        let mut value: Value = response.json().await.map_err(|e|e.to_string())?;
+        if !value.is_object() || crate::tidal::resource_id(&value["id"]) != track { return Err("Invalid recording metadata response".to_owned()); }
+        value["status"] = json!("complete");
+        value["checked_at"] = json!(chrono::Utc::now().timestamp());
+        Ok::<_,String>(value)
+    }.await;
+    let value = match fetched {
+        Ok(value)=>value,
+        Err(error) if cancel.load(Ordering::Relaxed)=>return Err(error),
+        Err(error)=>json!({"id":track,"status":"retry","retry_after":chrono::Utc::now().timestamp()+300,"error":error}),
+    };
+    db.set_preference(&key,&value).await?;
     Ok(value)
 }
 
@@ -929,6 +1003,15 @@ pub async fn execute(
     }
     if kind == "optimizations" || kind == "local_duplicates" || kind == "check_replacements" {
         if kind == "local_duplicates" || args["scope"] != "remote" && kind != "check_replacements" {
+            let manifest = crate::duplicates::manifest_fingerprint(&indexed);
+            if args["force"] != true
+                && db.get_preference(&format!("desktop-local-manifest:{root}")).await?.as_ref().and_then(Value::as_str) == Some(manifest.as_str())
+            {
+                if let Some(rows) = db.get_preference(&format!("desktop-local:{root}")).await?.and_then(|value| value.as_array().cloned()) {
+                    state.progress_for(kind, &format!("Local duplicates ready · {} saved groups reused · indexed files unchanged", rows.len()));
+                    return Ok(json!({"opportunities":rows.len(),"reused":true}));
+                }
+            }
             state.progress_for(
                 kind,
                 &format!(
@@ -948,7 +1031,7 @@ pub async fn execute(
                 .await?;
             db.set_preference(
                 &format!("desktop-local-manifest:{root}"),
-                &json!(crate::duplicates::manifest_fingerprint(&indexed)),
+                &json!(manifest),
             )
             .await?;
             state.progress_for(
@@ -1061,11 +1144,25 @@ pub async fn execute(
             .ok_or("Invalid cache directory")?
             .join("artwork-cache");
         std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        let saved_inspections = maintenance::load_inspections(db, "artwork-inspection:").await?;
+        let mut reused = 0;
+        let mut inspected = 0;
+        let mut checked = 0;
         let artwork_files:Vec<_>=indexed.iter().filter(|f|ids.is_empty() || ids.contains(&f.path)).collect();
         let total_artwork=artwork_files.len();
         for (position,file) in artwork_files.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {break;}
+            checked += 1;
             state.progress_for(kind,&format!("Checking artwork · {position}/{total_artwork} files · {}",file.path));
+            let (inspection, cached) = match maintenance::inspect_artwork(db, file, saved_inspections.get(&file.path), args["force"] == true).await {
+                Ok(result) => result,
+                Err(error) => {
+                    state.log(&format!("Artwork inspection failed · {} · {error}; file unchanged", file.path));
+                    continue;
+                }
+            };
+            if cached { reused += 1; } else { inspected += 1; }
+            if inspection.has_standard_cover() { continue; }
             let tags = workflows::extract_tags_map(&file.metadata);
             let detail = db
                 .get_detail(&json!({"path":file.path,"market":market}))
@@ -1100,21 +1197,6 @@ pub async fn execute(
                 }
                 std::fs::write(&target, &bytes).map_err(|e| e.to_string())?;
             }
-            use lofty::file::TaggedFileExt;
-            if let Ok(audio) = lofty::probe::Probe::open(&file.path).and_then(|p| p.read()) {
-                if audio
-                    .tags()
-                    .iter()
-                    .flat_map(|t| t.pictures())
-                    .filter(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
-                    .any(|p| {
-                        lofty::picture::PictureInformation::from_picture(p)
-                            .is_ok_and(|info| info.width == 1280 && info.height == 1280)
-                    })
-                {
-                    continue;
-                }
-            }
             output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"affected":true,"status":"Artwork available","changes":"Embed verified 1280 × 1280 front cover","size":file.size,"mtime":file.mtime,"item":{"path":file.path,"artwork":target,"tags":{}}}));
             state.progress_for(
                 kind,
@@ -1125,8 +1207,9 @@ pub async fn execute(
             );
         }
         let id = uuid::Uuid::new_v4().to_string();
+        state.progress_for(kind, &format!("Artwork checked · {checked}/{total_artwork} files · {reused} saved inspections reused · {inspected} files inspected · {} changes ready", output.len()));
         state.previews.lock().unwrap().insert(id.clone(),json!({"id":id,"created":chrono::Utc::now().timestamp_millis(),"operation":"artwork","root":root,"rows":output,"count":output.len()}));
-        return Ok(json!({"preview_id":id,"operation":"artwork","root":root}));
+        return Ok(json!({"preview_id":id,"operation":"artwork","root":root,"reused":reused,"inspected":inspected,"checked":checked}));
     }
     if kind == "match_artists" {
         let selected: HashSet<String> = args["artists"]
@@ -1146,7 +1229,7 @@ pub async fn execute(
             !name.is_empty() && if selected.is_empty() { artist["resolved"] != true } else { selected.contains(name) }
         }).collect();
         if pending.is_empty() { return Ok(json!({"checked":0})); }
-        let mut client = crate::tidal::TidalClient::from_db(db).await?;
+        let mut client = crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
         let conn = db.connect()?;
         let mut favourites = Vec::<crate::tidal::TidalArtist>::new();
         let mut saved = conn.query("SELECT payload FROM favourite_artists", ()).await.map_err(|e|e.to_string())?;
@@ -1209,17 +1292,7 @@ pub async fn execute(
                     scores.push(json!({"id":candidate.id,"name":candidate.name,"score":0,"evidence":"Artist name differs; manual review required"}));
                     continue;
                 }
-                let cache_key = format!("artist-evidence:{market}:{}", candidate.id);
-                let cat: crate::tidal::TidalCatalogue =
-                    if let Some(c) = db.get_preference(&cache_key).await? {
-                        serde_json::from_value(c).map_err(|e| e.to_string())?
-                    } else {
-                        let c = client
-                            .get_artist_catalogue(&candidate.id, market, false)
-                            .await?;
-                        db.set_preference(&cache_key, &json!(c)).await?;
-                        c
-                    };
+                let cat = client.artist_match_evidence(&candidate.id,market).await?;
                 let albums = cat
                     .releases
                     .iter()
@@ -1281,24 +1354,15 @@ pub async fn execute(
     if kind == "metadata" || kind == "manual_candidate" {
         let mut output = vec![];
         let http = crate::network::client(20)?;
-        let mut subscriber_token = None;
         let mut prepared = Vec::new();
         let mut albums = Vec::new();
-        let mut complete_dj: std::collections::HashMap<String, HashSet<String>> = std::collections::HashMap::new();
+        let mut seen_albums = HashSet::new();
         for file in indexed.iter().filter(|f| ids.is_empty() || ids.contains(&f.path)) {
             if cancel.load(Ordering::Relaxed) { break; }
             let detail = db.get_detail(&json!({"path":file.path,"market":market})).await?;
             let tags = workflows::extract_tags_map(&file.metadata);
             if let Some(album) = args["album_id"].as_str().or(detail["linked_ids"]["album_id"].as_str()).or_else(||tags.get("tidal_album_id").map(String::as_str)) {
-                if !complete_dj.contains_key(album) {
-                    let cached = db.get_preference(&format!("tag-review:{market}:{album}")).await?;
-                    let complete = cached.as_ref().filter(|v|v["track_metadata_source"]=="subscriber" && v["track_metadata_checked_at"].as_i64().is_some_and(|at|(0..30*86400).contains(&(chrono::Utc::now().timestamp()-at)))).and_then(|v|v["tracks"].as_array()).into_iter().flatten()
-                        .filter(|t|t["bpm"].as_f64().is_some_and(|n|n>0.) && t["key"].as_str().is_some_and(|s|!s.is_empty()))
-                        .filter_map(|t|t["id"].as_str().map(str::to_owned)).collect();
-                    complete_dj.insert(album.to_owned(),complete);
-                }
-                let track_id = detail["linked_ids"]["track_id"].as_str().or_else(||tags.get("tidal_track_id").map(String::as_str));
-                if track_id.is_none_or(|id| !complete_dj[album].contains(id)) { albums.push(album.to_owned()); }
+                if seen_albums.insert(album.to_owned()) { albums.push(album.to_owned()); }
             }
             // Retain only IDs, not the full candidate/metadata payload for every file.
             prepared.push((file,json!({"linked_ids":detail["linked_ids"]})));
@@ -1362,51 +1426,29 @@ pub async fn execute(
                 continue;
             };
             let mut track = rel.tracks[index].clone();
+            let before_enrichment = json!(track);
             if let Some(items) = album_metadata.get(album).and_then(|v|v["items"].as_array()) {
                 if let Some(raw) = items.iter().find(|v|v["id"].as_str().map(str::to_owned).unwrap_or_else(||v["id"].to_string()) == track.id) {
                     crate::subscriber_metadata::merge(&mut track, raw);
                 }
             }
 
+            let mut dj_note = None;
             if track.bpm.is_none() || track.key.is_none() {
-                let key = format!("dj-check:{market}:{}", track.id);
-                let cached = db.get_preference(&key).await?;
-                let extra = if let Some(c) = cached {
-                    c
-                } else {
-                    if subscriber_token.is_none() {
-                        subscriber_token = crate::stream_download::get_valid_token(db, &http)
-                            .await
-                            .ok();
-                    }
-                    if let Some(ref token) = subscriber_token {
-                        let response = crate::network::get(http
-                            .get(format!("https://api.tidal.com/v1/tracks/{}", track.id))
-                            .query(&[("countryCode", market)])
-                            .bearer_auth(token)
-                            , std::time::Duration::from_millis(350), 3, Some(cancel.as_ref()))
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .error_for_status()
-                            .map_err(|e| e.to_string())?;
-                        let data: Value = response.json().await.map_err(|e| e.to_string())?;
-                        db.set_preference(&key, &data).await?;
-                        data
-                    } else {
-                        Value::Null
-                    }
-                };
+                let extra = check_dj_metadata(db,&http,&track.id,market,cancel.clone()).await?;
+                if extra["status"] == "retry" { dj_note = Some(extra["error"].as_str().unwrap_or("Retry paused").to_owned()); }
                 crate::subscriber_metadata::merge(&mut track, &extra);
             }
-            rel.tracks[index] = track.clone();
-            let mut stored = value;
-            stored["tracks"]=json!(rel.tracks);
-            db.set_preference(&format!("tag-review:{market}:{}", rel.id), &stored).await?;
+            if json!(track) != before_enrichment {
+                let stored = publish_track_enrichment(db,&rel.id,market,&track).await?;
+                rel = serde_json::from_value(stored).map_err(|e|e.to_string())?;
+                track = rel.tracks.iter().find(|current|current.id == track.id).cloned().ok_or("Recording no longer in saved release")?;
+            }
             let mut changes = crate::enrichment::compute_missing_tags(&tags, &rel, &track);
             // Page ownership is not a reliable performer or album-artist credit.
             changes.remove("artist");
             changes.remove("albumartist");
-            output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":changes,"affected":!changes.is_empty(),"size":file.size,"mtime":file.mtime,"status":if changes.is_empty(){"No supplied missing tags"}else{"Missing tags found"},"item":{"path":file.path,"tags":changes},"source_release_id":rel.id,"source_track_id":track.id,"evidence":format!("API BPM: {} · Key: {}",track.bpm.map(|n|n.to_string()).unwrap_or("not supplied".into()),track.key.unwrap_or("not supplied".into()))}));
+            output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":changes,"affected":!changes.is_empty(),"size":file.size,"mtime":file.mtime,"status":if changes.is_empty(){"No supplied missing tags"}else{"Missing tags found"},"item":{"path":file.path,"tags":changes},"source_release_id":rel.id,"source_track_id":track.id,"evidence":format!("API BPM: {} · Key: {}{}",track.bpm.map(|n|n.to_string()).unwrap_or("not supplied".into()),track.key.unwrap_or("not supplied".into()),dj_note.map(|note|format!(" · DJ check deferred: {note}")).unwrap_or_default())}));
         }
         if kind == "manual_candidate" {
             return Ok(json!({"checked":ids.len()}));
@@ -1523,30 +1565,35 @@ pub async fn execute(
     }
     if kind == "mqa" {
         let mut rows = vec![];
+        let saved_inspections = maintenance::load_inspections(db, "mqa-audit:").await?;
+        let mut reused = 0;
+        let mut inspected = 0;
         for (position,file) in indexed.iter().enumerate() {
             state.progress_for(kind,&format!("MQA audit · {position}/{} files · {}",indexed.len(),file.path));
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let key = format!("mqa-audit:{}", file.path);
-            let saved = db.get_preference(&key).await?;
+            let saved = saved_inspections.get(&file.path);
             let result = if args["force"] != true
                 && saved.as_ref().is_some_and(|v| {
                     v["size"] == json!(file.size) && v["mtime"] == json!(file.mtime)
                 }) {
+                reused += 1;
                 saved.unwrap()["result"].clone()
             } else {
                 let path=file.path.clone();
-                tokio::task::spawn_blocking(move ||serde_json::to_value(crate::mqa::audit_file(std::path::Path::new(&path))))
-                    .await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?
+                let result = tokio::task::spawn_blocking(move ||serde_json::to_value(crate::mqa::audit_file(std::path::Path::new(&path))))
+                    .await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+                inspected += 1;
+                db.set_preference(&key, &json!({"size":file.size,"mtime":file.mtime,"result":result})).await?;
+                result
             };
-            db.set_preference(
-                &key,
-                &json!({"size":file.size,"mtime":file.mtime,"result":result}),
-            )
-            .await?;
             let tags = workflows::extract_tags_map(&file.metadata);
             rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"status":result["status"],"evidence":result["evidence"],"affected":result["detected"],"target":if result["detected"] == true { "Queue lossless replacement" } else { "—" }}));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            rows = cached_mqa_rows(db, &indexed).await?;
         }
         db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows))
             .await?;
@@ -1555,7 +1602,8 @@ pub async fn execute(
             &json!(crate::duplicates::manifest_fingerprint(&indexed)),
         )
         .await?;
-        return Ok(json!({"files":rows.len()}));
+        state.progress_for(kind, &format!("MQA audit ready · {}/{} files checked · {reused} saved inspections reused · {inspected} audio inspections", reused + inspected, rows.len()));
+        return Ok(json!({"files":rows.len(),"reused":reused,"inspected":inspected}));
     }
     Err(format!(
         "{kind} is not yet available in this build; no changes were made"
@@ -1565,6 +1613,106 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn track_enrichment_publishes_parallel_updates_without_replacing_sibling_metadata_or_queue_selection() {
+        let dir = std::env::temp_dir().join(format!("track-publish-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let conn = db.connect().unwrap();
+        let one = crate::tidal::TidalTrack{id:"101".into(),isrc:Some("ONE".into()),track_number:1,disc_number:1,credits_complete:true,credits:json!([]),..Default::default()};
+        let two = crate::tidal::TidalTrack{id:"102".into(),isrc:Some("TWO".into()),track_number:2,disc_number:1,credits_complete:true,credits:json!([]),..Default::default()};
+        let release = json!({"id":"10","title":"Release","artist":"Main","tracks_loaded":true,"tracks":[one,two]});
+        for (artist,market) in [("4","GB"),("5","GB"),("4","US")] {
+            conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES(?,?,?)",(artist,market,json!({"id":artist,"name":"Main","releases":[release]}).to_string())).await.unwrap();
+        }
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('10',?,1,'queued')",(json!({"id":"10","selected_track_ids":["101"],"destination":"keep"}).to_string(),)).await.unwrap();
+        publish_release(&db,"10","GB",release.clone()).await.unwrap();
+        let mut first = one.clone(); first.bpm = Some(124.); first.key = Some("G".into());
+        let mut second = two.clone(); second.copyright = Some("Label".into()); second.credits = json!([{"name":"Writer","role":"Composer"}]);
+        let (a,b) = tokio::join!(publish_track_enrichment(&db,"10","GB",&first),publish_track_enrichment(&db,"10","GB",&second));
+        a.unwrap(); b.unwrap();
+        let canonical = db.get_preference("tag-review:GB:10").await.unwrap().unwrap();
+        assert_eq!(canonical["tracks"][0]["bpm"],124.);
+        assert_eq!(canonical["tracks"][1]["copyright"],"Label");
+        assert_eq!(canonical["tracks"][1]["credits"],second.credits);
+        let mut rows = conn.query("SELECT market,payload FROM catalogue",()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            let market:String = row.get(0).unwrap();
+            let value:Value = serde_json::from_str(&row.get::<String>(1).unwrap()).unwrap();
+            assert_eq!(value["releases"][0]["tracks"],if market == "GB" {canonical["tracks"].clone()} else {release["tracks"].clone()});
+        }
+        drop(rows);
+        let mut rows = conn.query("SELECT payload,approved FROM queue WHERE id='10'",()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let queued:Value = serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+        assert_eq!(queued["tracks"],canonical["tracks"]); assert_eq!(queued["selected_track_ids"],json!(["101"]));
+        assert_eq!(queued["destination"],"keep"); assert_eq!(row.get::<i64>(1).unwrap(),1);
+        drop(rows);
+        first.isrc = Some("OTHER".into());
+        assert!(publish_track_enrichment(&db,"10","GB",&first).await.is_err());
+        assert_eq!(db.get_preference("tag-review:GB:10").await.unwrap().unwrap(),canonical);
+        drop(conn); drop(db); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dj_cache_keeps_successful_absence_and_bounds_failed_retries() {
+        let dir = std::env::temp_dir().join(format!("dj-cache-state-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let absent = json!({"id":101,"isrc":"ONE","status":"complete","bpm":null,"key":null,"checked_at":1});
+        db.set_preference("dj-check:GB:101",&absent).await.unwrap();
+        assert_eq!(check_dj_metadata(&db,&reqwest::Client::new(),"101","GB",Arc::new(AtomicBool::new(false))).await.unwrap(),absent);
+        assert!(db.get_preference("dj-check:US:101").await.unwrap().is_none());
+        assert!(dj_check_reusable(&json!({"status":"retry","retry_after":now+10}),now));
+        assert!(!dj_check_reusable(&json!({"status":"retry","retry_after":now-1}),now));
+        assert!(!dj_check_reusable(&Value::Null,now));
+        drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_release_publishes_complete_credited_cache_without_inventing_summary_pairing() {
+        let dir = std::env::temp_dir().join(format!("offline-release-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        db.set_preference("account-disconnected",&json!(true)).await.unwrap();
+        let shell = json!({"id":"10","artist":"Main","title":"Release","tracks_loaded":false,"discovery_checked_at":chrono::Utc::now().timestamp()});
+        db.set_preference("tag-review:GB:10",&shell).await.unwrap();
+        let raw = json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"fingerprint_status":"unbound","items":[{"id":101,"title":"Song","isrc":"ONE","trackNumber":1,"volumeNumber":1,"credits":[{"type":"Composer","contributors":[{"name":"Writer"}]}],"bpm":null,"key":null}]});
+        db.set_preference("subscriber-items:GB:10",&raw).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('4','GB',?)",(json!({"id":"4","name":"Main","releases":[shell]}).to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('10',?,1,'queued')",(json!({"id":"10","selected_track_ids":["101"]}).to_string(),)).await.unwrap();
+        let published = release(&db,"10","GB",false).await.unwrap();
+        assert_eq!(published["tracks_loaded"],true);
+        assert_eq!(published["tracks"][0]["credits_complete"],true);
+        assert_eq!(published["tracks"][0]["credits"][0]["name"],"Writer");
+        assert!(published["recommendation_snapshot"].is_null(),"An unpaired cache must not invent a matching summary");
+        assert_eq!(db.get_preference("subscriber-items:GB:10").await.unwrap().unwrap(),raw);
+        assert_eq!(release(&db,"10","GB",false).await.unwrap()["tracks"],published["tracks"]);
+        let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id='4' AND market='GB'",()).await.unwrap();
+        let catalogue: Value = serde_json::from_str(&rows.next().await.unwrap().unwrap().get::<String>(0).unwrap()).unwrap();
+        assert_eq!(catalogue["releases"][0]["tracks"],published["tracks"]);
+        drop(rows);
+        let mut rows = conn.query("SELECT payload FROM queue WHERE id='10'",()).await.unwrap();
+        let queue: Value = serde_json::from_str(&rows.next().await.unwrap().unwrap().get::<String>(0).unwrap()).unwrap();
+        assert_eq!(queue["tracks"],published["tracks"]);
+        assert_eq!(queue["selected_track_ids"],json!(["101"]));
+        drop(rows);
+        // An explicitly paired, old cache is reusable offline despite its age.
+        let summary = json!({"id":10,"title":"Release","artist":{"id":4,"name":"Main"},"numberOfTracks":1,"checked_at":1});
+        let mut paired = raw.clone();
+        paired["checked_at"] = json!(2);
+        paired["summary_fingerprint"] = json!(crate::tidal::summary_fingerprint(&summary));
+        db.set_preference("subscriber-items:GB:10",&paired).await.unwrap();
+        db.set_preference("subscriber-summary:GB:10",&summary).await.unwrap();
+        db.set_preference("tag-review:GB:10",&shell).await.unwrap();
+        let paired_release = release(&db,"10","GB",false).await.unwrap();
+        assert_eq!(paired_release["tracks"][0]["id"],published["tracks"][0]["id"]);
+        assert_eq!(paired_release["tracks"][0]["credits"],published["tracks"][0]["credits"]);
+        assert_eq!(paired_release["recommendation_snapshot"]["summary_fingerprint"],paired["summary_fingerprint"]);
+        assert_eq!(paired_release["recommendation_snapshot"]["optional_status"],"retry");
+        drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn recommendation_refresh_reuses_complete_unchanged_snapshots_and_rechecks_deltas() {
         let dir=std::env::temp_dir().join(format!("recommendation-delta-{}",uuid::Uuid::new_v4()));
@@ -1576,7 +1724,7 @@ mod tests {
         reshaped["label"]=json!("Label"); reshaped["numberOfVolumes"]=json!(1);
         reshaped["checked_at"]=json!(chrono::Utc::now().timestamp()); reshaped["streamReady"]=json!(false);
         assert_eq!(fingerprint,crate::tidal::summary_fingerprint(&reshaped));
-        let saved=json!({"id":"10","tracks_loaded":true,"track_metadata_source":"subscriber","track_metadata_checked_at":1,"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":fingerprint,"optional_status":"complete"},"tracks":[{"id":"101","credits_complete":true,"credits":[],"bpm":null,"key":null}]});
+        let saved=json!({"id":"10","tracks_loaded":true,"track_metadata_source":"subscriber","track_metadata_checked_at":1,"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":fingerprint,"optional_status":"complete"},"tracks":[{"id":"101","track_number":1,"disc_number":1,"credits_complete":true,"credits":[],"bpm":null,"key":null}]});
         db.set_preference("tag-review:GB:10",&saved).await.unwrap();
         let release=crate::tidal::TidalRelease{id:"10".into(),summary_fingerprint:Some(fingerprint.clone()),..Default::default()};
         let new=crate::tidal::TidalRelease{id:"11".into(),summary_fingerprint:Some("new".into()),..Default::default()};
@@ -1857,6 +2005,38 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("File changed since preview"));
         assert_eq!(changed, std::fs::read(&path).unwrap());
+        drop(db);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_duplicate_and_mqa_jobs_fill_gaps_and_allow_forced_rechecks() {
+        let temp = std::env::temp_dir().join(format!("tibrary-local-reuse-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("track.flac");
+        std::fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+        let db = TursoDb::open(temp.join("library.db")).await.unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {}).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        let args = json!({"root":temp});
+        let first = execute(&db, &backend, "local_duplicates", &args, cancel.clone()).await.unwrap();
+        assert_ne!(first["reused"], true);
+        let repeated = execute(&db, &backend, "local_duplicates", &args, cancel.clone()).await.unwrap();
+        assert_eq!(repeated["reused"], true);
+        let forced = execute(&db, &backend, "local_duplicates", &json!({"root":temp,"force":true}), cancel.clone()).await.unwrap();
+        assert_ne!(forced["reused"], true);
+        let first = execute(&db, &backend, "mqa", &args, cancel.clone()).await.unwrap();
+        assert_eq!(first["inspected"], 1);
+        let repeated = execute(&db, &backend, "mqa", &args, cancel.clone()).await.unwrap();
+        assert_eq!(repeated["inspected"], 0);
+        assert_eq!(repeated["reused"], 1);
+        let forced = execute(&db, &backend, "mqa", &json!({"root":temp,"force":true}), cancel.clone()).await.unwrap();
+        assert_eq!(forced["inspected"], 1);
+        crate::tag_writer::write_tags(&path, &std::collections::HashMap::from([("title".into(),"Changed externally".into())])).unwrap();
+        crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {}).await.unwrap();
+        assert_ne!(execute(&db, &backend, "local_duplicates", &args, cancel.clone()).await.unwrap()["reused"], true);
+        assert_eq!(execute(&db, &backend, "mqa", &args, cancel).await.unwrap()["inspected"], 1);
         drop(db);
         std::fs::remove_dir_all(temp).unwrap();
     }

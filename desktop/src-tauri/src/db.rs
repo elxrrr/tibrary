@@ -119,6 +119,7 @@ pub struct TursoDb {
     pub db: Database,
     pub path: PathBuf,
     pub revision: Arc<std::sync::atomic::AtomicU64>,
+    pub local_revision: Arc<std::sync::atomic::AtomicU64>,
     missing_rows_gate: Arc<tokio::sync::Mutex<()>>,
     missing_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<MissingRow>)>>>,
     link_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<LinkRow>)>>>,
@@ -142,6 +143,7 @@ impl TursoDb {
             db,
             path: path_buf,
             revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            local_revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             missing_rows_gate: Arc::new(tokio::sync::Mutex::new(())),
             missing_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             link_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -159,6 +161,11 @@ impl TursoDb {
 
     pub fn invalidate_missing_rows(&self) {
         self.missing_rows_cache.lock().unwrap().clear();
+        self.bump_revision();
+    }
+
+    pub fn note_local_change(&self) {
+        self.local_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.bump_revision();
     }
 
@@ -574,7 +581,7 @@ impl TursoDb {
             .await
             .map_err(|e| e.to_string())?;
         }
-        self.bump_revision();
+        self.note_local_change();
         Ok(())
     }
 
@@ -588,7 +595,7 @@ impl TursoDb {
             .await
             .map_err(|e| e.to_string())?;
 
-        self.bump_revision();
+        self.note_local_change();
         Ok(())
     }
 
@@ -2264,17 +2271,6 @@ impl TursoDb {
                 json!(stats_record.missing_releases),
             );
             obj.insert("correct".to_string(), json!(stats_record.correct));
-        }
-
-        // Include desktop-health maintenance counts (correct, organise, metadata, artwork, mqa, local, online)
-        if let Ok(Some(health_pref)) = self.get_preference("desktop-health").await {
-            if let Some(counts) = health_pref.get("counts").and_then(|v| v.as_object()) {
-                if let Some(obj) = stats_val.as_object_mut() {
-                    for (k, v) in counts {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
-            }
         }
 
         let stream_tok = crate::stream_download::load_saved_token(self).await;

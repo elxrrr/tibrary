@@ -309,19 +309,6 @@ impl DownloadManager {
                     }
                 };
 
-            db.set_preference(
-                &format!("subscriber-tracks:{market}:{ident}"),
-                &json!(all_tracks),
-            )
-            .await?;
-            for track in &all_tracks {
-                db.set_preference(
-                    &format!("dj-check:{market}:{}", track.id),
-                    &json!({"id":track.id,"isrc":track.isrc,"bpm":track.bpm,"key":track.key}),
-                )
-                .await?;
-            }
-
             // Publish the shared credited track list for linking and recommendations too.
             if let Err(error)=crate::actions::release(db,ident,market,false).await {
                 progress_cb(format!("Release metadata cached for download; catalogue publication deferred: {error}"));
@@ -794,10 +781,13 @@ impl DownloadManager {
 
                             if let Ok(meta_obj) = crate::scanner::read_audio_metadata(&p) {
                                 let meta_str = serde_json::to_string(&meta_obj).unwrap_or_default();
-                                let _ = conn.execute(
+                                match conn.execute(
                                     "INSERT OR REPLACE INTO local_files (path, root, size, mtime, metadata, present) VALUES (?, ?, ?, ?, ?, 1)",
                                     (p_str.as_str(), r.root.as_str(), size, mtime, meta_str.as_str()),
-                                ).await;
+                                ).await {
+                                    Ok(_) => db.note_local_change(),
+                                    Err(error) => progress_cb(format!("Audio saved; local index update needs retry · {} · {error}. Use Check local changes.", p.display())),
+                                }
                             }
                         }
                         break;

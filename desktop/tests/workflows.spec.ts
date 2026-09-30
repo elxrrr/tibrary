@@ -123,9 +123,11 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     await expect(page.getByRole("alert")).toHaveCount(0);
     if (process.env.TIBRARY_SCREENSHOTS && screenshots[name]) {
       if (name === "Local duplicates") {
-        await page.getByRole("button", {name:"Scan tags",exact:true}).click();
+        await page.getByRole("button", {name:"Check local duplicates",exact:true}).click();
+        await expect(page.locator(".header-workload")).toBeVisible();
         await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
-        await expect(page.getByRole("button", {name:"Rescan tags",exact:true})).toBeVisible();
+        await expect(page.getByRole("button", {name:"Check local duplicates",exact:true})).toBeEnabled();
+        await expect(page.locator(".header-workload")).toHaveCount(0);
       }
       await page.mouse.move(1590, 10);
       await page.screenshot({path:`docs/imgs/${screenshots[name]}.png`});
@@ -577,10 +579,42 @@ test("MQA and local duplicate scan controls complete without blocking navigation
   await page.getByRole("button",{name:/Recheck|Audit/}).first().click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
   await page.locator("aside").getByRole("button",{name:"Local duplicates",exact:true}).click();
-  await page.getByRole("button",{name:/^(Scan|Rescan) tags$/}).click();
+  await page.getByRole("button",{name:"Check local duplicates",exact:true}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
-  await expect(page.getByRole("button",{name:"Rescan tags"})).toBeVisible();
+  await expect(page.getByRole("button",{name:"Check local duplicates",exact:true})).toBeVisible();
   await expect(page.getByRole("heading",{name:"Local duplicates",exact:true})).toBeVisible();
+});
+
+test("local change checks reuse indexed tags and keep dependent controls gated across navigation", async ({page}) => {
+  let holdCompletion=true;
+  let running:any;
+  const scans:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    const response=await rpc(request.method,request.args);
+    if(request.method==="job.start" && request.args.kind==="scan") {
+      scans.push(request.args.args);
+      running=response.result;
+    }
+    if(holdCompletion && running && ["job.status","state"].includes(request.method)) response.result.job=running;
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.getByRole("button",{name:"Check local changes",exact:true}).click();
+  await expect.poll(()=>scans.length).toBe(1);
+  expect(scans[0].force).not.toBe(true);
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Check local changes",exact:true})).toBeDisabled();
+  await expect(page.getByRole("button",{name:"Link unresolved tracks",exact:true})).toBeDisabled();
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Update missing releases",exact:true})).toBeDisabled();
+  holdCompletion=false;
+  await expect(page.getByRole("button",{name:"Update missing releases",exact:true})).toBeEnabled();
+  const status=(await rpc("job.status")).result.job;
+  expect(status.status).toBe("complete");
+  expect(status.result.read).toBe(0);
+  expect(status.result.unchanged).toBe(2);
+  expect(scans).toHaveLength(1);
 });
 
 test("table reloads when saved page size arrives after the initial table", async ({page}) => {
@@ -608,7 +642,8 @@ test("cached release recheck reports activity and preserves release order and to
   const args = {route:"missing",timeline:"All missing releases",sort:"date",direction:"desc",limit:100};
   const before = (await rpc("table",args)).result;
   expect(before.total).toBe(before.missing_total);
-  await page.getByRole("button",{name:"Recheck cached releases",exact:true}).click();
+  await page.getByText("More update options",{exact:true}).click();
+  await page.getByRole("button",{name:"Recalculate saved results",exact:true}).click();
   await expect.poll(async () => (await rpc("job.status")).result.online_job?.status).toBe("complete");
   const after = (await rpc("table",args)).result;
   expect(after.rows.map((row:any)=>row.id)).toEqual(before.rows.map((row:any)=>row.id));

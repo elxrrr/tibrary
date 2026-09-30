@@ -44,6 +44,7 @@ import {
   Row,
   Job,
   AppState,
+  mergeJob,
 } from "./api";
 import { DataTable, Column } from "./DataTable";
 import { ActivityView, streamFor } from "./ActivityView";
@@ -283,14 +284,16 @@ function App() {
     stateRef = useRef(state);
   stateRef.current = state;
   const onlineRoute = ["catalogue", "artists", "links", "favourites", "missing", "metadata", "artwork", "online", "connections", "fix"].includes(route);
-  const busy = submitting || active(onlineRoute ? state?.online_job : state?.job);
+  const localBusy = submitting || active(state?.job);
+  const indexChanging = active(state?.job) && ["scan", "apply", "deep_apply", "consolidate"].includes(state?.job?.kind || "");
+  const busy = submitting || active(onlineRoute ? state?.online_job : state?.job) || (onlineRoute && indexChanging);
   const tree = ["missing", "queue", "downloaded"].includes(route);
   const notifyError = (e: any) => setError(String(e?.message || e));
   async function refresh(targetRoot?: string) {
     try {
       const activeRoot = targetRoot !== undefined ? targetRoot : root;
       const s = await call<AppState>("state", activeRoot ? { root: activeRoot } : {});
-      setState(s);
+      setState(previous => previous ? {...s, job:mergeJob(previous.job,s.job), online_job:mergeJob(previous.online_job,s.online_job), download_job:mergeJob(previous.download_job,s.download_job)} : s);
       if (!activeRoot && s.roots.length > 0) {
         setRoot(s.roots[0].root);
       } else if (activeRoot && !s.roots.some((r) => r.root === activeRoot)) {
@@ -301,7 +304,6 @@ function App() {
     }
   }
   useEffect(() => {
-    refresh(root);
     call("settings").then(setSettings).catch(notifyError);
   }, []);
   useEffect(() => {
@@ -409,6 +411,11 @@ function App() {
   ]);
   useEffect(() => {
     let dispose: (() => void) | undefined;
+    let refreshTimer: number | undefined;
+    const scheduleRefresh = () => {
+      window.clearTimeout(refreshTimer);
+      refreshTimer=window.setTimeout(() => {refreshTimer=undefined; refresh();}, 60);
+    };
     listen<any>("backend-event", ({ payload: p }) => {
       if (p.event === "download-monitor" && p.item) {
         const item = p.item as Row;
@@ -416,10 +423,10 @@ function App() {
         setDownloadMonitor((old) => ({ ...old, [key]: { ...old[key], ...item } }));
       }
       if (p.event === "progress" && p.download_job) {
-        setState((s) => s ? { ...s, download_job: p.download_job } : s);
+        setState((s) => s ? { ...s, download_job: mergeJob(s.download_job,p.download_job) } : s);
       }
       if (p.event === "progress" && p.online_job) {
-        setState((s) => s ? { ...s, online_job: p.online_job, logs: [
+        setState((s) => s ? { ...s, online_job: mergeJob(s.online_job,p.online_job), logs: [
           ...s.logs.filter(log => log.progress_id !== p.online_job.id),
           {job_id:p.online_job.id, job_kind:p.online_job.kind, job_status:p.online_job.status, progress_id:p.online_job.id, at:new Date().toISOString(), message:p.message, category:"online", level:"info"}
         ].slice(-1000)} : s);
@@ -429,7 +436,7 @@ function App() {
           s
             ? {
                 ...s,
-                job: p.job || s.job,
+                job: mergeJob(s.job,p.job),
                 logs: [
                   ...s.logs.filter(log => !p.job?.id || log.progress_id !== p.job.id),
                   {
@@ -445,7 +452,7 @@ function App() {
             : s,
         );
       if (p.event === "library-mutated") { setPreview(undefined); setReview(null); setDeep(null); }
-      if (["changed", "library-mutated", "job", "ready"].includes(p.event)) refresh();
+      if (["changed", "library-mutated", "job", "ready"].includes(p.event)) scheduleRefresh();
       if (p.event === "authentication") {
         setAuth("");
         refresh();
@@ -456,7 +463,7 @@ function App() {
     })
       .then((fn) => (dispose = fn))
       .catch(() => {});
-    return () => dispose?.();
+    return () => {dispose?.(); window.clearTimeout(refreshTimer);};
   }, [root]);
   // Fallback snapshot also recovers a missed completion event during window startup.
   useEffect(() => {
@@ -467,7 +474,7 @@ function App() {
       try {
         const update = await call<any>("job.status");
         if (!disposed && (update.job || update.online_job || update.download_job)) {
-          setState(s => s ? {...s, ...update} : s);
+          setState(s => s ? {...s, ...update, job:mergeJob(s.job,update.job), online_job:mergeJob(s.online_job,update.online_job), download_job:mergeJob(s.download_job,update.download_job)} : s);
           if (![update.job, update.online_job, update.download_job].some(active)) await refresh();
         }
       } catch (e) { if (!disposed) notifyError(e); }
@@ -526,7 +533,7 @@ function App() {
     if (kind === "download") setDownloadMonitor({});
     try {
       const j = await call<Job>("job.start", { kind, args: { root, ...args } });
-      setState((s) => (s ? kind === "download" ? { ...s, download_job: j } : onlineKinds.has(kind) ? { ...s, online_job: j } : { ...s, job: j } : s));
+      setState((s) => (s ? kind === "download" ? { ...s, download_job: mergeJob(s.download_job,j) } : onlineKinds.has(kind) ? { ...s, online_job: mergeJob(s.online_job,j) } : { ...s, job: mergeJob(s.job,j) } : s));
       if (kind === "preview") setSelected(new Set());
       if (!active(j)) await refresh();
     } catch (e) {
@@ -833,10 +840,11 @@ function App() {
                   Open
                 </button>
                 <button
-                  disabled={busy}
-                  onClick={() => run("scan", { root: r.root, force: true })}
+                  disabled={localBusy}
+                  onClick={() => run("scan", { root: r.root })}
+                  title="Find added, changed or removed files. Unchanged tags are reused; music files stay unchanged."
                 >
-                  Rescan tags
+                  Check local changes
                 </button>
               </div>
             ))
@@ -904,11 +912,9 @@ function App() {
           "artwork",
           "links",
         ].includes(route) && (
-          <button disabled={busy || !root} onClick={() => run("scan")}>
+          <button disabled={localBusy || !root} onClick={() => run("scan")} title="Update the shared index after editing files outside the app. Only new or changed file tags are read.">
             <RefreshCw size={15} />
-            {["metadata", "artwork"].includes(route)
-              ? "Rescan tags (local)"
-              : "Rescan tags"}
+            Check local changes
           </button>
         )}
         {["correct", "organise"].includes(route) && (
@@ -1005,7 +1011,7 @@ function App() {
               disabled={busy || !root}
               onClick={() => run("mqa")}
             >
-              Inspect unscanned files
+              Audit unscanned audio
             </button>
             <button
               disabled={busy || !root}
@@ -1038,7 +1044,7 @@ function App() {
                 })
               }
             >
-              {route === "local" ? (data.scanned ? "Rescan tags" : "Scan tags") : "Find cached replacements"}
+              {route === "local" ? "Check local duplicates" : "Find cached replacements"}
             </button>
             {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
               <button
@@ -1099,21 +1105,24 @@ function App() {
             <button
               className="primary"
               disabled={busy}
-              onClick={() => run("discography")}
-              title="Check release lists for your linked artists in the selected market. Saved track details and credits stay available; this does not download audio."
+              onClick={() => run("discography", { detailed: true })}
+              title="Check linked artist release lists and fill new, changed or missing track details, credits, genres and DJ data. Complete unchanged data is reused. No audio is downloaded."
             >
-              Check for new releases
+              Update missing releases
             </button>
-            <button disabled={busy} onClick={() => run("release_artists", { timeline })} title="Check album artist credits for this time range in small batches. Reuses saved credits and resumes unfinished checks when run again; no track downloads.">Check release artists</button>
-            <button disabled={busy} onClick={() => run("discography", { detailed: true })} title="Check artist release lists, then fetch track lists, credits, genres and available DJ metadata only for new, changed or incomplete releases. Complete unchanged details are reused from the database.">Update recommendation data</button>
             {state?.catalogue_refresh && state.catalogue_refresh.status !== "complete" && state.catalogue_refresh.completed.length < state.catalogue_refresh.ids.length && !active(state.online_job) && (
               <button disabled={busy} onClick={() => run("discography", { ...state.catalogue_refresh, resume: true })}>
                 Resume refresh ({state.catalogue_refresh.completed.length}/{state.catalogue_refresh.ids.length})
               </button>
             )}
-            <button disabled={busy} onClick={() => run("cached_releases")} title="Recalculate ownership and recommendations from saved local tags and catalogue data without contacting the service">
-              Recheck cached releases
-            </button>
+            <details className="update-options">
+              <summary>More update options</summary>
+              <div className="update-options-menu">
+                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("discography");}} title="Check artist release lists and market availability without collecting additional track details.">Check release lists only</button>
+                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("release_artists", { timeline });}} title="Fill missing album artist evidence for older saved releases; reuse existing checks.">Fill missing release artists</button>
+                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("cached_releases");}} title="Recalculate ownership and recommendations from the shared database without contacting the service.">Recalculate saved results</button>
+              </div>
+            </details>
             <button
               disabled={
                 busy || !Object.keys(selectedReleases(selection)).length
@@ -1182,7 +1191,7 @@ function App() {
           </div>
         )}
         {toolbar()}
-        {route === "missing" && <p className="hint scan-explainer">Check for new releases updates artist release lists. Update recommendation data fills missing or changed track lists, credits, genres and DJ metadata. Saved details are reused; audio is downloaded from the queue.</p>}
+        {route === "missing" && <p className="hint scan-explainer">Update missing releases checks for new music and fills gaps in the shared catalogue. Saved tracks, credits and DJ data are reused across linking, tags and downloads. No audio is downloaded here.</p>}
         {route === "missing" && (
           <div className="filters secondary">
             <select
@@ -1595,11 +1604,12 @@ function App() {
                   </small>
                 </div>
                 <button
-                  disabled={busy}
-                  onClick={() => run("scan", { root: r.root, force: true })}
+                  disabled={localBusy}
+                  onClick={() => run("scan", { root: r.root })}
                 >
-                  Rescan tags
+                  Check local changes
                 </button>
+                <button disabled={localBusy} onClick={() => run("scan", {root: r.root, force: true})} title="Read every file's tags again, even when size and modification time are unchanged. Use only when the normal change check misses an external edit.">Reread all tags</button>
                 <button
                   disabled={busy}
                   onClick={() =>

@@ -20,14 +20,10 @@ pub fn merge(track: &mut TidalTrack, raw: &Value) {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| raw["id"].to_string());
-    if id != track.id
-        || track
-            .isrc
-            .as_deref()
-            .is_none_or(|isrc| raw["isrc"].as_str() != Some(isrc))
-    {
+    if id != track.id || track.isrc.as_deref().zip(raw["isrc"].as_str()).is_some_and(|(a,b)| !a.eq_ignore_ascii_case(b)) {
         return;
     }
+    track.isrc = track.isrc.clone().or_else(||raw["isrc"].as_str().filter(|isrc|!isrc.trim().is_empty()).map(str::to_owned));
     track.bpm = track.bpm.or(raw["bpm"]
         .as_f64()
         .filter(|bpm| bpm.is_finite() && *bpm > 0.));
@@ -51,9 +47,11 @@ pub fn merge(track: &mut TidalTrack, raw: &Value) {
             std::slice::from_mut(&mut incoming),
             std::slice::from_ref(track),
         );
+        if !track.credits_complete || track.credits != incoming.credits {
+            track.credits_checked_at = Some(chrono::Utc::now().timestamp());
+        }
         track.credits = incoming.credits;
         track.credits_complete = true;
-        track.credits_checked_at = Some(chrono::Utc::now().timestamp());
     }
     if track.copyright.is_none() {
         track.copyright = raw["copyright"].as_str().map(str::to_owned);
@@ -237,18 +235,79 @@ pub async fn album_info(
     crate::stream_download::album_info_from_value(&item["attributes"])
 }
 
-pub async fn cached(db: &TursoDb, album: &str, market: &str) -> Result<Option<Value>, String> {
+async fn cached_snapshot(db: &TursoDb, album: &str, market: &str) -> Result<Option<Value>, String> {
     let now = chrono::Utc::now().timestamp();
-    Ok(db
-        .get_preference(&format!("subscriber-items:{market}:{album}"))
-        .await?
-        .filter(|v| {
-            v["schema"] == 2
-                && v["items"].is_array()
-                && v["checked_at"]
-                    .as_i64()
-                    .is_some_and(|at| (0..MAX_AGE).contains(&(now - at)))
-        }))
+    let Some(mut value) = db.get_preference(&format!("subscriber-items:{market}:{album}")).await? else { return Ok(None) };
+    // An empty optional DJ/credit value is a completed check. Malformed or
+    // partially credited lists, however, must never masquerade as complete.
+    if value["schema"] != 2 || !value["items"].as_array().is_some_and(|items| !items.is_empty() && items.iter().all(|item| item["credits"].is_array()))
+        || tracks(&value).is_err() { return Ok(None); }
+    let summary = db.get_preference(&format!("subscriber-summary:{market}:{album}")).await?;
+    if let Some(pinned) = value["summary_fingerprint"].as_str() {
+        return Ok(summary.as_ref().is_none_or(|current| crate::tidal::summary_fingerprint(current) == pinned).then_some(value));
+    }
+    let checked = value["checked_at"].as_i64().unwrap_or(0);
+    if let Some(summary) = summary.as_ref() {
+        let fingerprint = crate::tidal::summary_fingerprint(summary);
+        let prior = db.get_preference(&format!("tag-review:{market}:{album}")).await?;
+        // Upgrade older cache entries only with proof that this summary was
+        // observed before the list, or with a matching paired release snapshot.
+        // A newly refreshed summary must not be pinned onto an older list.
+        let paired = prior.as_ref().is_some_and(|prior| {
+            prior["recommendation_snapshot"]["summary_fingerprint"].as_str() == Some(&fingerprint)
+                && tracks(&value).ok().zip(serde_json::from_value::<Vec<TidalTrack>>(prior["tracks"].clone()).ok())
+                    .is_some_and(|(raw, saved)| raw.len() == saved.len() && raw.iter().all(|track| saved.iter().any(|candidate| candidate.id == track.id && candidate.track_number == track.track_number && candidate.disc_number == track.disc_number)))
+        });
+        let observed_before = value["fingerprint_status"].is_null()
+            && summary["checked_at"].as_i64().is_some_and(|at| at > 0 && at < checked);
+        if paired || observed_before {
+            value["summary_fingerprint"] = json!(fingerprint);
+            return Ok(Some(value));
+        }
+        if prior.as_ref().is_some_and(|prior| prior["recommendation_snapshot"]["summary_fingerprint"].as_str().is_some_and(|old| old != fingerprint)) {
+            return Ok(None);
+        }
+        // A newer (or same-second, therefore ambiguous) summary is not proof
+        // that an older unpaired list describes this edition, even if recent.
+        if summary["checked_at"].as_i64().is_some_and(|at|at >= checked) { return Ok(None); }
+    }
+    // Unpaired legacy entries retain their bounded lifetime until a validated
+    // fetch binds them. Explicitly unbound responses cannot be promoted by age.
+    Ok(((value["fingerprint_status"] != "unbound" || summary.is_none()) && (0..MAX_AGE).contains(&(now - checked))).then_some(value))
+}
+
+pub async fn cached(db: &TursoDb, album: &str, market: &str) -> Result<Option<Value>, String> {
+    let Some(mut value) = cached_snapshot(db,album,market).await? else { return Ok(None) };
+    supplement_cached_response(db,album,market,&mut value).await?;
+    Ok(Some(value))
+}
+
+async fn supplement_cached_response(db: &TursoDb, album: &str, market: &str, value: &mut Value) -> Result<(),String> {
+    let prior = db.get_preference(&format!("tag-review:{market}:{album}")).await?;
+    let canonical: Vec<TidalTrack> = prior.and_then(|prior|serde_json::from_value(prior["tracks"].clone()).ok()).unwrap_or_default();
+    let ids: Vec<_> = value["items"].as_array().into_iter().flatten().map(|item|crate::tidal::resource_id(&item["id"])).collect();
+    let conn = db.connect()?;
+    let mut rows = conn.query("SELECT payload FROM app_preferences WHERE key IN (SELECT 'dj-check:' || ? || ':' || value FROM json_each(?))",(market,json!(ids).to_string())).await.map_err(|e|e.to_string())?;
+    let mut checks = HashMap::new();
+    while let Some(row) = rows.next().await.map_err(|e|e.to_string())? {
+        if let Some(value) = row.get::<String>(0).ok().and_then(|raw|serde_json::from_str::<Value>(&raw).ok()) {
+            if value["status"] != "retry" { checks.insert(crate::tidal::resource_id(&value["id"]),value); }
+        }
+    }
+    drop(rows);
+    for item in value["items"].as_array_mut().into_iter().flatten() {
+        let id = crate::tidal::resource_id(&item["id"]);
+        let current = canonical.iter().find(|track|track.id == id).map(|track|json!({"id":track.id,"isrc":track.isrc,"bpm":track.bpm,"key":track.key,"keyScale":track.key_scale,"copyright":track.copyright}));
+        for source in current.iter().chain(checks.get(&id)) {
+            if item["isrc"].as_str().zip(source["isrc"].as_str()).is_some_and(|(a,b)|!a.eq_ignore_ascii_case(b)) { continue; }
+            for field in ["isrc","bpm","key","keyScale","copyright"] {
+                let absent = item[field].is_null() || item[field].as_str().is_some_and(|value|value.trim().is_empty()) || (field == "bpm" && item[field].as_f64().is_some_and(|value|value <= 0.));
+                if field == "keyScale" && item["key"].as_str().zip(source["key"].as_str()).is_some_and(|(a,b)|a != b) { continue; }
+                if absent && !source[field].is_null() { item[field] = source[field].clone(); }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn load(
@@ -259,6 +318,17 @@ pub async fn load(
     cancel: Arc<AtomicBool>,
     force: bool,
 ) -> Result<Value, String> {
+    load_with_cache_status(db,http,album,market,cancel,force).await.map(|(value,_)|value)
+}
+
+pub(crate) async fn load_with_cache_status(
+    db: &TursoDb,
+    http: &reqwest::Client,
+    album: &str,
+    market: &str,
+    cancel: Arc<AtomicBool>,
+    force: bool,
+) -> Result<(Value,bool),String> {
     if album.is_empty() || !album.chars().all(|c| c.is_ascii_digit()) {
         return Err("Invalid release ID".into());
     }
@@ -268,15 +338,44 @@ pub async fn load(
     let _guard = gate.lock().await;
     if !force {
         if let Some(value) = cached(db, album, market).await? {
-            return Ok(value);
+            return Ok((value,true));
         }
     }
-    let token = crate::stream_download::get_valid_token(db, http).await?;
-    let (_, value) = fetch(http.clone(), token, album.into(), market.into(), cancel).await?;
+    let retry_key = format!("subscriber-items-retry:{market}:{album}");
+    if !force {
+        if let Some(retry) = db.get_preference(&retry_key).await?.filter(|retry| retry["retry_after"].as_i64().is_some_and(|until| until > chrono::Utc::now().timestamp())) {
+            return Err(retry["error"].as_str().unwrap_or("Metadata retry paused; saved data retained").to_owned());
+        }
+    }
+    let before = db.get_preference(&format!("subscriber-summary:{market}:{album}")).await?;
+    let fetched = async {
+        let token = crate::stream_download::get_valid_token(db, http).await?;
+        let (_, value) = fetch(http.clone(), token, album.into(), market.into(), cancel.clone()).await?;
+        tracks(&value)?;
+        Ok::<_,String>(value)
+    }.await;
+    let mut value = match fetched {
+        Ok(value) => value,
+        Err(error) => {
+            if !cancel.load(Ordering::Relaxed) {
+                db.set_preference(&retry_key, &json!({"error":error,"retry_after":chrono::Utc::now().timestamp()+300})).await?;
+            }
+            return Err(error);
+        }
+    };
+    let after = db.get_preference(&format!("subscriber-summary:{market}:{album}")).await?;
+    if let Some(summary) = before.as_ref().filter(|prior| after.as_ref().is_some_and(|current| crate::tidal::summary_fingerprint(prior) == crate::tidal::summary_fingerprint(current))) {
+        value["summary_fingerprint"] = json!(crate::tidal::summary_fingerprint(summary));
+        value["fingerprint_status"] = json!("paired");
+    } else {
+        value["fingerprint_status"] = json!("unbound");
+    }
     tracks(&value)?; // Do not publish incomplete/malformed responses.
     db.set_preference(&format!("subscriber-items:{market}:{album}"), &value)
         .await?;
-    Ok(value)
+    db.set_preference(&retry_key, &Value::Null).await?;
+    supplement_cached_response(db,album,market,&mut value).await?;
+    Ok((value,false))
 }
 
 /// Preserve independently fetched discovery fields and never erase richer saved credits.
@@ -320,7 +419,6 @@ pub async fn prefetch(
     cancel: Arc<AtomicBool>,
     progress: impl Fn(&str),
 ) -> Result<HashMap<String, Value>, String> {
-    let now = chrono::Utc::now().timestamp();
     let mut result = HashMap::new();
     let mut pending = VecDeque::new();
     let mut seen = HashSet::new();
@@ -331,16 +429,7 @@ pub async fn prefetch(
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) || !seen.insert(id.clone()) {
             continue;
         }
-        let cached = db
-            .get_preference(&format!("subscriber-items:{market}:{id}"))
-            .await?;
-        if let Some(value) = cached.filter(|v| {
-            v["schema"] == 2
-                && v["items"].is_array()
-                && v["checked_at"]
-                    .as_i64()
-                    .is_some_and(|at| (0..MAX_AGE).contains(&(now - at)))
-        }) {
+        if let Some(value) = cached(db, &id, market).await? {
             result.insert(id, value);
         } else {
             pending.push_back(id);
@@ -492,7 +581,7 @@ mod tests {
         let db = TursoDb::open(dir.join("db")).await.unwrap();
         db.set_preference(
             "subscriber-items:GB:12",
-            &json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":1,"bpm":120}]}),
+            &json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":1,"bpm":120,"trackNumber":1,"volumeNumber":1,"credits":[]}]}),
         )
         .await
         .unwrap();
@@ -510,6 +599,40 @@ mod tests {
         assert_eq!(result["12"]["items"][0]["bpm"], 120);
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn credited_cache_reuses_aged_paired_lists_and_rejects_changed_or_unproven_summaries() {
+        let dir = std::env::temp_dir().join(format!("subscriber-paired-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let summary = json!({"id":12,"title":"Release","numberOfTracks":1,"artist":{"id":4,"name":"Main"},"checked_at":now});
+        let paired = json!({"schema":2,"checked_at":now-40*86400,"summary_fingerprint":crate::tidal::summary_fingerprint(&summary),"items":[{"id":121,"trackNumber":1,"volumeNumber":1,"credits":[],"bpm":null,"key":null}]});
+        db.set_preference("subscriber-summary:GB:12",&summary).await.unwrap();
+        db.set_preference("subscriber-items:GB:12",&paired).await.unwrap();
+        let reused = prefetch(&db,&reqwest::Client::new(),vec!["12".into()],"GB",Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+        assert_eq!(reused["12"]["items"],paired["items"],"Successful empty DJ fields are reusable without a connection");
+        assert!(cached(&db,"12","US").await.unwrap().is_none());
+        db.set_preference("tag-review:GB:12",&json!({"tracks":[{"id":"121","track_number":1,"disc_number":1,"credits_complete":true,"bpm":124,"key":"G","key_scale":"major"}]})).await.unwrap();
+        let enriched = cached(&db,"12","GB").await.unwrap().unwrap();
+        assert_eq!(enriched["items"][0]["bpm"].as_f64(),Some(124.),"Downloads reuse DJ values obtained by enrichment");
+        assert_eq!(enriched["items"][0]["keyScale"],"major");
+        let mut changed = summary.clone(); changed["numberOfTracks"] = json!(2);
+        db.set_preference("subscriber-summary:GB:12",&changed).await.unwrap();
+        assert!(cached(&db,"12","GB").await.unwrap().is_none());
+        let mut legacy = paired.clone(); legacy.as_object_mut().unwrap().remove("summary_fingerprint");
+        db.set_preference("subscriber-items:GB:12",&legacy).await.unwrap();
+        assert!(cached(&db,"12","GB").await.unwrap().is_none(),"A new summary cannot validate an unpaired old list");
+        let mut earlier = summary.clone(); earlier["checked_at"] = json!(now-41*86400);
+        db.set_preference("subscriber-summary:GB:12",&earlier).await.unwrap();
+        assert_eq!(cached(&db,"12","GB").await.unwrap().unwrap()["summary_fingerprint"],paired["summary_fingerprint"]);
+        legacy["fingerprint_status"] = json!("unbound");
+        db.set_preference("subscriber-items:GB:12",&legacy).await.unwrap();
+        assert!(cached(&db,"12","GB").await.unwrap().is_none(),"A response captured during a summary change stays unpaired");
+        let mut malformed = paired.clone(); malformed["items"][0]["credits"] = Value::Null;
+        db.set_preference("subscriber-items:GB:12",&malformed).await.unwrap();
+        assert!(cached(&db,"12","GB").await.unwrap().is_none());
+        drop(db); std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

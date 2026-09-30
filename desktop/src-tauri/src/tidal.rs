@@ -737,6 +737,28 @@ impl TidalClient {
         self.get_artist_catalogue_with_discovery(artist_id,market,detailed,true).await
     }
 
+    /// Matching artist names/release titles consumes the current shared
+    /// catalogue. Older evidence copies are migrated once, never preferred
+    /// over a catalogue refreshed by another workflow.
+    pub(crate) async fn artist_match_evidence(&mut self, artist_id: &str, market: &str) -> Result<TidalCatalogue,String> {
+        let conn = self.db.connect()?;
+        let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id=? AND market=?",(artist_id,market)).await.map_err(|e|e.to_string())?;
+        let saved = rows.next().await.map_err(|e|e.to_string())?.and_then(|row|row.get::<String>(0).ok());
+        drop(rows);
+        if let Some(saved) = saved.and_then(|raw|serde_json::from_str::<TidalCatalogue>(&raw).ok()).filter(|saved|saved.id == artist_id) {
+            conn.execute("DELETE FROM app_preferences WHERE key=?",(format!("artist-evidence:{market}:{artist_id}"),)).await.map_err(|e|e.to_string())?;
+            return Ok(saved);
+        }
+        let legacy = self.db.get_preference(&format!("artist-evidence:{market}:{artist_id}")).await?
+            .and_then(|value|serde_json::from_value::<TidalCatalogue>(value).ok()).filter(|saved|saved.id == artist_id);
+        let catalogue = match legacy {
+            Some(saved)=>saved,
+            None=>self.get_artist_catalogue_with_discovery(artist_id,market,false,false).await?,
+        };
+        self.save_catalogue_to_db(&self.db,market,&catalogue).await?;
+        Ok(catalogue)
+    }
+
     pub(crate) async fn get_artist_catalogue_with_discovery(
         &mut self,
         artist_id: &str,
@@ -874,7 +896,8 @@ impl TidalClient {
                                     release["discovery_checked_at"] =
                                         cached["discovery_checked_at"].clone();
                                 }
-                                if release["tracks_loaded"] != true && cached["tracks_loaded"] == true {
+                                let changed = release["summary_fingerprint"].as_str().zip(cached["summary_fingerprint"].as_str()).is_some_and(|(fresh,prior)|fresh != prior);
+                                if release["tracks_loaded"] != true && cached["tracks_loaded"] == true && !changed {
                                     release["tracks"] = cached["tracks"].clone();
                                     release["tracks_loaded"] = json!(true);
                                     release["track_count"] = cached["track_count"].clone();
@@ -896,6 +919,7 @@ impl TidalClient {
             .map_err(|e| e.to_string())?;
 
             TursoDb::index_catalogue(&conn,&catalogue.id,market,&payload).await?;
+            conn.execute("DELETE FROM app_preferences WHERE key=?",(format!("artist-evidence:{market}:{}",catalogue.id),)).await.map_err(|e|e.to_string())?;
             conn.execute("COMMIT", ()).await.map_err(|e|e.to_string())?;
             Ok::<_,String>(())
         }.await;
@@ -1136,7 +1160,7 @@ mod tests {
     }
 }
 
-fn resource_id(value: &Value) -> String {
+pub(crate) fn resource_id(value: &Value) -> String {
     value
         .as_str()
         .map(str::to_owned)
@@ -1357,6 +1381,28 @@ mod subscriber_tests {
         );
         assert_eq!(saved["genres"], json!(["House"]));
         assert_eq!(saved["replacement_id"], "43");
+    }
+
+    #[tokio::test]
+    async fn artist_evidence_uses_current_catalogue_and_migrates_only_legacy_fallback() {
+        let dir=std::env::temp_dir().join(format!("artist-evidence-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let mut client=TidalClient::from_db(&db).await.unwrap();
+        let catalogue=TidalCatalogue{id:"4".into(),name:"Main".into(),releases:vec![TidalRelease{id:"12".into(),title:"Current".into(),..Default::default()}]};
+        client.save_catalogue_to_db(&db,"GB",&catalogue).await.unwrap();
+        let mut legacy=catalogue.clone();legacy.releases[0].title="Old".into();
+        db.set_preference("artist-evidence:GB:4",&json!(legacy)).await.unwrap();
+        assert_eq!(client.artist_match_evidence("4","GB").await.unwrap().releases[0].title,"Current");
+        assert!(db.get_preference("artist-evidence:GB:4").await.unwrap().is_none());
+        legacy.id="5".into();
+        db.set_preference("artist-evidence:GB:5",&json!(legacy)).await.unwrap();
+        assert_eq!(client.artist_match_evidence("5","GB").await.unwrap().releases[0].title,"Old");
+        assert!(db.get_preference("artist-evidence:GB:5").await.unwrap().is_none());
+        let conn=db.connect().unwrap();
+        let mut rows=conn.query("SELECT market FROM catalogue WHERE artist_id='5'",()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<String>(0).unwrap(),"GB");
+        assert!(rows.next().await.unwrap().is_none());
+        drop(rows);drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
