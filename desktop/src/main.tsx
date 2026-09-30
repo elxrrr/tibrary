@@ -1,4 +1,4 @@
-import { MetadataView, DownloadReview, TagChanges } from "./MetadataView";
+import { MetadataView, DownloadReview, TagChanges, ReleaseMetadata } from "./MetadataView";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
@@ -238,7 +238,8 @@ function App() {
   const [action, setAction] = useState("dates"),
     [preview, setPreview] = useState<string | undefined>(),
     [timeline, setTimeline] = useState("Newer than newest owned"),
-    [recommendation, setRecommendation] = useState("My album artists"),
+    [artistScope, setArtistScope] = useState("My album artists"),
+    [recommendation, setRecommendation] = useState("All recommendations"),
     [copyright, setCopyright] = useState("All copyrights"),
     [releaseType, setReleaseType] = useState("All types");
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
@@ -261,7 +262,7 @@ function App() {
     if (route !== "overview" || !state) return;
     let alive = true;
     call("table", {route: "missing", timeline: "All missing releases", status: "all",
-      sort: "date", direction: "desc", limit: 20, recommendation: "My album artists"})
+      sort: "date", direction: "desc", limit: 20, artist_scope: "My album artists"})
       .then((result) => { if (alive) { setLatestMissing(result.rows); setMissingReleaseCount(result.total); } })
       .catch((e) => { if (alive) notifyError(e); });
     return () => { alive = false; };
@@ -367,6 +368,7 @@ function App() {
     preview_id: preview,
     timeline,
     recommendation,
+    artist_scope: artistScope,
     copyright,
     type: releaseType,
   };
@@ -414,6 +416,7 @@ function App() {
     preview,
     timeline,
     recommendation,
+    artistScope,
     copyright,
     releaseType,
     pageSize,
@@ -530,6 +533,14 @@ function App() {
     }
     if (j.kind === "manual_candidate" && selected.size)
       loadDetail({ id: [...selected][0] });
+    if (j.kind === "release_details" && detail?.release?.id && j.status === "complete") {
+      const id = detail.release.id;
+      call("detail", {release_id:id}).then(value => setDetail((current: any) => current?.release?.id === id ? {
+        ...current,
+        release:{...value, release:value.release || value.title},
+        track:current.track ? (value.tracks || []).find((track: Row) => track.id === current.track.id) || current.track : null,
+      } : current)).catch(notifyError);
+    }
     if (
       [
         "connections",
@@ -578,7 +589,8 @@ function App() {
         setDetail({
           release: { ...value, release: value.release || value.title,
             children: value.children || (value.tracks || []).map((t: Row) => ({...t, position: t.position || `Disc ${t.disc_number || 1} · Track ${t.track_number || "?"}`})) },
-          track: row.parent ? row : null,
+          track: row.parent ? {...row, ...(value.tracks || []).find((track: Row) => track.id === row.id)} : null,
+          evidence: row.evidence || [],
         });
       } else if (route === "artists" || route === "favourites") {
         const d = await call("detail", { artist: row.artist, root });
@@ -741,7 +753,7 @@ function App() {
     Icon: any = Music2,
   ) {
     return (
-      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setRecommendation("My album artists"); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
+      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
         <span className="metric-title">
           <Icon size={18} />
           {title}
@@ -874,7 +886,7 @@ function App() {
           <section className="card latest-missing-card">
             <div className="section-heading">
               <h2>Latest missing releases</h2>
-              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setRecommendation("My album artists"); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
+              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
                 View missing releases
               </button>
             </div>
@@ -1121,7 +1133,7 @@ function App() {
               className="primary"
               disabled={busy}
               onClick={() => run("discography", { detailed: true })}
-              title="Check linked artist release lists, then fill new, changed or missing track lists, credits, genres and available BPM/key data. The first fill can take hours for a large library; complete unchanged details are reused. For a faster discovery check, choose More update options → Check release lists only. No audio is downloaded."
+              title="Complete missing reference metadata for your downloaded, linked releases first. Then check artist release lists and fill new, changed or incomplete candidate details: tracks, contributor credits, available catalogue tags and BPM/key. Checked credits are reused. The first fill can take hours; choose Check release lists only for a lighter discovery check. No audio is downloaded."
             >
               Update missing releases
             </button>
@@ -1219,7 +1231,7 @@ function App() {
           </div>
         )}
         {toolbar()}
-        {route === "missing" && <p className="hint scan-explainer">Saved tracks, credits and market checks are reused. Confirmed unavailable releases stay in the Unavailable filter; failed requests never mark releases unavailable. No audio is downloaded here.</p>}
+        {route === "missing" && <p className="hint scan-explainer">Recommendations compare releases with your downloaded music and its verified online metadata. Update missing releases fills missing track details and credits; saved complete checks are reused. Select Recommended to narrow the list, or inspect all confidence levels.</p>}
         {route === "missing" && (
           <div className="filters secondary">
             <select
@@ -1241,16 +1253,21 @@ function App() {
               ))}
             </select>
             <select
+              aria-label="Album artist scope"
+              title="Choose releases credited to your linked album artists, other appearances, or releases whose album artist has not been checked. This works alongside the recommendation filter."
+              value={artistScope}
+              onChange={(e) => { setArtistScope(e.target.value); setOffset(0); }}
+            >
+              {["All artist appearances", "My album artists", "Other artist appearances", "Artist credits not checked"].map(v => <option key={v}>{v}</option>)}
+            </select>
+            <select
               aria-label="Recommendation"
-              title="My album artists keeps releases whose first credited album artist is one of your linked artists. Other appearances and unchecked credits remain available separately; artist order is not proof of an official release."
+              title="Confidence from recording matches, rights holders and role-specific credits shared with verified local music. Potential may mean insufficient metadata rather than a mismatch; inspect metadata for the evidence."
               value={recommendation}
               onChange={(e) => { setRecommendation(e.target.value); setOffset(0); }}
             >
               {[
                 "All recommendations",
-                "My album artists",
-                "Other artist appearances",
-                "Artist credits not checked",
                 "Recommended",
                 "Potential",
                 "Suspect / Low match",
@@ -2420,32 +2437,12 @@ function App() {
                 >
                   Open on web
                 </button>
-                <div className="review-list">
-                  {(detail.track
-                    ? [detail.track]
-                    : detail.release.children || []
-                  ).map((t: Row) => (
-                    <article key={t.id}>
-                      <strong>
-                        {t.position} · {t.title}
-                      </strong>
-                      <p>
-                        {t.isrc || "No recording identifier"} · BPM{" "}
-                        {t.bpm || "Not supplied"} · Key{" "}
-                        {t.key || "Not supplied"}
-                      </p>
-                      <button
-                        onClick={() =>
-                          external(`https://tidal.com/track/${t.id}`).catch(
-                            notifyError,
-                          )
-                        }
-                      >
-                        Open track on web
-                      </button>
-                    </article>
-                  ))}
-                </div>
+                <button disabled={busy} onClick={() => run("release_details", {id:detail.release.id})}
+                  title="Reuse saved track details and credits, fetching only missing or changed evidence for this release. Files are not changed.">
+                  Get missing metadata
+                </button>
+                {!!detail.evidence?.length && <section><h3>Recommendation evidence</h3><ul>{detail.evidence.map((line: string, index: number) => <li key={index}>{line}</li>)}</ul></section>}
+                <ReleaseMetadata release={detail.release} track={detail.track}/>
                 {detail.release.downloaded_files?.length > 0 && (
                   <section>
                     <h3>Downloaded files</h3>

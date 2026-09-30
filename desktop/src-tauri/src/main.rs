@@ -46,6 +46,16 @@ fn completed_refresh_ids(saved: &Value, ids: &[String], market: &str, detailed: 
     ids.iter().filter(|id| completed.contains(id)).cloned().collect()
 }
 
+fn reference_refresh_progress(backend: &Backend, message: &str, completed: usize, total: usize) {
+    let job = backend.online_job.lock().unwrap().clone();
+    if let Some(mut job) = job {
+        job["completed"] = json!(completed);
+        job["total"] = json!(total);
+        job["progress_phase_override"] = json!("reference releases");
+        backend.update_online_job_progress(message, job);
+    }
+}
+
 /// Publish durable artist results while a refresh is still running, without
 /// making large library views reload for every individual metadata write.
 fn publish_catalogue_changes(
@@ -1375,10 +1385,11 @@ async fn handle_rpc_uncached(
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
 
         let page = db
-            .get_missing_rows(
+            .get_missing_rows_scoped(
                 market,
                 timeline,
                 recommendation,
+                args.get("artist_scope").and_then(Value::as_str),
                 status_filter,
                 type_filter,
                 search,
@@ -2200,12 +2211,82 @@ async fn handle_rpc_uncached(
             let backend_prog = backend_task.clone();
             let mut last_published = None;
 
+            // Reference albums need the same evidence as candidates, including
+            // albums no longer returned on the artist's current catalogue page.
+            // Cache complete work individually so cancellation/resume never
+            // requires downloading the already checked credits again.
+            if detailed {
+                match db_clone.linked_reference_release_ids(&market, &ids).await {
+                    Err(error) => failure = Some(error),
+                    Ok(references) => {
+                        let mut reference_checked = 0usize;
+                        for batch in references.chunks(20) {
+                            if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
+                            reference_refresh_progress(&backend_task, &format!("Downloaded reference metadata · {reference_checked}/{} releases · reusing saved details and filling missing catalogue fields and credits", references.len()), reference_checked, references.len());
+                            let mut reference_client = client.clone().with_cancel(cancel_flag.clone());
+                            if let Err(error) = reference_client.albums(batch, &market, false).await {
+                                failure = Some(format!("Could not check downloaded release references: {error}"));
+                                break;
+                            }
+                            if let Err(error) = reference_client.discovery(batch, &market, false).await {
+                                if cancel_flag.load(Ordering::Relaxed) { break; }
+                                backend_task.log_for("discography", &format!("Optional catalogue fields could not be checked; saved reference metadata retained: {error}"), "warning");
+                            }
+                            let mut remaining = batch.iter();
+                            let mut reference_workers = tokio::task::JoinSet::new();
+                            loop {
+                                if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
+                                while reference_workers.len() < network::METADATA_CONCURRENCY {
+                                    let Some(id) = remaining.next() else { break; };
+                                    let id = id.clone();
+                                    let reference_db = db_clone.clone();
+                                    let reference_market = market.clone();
+                                    let reference_cancel = cancel_flag.clone();
+                                    reference_workers.spawn(async move {
+                                        let result = actions::release_with_cancel(&reference_db, &id, &reference_market, false, reference_cancel).await;
+                                        (id, result)
+                                    });
+                                }
+                                let Some(result) = reference_workers.join_next().await else { break; };
+                                match result {
+                                    Ok((id, Ok(release))) => {
+                                        reference_checked += 1;
+                                        let name = release["artist"].as_str().unwrap_or("Downloaded artist");
+                                        let title = release["title"].as_str().unwrap_or("Downloaded release");
+                                        reference_refresh_progress(&backend_task, &format!("Downloaded reference checked · {reference_checked}/{} releases · {name} — {title} · release ID {id} · saved details reused where complete", references.len()), reference_checked, references.len());
+                                        publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
+                                    }
+                                    Ok((id, Err(error))) => {
+                                        // Withdrawn online editions remain valid downloaded
+                                        // references. Retain their cached evidence.
+                                        if error.contains("HTTP 404") || error.contains("unavailable in the selected market") {
+                                            reference_checked += 1;
+                                            backend_task.log_for("discography", &format!("Downloaded reference {id} is no longer available online; its saved metadata remains usable"), "warning");
+                                        } else { failure = Some(format!("Downloaded reference {id}: {error}")); }
+                                    }
+                                    Err(error) => failure = Some(format!("Reference metadata worker stopped: {error}")),
+                                }
+                            }
+                            reference_workers.abort_all();
+                            while reference_workers.join_next().await.is_some() {}
+                        }
+                    }
+                }
+            }
+
             // Keep three artists in flight, sharing the global API pacing lane.
             // Catalogue/queue writes and checkpoints remain serial and durable.
             let mut pending: std::collections::VecDeque<_> = ids.iter().filter(|id| !completed.contains(id)).cloned().collect();
             let mut fetches = tokio::task::JoinSet::new();
+            let artist_job = backend_task.online_job.lock().unwrap().clone();
+            if let Some(mut job) = artist_job {
+                job.as_object_mut().unwrap().remove("progress_phase_override");
+                job["completed"] = json!(checked);
+                job["total"] = json!(total);
+                backend_task.update_online_job_progress(&format!("Checking release lists · {checked}/{total} artists · {market}"), job);
+            }
             loop {
-                if cancel_flag.load(Ordering::Relaxed) { break; }
+                if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
                 while fetches.len() < network::METADATA_CONCURRENCY {
                     let Some(artist_id) = pending.pop_front() else { break; };
                     let mut worker = client.clone().with_cancel(cancel_flag.clone());

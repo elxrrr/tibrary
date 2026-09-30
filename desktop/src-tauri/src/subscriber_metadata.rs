@@ -23,6 +23,7 @@ pub fn merge(track: &mut TidalTrack, raw: &Value) {
     if id != track.id || track.isrc.as_deref().zip(raw["isrc"].as_str()).is_some_and(|(a,b)| !a.eq_ignore_ascii_case(b)) {
         return;
     }
+    if track.artists.is_empty() {track.artists=artist_credits(raw);}
     track.isrc = track.isrc.clone().or_else(||raw["isrc"].as_str().filter(|isrc|!isrc.trim().is_empty()).map(str::to_owned));
     track.bpm = track.bpm.or(raw["bpm"]
         .as_f64()
@@ -147,12 +148,23 @@ pub fn normalize_credits(groups: &Value) -> Value {
             let Some(name) = person["name"].as_str().filter(|s| !s.trim().is_empty()) else {
                 continue;
             };
-            if seen.insert((name.to_lowercase(), role.to_lowercase())) {
-                entries.push(json!({"name":name,"role":role,"contributor_id":person["id"],"source":"subscriber"}));
+            if seen.insert((name.to_lowercase(), role.to_lowercase(), person["id"].to_string())) {
+                entries.push(json!({"name":name,"role":role,"contributor_id":person["id"],"roleId":group["roleId"],"source":"subscriber"}));
             }
         }
     }
     json!(entries)
+}
+
+/// Retain subscriber performer IDs and declared MAIN/FEATURED roles verbatim.
+/// Album-artist resolution can then distinguish an owner from an appearance.
+pub(crate) fn artist_credits(raw: &Value) -> Vec<Value> {
+    let mut artists=raw["artists"].as_array().cloned().unwrap_or_default();
+    if let Some(primary)=raw["artist"].as_object().filter(|artist|artist.get("id").is_some()) {
+        let primary=Value::Object(primary.clone());
+        if !artists.iter().any(|artist|crate::tidal::resource_id(&artist["id"]) == crate::tidal::resource_id(&primary["id"])) {artists.push(primary);}
+    }
+    artists
 }
 
 pub fn tracks(value: &Value) -> Result<Vec<TidalTrack>, String> {
@@ -179,6 +191,7 @@ pub fn tracks(value: &Value) -> Result<Vec<TidalTrack>, String> {
         }
         tracks.push(TidalTrack {
             id,
+            artists: artist_credits(item),
             title: crate::tidal::format_title(
                 item["title"].as_str().unwrap_or(""),
                 item["version"].as_str(),
@@ -207,6 +220,10 @@ pub fn tracks(value: &Value) -> Result<Vec<TidalTrack>, String> {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect(),
             media_metadata: item["mediaMetadata"].clone(),
+            genres: item["genres"].as_array().into_iter().flatten()
+                .filter_map(|genre|genre.as_str().or(genre["genreName"].as_str()).or(genre["name"].as_str()).filter(|name|!name.trim().is_empty()).map(str::to_owned)).collect(),
+            replacement_id: item.get("replacementId").map(crate::tidal::resource_id).filter(|id|!id.is_empty() && id != &crate::tidal::resource_id(&item["id"])),
+            discovery_checked_at: item.get("genres").and_then(|_|value["checked_at"].as_i64()),
             ..Default::default()
         });
     }
@@ -387,6 +404,11 @@ pub fn supplement(new: &mut [TidalTrack], old: &[TidalTrack]) {
             continue;
         };
         track.bpm = track.bpm.or(prior.bpm);
+        if track.artists.is_empty() {track.artists=prior.artists.clone();}
+        track.copyright=track.copyright.clone().or_else(||prior.copyright.clone());
+        if track.audio_modes.is_empty() {track.audio_modes=prior.audio_modes.clone();}
+        if track.media_tags.is_empty() {track.media_tags=prior.media_tags.clone();}
+        if track.media_metadata.is_null() {track.media_metadata=prior.media_metadata.clone();}
         if track.key.is_none() {
             track.key = prior.key.clone();
             track.key_scale = prior.key_scale.clone();
@@ -402,7 +424,8 @@ pub fn supplement(new: &mut [TidalTrack], old: &[TidalTrack]) {
         for credit in prior.credits.as_array().into_iter().flatten() {
             if !credits
                 .iter()
-                .any(|c| c["name"] == credit["name"] && c["role"] == credit["role"])
+                .any(|c| c["name"] == credit["name"] && c["role"] == credit["role"]
+                    && (c["contributor_id"].is_null() || credit["contributor_id"].is_null() || c["contributor_id"] == credit["contributor_id"]))
             {
                 credits.push(credit.clone());
             }
@@ -507,12 +530,17 @@ mod tests {
     #[test]
     fn credited_audio_excludes_video_and_keeps_roles_and_supplements() {
         let page = json!([
-            {"type":"track","item":{"id":1,"title":"Audio","trackNumber":1,"volumeNumber":1,"isrc":"ABC","bpm":120,"key":"C","keyScale":"MINOR"},"credits":[{"type":"Composer","contributors":[{"name":"Writer","id":2}]},{"type":"Producer","contributors":[{"name":"Writer","id":2}]},{"type":"Guitar","contributors":[{"name":"Player"}]}]},
+            {"type":"track","item":{"id":1,"title":"Audio","trackNumber":1,"volumeNumber":1,"isrc":"ABC","bpm":120,"key":"C","keyScale":"MINOR","artists":[{"id":10,"name":"Main artist","type":"MAIN"},{"id":11,"name":"Guest","type":"FEATURED"}],"genres":[{"genreName":"House"}]},"credits":[{"type":"Composer","contributors":[{"name":"Writer","id":2}]},{"type":"Producer","contributors":[{"name":"Writer","id":2}]},{"type":"Guitar","contributors":[{"name":"Player"}]}]},
             {"type":"video","item":{"id":3,"trackNumber":2}}
         ]);
         let items = audio_items(page.as_array().unwrap()).unwrap();
         let mut parsed = tracks(&json!({"items":items,"checked_at":1})).unwrap();
         assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].artists[0]["id"],10);
+        assert_eq!(parsed[0].artists[1]["type"],"FEATURED");
+        assert_eq!(parsed[0].genres,vec!["House"]);
+        let homonyms=normalize_credits(&json!([{"type":"Composer","contributors":[{"id":1,"name":"Same name"},{"id":2,"name":"Same name"}]}]));
+        assert_eq!(homonyms.as_array().unwrap().len(),2,"Distinct contributor identities must not collapse by display name");
         assert_eq!(parsed[0].credits.as_array().unwrap().len(), 3);
         assert_eq!(
             crate::enrichment::credit_tags(&parsed[0].credits)["composer"],
@@ -529,6 +557,9 @@ mod tests {
         supplement(&mut parsed, &[old]);
         assert_eq!(parsed[0].genres, vec!["House"]);
         assert_eq!(parsed[0].credits.as_array().unwrap().len(), 4);
+        let mut legacy=parsed.clone();legacy[0].artists.clear();
+        supplement(&mut legacy,&parsed);
+        assert_eq!(legacy[0].artists,parsed[0].artists);
         assert!(audio_items(&[json!({"type":"track","item":{"id":1}})]).is_err());
     }
 

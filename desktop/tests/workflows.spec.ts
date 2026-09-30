@@ -699,6 +699,53 @@ test("missing release filters, bidirectional sort and paging preserve the releas
   await expect(page.locator("tbody")).not.toContainText("Between Stations");
 });
 
+test("missing release metadata shows saved credits and independent confidence filters", async ({page}) => {
+  await rpc("queue.decision",{ids:["910001","910002","910003","910004","910005","910006"],decision:"removed"});
+  const queries:any[]=[];
+  const updates:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start") {
+      updates.push(request.args);
+      await route.fulfill({json:{result:{id:"metadata-update",kind:request.args.kind,status:"complete",message:"Saved metadata reused"}}});
+      return;
+    }
+    const response=await rpc(request.method,request.args);
+    if(request.method==="table" && request.args.route==="missing") queries.push(request.args);
+    if(request.method==="detail" && request.args.release_id && response.result) {
+      response.result={...response.result,track_count:1,tracks_loaded:true,
+        catalogue_metadata_status:{status:"checked",fields:{genres:"not_supplied",label:"not_supplied",providers:"supplied",replacement:"not_supplied"}},
+        providers:[{id:"provider-1",name:"Example distributor"}],
+        tracks:[{id:"recording-1",title:"Saved recording",disc_number:1,track_number:1,isrc:"GBTEST0000001",credits_complete:true,
+          credits:[{role:"Composer",name:"Reference writer",contributor_id:42}],artists:[{id:"900001",name:"North Assembly",type:"MAIN"}]}]};
+    }
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await page.getByRole("combobox",{name:"Release timeline",exact:true}).selectOption("All missing releases");
+  await page.getByRole("combobox",{name:"Recommendation",exact:true}).selectOption("Recommended");
+  await expect.poll(()=>queries.some(args=>args.artist_scope==="My album artists" && args.recommendation==="Recommended")).toBe(true);
+  await page.getByRole("combobox",{name:"Recommendation",exact:true}).selectOption("All recommendations");
+  const row=page.locator("tbody tr").filter({hasText:"Night Maps"}).first();
+  await expect(row).toBeVisible();
+  await row.click({button:"right"});
+  await page.getByRole("menuitem",{name:"View metadata / match details",exact:true}).click();
+  const dialog=page.getByRole("dialog");
+  await expect(dialog).toContainText("Track details and credits checked · 1/1 tracks");
+  await expect(dialog.getByRole("table",{name:"Catalogue checks"})).toContainText("Checked · not supplied by the service");
+  await expect(dialog).toContainText("Example distributor");
+  await dialog.locator("summary").filter({hasText:"Saved recording"}).click();
+  await expect(dialog.getByRole("table",{name:"Credits for Saved recording"})).toContainText("Reference writer");
+  await expect(dialog).toContainText("Performer credits: North Assembly (main)");
+  await dialog.getByRole("button",{name:"Get missing metadata",exact:true}).click();
+  await expect.poll(()=>updates.length).toBe(1);
+  expect(updates[0].kind).toBe("release_details");
+  expect(updates[0].args.force).toBeUndefined();
+  await expect(dialog.getByRole("button",{name:"Get missing metadata",exact:true})).toBeEnabled();
+  await page.unrouteAll({behavior:"wait"});
+});
+
 test("catalogue refresh publishes partial results without resetting table state or restarting work", async ({page}) => {
   await rpc("queue.decision",{ids:["910001","910002","910003","910004","910005","910006"],decision:"removed"});
   await page.addInitScript(() => {

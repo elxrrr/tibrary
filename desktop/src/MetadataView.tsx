@@ -9,6 +9,73 @@ const labels: Record<string, string> = {
 };
 export const metadataLabel = (key: string) => labels[key] || key.replaceAll("_", " ").replace(/^./, c => c.toUpperCase());
 
+export function creditCoverage(release: any) {
+  const tracks = Array.isArray(release?.tracks) ? release.tracks : [];
+  const checked = tracks.filter((track: any) => track.credits_complete === true).length;
+  const expected = Number(release?.track_count || (typeof release?.tracks === "number" ? release.tracks : tracks.length));
+  const loaded = release?.tracks_loaded === true && tracks.length > 0;
+  return {checked, total:Math.max(expected, tracks.length), loaded,
+    complete:loaded && checked === tracks.length && tracks.length >= expected};
+}
+
+function metadataText(value: any): string {
+  return readable(value?.text ?? value);
+}
+
+export function catalogueFieldStatus(release: any, field: string): string {
+  const status = release?.catalogue_metadata_status?.fields?.[field];
+  if (status === "supplied") return "Saved";
+  if (status === "not_supplied") return "Checked · not supplied by the service";
+  if (status === "incomplete") return "Check incomplete · update needed";
+  return "Not checked";
+}
+
+/** Display the actual saved online evidence, including successful empty checks. */
+export function ReleaseMetadata({release, track}: {release: any; track?: any}) {
+  const coverage = creditCoverage(release);
+  const fields: [string, any][] = [
+    ["Album artist", release.album_artist || release.artist],
+    ["Release date", release.date], ["Original release date", release.original_release_date],
+    ["UPC", release.upc], ["Record label", release.label],
+    ["Provider / distributor", release.providers?.map((provider: any) => provider.name).filter(Boolean).join("; ") || release.provider_name],
+    ["Copyright", release.copyright], ["Genres", release.genres],
+    ["Audio modes", release.audio_modes], ["Quality", release.quality],
+  ];
+  const tracks: any[] = track ? [track] : Array.isArray(release.tracks) ? release.tracks : [];
+  return <section className="release-metadata">
+    <h3>Saved online metadata</h3>
+    <p className={coverage.complete ? "success" : "warning"}>
+      {coverage.complete ? `Track details and credits checked · ${coverage.checked}/${coverage.total} tracks`
+        : coverage.loaded ? `Credits checked · ${coverage.checked}/${coverage.total} tracks · remaining evidence needs an update`
+        : "Release summary only · track details and credits have not been loaded"}
+    </p>
+    <p className="muted">Missing values are not proof of a mismatch. A completed credit check can return no credits; record labels and genres are separate catalogue fields.</p>
+    <div className="metadata-table"><table aria-label="Saved release metadata"><tbody>
+      {fields.map(([label, value]) => <tr key={label}><th scope="row">{label}</th><td>
+        {value == null || value === "" || (Array.isArray(value) && !value.length) ? "Not supplied in saved metadata" : metadataText(value)}
+      </td></tr>)}
+    </tbody></table></div>
+    <div className="metadata-table"><table aria-label="Catalogue checks"><thead><tr><th>Catalogue field</th><th>Check status</th></tr></thead><tbody>
+      {[["genres", "Genres"], ["label", "Record label"], ["providers", "Provider / distributor"], ["replacement", "Replacement release"]].map(([field, label]) =>
+        <tr key={field}><th scope="row">{label}</th><td>{catalogueFieldStatus(release, field)}</td></tr>)}
+    </tbody></table></div>
+    {release.catalogue_metadata_status?.checked_at && <p className="muted">Catalogue fields checked {new Date(release.catalogue_metadata_status.checked_at * 1000).toLocaleString()}</p>}
+    {release.metadata_note && <p className="warning">{release.metadata_note}</p>}
+    {release.track_metadata_checked_at && <p className="muted">Track details checked {new Date(release.track_metadata_checked_at * 1000).toLocaleString()}</p>}
+    <div className="metadata-sources">{tracks.map((recording: any) => <details key={recording.id} className="metadata-source">
+      <summary>{recording.title} · Disc {String(recording.disc_number || 1).padStart(2, "0")} · Track {String(recording.track_number || "?").padStart(2, "0")} · {recording.credits_complete ? "Credits checked" : "Credits not checked"}</summary>
+      <p>Track ID {recording.id} · ISRC {recording.isrc || "Not supplied"} · BPM {recording.bpm || "Not supplied"} · Key {recording.key || "Not supplied"}{recording.key_scale ? ` ${recording.key_scale}` : ""}</p>
+      {recording.artists?.length > 0 && <p>Performer credits: {recording.artists.map((artist: any) => `${artist.name || "Unnamed artist"}${artist.type ? ` (${artist.type.toLowerCase()})` : ""}`).join("; ")}</p>}
+      {recording.copyright && <p>Copyright: {metadataText(recording.copyright)}</p>}
+      {recording.genres?.length > 0 && <p>Genres: {readable(recording.genres)}</p>}
+      {Array.isArray(recording.credits) && recording.credits.length ? <div className="metadata-table"><table aria-label={`Credits for ${recording.title}`}>
+        <thead><tr><th>Role</th><th>Contributor</th><th>Contributor ID</th></tr></thead><tbody>
+          {recording.credits.map((credit: any, index: number) => <tr key={index}><td>{credit.role || credit.roleId || "Not supplied"}</td><td>{credit.name || credit.person || "Not supplied"}</td><td>{credit.contributor_id ?? "Not supplied"}</td></tr>)}
+        </tbody></table></div> : <p>{recording.credits_complete ? "Checked successfully; the service supplied no credits for this track." : "Credits have not been checked. Get missing metadata to complete this evidence."}</p>}
+    </details>)}</div>
+  </section>;
+}
+
 /** Keep source records separate: values from different releases must never look merged. */
 export function MetadataView({ value, title }: { value: any; title?: string }) {
   if (value == null || (Array.isArray(value) && !value.length)) return <p className="muted">No saved information.</p>;

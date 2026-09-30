@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.3** · [Setup and screenshots](../../README.md)
+Version **0.9.4** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -32,7 +32,7 @@ Artist matching starts from local **Album Artist** tags. Compilation placeholder
 
 Recording matches use ISRC, title, duration, release structure and track positions. Linking writes associations to the database, not file tags. Multiple compatible editions can supply metadata, but conflicting totals, mixes or recording evidence require review.
 
-Missing releases defaults to **My album artists**, using album-level artist IDs. Other appearances and unchecked artist credits remain available through the filters. Recommendation badges are evidence-based suggestions, not guarantees. Shared contributors, labels, rights, genres and verified recordings provide context; they do not override recording conflicts.
+Missing releases defaults to **My album artists**, using album-level artist IDs. Artist scope and recommendation confidence have separate filters, so you can combine **My album artists** with **Recommended**, or inspect other appearances and low-confidence results. Recommendation references come from present local files and their verified online links. Contributor IDs and roles, independent recordings, labels and copyright holders strengthen a match; common distributors, technical credits and genres provide context. Conflicting artists, compilations and unofficial releases cannot become Recommended.
 
 A release is marked superseded only when cached evidence shows a newer available release contains all its recordings. Exclusive mixes remain protected; superseded items remain inspectable.
 
@@ -41,7 +41,7 @@ A release is marked superseded only when cached evidence shows a newer available
 | Action | When to use it |
 | --- | --- |
 | Check local changes | Update the shared index after editing files outside Tibrary; reuse unchanged tags. |
-| Update missing releases | Check linked artist release lists and fill new, changed or incomplete online details. |
+| Update missing releases | Fill missing evidence for your downloaded, linked releases first, then check artist release lists and complete new, changed or incomplete candidates. |
 | More update options → Check release lists only | Check for new releases without collecting additional track details. |
 | More update options → Fill missing release artists | Fill album artist evidence for older cached releases. |
 | Check availability | Check selected releases, or the visible page; reuse recent market checks. |
@@ -49,7 +49,8 @@ A release is marked superseded only when cached evidence shows a newer available
 | More update options → Recheck saved availability online | Request fresh checks, including previously unavailable releases; bypass cached availability. |
 | More update options → Recalculate saved results | Recalculate ownership and recommendations locally, without API requests. |
 | Reread all tags in General | Force a complete tag read if an external editor preserved file size and modification time. |
-| Refresh track details and credits | Refresh metadata for a particular release. |
+| Get missing metadata in a release’s metadata view | Complete that release’s missing metadata, reusing checked track details and credits. |
+| Refresh track details and credits | Request a fresh check for a particular release. |
 | Recheck availability | Request a fresh market-availability check. |
 
 All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Metadata found during tagging, linking or downloading is shared with the other tools. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
@@ -60,7 +61,9 @@ The first recommendation-data fill can take hours for a large library. **Check r
 
 Availability is shared across artist, metadata and release checks for the selected market. Direct release checks are reused for seven days when available, one day when unavailable, and one hour when inconclusive. Artist-list flags are stored separately: they cannot restore a release that a direct check found unavailable. Older cached positives receive a direct check when you use **Check availability**; completed checks are reused. Confirmed unavailable releases leave the default Missing releases view but remain inspectable through **Unavailable**. Timeouts and rate-limit errors (HTTP 429) never mark a release unavailable. Use **Recheck saved availability online** to bypass these checks without resetting the database or rereading track details.
 
-If upstream tags change without changing a release's summary, use its manual detail refresh. Failed optional genre/replacement lookups retry after a cooldown while retaining the saved track credits; successful empty fields do not trigger repeated checks.
+Metadata views show the actual saved release fields, performers and contributor credits. They distinguish unchecked fields, incomplete checks and successful checks where the service supplied no value. A provider/distributor is displayed separately from a record label. Genre names use the catalogue’s `genreName` field. Optional label, genre, provider and replacement checks are cached for 30 days after a complete result; incomplete checks have a shorter retry window and share endpoint cooldowns. These checks do not redownload complete track credits. Raw returned catalogue and track data are retained for future interpretation.
+
+If upstream tags change without changing a release's summary, use its manual detail refresh. Missing fields are not negative matching evidence, and the app does not guess a label or genre when the service supplies none.
 
 Navigating between pages does not start or cancel scans. Jobs finish in the background and publish their results to every relevant view. Catalogue refreshes publish saved artist results while the job is still running, retaining table sorting and expanded tracks. Cancellation retains completed checks. Artwork dimensions and MQA audits are cached per file; unchanged files are reused. Reviewed tag-only moves retain valid inspections, while artwork or relevant MQA tag changes invalidate the corresponding result. Local duplicate checks reuse the saved analysis until the indexed file manifest changes.
 

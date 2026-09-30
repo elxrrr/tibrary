@@ -91,15 +91,15 @@ impl Progress {
                 (
                     d,
                     t,
-                    counts(message)
+                    job["progress_phase_override"].as_str().map(str::to_owned).or_else(|| counts(message)
                         .map(|c| c.2)
-                        .unwrap_or_else(|| "items".to_owned()),
+                    ).unwrap_or_else(|| "items".to_owned()),
                 )
             })
             .or_else(|| counts(message));
         let measured = measured.filter(|(_, _, unit)| match job["kind"].as_str() {
             Some("link") => unit == "tracks",
-            Some("discography") => unit == "artists" || unit == "items",
+            Some("discography") => unit == "artists" || unit == "items" || (explicit.is_some() && unit == "reference releases"),
             Some("download") => unit == "tracks",
             _ => true,
         });
@@ -138,6 +138,20 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn downloaded_references_have_their_own_measured_phase() {
+        let mut progress = Progress::default();
+        let mut job = json!({"id":"refresh","kind":"discography","completed":5,"total":10,"progress_phase_override":"reference releases"});
+        progress.update(&mut job,"Downloaded reference metadata · 5/10 releases",1.);
+        assert_eq!(job["percent"],50.);
+        assert_eq!(job["progress_phase"],"reference releases");
+        job.as_object_mut().unwrap().remove("progress_phase_override");
+        job["completed"]=json!(1);job["total"]=json!(20);
+        progress.update(&mut job,"Checking release lists · 1/20 artists",2.);
+        assert_eq!(job["percent"],5.);
+        assert_eq!(job["progress_phase"],"artists");
+        assert!(job["eta_seconds"].is_null());
+    }
     #[test]
     fn cached_start_and_phases_do_not_inflate_speed() {
         let mut e = Estimate::default();

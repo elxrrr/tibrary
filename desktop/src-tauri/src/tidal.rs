@@ -5,6 +5,11 @@ use std::time::Duration;
 
 use crate::db::TursoDb;
 
+/// Optional catalogue fields evolve independently from validated credited track
+/// lists. Upgrading this schema must never force another track-credit download.
+pub(crate) const DISCOVERY_SCHEMA: u32 = 2;
+const DISCOVERY_MAX_AGE: i64 = 30 * 86400;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TidalArtist {
     pub id: String,
@@ -24,6 +29,8 @@ pub struct TidalTrackSearchResult {
 pub struct TidalTrack {
     pub id: String,
     pub title: String,
+    #[serde(default, deserialize_with = "nullable_vec")]
+    pub artists: Vec<Value>,
     pub isrc: Option<String>,
     pub track_number: u32,
     pub disc_number: u32,
@@ -64,6 +71,11 @@ pub struct TidalRelease {
     #[serde(default, deserialize_with = "copyright_from_value")]
     pub copyright: Option<String>,
     pub label: Option<String>,
+    /// A distributor/provider is useful context, but is not a record label.
+    #[serde(default, deserialize_with = "nullable_vec")]
+    pub providers: Vec<Value>,
+    pub catalogue_metadata_status: Value,
+    pub catalogue_metadata: Value,
     pub quality: String,
     #[serde(default, deserialize_with = "nullable_vec")]
     pub tracks: Vec<TidalTrack>,
@@ -150,13 +162,34 @@ where
 
 #[cfg(test)]
 mod release_payload_tests {
+    #[tokio::test]
+    async fn optional_metadata_reuses_successful_absence_and_global_retry_without_authentication() {
+        use super::*;
+        let dir=std::env::temp_dir().join(format!("optional-cache-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        db.set_preference("account-disconnected",&json!(true)).await.unwrap();
+        let now=Utc::now().timestamp();
+        let checked=discovery_fields(&json!({"id":"10","relationships":{"genres":{"data":[]},"providers":{"data":[]},"replacement":{"data":null}}}),&[],now);
+        db.set_preference("subscriber-discovery:GB:10",&checked).await.unwrap();
+        let mut client=TidalClient::from_db(&db).await.unwrap();
+        assert_eq!(client.discovery(&["10".into(),"10".into()],"GB",false).await.unwrap(),std::collections::HashMap::from([("10".into(),checked.clone())]));
+        assert!(!discovery_cache_current(&json!({"checked_at":now,"genres":[]}),now),"The older parser cache needs one optional-fields upgrade");
+        db.set_preference("subscriber-discovery-paused:GB",&json!({"until":now+3600,"message":"Unsupported optional endpoint"})).await.unwrap();
+        assert!(client.discovery(&["11".into()],"GB",true).await.unwrap().is_empty(),"A forced edition refresh cannot bypass a global failure cooldown");
+        assert_eq!(client.discovery(&["10".into(),"11".into()],"GB",false).await.unwrap().len(),1,"Failure must preserve complete cached fields");
+        assert!(db.get_preference("subscriber-discovery:GB:11").await.unwrap().is_none(),"Unavailable access must never invent successful empty metadata");
+        drop(client);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn discovery_relationships_do_not_leak_between_resources() {
-        use super::{related_genres, replacement_id};
+        use super::{discovery_fields, related_genres, replacement_id};
         use serde_json::json;
         let included = vec![
-            json!({"type":"genres","id":"g","attributes":{"name":"Electronic"}}),
+            json!({"type":"genres","id":"g","attributes":{"genreName":"Electronic"}}),
             json!({"type":"genres","id":"other","attributes":{"name":"Rock"}}),
+            json!({"type":"providers","id":"p","attributes":{"name":"Distributor"}}),
+            json!({"type":"providers","id":"other","attributes":{"name":"Other distributor"}}),
         ];
         let resource = json!({"id":"1","relationships":{"genres":{"data":[{"type":"genres","id":"g"}]},"replacement":{"data":{"type":"albums","id":"2"}}}});
         assert_eq!(related_genres(&resource, &included), vec!["Electronic"]);
@@ -166,6 +199,15 @@ mod release_payload_tests {
             &json!({"id":"1","relationships":{"replacement":{"data":{"id":"1"}}}})
         )
         .is_none());
+        let fields = discovery_fields(&json!({"id":"1","relationships":{"genres":{"data":[]},"providers":{"data":[{"type":"providers","id":"p"}]},"replacement":{"data":null}}}), &included, 10);
+        assert_eq!(fields["providers"],json!([{"id":"p","name":"Distributor"}]));
+        assert!(fields["label"].is_null(),"Distribution must not invent a record label");
+        assert_eq!(fields["catalogue_metadata_status"]["fields"]["genres"],"not_supplied");
+        assert_eq!(fields["catalogue_metadata_status"]["fields"]["label"],"not_supplied");
+        assert_eq!(fields["catalogue_metadata_status"]["fields"]["providers"],"supplied");
+        let partial=discovery_fields(&json!({"id":"1","relationships":{"genres":{"data":[{"id":"missing","type":"genres"}]}}}), &included,10);
+        assert_eq!(partial["catalogue_metadata_status"]["fields"]["genres"],"incomplete");
+        assert_eq!(partial["valid_until"],3610);
     }
 
     #[test]
@@ -517,6 +559,14 @@ impl TidalClient {
         market: &str,
         force: bool,
     ) -> Result<std::collections::HashMap<String, Value>, String> {
+        if market.len() != 2 || !market.bytes().all(|byte|byte.is_ascii_alphabetic()) {
+            return Err("Choose a two-letter country code in Settings".into());
+        }
+        // Artist refreshes can overlap on shared compilations. Check their
+        // optional cache under one cancellable gate so overlapping batches and
+        // an unsupported endpoint are each requested only once.
+        let gate=crate::actions::release_gate(format!("discovery:{}:{market}",self.db.path.display()));
+        let _guard=crate::actions::release_guard(gate,self.cancel.as_ref()).await?;
         let mut result = std::collections::HashMap::new();
         let mut pending = Vec::new();
         let now = Utc::now().timestamp();
@@ -524,24 +574,32 @@ impl TidalClient {
             if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("Invalid release ID".into());
             }
-            let saved = self
-                .db
-                .get_preference(&format!("subscriber-discovery:{market}:{id}"))
-                .await?;
-            if let Some(value) = saved.filter(|v| {
-                !force
-                    && v["checked_at"]
-                        .as_i64()
-                        .is_some_and(|at| (0..30 * 86400).contains(&(now - at)))
-            }) {
+        }
+        // One indexed cache read per batch instead of opening a connection for
+        // every release in a large artist catalogue.
+        let prefix=format!("subscriber-discovery:{market}:");
+        let conn=self.db.connect()?;
+        let mut rows=conn.query("SELECT key,payload FROM app_preferences WHERE key IN (SELECT ? || value FROM json_each(?))",(prefix.as_str(),json!(ids).to_string())).await.map_err(|e|e.to_string())?;
+        let mut saved=std::collections::HashMap::new();
+        while let Some(row)=rows.next().await.map_err(|e|e.to_string())? {
+            let key:String=row.get(0).map_err(|e|e.to_string())?;
+            let payload:String=row.get(1).map_err(|e|e.to_string())?;
+            if let Ok(value)=serde_json::from_str::<Value>(&payload) { saved.insert(key.trim_start_matches(&prefix).to_owned(),value); }
+        }
+        drop(rows);
+        let mut seen=std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id) {continue;}
+            if let Some(value) = saved.remove(id).filter(|v| !force && discovery_cache_current(v,now)) {
                 result.insert(id.clone(), value);
-            } else if !pending.contains(id) {
+            } else {
                 pending.push(id.clone());
             }
         }
         let pause_key = format!("subscriber-discovery-paused:{market}");
-        if !force
-            && self
+        // A changed edition can force its track list without bypassing a global
+        // unsupported-endpoint cooldown for every release in the library.
+        if self
                 .db
                 .get_preference(&pause_key)
                 .await?
@@ -558,7 +616,7 @@ impl TidalClient {
                         .query(&[
                             ("countryCode", market),
                             ("filter[id]", batch.join(",").as_str()),
-                            ("include", "genres,replacement"),
+                            ("include", "genres,replacement,providers"),
                         ])
                         .bearer_auth(token)
                         .header("Accept", "application/vnd.api+json"),
@@ -591,25 +649,29 @@ impl TidalClient {
                 }
             };
             let included = payload["included"].as_array().cloned().unwrap_or_default();
+            let mut writes=Vec::new();
             for id in batch {
                 let resource = payload["data"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .find(|r| r["id"].as_str() == Some(id));
-                let value = if let Some(resource) = resource {
-                    let attrs = &resource["attributes"];
-                    json!({"checked_at":now,"genres":related_genres(resource,&included),"replacement_id":replacement_id(resource),
-                        "label":attrs["recordLabel"].as_str().or(attrs["recordLabel"]["name"].as_str()),
-                        "official":attrs["official"],"original_release_date":attrs["originalReleaseDate"],"source":"subscriber"})
-                } else {
-                    json!({"checked_at":now,"source":"subscriber","not_returned":true})
-                };
-                self.db
-                    .set_preference(&format!("subscriber-discovery:{market}:{id}"), &value)
-                    .await?;
+                let value = resource.map(|resource|discovery_fields(resource,&included,now))
+                    .unwrap_or_else(||json!({"schema":DISCOVERY_SCHEMA,"checked_at":now,"valid_until":now+86400,"source":"subscriber","not_returned":true,"catalogue_metadata_status":{"status":"not_returned","checked_at":now,"fields":{"genres":"incomplete","label":"incomplete","providers":"incomplete","replacement":"incomplete"}}}));
+                writes.push((format!("subscriber-discovery:{market}:{id}"),value.to_string()));
                 result.insert(id.clone(), value);
             }
+            // Publish the completed network batch atomically; never hold a
+            // database write transaction across an HTTP request.
+            conn.execute("BEGIN IMMEDIATE",()).await.map_err(|e|e.to_string())?;
+            let written=async {
+                for (key,payload) in writes { conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(key,payload)).await.map_err(|e|e.to_string())?; }
+                conn.execute("COMMIT",()).await.map_err(|e|e.to_string())?;
+                Ok::<_,String>(())
+            }.await;
+            if written.is_err() {let _=conn.execute("ROLLBACK",()).await;}
+            written?;
+            self.db.bump_revision();
         }
         Ok(result)
     }
@@ -889,6 +951,9 @@ impl TidalClient {
                                     "quality",
                                     "copyright",
                                     "label",
+                                    "providers",
+                                    "catalogue_metadata_status",
+                                    "catalogue_metadata",
                                     "official",
                                     "release_group_id",
                                     "primary_type",
@@ -1018,6 +1083,10 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
         let (credits, credits_complete) = included_credits(item, included);
         tracks.push(TidalTrack {
             id: item["id"].as_str().ok_or("Missing track ID")?.into(),
+            artists: item["relationships"]["artists"]["data"].as_array().into_iter().flatten().map(|reference| {
+                let artist=included.iter().find(|artist|artist["type"] == "artists" && artist["id"] == reference["id"]);
+                json!({"id":reference["id"],"name":artist.map(|artist|artist["attributes"]["name"].clone()),"type":reference["meta"]["type"]})
+            }).collect(),
             title: format_title(a["title"].as_str().unwrap_or(""), a["version"].as_str()),
             isrc: a["isrc"].as_str().map(str::to_owned),
             track_number: m["trackNumber"]
@@ -1074,7 +1143,7 @@ pub fn related_genres(resource: &Value, included: &[Value]) -> Vec<String> {
         if let Some(name) = included
             .iter()
             .find(|v| v["type"] == "genres" && v["id"] == reference["id"])
-            .and_then(|v| v["attributes"]["name"].as_str())
+            .and_then(|v| v["attributes"]["genreName"].as_str().or(v["attributes"]["name"].as_str()))
         {
             if !name.trim().is_empty()
                 && !values
@@ -1086,6 +1155,51 @@ pub fn related_genres(resource: &Value, included: &[Value]) -> Vec<String> {
         }
     }
     values
+}
+
+pub(crate) fn discovery_cache_current(fields: &Value, now: i64) -> bool {
+    fields["schema"] == DISCOVERY_SCHEMA
+        && fields["checked_at"].as_i64().is_some_and(|at| at <= now)
+        && fields["valid_until"].as_i64().is_some_and(|until| until > now)
+}
+
+/// Retain the actual compound response and distinguish a successful empty
+/// relationship from omitted or unresolved data. Provider identities are never
+/// silently promoted to record labels.
+fn discovery_fields(resource: &Value, included: &[Value], now: i64) -> Value {
+    let attrs=&resource["attributes"];
+    let genres=related_genres(resource,included);
+    let label=attrs["recordLabel"].as_str().or(attrs["recordLabel"]["name"].as_str()).filter(|label|!label.trim().is_empty());
+    let provider_refs=resource["relationships"]["providers"]["data"].as_array();
+    let providers:Vec<_>=provider_refs.into_iter().flatten().map(|reference| {
+        let name=included.iter().find(|v|v["type"] == "providers" && v["id"] == reference["id"])
+            .and_then(|provider|provider["attributes"]["name"].as_str());
+        json!({"id":reference["id"],"name":name})
+    }).collect();
+    let genre_refs=resource["relationships"]["genres"]["data"].as_array();
+    let genre_status=match genre_refs {
+        Some(refs) if refs.is_empty()=>"not_supplied",
+        Some(refs) if refs.iter().all(|reference|included.iter().any(|v|v["type"] == "genres" && v["id"] == reference["id"] && v["attributes"]["genreName"].as_str().or(v["attributes"]["name"].as_str()).is_some_and(|name|!name.trim().is_empty())))=>"supplied",
+        _=>"incomplete",
+    };
+    let provider_status=match provider_refs {
+        Some(refs) if refs.is_empty()=>"not_supplied",
+        Some(_) if providers.iter().all(|provider|provider["name"].as_str().is_some_and(|name|!name.trim().is_empty()))=>"supplied",
+        _=>"incomplete",
+    };
+    let replacement=replacement_id(resource);
+    let replacement_status=if replacement.is_some() {"supplied"}
+        else if resource["relationships"]["replacement"].as_object().is_some_and(|fields|fields.contains_key("data")) {"not_supplied"}
+        else {"incomplete"};
+    let complete=[genre_status,provider_status,replacement_status].iter().all(|status|*status != "incomplete");
+    let references:std::collections::HashSet<_>=resource["relationships"].as_object().into_iter().flat_map(|relationships|relationships.values())
+        .flat_map(|relationship|relationship["data"].as_array().cloned().unwrap_or_else(||vec![relationship["data"].clone()]))
+        .filter_map(|reference|reference["type"].as_str().zip(reference["id"].as_str()).map(|(kind,id)|(kind.to_owned(),id.to_owned()))).collect();
+    let related:Vec<_>=included.iter().filter(|value|value["type"].as_str().zip(value["id"].as_str()).is_some_and(|(kind,id)|references.contains(&(kind.to_owned(),id.to_owned())))).cloned().collect();
+    json!({"schema":DISCOVERY_SCHEMA,"checked_at":now,"valid_until":now+if complete {DISCOVERY_MAX_AGE} else {3600},"genres":genres,"replacement_id":replacement,
+        "label":label,"providers":providers,"official":attrs["official"],"original_release_date":attrs["originalReleaseDate"],"source":"subscriber",
+        "catalogue_metadata":{"data":resource,"included":related},
+        "catalogue_metadata_status":{"status":"checked","checked_at":now,"fields":{"genres":genre_status,"label":if label.is_some() {"supplied"} else {"not_supplied"},"providers":provider_status,"replacement":replacement_status,"original_release_date":if attrs["originalReleaseDate"].as_str().is_some_and(|date|!date.is_empty()) {"supplied"} else {"not_supplied"}}}})
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -1586,12 +1700,47 @@ mod subscriber_tests {
     }
 }
 
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "Explicit bounded subscriber schema check: two three-release requests, temporary database"]
+async fn live_optional_discovery_contract() {
+    let dir=std::env::temp_dir().join(format!("tibrary-discovery-contract-{}",uuid::Uuid::new_v4()));
+    let db=TursoDb::open(dir.join("db")).await.unwrap();
+    let mut client=TidalClient::from_db(&db).await.unwrap();
+    let ids=vec!["140303440".to_owned(),"234657671".to_owned(),"447957706".to_owned()];
+    client.albums(&ids,"GB",true).await.unwrap();
+    for id in &ids {
+        let raw=db.get_preference(&format!("subscriber-summary:GB:{id}")).await.unwrap().unwrap();
+        println!("subscriber album {id}: {}",json!({"label":raw["label"],"recordLabel":raw["recordLabel"],"genres":raw["genres"],"copyright":raw["copyright"],"originalReleaseDate":raw["originalReleaseDate"]}));
+    }
+    let optional=client.discovery(&ids,"GB",true).await.unwrap();
+    assert_eq!(optional.len(),ids.len(),"Optional metadata access rejected; inspect capability instead of repeating per release");
+    for id in &ids {
+        let fields=&optional[id];
+        println!("optional album {id}: {}",json!({"genres":fields["genres"],"providers":fields["providers"],"status":fields["catalogue_metadata_status"]}));
+        assert_eq!(fields["schema"],DISCOVERY_SCHEMA);
+        assert_eq!(fields["catalogue_metadata_status"]["status"],"checked");
+        assert!(!fields["providers"].as_array().unwrap().is_empty());
+        assert!(fields["catalogue_metadata"]["data"].is_object());
+        let mut merged=json!({"id":id});merge_discovery(&mut merged,fields);
+        let parsed:TidalRelease=serde_json::from_value(merged).unwrap();
+        assert!(!parsed.providers.is_empty());
+        assert_eq!(parsed.catalogue_metadata_status["status"],"checked");
+    }
+    db.set_preference("account-disconnected",&json!(true)).await.unwrap();
+    assert_eq!(client.discovery(&ids,"GB",false).await.unwrap(),optional,"A subsequent pass must reuse checked empty genres and provider metadata without authenticating");
+    drop(client);drop(db);std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Preserve known metadata when optional fields are absent or empty upstream.
 pub fn merge_discovery(value: &mut Value, fields: &Value) {
     for field in [
         "genres",
         "replacement_id",
         "label",
+        "providers",
+        "catalogue_metadata",
+        "catalogue_metadata_status",
         "official",
         "original_release_date",
     ] {

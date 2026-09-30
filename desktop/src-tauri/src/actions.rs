@@ -180,8 +180,7 @@ pub(crate) async fn recommendation_refresh_plan(
             changed.insert(release.id.clone());
         } else if recommendation_tracks_current(prior,fingerprint) {
             cached_tracks.insert(release.id.clone());
-            if prior["recommendation_snapshot"]["optional_status"] == "complete"
-                || prior["recommendation_snapshot"]["optional_retry_after"].as_i64().is_some_and(|until|until > chrono::Utc::now().timestamp()) {
+            if recommendation_optional_current(prior,chrono::Utc::now().timestamp()) {
                 reused.insert(release.id.clone());
             }
         }
@@ -197,11 +196,19 @@ fn recommendation_tracks_current(value: &Value, fingerprint: &str) -> bool {
         && value["tracks"].as_array().is_some_and(|tracks| !tracks.is_empty() && tracks.iter().all(|track|track["credits_complete"] == true))
 }
 
+fn recommendation_optional_current(value: &Value, now: i64) -> bool {
+    let snapshot=&value["recommendation_snapshot"];
+    (snapshot["optional_status"] == "complete"
+        && snapshot["optional_schema"] == crate::tidal::DISCOVERY_SCHEMA
+        && snapshot["optional_valid_until"].as_i64().is_some_and(|until|until > now))
+        || snapshot["optional_retry_after"].as_i64().is_some_and(|until|until > now)
+}
+
 fn summary_change_requires_track_refresh(reused_tracks: bool, before: Option<&Value>, after: Option<&Value>) -> bool {
     reused_tracks && before.zip(after).is_some_and(|(before,after)|crate::tidal::summary_fingerprint(before) != crate::tidal::summary_fingerprint(after))
 }
 
-async fn record_recommendation_snapshot(db: &TursoDb, value: &mut Value, market: &str, summary: Option<&Value>, optional_complete: bool) -> Result<(), String> {
+async fn record_recommendation_snapshot(db: &TursoDb, value: &mut Value, market: &str, summary: Option<&Value>, optional_fields: Option<&Value>) -> Result<(), String> {
     if let Some(summary) = summary {
         let fresh = serde_json::to_value(crate::tidal::release_from_subscriber(&summary,"")).map_err(|error|error.to_string())?;
         // An edition/title/primary-credit change must not be overwritten by the
@@ -211,12 +218,12 @@ async fn record_recommendation_snapshot(db: &TursoDb, value: &mut Value, market:
                 value[field]=fresh[field].clone();
             }
         }
-        let retry_after = if optional_complete {Value::Null} else {
+        let retry_after = if optional_fields.is_some() {Value::Null} else {
             db.get_preference(&format!("subscriber-discovery-paused:{market}")).await?
                 .and_then(|paused|paused["until"].as_i64()).filter(|until|*until > chrono::Utc::now().timestamp())
                 .map(|until|json!(until)).unwrap_or_else(||json!(chrono::Utc::now().timestamp()+3600))
         };
-        value["recommendation_snapshot"] = json!({"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":crate::tidal::summary_fingerprint(&summary),"checked_at":chrono::Utc::now().timestamp(),"optional_status":if optional_complete {"complete"} else {"retry"},"optional_retry_after":retry_after});
+        value["recommendation_snapshot"] = json!({"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":crate::tidal::summary_fingerprint(&summary),"checked_at":chrono::Utc::now().timestamp(),"optional_status":if optional_fields.is_some() {"complete"} else {"retry"},"optional_schema":if optional_fields.is_some() {json!(crate::tidal::DISCOVERY_SCHEMA)} else {Value::Null},"optional_valid_until":optional_fields.map(|fields|fields["valid_until"].clone()),"optional_retry_after":retry_after});
     }
     Ok(())
 }
@@ -245,16 +252,25 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
         value["recommendation_snapshot"]["summary_fingerprint"].as_str().is_some_and(|prior| prior != crate::tidal::summary_fingerprint(summary))
     });
     let snapshot_current = summary.as_ref().is_some_and(|summary| recommendation_tracks_current(&value,&crate::tidal::summary_fingerprint(summary)));
-    if !force && snapshot_current
-        && (value["recommendation_snapshot"]["optional_status"] == "complete"
-            || value["recommendation_snapshot"]["optional_retry_after"].as_i64().is_some_and(|until| until > chrono::Utc::now().timestamp())) {
+    if !force && snapshot_current && recommendation_optional_current(&value,chrono::Utc::now().timestamp()) {
         return Ok(value);
     }
     let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
     let mut reuse_tracks = !force && snapshot_current;
     let mut track_fingerprint = None;
     let mut unpaired_reused = false;
-    let mut tracks = if reuse_tracks { old_tracks.clone() } else {
+    let mut tracks = if reuse_tracks {
+        let mut tracks=old_tracks.clone();
+        // Richer normalisation can expose performer IDs from an already saved
+        // raw credited list; an additive field is not a reason for another GET.
+        if tracks.iter().any(|track|track.artists.is_empty()) {
+            if let Some(raw)=crate::subscriber_metadata::cached(db,id,market).await? {
+                let saved=crate::subscriber_metadata::tracks(&raw)?;
+                crate::subscriber_metadata::supplement(&mut tracks,&saved);
+            }
+        }
+        tracks
+    } else {
         let http=crate::network::client(20)?;
         match crate::subscriber_metadata::load_with_cache_status(db,&http,id,market,cancel.clone(),force).await {
             Ok((raw,cached))=>{
@@ -305,7 +321,12 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
         },
         Err(_) => std::collections::HashMap::new(),
     };
-    if let Some(fields)=optional.get(id) { crate::tidal::merge_discovery(&mut value,fields); }
+    if let Some(fields)=optional.get(id) {
+        crate::tidal::merge_discovery(&mut value,fields);
+    } else {
+        let paused=db.get_preference(&format!("subscriber-discovery-paused:{market}")).await?.unwrap_or(Value::Null);
+        value["catalogue_metadata_status"]=json!({"status":"retry","attempted_at":chrono::Utc::now().timestamp(),"retry_after":paused["until"],"note":paused["message"].as_str().unwrap_or("Optional catalogue fields could not be checked; saved values retained."),"fields":{"genres":"incomplete","label":"incomplete","providers":"incomplete","replacement":"incomplete"}});
+    }
     let current_summary=db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
     if summary_change_requires_track_refresh(reuse_tracks,summary.as_ref(),current_summary.as_ref())
         || (unpaired_reused && current_summary.is_some())
@@ -327,7 +348,7 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
     value["track_count"] = json!(tracks.len());
     // Pin the exact summary paired with this track list. A concurrent catalogue
     // write after this point will produce a different fingerprint on the next check.
-    record_recommendation_snapshot(db,&mut value,market,current_summary.as_ref(),optional.contains_key(id)).await?;
+    record_recommendation_snapshot(db,&mut value,market,current_summary.as_ref(),optional.get(id)).await?;
     publish_release(db, id, market, value).await
 }
 
@@ -1945,12 +1966,22 @@ mod tests {
         reshaped["label"]=json!("Label"); reshaped["numberOfVolumes"]=json!(1);
         reshaped["checked_at"]=json!(chrono::Utc::now().timestamp()); reshaped["streamReady"]=json!(false);
         assert_eq!(fingerprint,crate::tidal::summary_fingerprint(&reshaped));
-        let saved=json!({"id":"10","tracks_loaded":true,"track_metadata_source":"subscriber","track_metadata_checked_at":1,"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":fingerprint,"optional_status":"complete"},"tracks":[{"id":"101","track_number":1,"disc_number":1,"credits_complete":true,"credits":[],"bpm":null,"key":null}]});
+        let saved=json!({"id":"10","tracks_loaded":true,"track_metadata_source":"subscriber","track_metadata_checked_at":1,"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":fingerprint,"optional_status":"complete","optional_schema":crate::tidal::DISCOVERY_SCHEMA,"optional_valid_until":chrono::Utc::now().timestamp()+3600},"tracks":[{"id":"101","track_number":1,"disc_number":1,"credits_complete":true,"credits":[],"bpm":null,"key":null}]});
         db.set_preference("tag-review:GB:10",&saved).await.unwrap();
         let release=crate::tidal::TidalRelease{id:"10".into(),summary_fingerprint:Some(fingerprint.clone()),..Default::default()};
         let new=crate::tidal::TidalRelease{id:"11".into(),summary_fingerprint:Some("new".into()),..Default::default()};
         let (reused,changed,_)=recommendation_refresh_plan(&db,"GB",&[release.clone(),new]).await.unwrap();
         assert_eq!(reused,HashSet::from(["10".into()])); assert!(changed.is_empty());
+        let mut legacy=saved.clone();legacy["recommendation_snapshot"]["optional_schema"]=Value::Null;
+        db.set_preference("tag-review:GB:10",&legacy).await.unwrap();
+        let (reused,_,cached_tracks)=recommendation_refresh_plan(&db,"GB",&[release.clone()]).await.unwrap();
+        assert!(reused.is_empty());assert!(cached_tracks.contains("10"),"Optional genre/provider upgrade must not refetch complete credits");
+        legacy["recommendation_snapshot"]["optional_schema"]=json!(crate::tidal::DISCOVERY_SCHEMA);
+        legacy["recommendation_snapshot"]["optional_valid_until"]=json!(1);
+        db.set_preference("tag-review:GB:10",&legacy).await.unwrap();
+        let (reused,_,cached_tracks)=recommendation_refresh_plan(&db,"GB",&[release.clone()]).await.unwrap();
+        assert!(reused.is_empty());assert!(cached_tracks.contains("10"),"Expired optional fields refresh without another credited track-list fetch");
+        db.set_preference("tag-review:GB:10",&saved).await.unwrap();
         let mut changed_summary=summary.clone(); changed_summary["numberOfTracks"]=json!(3);
         assert!(summary_change_requires_track_refresh(true,Some(&summary),Some(&changed_summary)),"Refreshing an expired summary cannot retain an old credited track list");
         assert!(!summary_change_requires_track_refresh(true,Some(&summary),Some(&reshaped)),"Equivalent endpoint shapes must not cause extra track fetches");
@@ -1978,7 +2009,7 @@ mod tests {
         db.set_preference("tag-review:GB:10",&incomplete).await.unwrap();
         db.set_preference("subscriber-summary:GB:10",&reshaped).await.unwrap();
         db.set_preference("subscriber-items:GB:10",&json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":101,"title":"Track","isrc":"ABC","trackNumber":1,"volumeNumber":1,"credits":[]}]})).await.unwrap();
-        db.set_preference("subscriber-discovery:GB:10",&json!({"checked_at":chrono::Utc::now().timestamp(),"genres":[],"replacement_id":null})).await.unwrap();
+        db.set_preference("subscriber-discovery:GB:10",&json!({"schema":crate::tidal::DISCOVERY_SCHEMA,"checked_at":chrono::Utc::now().timestamp(),"valid_until":chrono::Utc::now().timestamp()+3600,"genres":[],"replacement_id":null})).await.unwrap();
         let repaired=super::release(&db,"10","GB",false).await.unwrap();
         assert_eq!(repaired["tracks"][0]["credits_complete"],true);
         assert_eq!(repaired["recommendation_snapshot"]["optional_status"],"complete");

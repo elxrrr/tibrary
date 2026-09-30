@@ -47,7 +47,7 @@ npm --prefix desktop run tauri dev
 4. Browse **Complete library → Missing releases** and queue the music you want.
 5. Use **Update library** for missing tags, artwork and replacements.
 
-Use **Check local changes** after editing files outside the app, and **Update missing releases** to discover new music and fill gaps in online metadata. Tools share their cached results; unchanged tags and complete release details are reused. Your database does not need resetting.
+Use **Check local changes** after editing files outside the app, and **Update missing releases** to discover new music and fill gaps in online metadata. Recommendation updates first complete metadata for your downloaded, linked releases, then fill candidate gaps. Tools share their cached results; unchanged tags and checked track credits are reused. Metadata views show which fields were checked, and artist scope and recommendation confidence can be filtered separately. Your database does not need resetting.
 
 ## Screenshots
 

@@ -517,6 +517,51 @@ impl TursoDb {
         Ok(res)
     }
 
+    /// Include downloaded reference editions even when an artist's current
+    /// catalogue page no longer lists them. Only active, unchanged file links
+    /// for the requested local album artists participate.
+    pub(crate) async fn linked_reference_release_ids(
+        &self,
+        market: &str,
+        artist_ids: &[String],
+    ) -> Result<Vec<String>, String> {
+        if artist_ids.is_empty() { return Ok(Vec::new()); }
+        let conn = self.connect()?;
+        let requested = json!(artist_ids).to_string();
+        let mut mappings = conn.query(
+            "SELECT artist FROM mappings WHERE status IN ('confirmed','auto') AND tidal_id IN (SELECT value FROM json_each(?)) UNION SELECT artist FROM additional_mappings WHERE tidal_id IN (SELECT value FROM json_each(?))",
+            (requested.clone(), requested),
+        ).await.map_err(|error|error.to_string())?;
+        let mut artists = HashSet::new();
+        while let Some(row) = mappings.next().await.map_err(|error|error.to_string())? {
+            let artist: String = row.get(0).map_err(|error|error.to_string())?;
+            if !is_compilation_artist(&artist) { artists.insert(crate::matching::name_key(&artist)); }
+        }
+        drop(mappings);
+        let mut links = conn.query(
+            "SELECT l.payload,l.stamp,f.size,f.mtime,f.metadata FROM track_links l JOIN local_files f ON f.path=l.path WHERE l.market=? AND f.present=1",
+            (market,),
+        ).await.map_err(|error|error.to_string())?;
+        let mut ids = HashSet::new();
+        while let Some(row) = links.next().await.map_err(|error|error.to_string())? {
+            let stamp: String = row.get(1).unwrap_or_default();
+            if !link_stamp_matches(&stamp,row.get(2).unwrap_or_default(),row.get(3).unwrap_or_default()) { continue; }
+            let Some(metadata) = row.get::<Option<String>>(4).ok().flatten().and_then(|raw|serde_json::from_str::<Value>(&raw).ok()) else {continue;};
+            let Some(artist) = extract_album_artist(&metadata) else {continue;};
+            if !artists.contains(&crate::matching::name_key(&artist)) {continue;}
+            let Some(payload) = row.get::<Option<String>>(0).ok().flatten().and_then(|raw|serde_json::from_str::<Value>(&raw).ok()) else {continue;};
+            if payload["status"] != "linked" && !payload["status"].is_null() {continue;}
+            for source in std::iter::once(&payload["ids"]).chain(payload["placements"].as_array().into_iter().flatten()) {
+                if let Some(id) = source["album_id"].as_str().filter(|id|!id.is_empty() && id.chars().all(|c|c.is_ascii_digit())) {
+                    ids.insert(id.to_owned());
+                }
+            }
+        }
+        let mut result: Vec<_> = ids.into_iter().collect();
+        result.sort();
+        Ok(result)
+    }
+
     pub async fn apply_file_update(
         &self,
         source: &str,
@@ -1414,6 +1459,138 @@ impl TursoDb {
         }
     }
 
+    /// Reference metadata is limited to releases which contain a currently
+    /// linked local recording. Candidate catalogues never bootstrap their own
+    /// recommendation evidence. Bulk reads avoid one cache lookup per file.
+    async fn recommendation_anchor_releases(
+        &self,
+        market: &str,
+        ids: &HashSet<String>,
+    ) -> Result<HashMap<String, Value>, String> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.connect()?;
+        let keys: Vec<_> = ids.iter().flat_map(|id|[format!("tag-review:{market}:{id}"),format!("subscriber-summary:{market}:{id}"),format!("subscriber-items:{market}:{id}")]).collect();
+        let mut canonical = HashMap::new();
+        let mut summaries = HashMap::new();
+        let mut items = HashMap::new();
+        for (key, value) in preference_snapshots_for_keys(&conn,keys).await? {
+            let id = key.rsplit(':').next().unwrap_or_default().to_owned();
+            if key.starts_with("tag-review:") {
+                canonical.insert(id, value);
+            } else if key.starts_with("subscriber-summary:") {
+                summaries.insert(id, value);
+            } else {
+                items.insert(id, value);
+            }
+        }
+        // A raw list and an album summary are separate responses. A newer
+        // timestamp alone cannot prove that their credits describe the same
+        // edition. Keep the published canonical snapshot when pairing fails.
+        items.retain(|id, raw| recommendation_subscriber_snapshot_current(raw, summaries.get(id), canonical.get(id)));
+
+        // Authoritative track snapshots do not need a second catalogue scan.
+        // An absent optional label/genre is not a reason to trust an older
+        // artist-page copy over the canonical cache.
+        let fallback_ids: HashSet<_> = ids.iter().filter(|id| {
+            let canonical_tracks = canonical.get(*id).is_some_and(|value|value["tracks"].as_array().is_some_and(|tracks|!tracks.is_empty()));
+            let subscriber_tracks = items.get(*id).is_some_and(|value|value["schema"] == 2
+                && value["items"].as_array().is_some_and(|tracks|!tracks.is_empty()
+                    && tracks.iter().all(|track|track["trackNumber"].as_u64().is_some_and(|n|n > 0) && track["volumeNumber"].as_u64().is_some_and(|n|n > 0))));
+            !canonical_tracks && !subscriber_tracks
+        }).cloned().collect();
+        let mut fallback = HashMap::<String, Value>::new();
+        if !fallback_ids.is_empty() {
+            // Turso currently expands IN(json_each(...)) repeatedly against a
+            // large release index. A sequential indexed market read plus Rust
+            // HashSet membership is bounded and avoids that Cartesian work.
+            let mut indexed = conn.query("SELECT artist_id,release_id FROM catalogue_release_index WHERE market=?", (market,))
+                .await.map_err(|error| error.to_string())?;
+            let mut indexed_artists = HashSet::new();
+            let mut selected_artists = HashSet::new();
+            while let Some(row) = indexed.next().await.map_err(|error| error.to_string())? {
+                let artist: String = row.get(0).map_err(|error| error.to_string())?;
+                let release: String = row.get(1).map_err(|error| error.to_string())?;
+                if fallback_ids.contains(&release) {selected_artists.insert(artist.clone());}
+                indexed_artists.insert(artist);
+            }
+            drop(indexed);
+            let mut fallback_rows = conn.query("SELECT artist_id,payload FROM catalogue WHERE market=?", (market,))
+                .await.map_err(|error| error.to_string())?;
+            while let Some(row) = fallback_rows.next().await.map_err(|error| error.to_string())? {
+                let artist: String = row.get(0).map_err(|error| error.to_string())?;
+                if !selected_artists.contains(&artist) && indexed_artists.contains(&artist) {continue;}
+                let raw: String = row.get(1).map_err(|error| error.to_string())?;
+                let Ok(payload) = serde_json::from_str::<Value>(&raw) else { continue; };
+                for value in payload["releases"].as_array().into_iter().flatten() {
+                    let id = crate::tidal::resource_id(&value["id"]);
+                    if !fallback_ids.contains(&id) {continue;}
+                    match fallback.entry(id) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {entry.insert(value.clone());}
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            if recommendation_metadata_time(value) > recommendation_metadata_time(entry.get()) {
+                                entry.insert(value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            drop(fallback_rows);
+        }
+
+        let mut result = HashMap::new();
+        for id in ids {
+            let mut value = match (canonical.remove(id), fallback.remove(id)) {
+                (Some(canonical), Some(fallback)) => recommendation_candidate_overlay(&fallback, canonical),
+                (Some(value), None) | (None, Some(value)) => value,
+                (None, None) => json!({"id":id}),
+            };
+            if let Some(summary) = summaries.remove(id) {
+                // A newer album summary owns release-level fields. Preserve
+                // credited track data independently from the summary timestamp.
+                if recommendation_metadata_time(&summary) >= recommendation_metadata_time(&value) {
+                    let normalized = serde_json::to_value(crate::tidal::release_from_subscriber(&summary, "")).map_err(|error| error.to_string())?;
+                    for field in ["artist", "title", "date", "label", "copyright", "genres", "upc", "original_release_date"] {
+                        if recommendation_field_populated(&normalized[field]) {
+                            value[field] = normalized[field].clone();
+                        }
+                    }
+                }
+            }
+            if let Some(raw) = items.remove(id) {
+                if let Ok(tracks) = crate::subscriber_metadata::tracks(&raw) {
+                    let incoming = serde_json::to_value(tracks).map_err(|error| error.to_string())?;
+                    let old_tracks_at = value["track_metadata_checked_at"].as_i64()
+                        .or_else(|| value["tracks"].as_array().into_iter().flatten().filter_map(|track|track["credits_checked_at"].as_i64()).max()).unwrap_or(0);
+                    if raw["checked_at"].as_i64().unwrap_or(0) > old_tracks_at
+                        || !value["tracks"].as_array().is_some_and(|tracks| !tracks.is_empty()) {
+                        value["tracks"] = incoming;
+                        value["tracks_loaded"] = json!(true);
+                    }
+                }
+            }
+            result.insert(id.clone(), value);
+        }
+        Ok(result)
+    }
+
+    async fn recommendation_candidate_snapshots(
+        &self,
+        market: &str,
+        releases: &[Value],
+    ) -> Result<HashMap<String, Value>, String> {
+        let keys: Vec<_> = releases.iter().map(|release|crate::tidal::resource_id(&release["id"]))
+            .filter(|id|!id.is_empty()).map(|id|format!("tag-review:{market}:{id}")).collect();
+        if keys.is_empty() {return Ok(HashMap::new());}
+        let conn = self.connect()?;
+        let mut saved = HashMap::new();
+        for (key, value) in preference_snapshots_for_keys(&conn,keys).await? {
+            saved.insert(key.rsplit(':').next().unwrap_or_default().to_owned(), value);
+        }
+        Ok(saved)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn build_missing_rows(&self, market: &str) -> Result<Vec<MissingRow>, String> {
         let conn = self.connect()?;
@@ -1433,11 +1610,8 @@ impl TursoDb {
         }
         let mut local_by_folder: HashMap<(String, String, String), LocalEdition> = HashMap::new();
         let mut local_dates: HashMap<String, Vec<String>> = HashMap::new();
-        let mut local_isrcs: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut local_labels: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut local_genres: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut local_rights: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut local_contributors: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut references: HashMap<String, crate::recommendations::ArtistReferenceProfile> = HashMap::new();
+        let mut local_recordings = HashMap::new();
         let mut local_files = conn
             .query(
                 "SELECT path, metadata FROM local_files WHERE present = 1 AND metadata IS NOT NULL",
@@ -1467,31 +1641,9 @@ impl TursoDb {
             }
             let date = extract_tag_str(&meta, &["date", "release_date", "releasedate", "year"])
                 .unwrap_or_default();
-            if let Some(isrc) = extract_tag_str(&meta, &["isrc"]) {
-                local_isrcs
-                    .entry(artist_key.clone())
-                    .or_default()
-                    .insert(isrc.trim().to_uppercase());
-            }
-            if let Some(genres) = extract_tag_str(&meta, &["genre"]) {
-                local_genres.entry(artist_key.clone()).or_default().extend(genres.split(';').map(crate::matching::name_key).filter(|s| !s.is_empty()));
-            }
-            if let Some(label) = extract_tag_str(&meta, &["label", "record_label", "recordlabel"]) {
-                local_labels
-                    .entry(artist_key.clone())
-                    .or_default()
-                    .insert(crate::matching::name_key(&label));
-            }
-            if let Some(rights) = extract_tag_str(&meta, &["copyright"]) {
-                local_rights
-                    .entry(artist_key.clone())
-                    .or_default()
-                    .insert(crate::matching::name_key(&rights));
-            }
-            local_contributors
-                .entry(artist_key.clone())
-                .or_default()
-                .extend(crate::recommendations::local_credit_names(&meta));
+            let recording_key = recommendation_recording_key(&meta, &path, &artist_key);
+            references.entry(artist_key.clone()).or_default().add_local_recording(&recording_key, &meta);
+            local_recordings.insert(path.clone(), (artist_key.clone(), recording_key, album.clone(), date.clone()));
             let folder = crate::duplicates::extract_release_folder(&path);
             let edition = local_by_folder
                 .entry((artist_key, title_key, folder))
@@ -1564,51 +1716,92 @@ impl TursoDb {
         // 2. Load linked album IDs from track_links
         let mut links_stmt = conn
             .query(
-                "SELECT l.payload,f.metadata,l.stamp,f.size,f.mtime,f.present FROM track_links l LEFT JOIN local_files f ON f.path=l.path WHERE l.market=?",
+                "SELECT l.payload,l.stamp,f.size,f.mtime,f.present,l.path FROM track_links l LEFT JOIN local_files f ON f.path=l.path WHERE l.market=?",
                 (market,),
             )
             .await
             .map_err(|e| e.to_string())?;
-        let mut linked_credit_tracks: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut linked_reference_tracks: HashMap<String, HashMap<String, HashSet<(String,String,String,String)>>> = HashMap::new();
         let mut linked_album_tracks: HashMap<String, HashSet<String>> = HashMap::new();
         while let Some(row) = links_stmt.next().await.map_err(|e| e.to_string())? {
             if let Ok(Some(payload_str)) = row.get::<Option<String>>(0) {
                 if let Ok(payload) = serde_json::from_str::<Value>(&payload_str) {
-                    let metadata: String = row.get(1).unwrap_or_default();
-                    let stamp: String = row.get(2).unwrap_or_default();
-                    let size: i64 = row.get(3).unwrap_or_default();
-                    let mtime: i64 = row.get(4).unwrap_or_default();
-                    let current = row.get::<i64>(5).unwrap_or(0) == 1
+                    let stamp: String = row.get(1).unwrap_or_default();
+                    let size: i64 = row.get(2).unwrap_or_default();
+                    let mtime: i64 = row.get(3).unwrap_or_default();
+                    let current = row.get::<i64>(4).unwrap_or(0) == 1
                         && link_stamp_matches(&stamp, size, mtime);
                     if current && (payload["status"] == "linked" || payload["status"].is_null()) {
-                        if let Some(artist) = serde_json::from_str::<Value>(&metadata)
-                            .ok()
-                            .and_then(|m| extract_album_artist(&m))
-                        {
-                            let key = crate::matching::name_key(&artist);
-                            let mut sources = vec![&payload["ids"]];
-                            sources.extend(payload["placements"].as_array().into_iter().flatten());
-                            for source in sources {
-                                if let Some(id) = source["track_id"].as_str() {
-                                    linked_credit_tracks
-                                        .entry(id.to_owned())
-                                        .or_default()
-                                        .insert(key.clone());
-                                }
-                            }
-                        }
-                    }
-
-                    if current && (payload["status"] == "linked" || payload["status"].is_null()) {
+                        let path: String = row.get(5).unwrap_or_default();
                         for source in std::iter::once(&payload["ids"]).chain(payload["placements"].as_array().into_iter().flatten()) {
                             if let (Some(album),Some(track)) = (source["album_id"].as_str(),source["track_id"].as_str()) {
                                 linked_album_tracks.entry(album.to_owned()).or_default().insert(track.to_owned());
+                                if let Some(reference) = local_recordings.get(&path) {
+                                    linked_reference_tracks.entry(album.to_owned()).or_default()
+                                        .entry(track.to_owned()).or_default().insert(reference.clone());
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        drop(links_stmt);
+        let mut mapping_rows = conn.query(
+            "SELECT artist,tidal_id FROM mappings WHERE status IN ('confirmed','auto') UNION SELECT artist,tidal_id FROM additional_mappings",
+            (),
+        ).await.map_err(|error|error.to_string())?;
+        let mut artist_reference_ids: HashMap<String,HashSet<String>> = HashMap::new();
+        while let Some(row) = mapping_rows.next().await.map_err(|error|error.to_string())? {
+            let artist: String = row.get(0).unwrap_or_default();
+            let id: String = row.get(1).unwrap_or_default();
+            if !id.trim().is_empty() && !is_compilation_artist(&artist) {
+                artist_reference_ids.entry(crate::matching::name_key(&artist)).or_default().insert(id);
+            }
+        }
+        drop(mapping_rows);
+
+        // Finish every downloaded reference profile before scoring any
+        // candidate. Catalogue ordering and alternate artist pages cannot
+        // change the evidence available to an earlier candidate.
+        let reference_ids: HashSet<_> = linked_reference_tracks.keys().cloned().collect();
+        let anchor_releases = self.recommendation_anchor_releases(market, &reference_ids).await?;
+        let mut canonical_recordings = HashMap::<(String,String), String>::new();
+        for (album_id, tracks) in &linked_reference_tracks {
+            let Some(release) = anchor_releases.get(album_id) else {continue;};
+            for track in release["tracks"].as_array().into_iter().flatten() {
+                let id = crate::tidal::resource_id(&track["id"]);
+                let Some(anchors) = tracks.get(&id) else {continue;};
+                let Some(isrc) = track["isrc"].as_str() else {continue;};
+                let cleaned: String = isrc.chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_uppercase).collect();
+                if cleaned.is_empty() {continue;}
+                let canonical = format!("isrc:{cleaned}");
+                for (artist, recording, _, _) in anchors {
+                    canonical_recordings.entry((artist.clone(),recording.clone()))
+                        .and_modify(|key|{if canonical < *key {*key = canonical.clone();}}).or_insert_with(||canonical.clone());
+                }
+            }
+        }
+        for ((artist, recording), canonical) in &canonical_recordings {
+            references.entry(artist.clone()).or_default().canonicalize_recording(recording, canonical);
+        }
+        for (album_id, tracks) in &linked_reference_tracks {
+            let Some(release) = anchor_releases.get(album_id) else {continue;};
+            let remote_tracks: HashMap<_,_> = release["tracks"].as_array().into_iter().flatten()
+                .map(|track|(crate::tidal::resource_id(&track["id"]),track)).collect();
+            for (track_id, anchors) in tracks {
+                let unavailable = json!({"id":track_id});
+                let track = remote_tracks.get(track_id).copied().unwrap_or(&unavailable);
+                for (artist, recording, album, date) in anchors {
+                    // Multiple online placements of one downloaded edition do
+                    // not become multiple independent label/rights references.
+                    let reference_release = json!({"album":album,"date":date,"label":release["label"],"copyright":release["copyright"],"genres":release["genres"],"artist_ids":artist_reference_ids.get(artist)});
+                    let recording = canonical_recordings.get(&(artist.clone(),recording.clone())).unwrap_or(recording);
+                    references.entry(artist.clone()).or_default().add_verified_recording(recording, track, &reference_release);
+                }
+            }
+        }
+        let corpus = crate::recommendations::ReferenceCorpus::from_profiles(&references);
 
         let album_credit_cache = crate::release_artists::cached(self, market).await?;
         let album_names = crate::release_artists::album_names(self, market).await?;
@@ -1693,29 +1886,11 @@ impl TursoDb {
                 Some(r) => r,
                 None => continue,
             };
-
-            // Use remote credits only when anchored to a currently verified local
-            // recording. Catalogue membership or a recommendation is never an anchor.
-            for track in releases
-                .iter()
-                .flat_map(|release| release["tracks"].as_array().into_iter().flatten())
-            {
-                if let Some(artists) = track["id"]
-                    .as_str()
-                    .and_then(|id| linked_credit_tracks.get(id))
-                {
-                    let names = crate::recommendations::credit_names(&track["credits"]);
-                    for artist in artists {
-                        local_genres.entry(artist.clone()).or_default().extend(track["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(crate::matching::name_key));
-                        local_contributors
-                            .entry(artist.clone())
-                            .or_default()
-                            .extend(names.iter().filter(|name| *name != artist).cloned());
-                    }
-                }
-            }
-
-            for rel in releases {
+            let mut candidate_snapshots = self.recommendation_candidate_snapshots(market, releases).await?;
+            for listed in releases {
+                let listed_id = crate::tidal::resource_id(&listed["id"]);
+                let enriched = candidate_snapshots.remove(&listed_id).map(|cached|recommendation_candidate_overlay(listed, cached));
+                let rel = enriched.as_ref().unwrap_or(listed);
                 let id = rel
                     .get("id")
                     .map(|v| v.to_string().trim_matches('"').to_string())
@@ -1906,63 +2081,26 @@ impl TursoDb {
                     })
                     || title.to_lowercase().contains("bootleg");
                 let is_unofficial = is_bootleg && !recommend_bootlegs;
-                let is_official = rel
-                    .get("official")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                let is_official = rel.get("official").and_then(Value::as_bool) == Some(true);
                 let saved_lead = album_credit_cache.get(&id).and_then(|v|v["ids"].as_array()).and_then(|a|a.first()).and_then(Value::as_str);
-                let primary = saved_lead.map(|lead|lead == artist_id).unwrap_or_else(||rel["primary_artist_verified"].as_bool().unwrap_or(false));
-                let conflict = saved_lead.map(|lead|lead != artist_id).unwrap_or_else(|| rel["artist_credits"].as_array().and_then(|a|a.first()).and_then(Value::as_str).is_some_and(|name|crate::matching::name_key(name) != crate::matching::name_key(&artist_name)));
-                let label = rel
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .map(crate::matching::name_key)
+                let expected_ids = artist_reference_ids.get(&artist_key);
+                let primary = saved_lead.map(|lead|expected_ids.map(|ids|ids.contains(lead)).unwrap_or(lead == artist_id))
+                    .unwrap_or_else(||rel["primary_artist_verified"].as_bool().unwrap_or(false));
+                let conflict = saved_lead.map(|lead|expected_ids.map(|ids|!ids.contains(lead)).unwrap_or(lead != artist_id))
+                    .unwrap_or_else(|| rel["artist_credits"].as_array().and_then(|a|a.first()).and_then(Value::as_str).is_some_and(|name|crate::matching::name_key(name) != crate::matching::name_key(&artist_name)));
+                let evidence = references.get(&artist_key)
+                    .map(|reference|reference.evidence(rel, rel["tracks"].as_array(), &corpus))
                     .unwrap_or_default();
-                let rights = rel
-                    .get("copyright")
-                    .and_then(Value::as_str)
-                    .or_else(|| rel["copyright"]["text"].as_str())
-                    .map(crate::matching::name_key)
-                    .unwrap_or_default();
-                let label_match = !label.is_empty()
-                    && local_labels
-                        .get(&artist_key)
-                        .is_some_and(|values| values.contains(&label));
-                let rights_match = !rights.is_empty()
-                    && local_rights
-                        .get(&artist_key)
-                        .is_some_and(|values| values.contains(&rights));
-                let recordings = children
-                    .iter()
-                    .filter(|track| {
-                        !track.isrc.is_empty()
-                            && local_isrcs
-                                .get(&artist_key)
-                                .is_some_and(|values| values.contains(&track.isrc.to_uppercase()))
-                    })
-                    .count();
-                let (contributor_tracks, contributors) =
-                    crate::recommendations::shared_contributor_evidence(
-                        local_contributors.get(&artist_key),
-                        rel["tracks"].as_array(),
-                    );
-                let (_score, mut badge, mut reasons) = crate::recommendations::recommendation_score(
+                let (_score, mut badge, mut reasons) = crate::recommendations::recommendation_score_with_evidence(
                     primary,
                     conflict,
                     true,
-                    label_match,
-                    label_match,
-                    rights_match,
-                    recordings,
-                    contributor_tracks,
-                    contributors,
+                    &evidence,
                     is_compilation && !recommend_compilations,
                     is_unofficial,
                     is_official,
                 );
-                let shared_genres: Vec<_> = rel["genres"].as_array().into_iter().flatten().filter_map(Value::as_str)
-                    .filter(|g| local_genres.get(&artist_key).is_some_and(|set| set.contains(&crate::matching::name_key(g)))).collect();
-                if !shared_genres.is_empty() { reasons.push(format!("Shared genres: {} (supporting context, not identity proof)",shared_genres.join(", "))); }
+                reasons.extend(recommendation_metadata_evidence(rel));
                 if let Some(replacement) = rel["replacement_id"].as_str() {
                     reasons.push(format!("Provider replacement release: {replacement}; inspect its recordings before changing links"));
                 }
@@ -2189,6 +2327,26 @@ impl TursoDb {
         offset: usize,
         limit: usize,
     ) -> Result<TablePage<MissingRow>, String> {
+        self.get_missing_rows_scoped(market, timeline, recommendation, None, status_filter, type_filter, search, sort, direction, offset, limit).await
+    }
+
+    /// Album-artist scope and recommendation strength are independent. A user
+    /// can inspect just their album artists AND strong recommendations without
+    /// either filter silently replacing the other.
+    pub async fn get_missing_rows_scoped(
+        &self,
+        market: &str,
+        timeline: Option<&str>,
+        recommendation: Option<&str>,
+        artist_scope: Option<&str>,
+        status_filter: Option<&str>,
+        type_filter: Option<&str>,
+        search: Option<&str>,
+        sort: Option<&str>,
+        direction: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<TablePage<MissingRow>, String> {
         let build_guard = self.missing_rows_gate.lock().await;
         let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
         let key = format!("{market}:{}", chrono::Utc::now().format("%Y-%m-%d"));
@@ -2240,12 +2398,14 @@ impl TursoDb {
             }
         }
 
-        if !inspecting_unavailable && recommendation.is_some_and(|v| ["My album artists", "Other artist appearances", "Artist credits not checked"].contains(&v)) {
+        let is_scope = |value: &str| ["My album artists", "Other artist appearances", "Artist credits not checked"].contains(&value);
+        let scope = artist_scope.filter(|value|is_scope(value)).or_else(||recommendation.filter(|value|is_scope(value)));
+        if !inspecting_unavailable && scope.is_some() {
             let credits = crate::release_artists::cached(self, market).await?;
             let linked = self.get_linked_artist_ids().await?.into_iter().collect();
-            rows.retain(|r| crate::release_artists::classify(credits.get(&r.id), &linked) == recommendation.unwrap());
+            rows.retain(|r| crate::release_artists::classify(credits.get(&r.id), &linked) == scope.unwrap());
         }
-        if let Some(rf) = recommendation.filter(|v| !inspecting_unavailable && !["My album artists", "Other artist appearances", "Artist credits not checked"].contains(v)) {
+        if let Some(rf) = recommendation.filter(|v| !inspecting_unavailable && !is_scope(v)) {
             let rf_clean = rf.trim();
             if rf_clean != "All recommendations" && rf_clean != "all" && !rf_clean.is_empty() {
                 rows.retain(|r| {
@@ -3890,6 +4050,171 @@ fn extract_tag_str(val: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// Bound key batches use primary-key seeks. A large IN(json_each(...)) can
+/// turn into repeated virtual-table expansion in the embedded database.
+async fn preference_snapshots_for_keys(conn: &Connection, mut keys: Vec<String>) -> Result<Vec<(String,Value)>,String> {
+    keys.sort();
+    keys.dedup();
+    let mut snapshots = Vec::new();
+    for chunk in keys.chunks(256) {
+        let placeholders = vec!["?";chunk.len()].join(",");
+        let mut rows = conn.query(format!("SELECT key,payload FROM app_preferences WHERE key IN ({placeholders})"),chunk.to_vec())
+            .await.map_err(|error|error.to_string())?;
+        while let Some(row) = rows.next().await.map_err(|error|error.to_string())? {
+            let key: String = row.get(0).map_err(|error|error.to_string())?;
+            let raw: String = row.get(1).map_err(|error|error.to_string())?;
+            if let Ok(value) = serde_json::from_str::<Value>(&raw) {snapshots.push((key,value));}
+        }
+    }
+    Ok(snapshots)
+}
+
+fn recommendation_candidate_overlay(listed: &Value, mut cached: Value) -> Value {
+    if !cached.is_object() {return listed.clone();}
+    let paired = cached["recommendation_snapshot"]["summary_fingerprint"].as_str()
+        .or_else(||cached["summary_fingerprint"].as_str());
+    let current = listed["summary_fingerprint"].as_str();
+    let same_summary = match (paired, current) {
+        (Some(prior), Some(current)) => prior == current,
+        // Unpaired legacy details can fill a thin listing for that exact ID.
+        // Existing, structurally different track lists must not be replaced.
+        (None, _) => listed["tracks_loaded"] != true
+            || recommendation_release_identity_matches(listed, &cached),
+        (Some(_), None) => listed["tracks_loaded"] != true
+            && recommendation_release_identity_matches(listed, &cached),
+    };
+    if !same_summary {
+        // Credits and release-level metadata share edition provenance. Keep
+        // the candidate visible, using its current listing, without carrying
+        // an older edition's label, rights or completion claims into scoring.
+        let mut current = listed.clone();
+        current["recommendation_track_snapshot_conflict"] = json!(true);
+        return current;
+    }
+    let use_cached_tracks = same_summary && cached["tracks_loaded"] == true
+        && cached["tracks"].as_array().is_some_and(|tracks|!tracks.is_empty());
+    let newer_listing = recommendation_metadata_time(listed) > recommendation_metadata_time(&cached);
+    for (field, value) in listed.as_object().into_iter().flatten() {
+        let metadata_field = matches!(field.as_str(), "label" | "copyright" | "genres" | "upc" | "original_release_date"
+            | "tag_checked_at" | "track_metadata_checked_at" | "track_metadata_source" | "discovery_checked_at"
+            | "subscriber_discovery_checked_at" | "recommendation_snapshot" | "providers" | "catalogue_metadata_status");
+        let track_field = matches!(field.as_str(), "tracks" | "tracks_loaded" | "track_count");
+        let checked_absent = cached["catalogue_metadata_status"]["fields"][field].as_str() == Some("not_supplied");
+        if (!metadata_field && !track_field) || (track_field && !use_cached_tracks)
+            || (metadata_field && newer_listing && recommendation_field_populated(value))
+            || (metadata_field && !recommendation_field_populated(&cached[field]) && recommendation_field_populated(value) && !checked_absent)
+            || !cached.as_object().is_some_and(|object|object.contains_key(field)) {
+            cached[field] = value.clone();
+        }
+    }
+    cached
+}
+
+fn recommendation_subscriber_snapshot_current(raw: &Value, summary: Option<&Value>, canonical: Option<&Value>) -> bool {
+    if raw["schema"] != 2 || !raw["items"].as_array().is_some_and(|tracks|!tracks.is_empty()
+        && tracks.iter().all(|track|track["credits"].is_array()))
+        || crate::subscriber_metadata::tracks(raw).is_err() {
+        return false;
+    }
+    let canonical_fingerprint = canonical.and_then(|value|value["recommendation_snapshot"]["summary_fingerprint"].as_str()
+        .or_else(||value["summary_fingerprint"].as_str()));
+    if let Some(pinned) = raw["summary_fingerprint"].as_str() {
+        return summary.map(|summary|crate::tidal::summary_fingerprint(summary) == pinned)
+            .unwrap_or_else(||canonical_fingerprint.is_none_or(|current|current == pinned));
+    }
+    let checked = raw["checked_at"].as_i64().unwrap_or(0);
+    if let Some(summary) = summary {
+        let current = crate::tidal::summary_fingerprint(summary);
+        if canonical_fingerprint.is_some_and(|old|old != current) {return false;}
+        let paired = canonical.filter(|_|canonical_fingerprint == Some(current.as_str()))
+            .and_then(|value|value["tracks"].as_array())
+            .is_some_and(|saved| {
+                let raw_tracks = raw["items"].as_array().unwrap();
+                saved.len() == raw_tracks.len() && raw_tracks.iter().all(|track|saved.iter().any(|prior|
+                    crate::tidal::resource_id(&prior["id"]) == crate::tidal::resource_id(&track["id"])
+                    && prior["track_number"] == track["trackNumber"] && prior["disc_number"] == track["volumeNumber"]))
+            });
+        if paired || (raw["fingerprint_status"].is_null()
+            && summary["checked_at"].as_i64().is_some_and(|at|at > 0 && at < checked)) {
+            return true;
+        }
+        return false;
+    }
+    // Legacy unpaired data has a bounded lifetime; a deliberately unbound
+    // response cannot replace a verified canonical recording list.
+    raw["fingerprint_status"] != "unbound"
+        && (0..30 * 86400).contains(&(chrono::Utc::now().timestamp()-checked))
+}
+
+fn recommendation_release_identity_matches(left: &Value, right: &Value) -> bool {
+    let title = |value: &Value|crate::matching::name_key(value["title"].as_str().unwrap_or_default());
+    let count = |value: &Value|value["track_count"].as_u64().unwrap_or(0);
+    title(left) == title(right) && (count(left) == 0 || count(right) == 0 || count(left) == count(right))
+}
+
+fn recommendation_recording_key(metadata: &Value, path: &str, artist: &str) -> String {
+    if let Some(isrc) = extract_tag_str(metadata, &["isrc"]) {
+        let isrc: String = isrc.chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_uppercase).collect();
+        if !isrc.is_empty() {return format!("isrc:{isrc}");}
+    }
+    if let Some(title) = extract_tag_str(metadata, &["title"]) {
+        let duration = extract_tag_f64(metadata, &["duration"]).unwrap_or(0.0);
+        // Copies and alternate release placements of one audio recording are
+        // one reference, rather than independent corroboration of a person.
+        return format!("artist:{artist}:title:{}:duration:{:.0}", crate::matching::name_key(&title), duration);
+    }
+    format!("path:{path}")
+}
+
+fn recommendation_metadata_time(value: &Value) -> i64 {
+    ["tag_checked_at", "checked_at", "track_metadata_checked_at", "discovery_checked_at"]
+        .iter().filter_map(|field|value[field].as_i64().or_else(||value[field].as_f64().map(|time|time as i64)))
+        .chain(value["recommendation_snapshot"]["checked_at"].as_i64()).max().unwrap_or(0)
+}
+
+fn recommendation_field_populated(value: &Value) -> bool {
+    !value.is_null() && !value.as_str().is_some_and(|value|value.trim().is_empty())
+        && !value.as_array().is_some_and(Vec::is_empty)
+}
+
+fn recommendation_metadata_evidence(release: &Value) -> Vec<String> {
+    let tracks = release["tracks"].as_array();
+    let loaded = release["tracks_loaded"] == true && tracks.is_some_and(|tracks|!tracks.is_empty());
+    let (checked, total) = tracks.map(|tracks|(
+        tracks.iter().filter(|track|track["credits_complete"] == true || track["credits_checked_at"].as_i64().is_some_and(|at|at > 0)).count(), tracks.len()
+    )).unwrap_or_default();
+    let mut evidence = Vec::new();
+    if release["recommendation_track_snapshot_conflict"] == true {
+        evidence.push("Metadata: saved track credits describe an older release summary; refresh this edition to compare current credits".into());
+    }
+    if !loaded {
+        evidence.push("Metadata: release summary only; full track credits have not been cached yet".into());
+    } else if checked < total {
+        evidence.push(format!("Metadata: full credits checked for {checked}/{total} tracks; recommendation evidence is incomplete"));
+    } else {
+        let nonempty = tracks.unwrap().iter().filter(|track|track["credits"].as_array().is_some_and(|credits|!credits.is_empty())).count();
+        evidence.push(format!("Metadata: credits checked for all {total} tracks; {} supplied contributor credits", nonempty));
+    }
+    let optional_checked = release["subscriber_discovery_checked_at"].as_i64().is_some_and(|at|at > 0)
+        || release["recommendation_snapshot"]["optional_status"] == "complete";
+    for (field, name) in [("label", "Label"), ("genres", "Genres")] {
+        if !recommendation_field_populated(&release[field]) {
+            let state = release["catalogue_metadata_status"]["fields"][field].as_str();
+            let explanation = match state {
+                Some("not_supplied") => "checked; not supplied by the online source",
+                Some("incomplete") => "metadata request incomplete; refresh will retry this missing field",
+                _ if optional_checked => "checked; not supplied by the online source",
+                _ => "not cached; missing metadata can be fetched during refresh",
+            };
+            evidence.push(format!("{name}: {explanation}"));
+        }
+    }
+    if release["providers"].as_array().is_some_and(|providers|!providers.is_empty()) {
+        evidence.push("Distribution provider is cached separately; it is not treated as a record label or proof of artist identity".into());
+    }
+    evidence
+}
+
 fn extract_album_artist(val: &Value) -> Option<String> {
     // Search both metadata locations for the grouping tag before considering performer credits.
     extract_tag_str(val, &["album_artist", "albumartist"])
@@ -4004,6 +4329,151 @@ fn is_compilation_artist(artist: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn downloaded_reference_profiles_use_canonical_cache_before_scoring_and_keep_scope_independent() {
+        let folder = std::env::temp_dir().join(format!("tibrary-reference-profiles-{}", uuid::Uuid::new_v4()));
+        let store = super::TursoDb::open(&folder.join("db")).await.unwrap();
+        let conn = store.connect().unwrap();
+        let credits = serde_json::json!([{"name":"Writer One","role":"Composer","contributor_id":"1"},{"name":"Producer Two","role":"Producer","contributor_id":"2"}]);
+        for (id, album, date, path, recording) in [
+            ("100","First","2020-01-01","/music/first.flac","1001"),
+            ("200","Second","2021-01-01","/music/second.flac","2001"),
+        ] {
+            let metadata = serde_json::json!({"albumartist":"Example","album":album,"title":format!("Song {id}"),"date":date});
+            conn.execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES(?,'/music',10,20,?,1)", (path,metadata.to_string())).await.unwrap();
+            let link = serde_json::json!({"status":"linked","ids":{"track_id":recording,"album_id":id},"placements":[{"track_id":recording,"album_id":id}]});
+            conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES(?,'GB','[0,0,10,20]',?)", (path,link.to_string())).await.unwrap();
+        }
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Example','a','confirmed')", ()).await.unwrap();
+        conn.execute("INSERT INTO additional_mappings(artist,tidal_id) VALUES('Example','z')", ()).await.unwrap();
+        // The first downloaded edition exists only in the shared canonical
+        // cache. It need not remain on any current artist catalogue page.
+        store.set_preference("tag-review:GB:100", &serde_json::json!({
+            "id":"100","title":"First","date":"2020-01-01","label":"Example Records",
+            "copyright":"℗ 2020 Example Music Ltd.","genres":["Electronic"],
+            "tracks_loaded":true,"track_count":1,"tracks":[{"id":"1001","isrc":"REF100","credits":credits,"credits_complete":true,"artists":[{"id":"unconfirmed-guest","name":"Foreign performer","type":"MAIN"}]}],"tag_checked_at":10,
+        })).await.unwrap();
+        let anchor = serde_json::json!({"id":"200","title":"Second","artist":"Example","date":"2021-01-01","label":"Example Records","copyright":"© 2021 Example Music Ltd.","genres":["Electronic"],"tracks_loaded":true,"track_count":1,"tracks":[{"id":"2001","isrc":"REF200","credits":credits,"credits_complete":true}]});
+        let candidate = serde_json::json!({"id":"300","title":"New","artist":"Example","date":"2024-01-01","primary_artist_verified":true,"available":true,"tracks_loaded":false,"track_count":3,"tracks":[],"summary_fingerprint":"current"});
+        let potential = serde_json::json!({"id":"400","title":"Unverified","artist":"Example","date":"2024-02-01","primary_artist_verified":true,"available":true,"tracks_loaded":false,"track_count":1,"tracks":[]});
+        let first = serde_json::json!({"name":"Example","releases":[candidate,potential]});
+        let last = serde_json::json!({"name":"Example","releases":[anchor]});
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('a','GB',?)",(first.to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('z','GB',?)",(last.to_string(),)).await.unwrap();
+        store.set_preference("tag-review:GB:300", &serde_json::json!({
+            "id":"300","title":"New","artist":"Example","date":"2024-01-01","track_count":3,"tracks_loaded":true,
+            "label":"Example Records","copyright":"℗ 2024 Example Music Limited","genres":["Electronic"],"tag_checked_at":20,
+            "recommendation_snapshot":{"summary_fingerprint":"current","optional_status":"complete"},
+            "tracks":[{"id":"3001","isrc":"NEW1","credits":credits,"credits_complete":true},{"id":"3002","isrc":"NEW2","credits":credits,"credits_complete":true},{"id":"3003","isrc":"NEW3","credits":[],"credits_complete":true}],
+        })).await.unwrap();
+        for id in ["300","400"] {
+            store.set_preference(&format!("release-artists:GB:{id}"), &serde_json::json!({"ids":["a"],"names":["Example"],"checked_at":20})).await.unwrap();
+        }
+        let before = store.build_missing_rows("GB").await.unwrap();
+        let recommended = before.iter().find(|row|row.id == "300").unwrap();
+        assert_eq!(recommended.recommendation,"Recommended");
+        assert_eq!(recommended.children.len(),3,"canonical candidate details must fill the thin catalogue snapshot");
+        assert!(recommended.evidence.iter().any(|reason|reason.contains("Copyright holder matches at least two")));
+        assert!(recommended.evidence.iter().any(|reason|reason.contains("independent downloaded recordings")));
+        assert!(!recommended.evidence.iter().any(|reason|reason.contains("marks the release official")),"an absent provider official flag is unknown");
+        assert_eq!(before.iter().find(|row|row.id == "400").unwrap().recommendation,"Potential");
+        assert_eq!(store.linked_reference_release_ids("GB",&["z".into()]).await.unwrap(),vec!["100","200"]);
+        conn.execute("UPDATE catalogue SET payload=? WHERE artist_id='a'",(last.to_string(),)).await.unwrap();
+        conn.execute("UPDATE catalogue SET payload=? WHERE artist_id='z'",(first.to_string(),)).await.unwrap();
+        let reordered = store.build_missing_rows("GB").await.unwrap();
+        let reordered = reordered.iter().find(|row|row.id == "300").unwrap();
+        assert_eq!(recommended.recommendation,reordered.recommendation);
+        assert_eq!(recommended.evidence,reordered.evidence,"candidate order cannot determine available reference evidence");
+
+        let scoped = store.get_missing_rows_scoped("GB",Some("All missing releases"),Some("Recommended"),Some("My album artists"),None,None,None,None,None,0,10).await.unwrap();
+        assert_eq!(scoped.total,1);
+        assert_eq!(scoped.rows[0].id,"300");
+        let legacy_scope = store.get_missing_rows("GB",Some("All missing releases"),Some("My album artists"),None,None,None,None,None,0,10).await.unwrap();
+        assert_eq!(legacy_scope.total,2,"legacy scope-only filters remain compatible");
+
+        // A historical guest performer on a downloaded track does not become
+        // a canonical album artist. Confirmed IDs do recognise a public alias
+        // even when its displayed name differs from the local album artist.
+        let mut alias = store.get_preference("tag-review:GB:300").await.unwrap().unwrap();
+        for track in alias["tracks"].as_array_mut().unwrap() {
+            track["credits"] = serde_json::json!([]);
+            track["artists"] = serde_json::json!([{"id":"unconfirmed-guest","name":"Foreign performer","type":"MAIN"}]);
+        }
+        store.set_preference("tag-review:GB:300",&alias).await.unwrap();
+        let foreign = store.build_missing_rows("GB").await.unwrap();
+        assert_eq!(foreign.iter().find(|row|row.id == "300").unwrap().recommendation,"Suspect");
+        for track in alias["tracks"].as_array_mut().unwrap() {
+            track["artists"] = serde_json::json!([{"id":"z","name":"Different public alias","type":"MAIN"}]);
+        }
+        store.set_preference("tag-review:GB:300",&alias).await.unwrap();
+        let alias_rows = store.build_missing_rows("GB").await.unwrap();
+        assert_eq!(alias_rows.iter().find(|row|row.id == "300").unwrap().recommendation,"Recommended");
+
+        // A stale or removed file cannot lend remote evidence to any candidate.
+        conn.execute("UPDATE local_files SET mtime=21 WHERE path='/music/second.flac'",()).await.unwrap();
+        let stale = store.build_missing_rows("GB").await.unwrap();
+        assert_eq!(stale.iter().find(|row|row.id == "300").unwrap().recommendation,"Potential");
+        assert_eq!(store.linked_reference_release_ids("GB",&["a".into()]).await.unwrap(),vec!["100"]);
+        // A complete canonical reference works independently of discovery
+        // tables. This guards against expensive whole-catalogue rereads when
+        // thousands of downloaded release snapshots already exist.
+        conn.execute("DROP TABLE catalogue_release_index",()).await.unwrap();
+        conn.execute("DROP TABLE catalogue",()).await.unwrap();
+        let cached_only = store.recommendation_anchor_releases("GB",&std::collections::HashSet::from(["100".to_string()])).await.unwrap();
+        assert_eq!(cached_only["100"]["tracks"][0]["id"],"1001");
+        // A newly cached raw response for a different release summary must
+        // never overwrite the verified credits of downloaded recordings.
+        let summary = serde_json::json!({"id":"100","title":"First","numberOfTracks":1,"artist":{"id":"a","name":"Example"},"checked_at":100});
+        store.set_preference("subscriber-summary:GB:100",&summary).await.unwrap();
+        let mut canonical = store.get_preference("tag-review:GB:100").await.unwrap().unwrap();
+        canonical["recommendation_snapshot"] = serde_json::json!({"summary_fingerprint":crate::tidal::summary_fingerprint(&summary)});
+        store.set_preference("tag-review:GB:100",&canonical).await.unwrap();
+        store.set_preference("subscriber-items:GB:100",&serde_json::json!({"schema":2,"checked_at":101,"summary_fingerprint":"different-edition","items":[{"id":"1001","title":"Unrelated recording","isrc":"WRONG","trackNumber":1,"volumeNumber":1,"credits":[]}]})).await.unwrap();
+        let guarded = store.recommendation_anchor_releases("GB",&std::collections::HashSet::from(["100".to_string()])).await.unwrap();
+        assert_eq!(guarded["100"]["tracks"][0]["isrc"],"REF100");
+        assert_eq!(guarded["100"]["tracks"][0]["credits"],credits,"unpaired raw metadata cannot erase canonical contributor evidence");
+        drop(conn); drop(store); std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn candidate_snapshot_conflicts_and_metadata_absence_are_explicit() {
+        let listed = serde_json::json!({"id":"1","title":"Current","artist":"Main","track_count":3,"tracks_loaded":false,"tracks":[],"available":false,"summary_fingerprint":"new"});
+        let cached = serde_json::json!({"id":"1","title":"Earlier","artist":"Guest","track_count":2,"tracks_loaded":true,"available":true,"label":"Stale Label","copyright":"Old Rights Holder","genres":["Old Genre"],"catalogue_metadata_status":{"fields":{"genres":"not_supplied","label":"incomplete"}},"recommendation_snapshot":{"summary_fingerprint":"old","optional_status":"complete"},"tracks":[{"id":"11","credits_complete":true,"credits":[]}]});
+        let combined = super::recommendation_candidate_overlay(&listed,cached);
+        assert_eq!(combined["artist"],"Main");
+        assert_eq!(combined["title"],"Current");
+        assert_eq!(combined["available"],false);
+        assert_eq!(combined["tracks_loaded"],false);
+        assert_eq!(combined["track_count"],3);
+        assert!(combined["tracks"].as_array().unwrap().is_empty());
+        assert!(combined["label"].is_null());
+        assert!(combined["copyright"].is_null());
+        assert!(combined["genres"].is_null());
+        assert!(combined["recommendation_snapshot"].is_null(),"a previous edition's checked flags do not describe this candidate");
+        assert!(combined["catalogue_metadata_status"].is_null());
+        let evidence = super::recommendation_metadata_evidence(&combined);
+        assert!(evidence.iter().any(|reason|reason.contains("older release summary")));
+        assert!(evidence.iter().any(|reason|reason.contains("Label: not cached")));
+        assert!(evidence.iter().any(|reason|reason.contains("Genres: not cached")));
+        let checked_empty = serde_json::json!({"tracks_loaded":true,"tracks":[{"id":"11","credits_complete":true,"credits":[]}],"recommendation_snapshot":{"optional_status":"complete"}});
+        let evidence = super::recommendation_metadata_evidence(&checked_empty);
+        assert!(evidence.iter().any(|reason|reason.contains("credits checked for all 1 tracks; 0")));
+        let full_listing = serde_json::json!({"id":"1","title":"Current","track_count":1,"tracks_loaded":true,"label":"Known Label","genres":["Old genre"],"tracks":[{"id":"11","credits_complete":true,"credits":[]}]});
+        let partial_cache = serde_json::json!({"id":"1","title":"Current","track_count":1,"tracks_loaded":false,"tracks":[],"label":null,"genres":[],"catalogue_metadata_status":{"fields":{"genres":"not_supplied"}}});
+        let retained = super::recommendation_candidate_overlay(&full_listing,partial_cache);
+        assert_eq!(retained["label"],"Known Label","an unchecked empty field cannot erase previously captured metadata");
+        assert_eq!(retained["tracks"][0]["id"],"11","a partial cache cannot erase a complete matching catalogue track list");
+        assert_eq!(retained["genres"],serde_json::json!([]),"an explicitly checked empty result is distinct from an unchecked field");
+        let summary = serde_json::json!({"id":1,"title":"Current","numberOfTracks":1,"checked_at":2});
+        let mut raw = serde_json::json!({"schema":2,"checked_at":3,"summary_fingerprint":crate::tidal::summary_fingerprint(&summary),"items":[{"id":11,"trackNumber":1,"volumeNumber":1,"credits":[]}]});
+        assert!(super::recommendation_subscriber_snapshot_current(&raw,Some(&summary),None));
+        raw["summary_fingerprint"] = serde_json::json!("old");
+        assert!(!super::recommendation_subscriber_snapshot_current(&raw,Some(&summary),None));
+        raw.as_object_mut().unwrap().remove("summary_fingerprint");
+        raw["checked_at"] = serde_json::json!(2);
+        assert!(!super::recommendation_subscriber_snapshot_current(&raw,Some(&summary),None),"same-second unpaired responses do not prove edition identity");
+    }
+
+    #[tokio::test]
     async fn recommendations_use_only_current_verified_remote_credit_anchors() {
         let folder =
             std::env::temp_dir().join(format!("tibrary-credit-anchors-{}", uuid::Uuid::new_v4()));
@@ -4011,7 +4481,7 @@ mod tests {
         let conn = store.connect().unwrap();
         let credits = serde_json::json!([{"name":"Writer One","role":"Composer"},{"name":"Writer Two","role":"Producer"}]);
         let catalogue = serde_json::json!({"id":"artist","name":"Example","releases":[
-            {"id":"owned","title":"Owned","artist":"Example","date":"2020-01-01","available":true,"tracks_loaded":true,"track_count":1,"tracks":[{"id":"anchor","title":"Owned song","credits":credits}]},
+            {"id":"owned","title":"Owned","artist":"Example","date":"2020-01-01","available":true,"tracks_loaded":true,"track_count":2,"tracks":[{"id":"anchor","title":"Owned song","credits":credits},{"id":"anchor2","title":"Another owned song","credits":credits}]},
             {"id":"new","title":"New","artist":"Example","date":"2021-01-01","available":true,"primary_artist_verified":true,"tracks_loaded":true,"track_count":2,"tracks":[{"id":"new1","title":"New one","credits":credits},{"id":"new2","title":"New two","credits":credits}]}
         ]});
         conn.execute(
@@ -4029,7 +4499,13 @@ mod tests {
         conn.execute("INSERT OR IGNORE INTO mappings(artist,tidal_id,status) SELECT artist_id,artist_id,'confirmed' FROM catalogue", ()).await.unwrap();
         let rows = store.build_missing_rows("GB").await.unwrap();
         let row = rows.iter().find(|row| row.id == "new").unwrap();
-        assert_eq!(row.recommendation, "Recommended");
+        assert_eq!(row.recommendation, "Potential", "one downloaded recording cannot independently corroborate a whole contributor network");
+        let second = serde_json::json!({"albumartist":"Example","album":"Owned","title":"Another owned song"});
+        conn.execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES('/music/second.flac','/music',10,20,?,1)", (second.to_string(),)).await.unwrap();
+        let second_link = serde_json::json!({"status":"linked","ids":{"track_id":"anchor2","album_id":"owned"}});
+        conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES('/music/second.flac','GB','[0,0,10,20]',?)", (second_link.to_string(),)).await.unwrap();
+        let rows = store.build_missing_rows("GB").await.unwrap();
+        assert_eq!(rows.iter().find(|row|row.id == "new").unwrap().recommendation, "Recommended");
         conn.execute("UPDATE local_files SET mtime=21", ())
             .await
             .unwrap();
