@@ -699,6 +699,75 @@ test("missing release filters, bidirectional sort and paging preserve the releas
   await expect(page.locator("tbody")).not.toContainText("Between Stations");
 });
 
+test("catalogue refresh publishes partial results without resetting table state or restarting work", async ({page}) => {
+  await rpc("queue.decision",{ids:["910001","910002","910003","910004","910005","910006"],decision:"removed"});
+  await page.addInitScript(() => {
+    let id=0;
+    const callbacks=new Map<number,(event:any)=>void>();
+    const listeners=new Map<number,string>();
+    (window as any).__TAURI_INTERNALS__={
+      transformCallback:(callback:(event:any)=>void)=>{callbacks.set(++id,callback);return id;},
+      invoke:async(command:string,args:any)=>{
+        if(command==="plugin:event|listen") {listeners.set(args.handler,args.event);return args.handler;}
+        if(command==="plugin:event|unlisten") callbacks.delete(args.eventId);
+      },
+    };
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:(_event:string,eventId:number)=>listeners.delete(eventId)};
+    (window as any).emitBackendEvent=(payload:any)=>{
+      for(const [handler,event] of listeners) if(event==="backend-event") callbacks.get(handler)?.({event,id:handler,payload});
+    };
+  });
+  const job={id:"refresh-in-progress",kind:"discography",status:"running",message:"Checking North Assembly releases",started:Date.now()/1000,completed:1,total:20};
+  let phase=0, stateCalls=0, starts=0;
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start") starts++;
+    const response=await rpc(request.method,request.args);
+    if(["state","job.status"].includes(request.method) && response.result) {
+      response.result.online_job=job;
+      if(request.method==="state") {stateCalls++;response.result.revision=500+phase;}
+      else delete response.result.revision;
+    }
+    if(request.method==="table" && request.args.route==="missing") {
+      const rows=response.result.rows;
+      const base=rows.find((row:any)=>row.release==="Blue Hours");
+      response.result.rows=[...rows.filter((row:any)=>!phase || row.release!=="Night Maps"),
+        ...Array.from({length:30},(_,index)=>({...base,id:`cached-${index}`,release:`Cached release ${index+1}`,children:[],expanded_available:true}))];
+      response.result.total=response.result.rows.length;
+    }
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await page.getByRole("combobox",{name:"Release timeline"}).selectOption("All missing releases");
+  await page.getByRole("button",{name:"Coverage",exact:true}).click();
+  await page.getByRole("button",{name:"Coverage",exact:true}).click();
+  await expect(page.locator("th[aria-sort='descending']")).toContainText("Coverage");
+  await expect(page.locator("tbody")).toContainText("Night Maps");
+  await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
+  const childRow=page.locator("tr").filter({has:page.getByRole("checkbox",{name:"Select track First Light",exact:true})});
+  await expect(childRow).toBeVisible();
+  await childRow.evaluate(element=>element.setAttribute("data-retained","yes"));
+  const scroller=page.locator(".table-scroll");
+  await scroller.evaluate(element=>{element.scrollTop=80;});
+  const scrollTop=await scroller.evaluate(element=>element.scrollTop);
+  expect(scrollTop).toBeGreaterThan(0);
+  const before=stateCalls;
+  phase=1;
+  await page.evaluate(()=>{
+    for(let revision=501;revision<=503;revision++) (window as any).emitBackendEvent({event:"changed",reason:"catalogue-refresh",revision});
+  });
+  await expect(page.locator("tbody")).not.toContainText("Night Maps");
+  expect(stateCalls-before).toBe(1);
+  await expect(page.locator("th[aria-sort='descending']")).toContainText("Coverage");
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toHaveAttribute("aria-expanded","true");
+  await expect(childRow).toHaveAttribute("data-retained","yes");
+  expect(await scroller.evaluate(element=>element.scrollTop)).toBe(scrollTop);
+  await expect(page.getByRole("button",{name:"Update missing releases",exact:true})).toBeDisabled();
+  expect(starts).toBe(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
 test("missing release availability checks use the requested scope and preserve unavailable inspection", async ({page}) => {
   await rpc("queue.decision",{ids:["910001","910002","910003","910004","910005","910006"],decision:"removed"});
   const checks:any[]=[];

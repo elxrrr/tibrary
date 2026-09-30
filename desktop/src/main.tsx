@@ -51,6 +51,7 @@ import { ActivityView, streamFor } from "./ActivityView";
 import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import "./style.css";
+import { version as appVersion } from "../package.json";
 const groups = [
   {
     id: "prepare",
@@ -412,9 +413,12 @@ function App() {
   useEffect(() => {
     let dispose: (() => void) | undefined;
     let refreshTimer: number | undefined;
-    const scheduleRefresh = () => {
+    const scheduleRefresh = (delay = 60) => {
+      // Coalesce artist results without delaying an already scheduled refresh.
+      // Completion and local mutations still publish immediately.
+      if (refreshTimer !== undefined && delay > 60) return;
       window.clearTimeout(refreshTimer);
-      refreshTimer=window.setTimeout(() => {refreshTimer=undefined; refresh();}, 60);
+      refreshTimer=window.setTimeout(() => {refreshTimer=undefined; refresh();}, delay);
     };
     listen<any>("backend-event", ({ payload: p }) => {
       if (p.event === "download-monitor" && p.item) {
@@ -452,7 +456,8 @@ function App() {
             : s,
         );
       if (p.event === "library-mutated") { setPreview(undefined); setReview(null); setDeep(null); }
-      if (["changed", "library-mutated", "job", "ready"].includes(p.event)) scheduleRefresh();
+      if (["changed", "library-mutated", "job", "ready"].includes(p.event))
+        scheduleRefresh(p.event === "changed" && p.reason === "catalogue-refresh" ? 2000 : 60);
       if (p.event === "authentication") {
         setAuth("");
         refresh();
@@ -2072,7 +2077,7 @@ function App() {
           </div>
         ))}
         <div className="sidebar-bottom">
-          <span className="sidebar-version">v0.9.1</span>
+          <span className="sidebar-version">v{appVersion}</span>
         </div>
       </aside>
       <main>

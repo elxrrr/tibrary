@@ -57,6 +57,8 @@ pub struct TidalRelease {
     pub date: String,
     pub r#type: String,
     pub available: Option<bool>,
+    pub availability_checked_at: Option<i64>,
+    pub availability_source: Option<String>,
     pub track_count: usize,
     pub explicit: bool,
     #[serde(default, deserialize_with = "copyright_from_value")]
@@ -458,48 +460,51 @@ impl TidalClient {
                 }
                 let mut item = item.clone();
                 item["checked_at"] = json!(now);
+                item["availability_source"] = json!("album_lookup");
                 summaries.push(item.clone());
                 raw.push(item);
             }
-            self.cache_summaries(&summaries,market,batch).await?;
+            self.cache_summaries(&summaries,market,batch,"album_lookup").await?;
         }
         Ok(album_resources(&raw))
     }
 
     #[cfg(test)]
     async fn cache_summary(&self, raw: &Value, market: &str) -> Result<(), String> {
-        self.cache_summaries(std::slice::from_ref(raw),market,&[]).await
+        self.cache_summaries(std::slice::from_ref(raw),market,&[],"album_lookup").await
     }
 
-    async fn cache_summaries(&self, values: &[Value], market: &str, requested: &[String]) -> Result<(), String> {
+    async fn cache_summaries(&self, values: &[Value], market: &str, requested: &[String], source: &str) -> Result<(), String> {
         if values.is_empty() && requested.is_empty() { return Ok(()); }
         let conn = self.db.connect()?;
         conn.execute("BEGIN IMMEDIATE",()).await.map_err(|error|error.to_string())?;
         let result = async {
             for raw in values {
                 let id = resource_id(&raw["id"]);
+                let mut raw = raw.clone();
+                raw["availability_source"] = json!(source);
                 conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("subscriber-summary:{market}:{id}"),raw.to_string())).await.map_err(|error|error.to_string())?;
-                let artists = album_artists(raw);
+                let artists = album_artists(&raw);
                 let ids: Vec<_> = artists.iter().map(|artist|resource_id(&artist["id"])).collect();
                 if !ids.is_empty() {
                     let value=json!({"ids":ids,"names":artists.iter().map(|artist|artist["name"].clone()).collect::<Vec<_>>(),"checked_at":raw["checked_at"],"source":"subscriber album credits"});
                     conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("release-artists:{market}:{id}"),value.to_string())).await.map_err(|error|error.to_string())?;
                 }
-                if let Some(available) = subscriber_available(raw) {
-                    let value=json!({"available":available,"checked_at":raw["checked_at"]});
-                    conn.execute("INSERT INTO app_preferences(key,payload) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload WHERE COALESCE(json_extract(app_preferences.payload,'$.checked_at'),0) <= json_extract(excluded.payload,'$.checked_at')",(format!("release-live:{market}:{id}"),value.to_string())).await.map_err(|error|error.to_string())?;
+                if let Some(available) = subscriber_available(&raw) {
+                    crate::availability::save_observation(&conn, &id, market, Some(available), raw["checked_at"].as_i64().unwrap_or(0), source).await?;
                 }
             }
             // Successful summary batches also prove absence. Save withdrawals
             // centrally wherever metadata is fetched, without another API call.
             let returned: std::collections::HashSet<_> = values.iter().map(|value| resource_id(&value["id"])).collect();
             for id in requested.iter().filter(|id| !returned.contains(*id)) {
-                conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("release-live:{market}:{id}"),json!({"available":false,"checked_at":Utc::now().timestamp()}).to_string())).await.map_err(|error|error.to_string())?;
+                crate::availability::save_observation(&conn, id, market, Some(false), Utc::now().timestamp(), "album_lookup").await?;
             }
             conn.execute("COMMIT",()).await.map_err(|error|error.to_string())?;
             Ok::<_,String>(())
         }.await;
         if result.is_err() { let _=conn.execute("ROLLBACK",()).await; }
+        if result.is_ok() { self.db.bump_revision(); }
         result
     }
 
@@ -802,6 +807,7 @@ impl TidalClient {
                     continue;
                 }
                 raw["checked_at"] = json!(Utc::now().timestamp());
+                raw["availability_source"] = json!("artist_list");
                 summaries.push(raw.clone());
                 let mut release = release_from_subscriber(&raw, artist_id);
                 if detailed {
@@ -812,7 +818,7 @@ impl TidalClient {
                 releases.push(release);
             }
         }
-        self.cache_summaries(&summaries,market,&[]).await?;
+        self.cache_summaries(&summaries,market,&[],"artist_list").await?;
         let extra = if enrich_discovery {
             let (reused, _, _) = crate::actions::recommendation_refresh_plan(&self.db,market,&releases).await?;
             let ids = releases.iter().filter(|r| !reused.contains(&r.id)).map(|r|r.id.clone()).collect::<Vec<_>>();
@@ -1284,6 +1290,8 @@ pub(crate) fn release_from_subscriber(raw: &Value, artist_id: &str) -> TidalRele
         date: raw["releaseDate"].as_str().unwrap_or("").into(),
         r#type: raw["type"].as_str().unwrap_or("ALBUM").into(),
         available: subscriber_available(raw),
+        availability_checked_at: raw["checked_at"].as_i64(),
+        availability_source: raw["availability_source"].as_str().map(str::to_owned),
         track_count: raw["numberOfTracks"].as_u64().unwrap_or(0) as usize,
         explicit: raw["explicit"].as_bool().unwrap_or(false),
         copyright: raw["copyright"].as_str().map(str::to_owned),
@@ -1420,11 +1428,12 @@ mod subscriber_tests {
         assert_eq!(client.artist_name("4","GB").await.unwrap(),"Main");
         let raw = json!({"id":12,"title":"Release","artist":{"id":4,"name":"Main"},"checked_at":Utc::now().timestamp(),"allowStreaming":true,"streamReady":true});
         client.cache_summary(&raw, "GB").await.unwrap();
-        client.cache_summaries(std::slice::from_ref(&raw),"GB",&["12".into(),"13".into()]).await.unwrap();
+        client.cache_summaries(std::slice::from_ref(&raw),"GB",&["12".into(),"13".into()],"album_lookup").await.unwrap();
         assert_eq!(db.get_preference("release-live:GB:13").await.unwrap().unwrap()["available"],false,"Successful metadata batches must retain omitted release availability for other views");
         assert!(db.get_preference("release-live:US:13").await.unwrap().is_none());
         let payload = client.albums(&["12".into()], "GB", false).await.unwrap();
         assert_eq!(payload["data"][0]["id"], "12");
+        assert_eq!(payload["data"][0]["attributes"]["availability_source"], "album_lookup");
         assert!(db
             .get_preference("release-artists:US:12")
             .await
@@ -1473,6 +1482,29 @@ mod subscriber_tests {
         let cached: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(cached["releases"][0]["genres"], json!(["Electronic"]));
         assert_eq!(cached["releases"][0]["replacement_id"], "13");
+    }
+
+    #[tokio::test]
+    async fn refreshed_artist_list_cannot_restore_a_directly_withdrawn_release() {
+        let dir = std::env::temp_dir().join(format!("subscriber-withdrawal-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let mut client = TidalClient::from_db(&db).await.unwrap();
+        let now = Utc::now().timestamp();
+        let raw = json!({"id":12,"title":"Release","artist":{"id":4,"name":"Main"},"checked_at":now,"allowStreaming":true,"streamReady":true});
+        crate::availability::save_response(&db, &json!({"data":[]}), &["12".into()], "GB").await.unwrap();
+        client.cache_summaries(std::slice::from_ref(&raw), "GB", &[], "artist_list").await.unwrap();
+        let saved = db.get_preference("release-live:GB:12").await.unwrap().unwrap();
+        assert_eq!(saved["available"], false);
+        assert_eq!(saved["source"], "album_lookup");
+        // Normalization and cached metadata must retain weaker provenance too.
+        let payload = client.albums(&["12".into()], "GB", false).await.unwrap();
+        assert_eq!(payload["data"][0]["attributes"]["availability_source"], "artist_list");
+        let mut raw = raw;
+        raw["availability_source"] = json!("artist_list");
+        let rel = release_from_subscriber(&raw, "4");
+        assert_eq!(rel.availability_source.as_deref(), Some("artist_list"));
+        assert_eq!(rel.availability_checked_at, Some(now));
+        drop(client); drop(db); std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

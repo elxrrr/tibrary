@@ -685,7 +685,7 @@ mod tests {
         conflict.tracks[0].track_number = 2;
         cat.releases.insert(0, conflict);
         for release in &cat.releases {
-            store.set_preference(&format!("release-live:GB:{}",release.id),&json!({"available":true,"checked_at":chrono::Utc::now().timestamp()})).await.unwrap();
+            store.set_preference(&format!("release-live:GB:{}",release.id),&json!({"available":true,"checked_at":chrono::Utc::now().timestamp(),"source":"album_lookup"})).await.unwrap();
         }
         conn.execute(
             "INSERT INTO catalogue (artist_id, market, payload, fetched) VALUES ('queen_id', 'GB', ?, '2026-01-01')",

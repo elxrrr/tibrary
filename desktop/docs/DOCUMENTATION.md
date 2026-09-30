@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.1** · [Setup and screenshots](../../README.md)
+Version **0.9.2** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -54,11 +54,11 @@ All online workflows use one subscriber connection. Refreshes keep up to three a
 
 Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
 
-Availability is shared across artist, metadata and release checks for the selected market. Confirmed available results are reused for seven days, unavailable results for one day, and inconclusive results for one hour. Confirmed unavailable releases leave the default Missing releases view but remain inspectable through **Unavailable**. Timeouts and rate-limit errors (HTTP 429) never mark a release unavailable. Use **Recheck saved availability online** to request fresh checks without resetting the database.
+Availability is shared across artist, metadata and release checks for the selected market. Direct release checks are reused for seven days when available, one day when unavailable, and one hour when inconclusive. Artist-list flags are stored separately: they cannot restore a release that a direct check found unavailable. Older cached positives receive a direct check when you use **Check availability**; completed checks are reused. Confirmed unavailable releases leave the default Missing releases view but remain inspectable through **Unavailable**. Timeouts and rate-limit errors (HTTP 429) never mark a release unavailable. Use **Recheck saved availability online** to bypass these checks without resetting the database or rereading track details.
 
 If upstream tags change without changing a release's summary, use its manual detail refresh. Failed optional genre/replacement lookups retry after a cooldown while retaining the saved track credits; successful empty fields do not trigger repeated checks.
 
-Navigating between pages does not start or cancel scans. Jobs finish in the background and publish their results to every relevant view. Cancellation retains completed checks. Artwork dimensions and MQA audits are cached per file; unchanged files are reused. Reviewed tag-only moves retain valid inspections, while artwork or relevant MQA tag changes invalidate the corresponding result. Local duplicate checks reuse the saved analysis until the indexed file manifest changes.
+Navigating between pages does not start or cancel scans. Jobs finish in the background and publish their results to every relevant view. Catalogue refreshes publish saved artist results while the job is still running, retaining table sorting and expanded tracks. Cancellation retains completed checks. Artwork dimensions and MQA audits are cached per file; unchanged files are reused. Reviewed tag-only moves retain valid inspections, while artwork or relevant MQA tag changes invalidate the corresponding result. Local duplicate checks reuse the saved analysis until the indexed file manifest changes.
 
 BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. Missing fields are not invented. Missing-tag previews preserve existing tags. No developer credentials or database reset are needed.
 
@@ -126,4 +126,4 @@ codesign --verify --deep --strict desktop/src-tauri/target/release/bundle/macos/
 
 The editable app icon is `desktop/icon.svg`; platform icon files are in `desktop/src-tauri/icons/`. Regenerate them with the Tauri icon command when the artwork changes.
 
-Update the npm, Cargo and Tauri versions together with the sidebar version. Run the checks, refresh screenshots, commit and tag the tested revision. GitHub releases publish source only; do not attach the locally built app or installers. The local build is ad-hoc signed, not notarised.
+Before distributing an updated app build, increment the patch version (for example, `0.9.1` → `0.9.2`) in `desktop/package.json`, `desktop/package-lock.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/Cargo.lock` and `desktop/src-tauri/tauri.conf.json`. Keep these versions identical; the sidebar reads the package version automatically. Run the checks, refresh screenshots, commit and tag the tested revision. GitHub releases publish source only; do not attach the locally built app or installers. The local build is ad-hoc signed, not notarised.

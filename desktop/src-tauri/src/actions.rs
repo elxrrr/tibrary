@@ -307,7 +307,8 @@ fn apply_release_discovery(value: &mut Value, raw: &Value, id: &str) {
         value["available"] = json!(available);
         // Reading a cached summary today is not a new availability observation.
         // Its original timestamp must not overwrite a later withdrawal check.
-        value["availability_checked_at"] = data["attributes"]["checked_at"].as_i64().map(|at| json!(at)).unwrap_or_else(||value["discovery_checked_at"].clone());
+        value["availability_checked_at"] = data["attributes"]["checked_at"].clone();
+        value["availability_source"] = data["attributes"]["availability_source"].clone();
     }
     if let Some(artists) = data["relationships"]["artists"]["data"].as_array() {
         value["album_artist_ids"] = json!(artists.iter().filter_map(|a| a["id"].as_str()).collect::<Vec<_>>());
@@ -362,7 +363,7 @@ async fn publish_release_update(
         }
         conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("tag-review:{market}:{id}"),value.to_string())).await.map_err(|e|e.to_string())?;
         if let (Some(available), Some(checked_at)) = (value["available"].as_bool(),value["availability_checked_at"].as_i64()) {
-            conn.execute("INSERT INTO app_preferences(key,payload) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload WHERE COALESCE(json_extract(app_preferences.payload,'$.checked_at'),0) <= json_extract(excluded.payload,'$.checked_at')", (format!("release-live:{market}:{id}"),json!({"available":available,"checked_at":checked_at}).to_string())).await.map_err(|e|e.to_string())?;
+            crate::availability::save_observation(&conn, id, market, Some(available), checked_at, value["availability_source"].as_str().unwrap_or("legacy")).await?;
         }
         let mut rows = conn
             .query(
@@ -1645,7 +1646,7 @@ mod tests {
         let db = TursoDb::open(dir.join("db")).await.unwrap();
         let now = chrono::Utc::now().timestamp();
         for (id, status) in [("1",json!(true)),("2",json!(false)),("3",Value::Null)] {
-            db.set_preference(&format!("release-live:GB:{id}"), &json!({"available":status,"checked_at":now})).await.unwrap();
+            db.set_preference(&format!("release-live:GB:{id}"), &json!({"available":status,"checked_at":now,"source":"album_lookup"})).await.unwrap();
         }
         let backend = Arc::new(Backend::new());
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1658,6 +1659,11 @@ mod tests {
         assert_eq!(old["availability_checked_at"],now-14*86400);
         publish_release(&db,"2","GB",old).await.unwrap();
         assert_eq!(db.get_preference("release-live:GB:2").await.unwrap().unwrap()["available"],false);
+        let mut listed = json!({"id":"2","title":"Release","tracks":[]});
+        apply_release_discovery(&mut listed,&json!({"data":[{"id":"2","attributes":{"availability":["STREAM"],"checked_at":now,"availability_source":"artist_list"}}]}),"2");
+        assert_eq!(listed["availability_source"],"artist_list");
+        publish_release(&db,"2","GB",listed).await.unwrap();
+        assert_eq!(db.get_preference("release-live:GB:2").await.unwrap().unwrap()["available"],false,"Metadata enrichment cannot launder a listing into a verified restoration");
         let cancelled = crate::availability::check_with_progress(&db,&["2".into(),"4".into()],"GB",false,Arc::new(AtomicBool::new(true)),|_|{},|_|{}).await;
         assert!(cancelled.is_err());
         assert!(db.get_preference("release-live:GB:4").await.unwrap().is_none());

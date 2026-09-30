@@ -1598,11 +1598,11 @@ impl TursoDb {
             let key: String = row.get(0).map_err(|error| error.to_string())?;
             let payload: String = row.get(1).map_err(|error| error.to_string())?;
             let Ok(value) = serde_json::from_str::<Value>(&payload) else { continue; };
-            if let (Some(available), Some(checked_at)) = (value["available"].as_bool(), value["checked_at"].as_i64()) {
+            if let (Some(_), Some(checked_at)) = (value["available"].as_bool(), value["checked_at"].as_i64()) {
                 // Malformed, undated or future-dated entries cannot suppress a
                 // real release. Expired checks remain evidence until rechecked.
                 if checked_at > 0 && checked_at <= now + 60 {
-                    market_availability.insert(key.rsplit(':').next().unwrap_or("").to_owned(), (available, checked_at));
+                    market_availability.insert(key.rsplit(':').next().unwrap_or("").to_owned(), value);
                 }
             }
         }
@@ -1631,7 +1631,7 @@ impl TursoDb {
             quality: String,
             status: String,
             available: Option<bool>,
-            availability_checked_at: i64,
+            availability_observation: Value,
             approved: bool,
             expanded_available: bool,
             children: Vec<MissingChildTrack>,
@@ -1732,20 +1732,20 @@ impl TursoDb {
                     album_names.get(&id).map(String::as_str), album_credit_cache.get(&id));
                 let release_checked_at = rel["availability_checked_at"].as_i64()
                     .or_else(|| rel["checked_at"].as_i64()).unwrap_or(0);
+                let release_observation = json!({"available":rel["available"],"checked_at":release_checked_at,"source":rel["availability_source"]});
                 let saved_availability = market_availability.get(&id)
-                    .filter(|(_, checked_at)| *checked_at >= release_checked_at);
-                let available = saved_availability.map(|(available, _)| *available)
+                    .filter(|saved| !crate::availability::observation_wins(&release_observation, saved));
+                let available = saved_availability.and_then(|saved| saved["available"].as_bool())
                     .or_else(|| rel.get("available").and_then(Value::as_bool));
-                let availability_checked_at = saved_availability
-                    .map(|(_, checked_at)| *checked_at).unwrap_or(release_checked_at);
+                let availability_observation = saved_availability.cloned().unwrap_or(release_observation);
                 if let Ok(mut parsed) = serde_json::from_value::<crate::tidal::TidalRelease>(rel.clone()) {
                     parsed.artist=rel_artist.clone();
                     parsed.available=available;
                     let latest = full_releases.entry(parsed.id.clone()).or_insert(parsed);
                     if available.is_some() && full_availability_observed.get(&id)
-                        .is_none_or(|previous| availability_checked_at > *previous) {
+                        .is_none_or(|previous| crate::availability::observation_wins(&availability_observation, previous)) {
                         latest.available=available;
-                        full_availability_observed.insert(id.clone(), availability_checked_at);
+                        full_availability_observed.insert(id.clone(), availability_observation.clone());
                     }
                 }
 
@@ -1993,7 +1993,7 @@ impl TursoDb {
                             quality,
                             status,
                             available,
-                            availability_checked_at,
+                            availability_observation,
                             approved,
                             expanded_available: tracks_loaded,
                             children,
@@ -2003,13 +2003,12 @@ impl TursoDb {
                     }
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         let existing = e.get_mut();
-                        // The same ID can occur on several artist pages. Its
-                        // most recent known availability wins independently of
-                        // coverage or recommendation ranking, in both views.
+                        // The same ID can occur on several artist pages. A
+                        // newer listing cannot undo a direct withdrawal check.
                         if available.is_some() && (existing.available.is_none()
-                            || availability_checked_at > existing.availability_checked_at) {
+                            || crate::availability::observation_wins(&availability_observation, &existing.availability_observation)) {
                             existing.available = available;
-                            existing.availability_checked_at = availability_checked_at;
+                            existing.availability_observation = availability_observation;
                             existing.status = status.clone();
                             existing.approved = approved;
                         }
@@ -4500,10 +4499,14 @@ with sqlite3.connect('{db}') as db:
         });
         let mut newer_summary = release("22", "Recently restored", "2020-01-01", 1);
         newer_summary["availability_checked_at"] = json!(now);
+        newer_summary["availability_source"] = json!("album_lookup");
         let mut unknown = release("24", "Unchecked release", "2020-01-01", 1);
         unknown["available"] = Value::Null;
         let mut known_unavailable = release("25", "Unavailable bootleg", "2020-01-01", 1);
         known_unavailable["available"] = json!(false);
+        let mut stale_list_positive = release("26", "Still on the artist page", "2020-01-01", 1);
+        stale_list_positive["availability_checked_at"] = json!(now);
+        stale_list_positive["availability_source"] = json!("artist_list");
         let mut restored_reference = release("32", "Restored across artist pages", "2020-01-01", 1);
         restored_reference["availability_checked_at"] = json!(now);
         let mut stale_live_reference = release("33", "Removed larger edition", "2021-01-01", 2);
@@ -4515,6 +4518,7 @@ with sqlite3.connect('{db}') as db:
             release("23", "Different market", "2020-01-01", 1),
             unknown,
             known_unavailable,
+            stale_list_positive,
             release("30", "Earlier single", "2020-01-01", 1),
             release("31", "Larger release", "2021-01-01", 2),
             restored_reference.clone(),
@@ -4537,6 +4541,7 @@ with sqlite3.connect('{db}') as db:
         store.set_preference("release-live:GB:22",&json!({"available":false,"checked_at":now-10})).await.unwrap();
         store.set_preference("release-live:US:23",&json!({"available":false,"checked_at":now})).await.unwrap();
         store.set_preference("release-live:GB:24",&json!({"available":"false","checked_at":now})).await.unwrap();
+        store.set_preference("release-live:GB:26",&json!({"available":false,"checked_at":now-10,"source":"album_lookup"})).await.unwrap();
 
         let page = store.get_missing_rows("GB",None,None,None,None,None,None,None,0,100).await.unwrap();
         let shown: HashSet<_> = page.rows.iter().map(|row|row.id.as_str()).collect();
@@ -4547,7 +4552,7 @@ with sqlite3.connect('{db}') as db:
         assert_eq!(page.rows.iter().find(|row|row.id == "32").unwrap().available,Some(true),"An older reference on another artist page must not undo a newer positive observation");
 
         let unavailable = store.get_missing_rows("GB",Some("Newer than newest owned"),Some("Recommended"),Some("Unavailable"),None,None,None,None,0,100).await.unwrap();
-        assert_eq!(unavailable.rows.iter().map(|row|row.id.as_str()).collect::<HashSet<_>>(),HashSet::from(["20","25","31","33"]));
+        assert_eq!(unavailable.rows.iter().map(|row|row.id.as_str()).collect::<HashSet<_>>(),HashSet::from(["20","25","26","31","33"]));
         assert!(unavailable.rows.iter().all(|row|row.status == "Unavailable" && !row.approved));
         let mut queue = conn.query("SELECT approved,decision FROM queue WHERE id='20'",()).await.unwrap();
         let row = queue.next().await.unwrap().unwrap();

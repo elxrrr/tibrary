@@ -46,6 +46,27 @@ fn completed_refresh_ids(saved: &Value, ids: &[String], market: &str, detailed: 
     ids.iter().filter(|id| completed.contains(id)).cloned().collect()
 }
 
+/// Publish durable artist results while a refresh is still running, without
+/// making large library views reload for every individual metadata write.
+fn publish_catalogue_changes(
+    app: Option<&tauri::AppHandle>,
+    db: &TursoDb,
+    last_published: &mut Option<std::time::Instant>,
+) {
+    let now = std::time::Instant::now();
+    if last_published.is_some_and(|previous| now.duration_since(previous).as_secs() < 5) {
+        return;
+    }
+    if let Some(app) = app {
+        let _ = app.emit("backend-event", json!({
+            "event": "changed",
+            "reason": "catalogue-refresh",
+            "revision": db.revision.load(Ordering::SeqCst),
+        }));
+        *last_published = Some(now);
+    }
+}
+
 fn is_online_job(kind: &str) -> bool {
     matches!(
         kind,
@@ -2065,6 +2086,7 @@ async fn handle_rpc_uncached(
             let mut checked_details = 0usize;
             let mut failure: Option<String> = None;
             let backend_prog = backend_task.clone();
+            let mut last_published = None;
 
             // Keep three artists in flight, sharing the global API pacing lane.
             // Catalogue/queue writes and checkpoints remain serial and durable.
@@ -2123,6 +2145,7 @@ async fn handle_rpc_uncached(
                             failure = Some(e);
                             break;
                         } else {
+                            publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                             if detailed {
                                 let (reused,changed,cached_tracks) = match actions::recommendation_refresh_plan(&db_clone,&market,&catalogue.releases).await {
                                     Ok(plan) => plan,
@@ -2163,6 +2186,7 @@ async fn handle_rpc_uncached(
                                             break;
                                         }
                                         checked_details += 1;
+                                        publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                                     }
                                 }
                                 if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
