@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.4** · [Setup and screenshots](../../README.md)
+Version **0.9.5** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -12,7 +12,7 @@ Version **0.9.4** · [Setup and screenshots](../../README.md)
 | Complete library | Find missing releases, select whole releases or individual tracks, and manage downloads. |
 | Update library | Audit MQA files, fill missing metadata, improve artwork and review online replacements. |
 | Settings → General | Manage the subscriber connection, libraries, appearance, downloads and matching preferences. |
-| Settings → Activity | Follow local, online and download jobs; expand a job for individual checks and outcomes. |
+| Settings → Activity | Search one saved activity log; inspect detailed checks and cancel individual workers. |
 
 ### Local changes
 
@@ -79,7 +79,9 @@ MQA replacements use the selected library's existing file paths, including multi
 
 In Downloaded releases, checked releases or tracks limit the export without changing the saved queue. With no checked items, the export uses the saved completed-download selections.
 
-Activity shows item counts, percentage and a smoothed ETA where measurable; discovery remains indeterminate until the total is known. Each channel shows one expandable group per job. Parallel download releases and tracks stay inside their download job; status updates retain the existing rows. Expanded running jobs append saved details automatically, and older history loads as you scroll. Activity is saved by default: job summaries return after reopening, and expanding them loads their saved details. **Save activity logs** must remain enabled to retain history; clearing a panel removes its saved entries.
+Activity shows one log, most recent first, with the worker and task named on each row. Search it to inspect individual checks and outcomes; older saved messages load as you scroll, including after reopening. Progress updates replace their existing row, and parallel download tracks show their own transfer progress. Three compact worker cards show item counts, percentage and a smoothed ETA where measurable, with independent cancellation controls. **Save activity logs** must remain enabled to retain history; clearing activity removes its saved entries.
+
+Pages load independently during refreshes. A changing catalogue does not discard an in-flight table result: usable rows appear first, followed by one coalesced update. Sorting, selection and expanded releases are retained. Queue approvals, exports and download previews remain available during catalogue updates and local scans. Release disclosure fetches only missing track details through the shared cache without replacing the current refresh task. Reviewed tag changes, moves and duplicate removal cannot overlap downloads; scans and metadata reads can.
 
 Closing during downloads asks whether to keep downloading or stop and quit. Completed downloads remain. Interrupted catalogue refreshes retain their checkpoints; explicitly cancelled jobs stay cancelled. File mutations are not automatically replayed.
 

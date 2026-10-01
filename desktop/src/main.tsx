@@ -51,6 +51,7 @@ import { DataTable, Column } from "./DataTable";
 import { ActivityView, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
 import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
+import { CoalescedQuery } from "./query";
 import "./style.css";
 import { version as appVersion } from "../package.json";
 const groups = [
@@ -245,6 +246,13 @@ function App() {
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
   const [downloadMonitor, setDownloadMonitor] = useState<Record<string, Row>>({});
+  const [tableReader] = useState(() => new CoalescedQuery<any>(setLoading, e => setError(String(e))));
+  const [overviewReader] = useState(() => new CoalescedQuery<any>(() => {}, e => setError(String(e))));
+  const queueSelectionGuard = useRef({pending:0, minRevision:0});
+  const detailReads = useRef(new Set<string>());
+  const [loadingDetails, setLoadingDetails] = useState(new Set<string>());
+  const [tableRefresh, setTableRefresh] = useState(0);
+  useEffect(() => () => { tableReader.clear(); overviewReader.clear(); }, [tableReader, overviewReader]);
   const activityEpochs = useRef([0,0,0]);
   function mergeActivityEpochs(epochs?: number[]) {
     const previous = activityEpochs.current;
@@ -259,13 +267,11 @@ function App() {
     return () => window.clearInterval(timer);
   }, [state?.job?.status, state?.online_job?.status, state?.download_job?.status]);
   useEffect(() => {
-    if (route !== "overview" || !state) return;
-    let alive = true;
-    call("table", {route: "missing", timeline: "All missing releases", status: "all",
-      sort: "date", direction: "desc", limit: 20, artist_scope: "My album artists"})
-      .then((result) => { if (alive) { setLatestMissing(result.rows); setMissingReleaseCount(result.total); } })
-      .catch((e) => { if (alive) notifyError(e); });
-    return () => { alive = false; };
+    if (route !== "overview" || !state) { overviewReader.clear(); return; }
+    const args = {route: "missing", timeline: "All missing releases", status: "all",
+      sort: "date", direction: "desc", limit: 20, artist_scope: "My album artists"};
+    overviewReader.request({key:JSON.stringify(args), revision:state.revision,
+      read:()=>call("table",args), publish:result=>{setLatestMissing(result.rows); setMissingReleaseCount(result.total);}});
   }, [route, state?.revision]);
   const [detail, setDetail] = useState<any>(null),
     [review, setReview] = useState<any>(null),
@@ -287,8 +293,7 @@ function App() {
         .querySelector<HTMLButtonElement>('[role="menu"] button')
         ?.focus();
   }, [menu]);
-  const sequence = useRef(0),
-    seenJobs = useRef(new Set<string>()),
+  const seenJobs = useRef(new Set<string>()),
     lastRoute = useRef(route),
     stateRef = useRef(state);
   stateRef.current = state;
@@ -296,6 +301,9 @@ function App() {
   const localBusy = submitting || active(state?.job);
   const indexChanging = active(state?.job) && ["scan", "apply", "deep_apply", "consolidate"].includes(state?.job?.kind || "");
   const busy = submitting || active(onlineRoute ? state?.online_job : state?.job) || (onlineRoute && indexChanging);
+  const fileChangesRunning = active(state?.job) && ["apply", "deep_apply", "consolidate"].includes(state?.job?.kind || "");
+  const queueBusy = submitting || (route === "queue" && active(state?.download_job));
+  const downloadBusy = submitting || active(state?.download_job) || fileChangesRunning;
   const tree = ["missing", "queue", "downloaded"].includes(route);
   const notifyError = (e: any) => setError(String(e?.message || e));
   async function refresh(targetRoot?: string) {
@@ -303,7 +311,7 @@ function App() {
       const activeRoot = targetRoot !== undefined ? targetRoot : root;
       const s = await call<AppState>("state", activeRoot ? { root: activeRoot } : {});
       const epochs = mergeActivityEpochs(s.activity_epochs);
-      setState(previous => previous ? {...s, logs:mergeActivitySnapshot(previous.logs,s.logs,previous.activity_epochs,s.activity_epochs), activity_epochs:[0,1,2].map(i=>Math.max(previous.activity_epochs?.[i] || 0,s.activity_epochs?.[i] || 0)), job:mergeJob(previous.job,s.job), online_job:mergeJob(previous.online_job,s.online_job), download_job:mergeJob(previous.download_job,s.download_job)} : s);
+      setState(previous => previous ? {...s, revision:Math.max(previous.revision,s.revision), logs:mergeActivitySnapshot(previous.logs,s.logs,previous.activity_epochs,s.activity_epochs), activity_epochs:[0,1,2].map(i=>Math.max(previous.activity_epochs?.[i] || 0,s.activity_epochs?.[i] || 0)), job:mergeJob(previous.job,s.job), online_job:mergeJob(previous.online_job,s.online_job), download_job:mergeJob(previous.download_job,s.download_job)} : s);
       if (s.download_monitor && epochs.downloadsAccepted) setDownloadMonitor(old => mergeDownloadMonitor(epochs.downloadsCleared ? {} : old,s.download_monitor!));
       if (!activeRoot && s.roots.length > 0) {
         setRoot(s.roots[0].root);
@@ -322,12 +330,14 @@ function App() {
     setSelected(new Set());
     setOffset(0);
     setPreview(undefined);
+    queueSelectionGuard.current = {pending:0, minRevision:0};
     refresh(root);
   }, [root]);
   useEffect(() => {
     localStorage.setItem("tibrary.route", route);
     setData({rows: [], total: 0});
     setSelection({});
+    queueSelectionGuard.current = {pending:0, minRevision:0};
     setSelected(new Set());
     setOffset(0);
     setQuery("");
@@ -373,38 +383,20 @@ function App() {
     type: releaseType,
   };
   useEffect(() => {
-    let alive = true;
-    const n = ++sequence.current;
-    if (!state || (root && !state.roots.some((r) => r.root === root))) return;
-    if (["overview", "prepare", "catalogue", "complete", "fix", "settings"].includes(route)) {
-      setLoading(false);
+    if (!state || (root && !state.roots.some((r) => r.root === root))
+      || ["overview", "prepare", "catalogue", "complete", "fix", "settings", "general", "connections", "downloads", "activity"].includes(route)) {
+      tableReader.clear();
       return;
     }
-    setLoading(true);
-    const timer = setTimeout(
-      () =>
-        call("table", viewArgs)
-          .then((value) => {
-            if (alive && n === sequence.current) {
-              setData(value);
-              if (!preview && value.preview_id) setPreview(value.preview_id);
-              if (route === "queue")
-                setSelection(
-                  Object.fromEntries(
-                    value.rows.map((r: Row) => [r.id, r.selected]),
-                  ),
-                );
-            }
-          })
-          .catch((e) => alive && notifyError(e))
-          .finally(() => alive && setLoading(false)),
-      query ? 150 : 0,
-    );
-    return () => {
-      alive = false;
-      clearTimeout(timer);
-    };
+    tableReader.request({key:JSON.stringify(viewArgs), revision:state.revision, version:tableRefresh,
+      read:()=>call("table",viewArgs), publish:(value, readRevision)=>{
+        setData(value);
+        if (!preview && value.preview_id) setPreview(value.preview_id);
+        if (route === "queue" && !queueSelectionGuard.current.pending && readRevision >= queueSelectionGuard.current.minRevision)
+          setSelection(Object.fromEntries(value.rows.map((r:Row)=>[r.id,r.selected])));
+      }}, query ? 150 : 0);
   }, [
+    tableRefresh,
     route,
     root,
     offset,
@@ -491,7 +483,7 @@ function App() {
         const update = await call<any>("job.status");
         if (!disposed && (update.job || update.online_job || update.download_job)) {
           const epochs = mergeActivityEpochs(update.activity_epochs);
-          setState(s => s ? {...s, ...update, logs:mergeActivitySnapshot(s.logs,update.logs || [],s.activity_epochs,update.activity_epochs), activity_epochs:[0,1,2].map(i=>Math.max(s.activity_epochs?.[i] || 0,update.activity_epochs?.[i] || 0)), job:mergeJob(s.job,update.job), online_job:mergeJob(s.online_job,update.online_job), download_job:mergeJob(s.download_job,update.download_job)} : s);
+          setState(s => s ? {...s, ...update, revision:Math.max(s.revision,update.revision || 0), logs:mergeActivitySnapshot(s.logs,update.logs || [],s.activity_epochs,update.activity_epochs), activity_epochs:[0,1,2].map(i=>Math.max(s.activity_epochs?.[i] || 0,update.activity_epochs?.[i] || 0)), job:mergeJob(s.job,update.job), online_job:mergeJob(s.online_job,update.online_job), download_job:mergeJob(s.download_job,update.download_job)} : s);
           if (update.download_monitor && epochs.downloadsAccepted) setDownloadMonitor(old=>mergeDownloadMonitor(epochs.downloadsCleared ? {} : old,update.download_monitor));
           if (![update.job, update.online_job, update.download_job].some(active)) await refresh();
         }
@@ -627,8 +619,31 @@ function App() {
     }
   }
   async function selectTree(next: Selection) {
+    const prior = selection;
     setSelection(next);
-    if (route === "queue") await mutate("queue.select", { selection: next });
+    if (route === "queue") {
+      const guard = queueSelectionGuard.current;
+      guard.pending++;
+      guard.minRevision = Math.max(guard.minRevision,(stateRef.current?.revision || 0)+1);
+      try {
+        if (!await mutate("queue.select", {selection:next})) {guard.minRevision=0; setSelection(prior);}
+      } finally {guard.pending--;}
+    }
+  }
+
+  async function loadReleaseTracks(row: Row) {
+    if (detailReads.current.has(row.id)) return;
+    detailReads.current.add(row.id);
+    setLoadingDetails(previous=>new Set(previous).add(row.id));
+    try {
+      await call("release.ensure_tracks", {id:row.id});
+      setTableRefresh(previous=>previous+1);
+      await refresh();
+    } catch (e) { notifyError(e); }
+    finally {
+      detailReads.current.delete(row.id);
+      setLoadingDetails(previous=>{const next=new Set(previous);next.delete(row.id);return next;});
+    }
   }
   async function prepareApply() {
     if (!preview || !selected.size) return;
@@ -1024,7 +1039,7 @@ function App() {
                 : "Find artwork (online)"}
             </button>
             <button
-              disabled={busy || !preview || !selected.size}
+              disabled={localBusy || active(state?.download_job) || !preview || !selected.size}
               onClick={prepareApply}
             >
               Review & apply ({selected.size})
@@ -1165,7 +1180,7 @@ function App() {
             </details>
             <button
               disabled={
-                busy || !Object.keys(selectedReleases(selection)).length
+                queueBusy || !Object.keys(selectedReleases(selection)).length
               }
               onClick={() =>
                 mutate("queue.add", { selection: selectedReleases(selection) })
@@ -1179,7 +1194,7 @@ function App() {
           <>
             <button
               className="primary"
-              disabled={busy || active(state?.download_job) || !state?.stats.approved_queue}
+              disabled={downloadBusy || !state?.stats.approved_queue}
               onClick={async () => {
                 setSubmitting(true);
                 try { setReview({ operation: "download", rows: await call("queue.preview") }); }
@@ -1190,13 +1205,13 @@ function App() {
               <ArrowDownToLine size={16} />
               Download
             </button>
-            <button disabled={busy} onClick={() => openExport("queue")}>
+            <button disabled={submitting} onClick={() => openExport("queue")}>
               Export
             </button>
           </>
         )}
         {route === "downloaded" && (
-          <button disabled={busy} onClick={() => openExport("downloaded")}>
+          <button disabled={submitting} onClick={() => openExport("downloaded")}>
             Export
           </button>
         )}
@@ -1231,7 +1246,6 @@ function App() {
           </div>
         )}
         {toolbar()}
-        {route === "missing" && <p className="hint scan-explainer">Recommendations compare releases with your downloaded music and its verified online metadata. Update missing releases fills missing track details and credits; saved complete checks are reused. Select Recommended to narrow the list, or inspect all confidence levels.</p>}
         {route === "missing" && (
           <div className="filters secondary">
             <select
@@ -1401,17 +1415,12 @@ function App() {
           onTreeSelect={selectTree}
           expanded={expanded}
           setExpanded={setExpanded}
-          onExpand={(r) => {
-            if (!busy) run("release_details", { id: r.id });
-            else
-              setToast(
-                "Track details can be loaded when the current operation finishes.",
-              );
-          }}
+          onExpand={loadReleaseTracks}
+          loadingDetails={loadingDetails}
           onDetail={loadDetail}
           onMenu={(row, x, y) => setMenu({ row, x, y })}
           loading={loading}
-          busy={busy}
+          busy={tree ? queueBusy : busy}
         />
         <footer className="table-footer">
           <span>
@@ -1954,7 +1963,7 @@ function App() {
           {route === "downloaded" && (
             <>
               <hr />
-              <button role="menuitem" disabled={busy} onClick={() => {
+              <button role="menuitem" disabled={queueBusy || active(state?.download_job)} onClick={() => {
                 mutate("queue.redownload", { release_id: r.parent || r.id, ...(r.parent ? { track_id: r.id } : {}) });
                 setMenu(null);
               }}>{r.parent ? "Redownload track" : "Redownload release"}</button>
@@ -1965,7 +1974,7 @@ function App() {
               <hr />
               <button
                 role="menuitem"
-                disabled={busy}
+                disabled={queueBusy}
                 onClick={() => {
                   if (route === "missing")
                     mutate("queue.add", {
@@ -1981,7 +1990,7 @@ function App() {
               </button>
               <button
                 role="menuitem"
-                disabled={busy}
+                disabled={queueBusy}
                 onClick={() => {
                   mutate("queue.decision", { ids, decision: "ignored" });
                   setMenu(null);
@@ -1991,7 +2000,7 @@ function App() {
               </button>
               <button
                 role="menuitem"
-                disabled={busy}
+                disabled={queueBusy}
                 onClick={() => {
                   mutate("queue.decision", { ids, decision: "removed" });
                   setMenu(null);
@@ -2187,8 +2196,8 @@ function App() {
               onClear={async (stream) => {
                 const cleared = await call("logs.clear", {stream});
                 mergeActivityEpochs(cleared.activity_epochs);
-                if (stream === "downloads") setDownloadMonitor({});
-                setState(old => old ? {...old, activity_epochs:cleared.activity_epochs || old.activity_epochs, logs: old.logs.filter(entry => streamFor(entry) !== stream)} : old);
+                if (stream === "downloads" || stream === "all") setDownloadMonitor({});
+                setState(old => old ? {...old, activity_epochs:cleared.activity_epochs || old.activity_epochs, logs: stream === "all" ? [] : old.logs.filter(entry => streamFor(entry) !== stream)} : old);
               }}
               onCancel={(kind) => call("job.cancel", {kind}).catch(notifyError)}
             />
@@ -2530,7 +2539,11 @@ function App() {
           </div>
           <footer>
             <button onClick={() => setReview(null)}>Cancel</button>
-            <button className="primary" disabled={busy || (review.operation === "download" && !review.rows?.length)} onClick={confirmReview}>
+            <button className="primary" disabled={review.operation === "download"
+              ? downloadBusy || !review.rows?.length
+              : review.operation === "component_update"
+                ? submitting || active(state?.online_job)
+                : localBusy || active(state?.download_job)} onClick={confirmReview}>
               {review.operation === "consolidate"
                 ? review.count
                   ? `Move ${review.count} duplicate files to Trash`

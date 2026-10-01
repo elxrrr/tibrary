@@ -16,7 +16,7 @@ A local-first music library manager for macOS, built with Rust and Tauri.
 - **Link your collection:** match album artists, recordings and whole releases using cached catalogue evidence.
 - **Find missing music:** discover new releases and incomplete albums, filter recommendations, and queue selected tracks.
 - **Update your files:** fill available tags—including BPM and Camelot keys—improve artwork, and audit MQA files.
-- **Follow the work:** separate activity panels for local tasks, online checks and downloads, with one expandable history per job.
+- **Follow the work:** one searchable activity log with saved details and separate cancellation controls for local tasks, online checks and downloads.
 
 Linking only updates the app database. File changes are reviewed separately; duplicate removal uses Trash. One subscriber account supplies catalogue metadata and downloads. Available metadata varies by release.
 
@@ -48,6 +48,8 @@ npm --prefix desktop run tauri dev
 5. Use **Update library** for missing tags, artwork and replacements.
 
 Use **Check local changes** after editing files outside the app, and **Update missing releases** to discover new music and fill gaps in online metadata. Recommendation updates first complete metadata for your downloaded, linked releases, then fill candidate gaps. Tools share their cached results; unchanged tags and checked track credits are reused. Metadata views show which fields were checked, and artist scope and recommendation confidence can be filtered separately. Your database does not need resetting.
+
+Browse cached releases and manage the queue while updates run. Expanding a release loads missing track details on demand; downloads and local scans run independently. File-changing operations wait for active downloads to finish.
 
 ## Screenshots
 

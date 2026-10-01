@@ -66,6 +66,93 @@ test.afterEach(async () => {
   await new Promise<void>((resolve) => child.on("exit", () => resolve()));
   rmSync(folder, { recursive: true, force: true });
 });
+
+test("tables publish usable results while catalogue revisions keep advancing", async ({page}) => {
+  await page.addInitScript(() => {
+    let id=0;
+    const callbacks=new Map<number,(event:any)=>void>(), listeners=new Map<number,string>();
+    (window as any).__TAURI_INTERNALS__={
+      transformCallback:(callback:(event:any)=>void)=>{callbacks.set(++id,callback);return id;},
+      invoke:async(command:string,args:any)=>{
+        if(command==="plugin:event|listen") {listeners.set(args.handler,args.event);return args.handler;}
+        if(command==="plugin:event|unlisten") callbacks.delete(args.eventId);
+      },
+    };
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:(_event:string,eventId:number)=>listeners.delete(eventId)};
+    (window as any).emitBackendEvent=(payload:any)=>{
+      for(const [handler,event] of listeners) if(event==="backend-event") callbacks.get(handler)?.({event,id:handler,payload});
+    };
+  });
+  let revision=1000;
+  const job={id:"advancing-refresh",kind:"discography",status:"running",message:"Checking cached artist releases",started:Date.now()/1000,completed:1,total:20};
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    const response=await rpc(request.method,request.args);
+    if(["state","job.status"].includes(request.method) && response.result) {
+      response.result.online_job=job;
+      if(request.method==="state") response.result.revision=++revision;
+      else delete response.result.revision;
+    }
+    if(request.method==="table" && request.args.route==="missing") await new Promise(resolve=>setTimeout(resolve,700));
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading",{name:"Overview",exact:true})).toBeVisible();
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await page.getByRole("combobox",{name:"Release timeline"}).selectOption("All missing releases");
+  await page.evaluate(()=>{(window as any).refreshTestTimer=setInterval(()=>(window as any).emitBackendEvent({event:"changed"}),80);});
+  try {
+    await expect(page.locator("tbody")).toContainText("Night Maps",{timeout:1800});
+    await expect(page.getByRole("button",{name:"Update missing releases",exact:true})).toBeDisabled();
+    await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
+    await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeVisible({timeout:1500});
+    await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeEnabled();
+  } finally {await page.evaluate(()=>clearInterval((window as any).refreshTestTimer));}
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("queue approvals and lazy tracks stay usable during independent scans and refreshes", async ({page}) => {
+  const started=Date.now()/1000;
+  const local={id:"independent-scan",kind:"scan",status:"running",message:"Reading local files",started,completed:1,total:20};
+  const online={id:"independent-refresh",kind:"discography",status:"running",message:"Checking artist releases",started,completed:1,total:20};
+  let tracksReady=false, details=0;
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    const response=await rpc(request.method,request.args);
+    if(["state","job.status"].includes(request.method) && response.result) Object.assign(response.result,{job:local,online_job:online,download_job:null});
+    if(request.method==="table" && request.args.route==="queue" && !tracksReady) {
+      const row=response.result.rows.find((row:any)=>row.release==="Blue Hours");
+      if(row) {row.children=[];row.expanded_available=false;}
+    }
+    if(request.method==="release.ensure_tracks") {
+      details++;
+      await new Promise(resolve=>setTimeout(resolve,250));
+      tracksReady=true;
+    }
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
+  await page.getByRole("checkbox",{name:"Select Blue Hours",exact:true}).check();
+  await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeChecked();
+  await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
+  await expect(page.getByRole("status").filter({hasText:"Loading track details…"})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
+  expect(details).toBe(1);
+  await page.getByRole("checkbox",{name:"Select track First Light",exact:true}).uncheck();
+  await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).not.toBeChecked();
+  await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeChecked({indeterminate:true});
+  await page.getByRole("button",{name:"Download",exact:true}).click();
+  const dialog=page.getByRole("dialog");
+  await expect(dialog.getByRole("table",{name:"Tracks in Blue Hours"})).toContainText("Drift");
+  await expect(dialog).not.toContainText("First Light");
+  await expect(dialog.getByRole("button",{name:"Start download",exact:true})).toBeEnabled();
+  await dialog.getByRole("button",{name:"Cancel",exact:true}).click();
+  await page.getByRole("button",{name:"Export",exact:true}).click();
+  await expect(page.getByRole("dialog")).toContainText("tidal.com/track/");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
 test("all workflow routes render with no runtime errors", async ({ page }) => {
   if (process.env.TIBRARY_SCREENSHOTS) {
     await page.emulateMedia({colorScheme:"dark"});
@@ -453,19 +540,19 @@ test("downloaded release and track menus requeue the original record", async ({p
   expect(queued.result.rows.find((row:any) => row.id === "910001")?.selected).toEqual(["91000101"]);
 });
 
-test("activity has independent online, local and download panels", async ({page}) => {
+test("activity has one verbose log and independent worker controls", async ({page}) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"Activity",exact:true}).click();
-  await expect(page.getByRole("region", {name:"Online actions"})).toBeVisible();
-  await expect(page.getByRole("region", {name:"Local actions"})).toBeVisible();
-  await expect(page.getByRole("region", {name:"Downloads"})).toBeVisible();
-  await expect(page.locator(".activity-status small")).toHaveText(["Online actions", "Local actions", "Downloads"]);
+  const panel=page.getByRole("region", {name:"Activity log",exact:true});
+  await expect(panel).toBeVisible();
+  await expect(page.locator(".activity-status small")).toHaveText(["Local actions", "Online actions", "Downloads"]);
   await expect(page.locator(".activity-status h2")).toHaveText(["Awaiting task...", "Awaiting task...", "Awaiting task..."]);
-  expect((await page.getByRole("region", {name:"Downloads"}).boundingBox())?.height).toBeGreaterThan(500);
-  await page.getByRole("searchbox", {name:"Search local actions"}).fill("nothing matches");
-  await expect(page.getByRole("region", {name:"Online actions"}).getByRole("searchbox")).toHaveValue("");
-  await page.getByRole("button", {name:"Clear local actions"}).click();
-  await expect(page.getByRole("region", {name:"Downloads"})).toBeVisible();
+  expect((await panel.boundingBox())?.height).toBeGreaterThan(500);
+  await panel.getByRole("searchbox", {name:"Search activity"}).fill("nothing matches");
+  await expect(panel.getByRole("searchbox")).toHaveValue("nothing matches");
+  await panel.getByRole("button", {name:"Clear activity"}).click();
+  await expect(page.getByRole("region", {name:"Downloads worker",exact:true})).toBeVisible();
+  await expect(panel.getByRole("button",{name:/saved history|more details/})).toHaveCount(0);
 });
 
 test("display highlight preference changes focus palette", async ({page}) => {
@@ -973,7 +1060,7 @@ test("favourite artist states have distinct theme-aware colours", async ({page})
   }
 });
 
-test("completed job activity stays grouped with persistent per-item details", async ({page}) => {
+test("completed job activity exposes persistent per-item details without expansion", async ({page}) => {
   await page.goto("/");
   const job = (await rpc("job.start",{kind:"scan",args:{root:join(folder,"music"),force:true}})).result;
   await expect.poll(async()=> (await rpc("job.status")).result.job?.status).toBe("complete");
@@ -982,14 +1069,10 @@ test("completed job activity stays grouped with persistent per-item details", as
   expect(history.every((entry:any)=>entry.job_id === job.id)).toBe(true);
   expect(history.some((entry:any)=>entry.message.includes("Reading local tags"))).toBe(true);
   await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
-  const panel=page.getByRole("region",{name:"Local actions",exact:true});
-  const toggle=panel.getByRole("button",{name:/Scan library.*complete/}).first();
-  await expect(toggle).toBeVisible();
-  await expect(panel.locator(".batch-children")).toHaveCount(0);
-  await toggle.click();
-  await expect(panel.locator(".batch-children")).toContainText("Reading local tags");
-  await expect(panel.getByRole("button",{name:/Load (full saved history|more details)/})).toHaveCount(0);
-  await expect(panel.locator(".batch-children .log-row")).toHaveCount(history.length);
+  const panel=page.getByRole("region",{name:"Activity log",exact:true});
+  await expect(panel.locator(".log-row").filter({hasText:"Reading local tags"}).first()).toBeVisible();
+  await expect(panel.locator(`[data-job-id="${job.id}"]`)).toHaveCount(history.length);
+  await expect(panel.getByRole("button",{name:/saved history|more details/})).toHaveCount(0);
 });
 
 
@@ -1011,11 +1094,12 @@ test("table headers remain opaque in light and dark themes, including dialogs", 
 });
 
 
-test("local activity keeps its layout and expanded live row stable during updates", async ({page}) => {
+test("activity keeps its live progress row stable during updates", async ({page}) => {
   let message = "Checking file 1 of 20";
   const started=Date.now()/1000;
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
+    if (request.method === "logs.history") return route.fulfill({json:{result:{entries:[],next_before_id:null}}});
     const response=await rpc(request.method,request.args);
     if (["state","job.status"].includes(request.method) && response.result) {
       response.result.job={id:"local-live",kind:"scan",status:"running",message,started,completed:1,total:20};
@@ -1025,20 +1109,20 @@ test("local activity keeps its layout and expanded live row stable during update
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
-  const panel=page.getByRole("region",{name:"Local actions",exact:true});
-  await panel.locator(".batch-toggle").click();
-  const row=panel.locator(".log-row").last();
+  const panel=page.getByRole("region",{name:"Activity log",exact:true});
+  const row=panel.locator(".log-row");
+  await expect(row).toHaveCount(1);
   await row.evaluate(element=>element.setAttribute("data-stability-check","retained"));
   const top=(await panel.boundingBox())!.y;
   message="Reading local tags · 12/20 files · An artist with a very long album name and an extended track title which needs to wrap across several lines without moving the panel";
   await expect(row).toContainText("12/20");
   await expect(row).toHaveAttribute("data-stability-check","retained");
   expect((await panel.boundingBox())!.y).toBe(top);
-  await expect(panel.locator(".batch-toggle")).toHaveAttribute("aria-expanded","true");
+  await expect(panel.locator(".batch-toggle")).toHaveCount(0);
   await expect(panel.getByRole("button",{name:/saved history|more details/})).toHaveCount(0);
 });
 
-test("activity keeps each job in its channel and nests parallel downloads through empty snapshots", async ({page}) => {
+test("unified activity retains concurrent details through empty snapshots and cancels only the selected worker", async ({page}) => {
   const started=Date.now()/1000;
   const local={id:"group-local",kind:"apply",status:"running",message:"Updating local tags",started,completed:1,total:5};
   const online={id:"group-online",kind:"discography",status:"running",message:"Artist 2 of 10 — release details",started,completed:2,total:10};
@@ -1052,15 +1136,21 @@ test("activity keeps each job in its channel and nests parallel downloads throug
     [`${download.id}:batch:r${n}`,{id:`r${n}`,kind:"batch",job_id:download.id,release_id:`r${n}`,artist:"Artist",release:`Release ${n}`,status:"running",total_tracks:1}],
     [`${download.id}:track:r${n}:t${n}`,{id:`t${n}`,kind:"track",job_id:download.id,release_id:`r${n}`,title:`Track ${n}`,status:"running",index:1,total_tracks:1,percent:25,bytes:1024,updated_at:started}],
   ]));
-  let empty=false, emptyReplies=0, snapshots=0;
-  const epochs=[0,0,0];
+  let empty=false,emptyReplies=0,snapshots=0;
+  const cancelled:string[]=[];
+  let epochs=[0,0,0];
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
     if (request.method === "logs.clear") {
-      epochs[request.args.stream === "online" ? 0 : request.args.stream === "downloads" ? 2 : 1]++;
+      expect(request.args.stream).toBe("all");
+      epochs=[1,1,1];
       return route.fulfill({json:{result:{cleared:true,activity_epochs:epochs}}});
     }
-    if (request.method === "logs.job") return route.fulfill({json:{result:logs.filter(entry=>entry.job_id===request.args.id)}});
+    if (request.method === "logs.history") return route.fulfill({json:{result:{entries:[],next_before_id:null}}});
+    if (request.method === "job.cancel") {
+      cancelled.push(request.args.kind);
+      return route.fulfill({json:{result:{cancelled:true}}});
+    }
     const response=await rpc(request.method,request.args);
     if (["state","job.status"].includes(request.method) && response.result) {
       Object.assign(response.result,{job:local,online_job:online,download_job:download,activity_epochs:[0,0,0],logs:empty?[]:logs,download_monitor:empty?{}:monitor});
@@ -1071,45 +1161,35 @@ test("activity keeps each job in its channel and nests parallel downloads throug
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
-  for (const name of ["Online actions","Local actions","Downloads"]) {
-    const panel=page.getByRole("region",{name,exact:true});
-    await expect(panel.locator(".job-toggle")).toHaveCount(1);
-    await panel.locator(".job-toggle").click();
-  }
-  const localPanel=page.getByRole("region",{name:"Local actions",exact:true});
-  const onlinePanel=page.getByRole("region",{name:"Online actions",exact:true});
-  const downloadPanel=page.getByRole("region",{name:"Downloads",exact:true});
-  await expect(localPanel.locator(".batch-children")).toContainText(logs[0].message);
-  await expect(onlinePanel.locator(".batch-children")).toContainText(logs[1].message);
-  await expect(downloadPanel.locator(".download-job-details .release-toggle")).toHaveCount(2);
-  await expect(downloadPanel.locator(".download-row")).toHaveCount(2);
+  const panel=page.getByRole("region",{name:"Activity log",exact:true});
+  for (const entry of logs) await expect(panel.locator(".log-row").filter({hasText:entry.message})).toHaveCount(1);
+  await expect(panel.locator(".log-row").filter({hasText:/Track [12] · running/})).toHaveCount(2);
+  await page.getByRole("region",{name:"Online actions worker",exact:true}).getByRole("button",{name:"Cancel task",exact:true}).click();
+  expect(cancelled).toEqual(["discography"]);
+  await expect(page.getByRole("region",{name:"Local actions worker",exact:true}).getByRole("button",{name:"Cancel task",exact:true})).toBeEnabled();
+  await expect(page.getByRole("region",{name:"Downloads worker",exact:true}).getByRole("button",{name:"Cancel task",exact:true})).toBeEnabled();
   empty=true;
   await expect.poll(()=>emptyReplies).toBeGreaterThan(0);
-  await expect(localPanel.locator(".log-row")).toContainText(logs[0].message);
-  await expect(onlinePanel.locator(".log-row")).toContainText(logs[1].message);
-  await expect(downloadPanel.locator(".download-row")).toHaveCount(2);
-  await expect(downloadPanel.locator(".job-toggle")).toHaveAttribute("aria-expanded","true");
-  // A slow, old snapshot arriving after Clear must not restore its archived
-  // rows or transfer monitor. Active job headers can remain available.
+  for (const entry of logs) await expect(panel.locator(".log-row").filter({hasText:entry.message})).toHaveCount(1);
+  await expect(panel.locator(".log-row").filter({hasText:/Track [12] · running/})).toHaveCount(2);
+  // Old snapshots after Clear must not restore archived rows or transfers.
   empty=false;
-  await onlinePanel.getByRole("button",{name:"Clear online actions",exact:true}).click();
-  await downloadPanel.getByRole("button",{name:"Clear downloads",exact:true}).click();
+  await panel.getByRole("button",{name:"Clear activity",exact:true}).click();
   const afterClear=snapshots;
   await expect.poll(()=>snapshots).toBeGreaterThan(afterClear);
-  await expect(onlinePanel.locator(".job-toggle")).toHaveAttribute("aria-expanded","false");
-  await expect(onlinePanel.locator(".log-row")).toHaveCount(0);
-  await downloadPanel.locator(".job-toggle").click();
-  await expect(downloadPanel.locator(".download-row")).toHaveCount(0);
+  await expect(panel.locator(".log-row")).toHaveCount(0);
 });
 
-test("expanded saved job history appends pages and searches archived details without disappearing", async ({page}) => {
-  const entries=Array.from({length:1002},(_,i)=>({at:new Date(Date.parse("2026-09-30T12:00:00Z")+i*1000).toISOString(),message:`Checked recording ${i+1}`,category:"online",job_id:"archive-refresh",job_kind:"discography",job_status:i===1001?"complete":"running"}));
-  const offsets:number[]=[];
+test("saved activity loads older pages and searches archived details without expansion", async ({page}) => {
+  const entries=Array.from({length:1002},(_,i)=>({saved_id:i+1,at:new Date(Date.parse("2026-09-30T12:00:00Z")+i*1000).toISOString(),message:`Checked recording ${i+1}`,category:"online",job_id:"archive-refresh",job_kind:"discography",job_status:i===1001?"complete":"running"}));
+  const cursors:(number|null)[]=[];
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
-    if (request.method === "logs.job" && request.args.id === "archive-refresh") {
-      offsets.push(request.args.offset || 0);
-      return route.fulfill({json:{result:entries.slice(request.args.offset || 0,(request.args.offset || 0)+1000)}});
+    if (request.method === "logs.history") {
+      cursors.push(request.args.before_id || null);
+      const candidates=entries.filter(entry=>(!request.args.before_id || entry.saved_id < request.args.before_id) && (!request.args.search || entry.message.includes(request.args.search))).slice().reverse();
+      const pageEntries=candidates.slice(0,500);
+      return route.fulfill({json:{result:{entries:pageEntries,next_before_id:candidates.length>500 ? pageEntries.at(-1)!.saved_id : null}}});
     }
     const response=await rpc(request.method,request.args);
     if (request.method === "state" && response.result) Object.assign(response.result,{job:null,online_job:{id:"archive-refresh",kind:"discography",status:"complete",message:"Release refresh complete",started:1,historical:true},download_job:null,logs:[entries[1001]],download_monitor:{},activity_epochs:[0,0,0]});
@@ -1117,16 +1197,16 @@ test("expanded saved job history appends pages and searches archived details wit
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
-  const panel=page.getByRole("region",{name:"Online actions",exact:true});
-  await panel.locator(".job-toggle").click();
-  await expect(panel.locator(".log-row")).toHaveCount(1001);
+  const panel=page.getByRole("region",{name:"Activity log",exact:true});
+  await expect(panel.locator(".log-row")).toHaveCount(500);
+  await panel.locator(".activity-log").evaluate(element=>{element.scrollTop=element.scrollHeight;});
+  await expect(panel.locator(".log-row")).toHaveCount(1000);
   await panel.locator(".activity-log").evaluate(element=>{element.scrollTop=element.scrollHeight;});
   await expect(panel.locator(".log-row")).toHaveCount(1002);
-  expect(offsets).toEqual([0,1000]);
-  await panel.getByRole("searchbox").fill("Checked recording 1001");
-  await expect(panel.locator(".job-toggle")).toBeVisible();
-  await expect(panel.locator(".log-row")).toHaveCount(1);
-  await expect(panel.locator(".log-row")).toContainText("Checked recording 1001");
-  await panel.getByRole("searchbox").fill("");
-  await expect(panel.locator(".log-row")).toHaveCount(1002);
+  expect(cursors).toEqual([null,503,3]);
+  await panel.getByRole("searchbox").fill("Checked recording 10");
+  await expect(panel.locator(".log-row")).toHaveCount(14);
+  await expect(panel.locator(".log-row").first()).toContainText("Checked recording 1002");
+  await expect(panel.locator(".batch-toggle")).toHaveCount(0);
+  await page.unrouteAll({behavior:"wait"});
 });

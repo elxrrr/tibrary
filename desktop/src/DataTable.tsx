@@ -50,6 +50,7 @@ export function DataTable({
   treeSelection,
   onTreeSelect,
   onExpand,
+  loadingDetails,
   expanded,
   setExpanded,
   onDetail,
@@ -69,6 +70,7 @@ export function DataTable({
   treeSelection?: Selection;
   onTreeSelect?: (s: Selection) => void;
   onExpand?: (r: Row) => void;
+  loadingDetails?: Set<string>;
   expanded: Set<string>;
   setExpanded: (s: Set<string>) => void;
   onDetail: (r: Row) => void;
@@ -297,10 +299,10 @@ export function DataTable({
                     <tr className="child">
                       <td />
                       <td colSpan={columns.length + 1}>
-                        Track details are not cached yet.{" "}
-                        {busy
-                          ? "An operation is running."
-                          : "Use “Load track details” to fetch them."}
+                        {loadingDetails?.has(r.id) ? <span role="status">Loading track details…</span> : <>
+                          Track details are not cached yet.{" "}
+                          <button onClick={() => onExpand?.(r)}>Load track details</button>
+                        </>}
                       </td>
                     </tr>
                   ) : (

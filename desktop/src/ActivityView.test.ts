@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { compactProgress, workload, groupActivity, groupDownloads, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
+import { compactProgress, workload, mergeActivityHistory, downloadActivity, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
 import { mergeJob } from "./api";
 
 it("preserves completion, cancellation and newer progress when request replies arrive late", () => {
@@ -37,18 +37,21 @@ it("shows measured ETA and marks stale or cancelled estimates honestly", () => {
   expect(workload({...job,completed:undefined,total:undefined},{},11000)?.percent).toBeNull();
 });
 
-it("keeps completed job details grouped separately from unrelated messages", () => {
-  const at = "2026-09-27T12:00:00Z";
-  const result=groupActivity([
-    {at,message:"Started",job_id:"a",job_kind:"link",job_status:"running"},
-    {at,message:"Needs review · Artist — Track · Partial release match",job_id:"a",job_kind:"link",job_status:"running"},
-    {at,message:"Finished",job_id:"a",job_kind:"link",job_status:"complete"},
-    {at,message:"Settings saved"},
-  ]);
-  expect(result.groups).toHaveLength(1);
-  expect(result.groups[0].entries).toHaveLength(3);
-  expect(result.groups[0].status).toBe("complete");
-  expect(result.standalone).toHaveLength(1);
+it("interleaves verbose job details chronologically and reuses saved/live entry identities", () => {
+  const saved = [
+    {at:"2026-09-27T12:00:00Z",message:"Started scan",job_id:"local",job_kind:"scan",saved_id:1},
+    {at:"2026-09-27T12:00:02Z",message:"Release details saved",job_id:"online",job_kind:"discography",saved_id:3},
+  ];
+  const live = [
+    {at:"2026-09-27T12:00:01Z",message:"Downloading track",job_id:"download",job_kind:"download"},
+    {...saved[1],saved_id:undefined},
+    {at:"2026-09-27T12:00:03Z",message:"Finished scan",job_id:"local",job_kind:"scan",job_status:"complete"},
+  ];
+  const result=mergeActivityHistory(saved,live);
+  expect(result.map(entry=>entry.message)).toEqual(["Finished scan","Release details saved","Downloading track","Started scan"]);
+  expect(result.filter(entry=>entry.job_id === "online")).toHaveLength(1);
+  const progress={at:"2026-09-27T12:00:04Z",message:"1/4 files",progress_id:"scan"};
+  expect(mergeActivityHistory([progress],[{...progress,at:"2026-09-27T12:00:05Z",message:"2/4 files"}])).toEqual([{...progress,at:"2026-09-27T12:00:05Z",message:"2/4 files"}]);
 });
 
 it("routes all details and errors by the owning job rather than incidental message words", () => {
@@ -69,7 +72,6 @@ it("keeps observed details through empty snapshots, late progress and deliberate
   const finished = {...initial,at:"2026-09-30T12:00:03Z",message:"Finished",job_status:"complete"};
   rows = mergeActivitySnapshot(rows,[finished]);
   expect(rows.every(row=>!row.progress_id)).toBe(true);
-  expect(groupActivity([...rows,progress]).groups[0].status).toBe("complete");
   expect(mergeActivitySnapshot(rows,[],[0,0,0],[1,0,0])).toEqual([]);
   expect(mergeActivitySnapshot([],rows,[1,0,0],[0,0,0])).toEqual([]);
 });
@@ -79,16 +81,25 @@ it("retains previous job summaries when one verbose job exceeds the recent detai
   const details = Array.from({length:1100},(_,i)=>({at:new Date(Date.parse("2026-09-30T12:00:00Z")+i*1000).toISOString(),message:`File ${i}`,job_id:"new",job_kind:"scan",job_status:"running"}));
   const rows = mergeActivitySnapshot([old],details);
   expect(rows).toHaveLength(1001);
-  expect(groupActivity(rows).groups.map(group=>group.id)).toEqual(["new","old"]);
+  expect(rows.some(entry=>entry.job_id === "old")).toBe(true);
 });
 
-it("nests releases under their download job and prevents late snapshots regressing transfer state", () => {
+it("keeps independent transfer lines and prevents late snapshots regressing transfer state", () => {
   const job={id:"download-one",kind:"download",status:"running",message:"Downloading two releases",started:1};
   const items=[{id:"a",kind:"batch",release_id:"r1",job_id:job.id,status:"running"},{id:"b",kind:"batch",release_id:"r2",job_id:job.id,status:"running"},{id:"c",kind:"track",release_id:"r1",job_id:job.id,status:"running"}];
-  expect(groupDownloads(groupActivity([],job).groups,items,job)).toHaveLength(1);
-  expect(groupDownloads([],items)).toHaveLength(1);
+  const transfer=downloadActivity(Object.fromEntries(items.map(item=>[item.id,item])),job);
+  expect(transfer).toHaveLength(3);
+  expect(new Set(transfer.map(entry=>entry.progress_id)).size).toBe(3);
+  expect(transfer.every(entry=>entry.job_id === job.id)).toBe(true);
   const current={track:{id:"a",status:"complete",bytes:1024,updated_at:3}};
   expect(mergeDownloadMonitor(current,{track:{id:"a",status:"running",bytes:512,updated_at:2}})).toEqual(current);
   const monitor={old:{id:"old",kind:"batch",job_id:"previous",total_tracks:20,completed_tracks:20},current:{id:"new",kind:"batch",job_id:job.id,total_tracks:4,completed_tracks:1}};
   expect(workload(job,monitor,2000)?.percent).toBe(25);
+});
+
+it("summarizes batch bytes and keeps per-track speed and ETA in the unified log", () => {
+  const rows=downloadActivity({batch:{id:"r",kind:"batch",release_id:"r",job_id:"d",artist:"Artist",release:"Release",completed_tracks:1,total_tracks:2,status:"running"},track:{id:"t",kind:"track",release_id:"r",job_id:"d",title:"Track",index:2,total_tracks:2,status:"downloading",percent:50,bytes:1048576,estimated_total_bytes:2097152,bytes_per_second:1048576,eta_seconds:2}});
+  expect(rows[0].message).toContain("1/2 tracks · 1.0 MB / ~2.0 MB");
+  expect(rows[1].message).toContain("Track 2/2 · 50%");
+  expect(rows[1].message).toContain("1.0 MB/s · ~2s remaining");
 });

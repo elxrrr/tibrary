@@ -12,7 +12,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
 };
 use tauri::{Emitter, Manager};
@@ -79,7 +79,7 @@ fn publish_catalogue_changes(
 
 const ONLINE_JOB_KINDS: &[&str] = &[
     "link", "check_availability", "cached_releases", "release_artists",
-    "discography", "release_details", "connections", "favourites",
+    "discography", "release_details", "release_tracks", "connections", "favourites",
     "match_artists", "metadata", "manual_candidate", "artwork",
     "check_replacements", "optimizations", "deep_review", "deep_preview",
     "connect_account", "connect_download",
@@ -313,7 +313,7 @@ pub struct Backend {
     progress_estimates: Mutex<progress::Progress>,
     progress_clock: std::time::Instant,
     pub dispatch_gate: tokio::sync::Mutex<()>,
-    pub read_gate: tokio::sync::Mutex<()>,
+    read_gates: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     pub view_cache: Mutex<HashMap<String, (u64, std::time::Instant, Value)>>,
     pub pending_pkce: Mutex<Option<crate::stream_download::PkceFlow>>,
     pub persist_logs: Arc<AtomicBool>,
@@ -345,7 +345,7 @@ impl Default for Backend {
             progress_estimates: Mutex::new(progress::Progress::default()),
             progress_clock: std::time::Instant::now(),
             dispatch_gate: tokio::sync::Mutex::new(()),
-            read_gate: tokio::sync::Mutex::new(()),
+            read_gates: Mutex::new(HashMap::new()),
             view_cache: Mutex::new(HashMap::new()),
             pending_pkce: Mutex::new(None),
             persist_logs: Arc::new(AtomicBool::new(true)),
@@ -360,6 +360,18 @@ impl Backend {
 
     pub fn set_db(&self, db: Arc<TursoDb>) {
         *self.db.lock().unwrap() = Some(db);
+    }
+
+    fn read_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // Coalesce identical requests without making a large catalogue rebuild
+        // hold up unrelated queue, file or settings views. Weak entries expire
+        // once the last request finishes, so changing filters cannot leak gates.
+        let mut gates = self.read_gates.lock().unwrap();
+        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) { return gate; }
+        if gates.len() >= 64 { gates.retain(|_, gate| gate.strong_count() > 0); }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(key.to_owned(), Arc::downgrade(&gate));
+        gate
     }
 
     pub fn log(&self, msg: &str) {
@@ -832,13 +844,10 @@ async fn handle_rpc_call(
     }
 
     let cacheable = method == "table" || method == "state";
-    let _read = if cacheable {
-        Some(state.read_gate.lock().await)
-    } else {
-        None
-    };
-    let revision = db.revision.load(Ordering::SeqCst);
     let key = format!("{method}:{}", args);
+    let gate = cacheable.then(|| state.read_gate(&key));
+    let _read = match gate.as_ref() { Some(gate) => Some(gate.lock().await), None => None };
+    let revision = db.revision.load(Ordering::SeqCst);
     if cacheable {
         let saved = state.view_cache.lock().unwrap().get(&key).cloned();
         if let Some((rev, created, mut value)) = saved {
@@ -909,6 +918,17 @@ async fn handle_rpc_uncached(
     } else {
         None
     };
+    if method == "job.start" {
+        let kind = args["kind"].as_str().unwrap_or("");
+        if kind == "download" && state.active_job.lock().unwrap().as_ref().is_some_and(|job|
+            matches!(job["status"].as_str(), Some("running"|"cancelling"))
+            && matches!(job["kind"].as_str(), Some("apply"|"deep_apply"|"consolidate"))) {
+            return Err("Files are being updated. Downloads will be available when that operation finishes.".into());
+        }
+        if matches!(kind, "apply"|"deep_apply"|"consolidate") && state.download_cancel.lock().unwrap().is_some() {
+            return Err("A download is writing files. Wait for it to finish or cancel it before changing files.".into());
+        }
+    }
     if method == "job.start" && args["kind"] != "download" {
         let kind = args["kind"].as_str().unwrap_or("");
         let occupied = if is_online_job(kind) {
@@ -1099,6 +1119,9 @@ async fn handle_rpc_uncached(
     if method == "turso.tags.write" {
         if state.active_job_cancel.lock().unwrap().is_some() {
             return Err("A local task is already running. Wait for completion or cancel it first.".into());
+        }
+        if state.download_cancel.lock().unwrap().is_some() {
+            return Err("A download is writing files. Wait for it to finish or cancel it before changing tags.".into());
         }
         let path_str = args
             .get("path")
@@ -1308,6 +1331,12 @@ async fn handle_rpc_uncached(
         let id = args["id"].as_str().ok_or("Missing job ID")?;
         state.flush_activity().await;
         return Ok(json!(db.job_activity(id, args["offset"].as_u64().unwrap_or(0) as usize).await?));
+    }
+    if method == "logs.history" {
+        // Read the durable page immediately. The frontend merges live entries
+        // while the asynchronous writer catches up; ongoing jobs must never
+        // delay opening their activity history.
+        return db.activity_history(args["before_id"].as_i64(), args["limit"].as_u64().unwrap_or(500) as usize, args["search"].as_str()).await;
     }
     if method == "logs.clear" {
         let stream = args.get("stream").and_then(Value::as_str).unwrap_or("all");
@@ -1753,6 +1782,37 @@ async fn handle_rpc_uncached(
     }
 
     // DETAILS & PREVIEW
+    if method == "release.ensure_tracks" {
+        let id = args["id"].as_str().ok_or("Choose a release")?;
+        let settings = db.get_settings().await?;
+        let market = args["market"].as_str().filter(|market|!market.trim().is_empty())
+            .or_else(||settings["general"]["market"].as_str()).unwrap_or("GB").to_uppercase();
+        let market = market.as_str();
+        let current = db.get_detail(&json!({"release_id":id,"market":market})).await?;
+        let title = current["title"].as_str().unwrap_or(id);
+        let context = json!({"id":uuid::Uuid::new_v4().to_string(),"kind":"release_tracks","status":"running"});
+        state.log_with_job(&format!("Loading selected release tracks · {title} · release ID {id} · {market} · saved data first"), "info", Some("online"), Some(&context));
+        let cancel = Arc::new(AtomicBool::new(false));
+        struct CancelOnDrop(Arc<AtomicBool>);
+        impl Drop for CancelOnDrop { fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); } }
+        let _cancel_on_drop = CancelOnDrop(cancel.clone());
+        let result = actions::ensure_release_tracks(db,id,market,cancel).await;
+        let mut finished = context;
+        match result {
+            Ok(value) => {
+                finished["status"] = json!("complete");
+                state.log_with_job(&format!("Selected release tracks ready · {title} · release ID {id} · {} audio tracks cached",value["track_count"]), "info", Some("online"), Some(&finished));
+                state.view_cache.lock().unwrap().clear();
+                if let Some(app)=app_handle { let _=app.emit("backend-event",json!({"event":"changed"})); }
+                return Ok(value);
+            }
+            Err(error) => {
+                finished["status"] = json!("failed");
+                state.log_with_job(&format!("Selected release tracks could not be loaded · {title} · release ID {id}: {error}"), "error", Some("online"), Some(&finished));
+                return Err(error);
+            }
+        }
+    }
     if method == "detail" {
         let mut detail = db.get_detail(&args).await?;
         if args["check_availability"] == true {
@@ -3164,6 +3224,82 @@ fn main() {
 
 #[cfg(test)]
 mod activity_tests {
+    #[tokio::test]
+    async fn slow_catalogue_reads_do_not_block_queue_updates_or_independent_workers() {
+        let dir=std::env::temp_dir().join(format!("independent-reads-{}",uuid::Uuid::new_v4()));
+        let db=Arc::new(TursoDb::open(dir.join("db")).await.unwrap());
+        let backend=Arc::new(Backend::new());
+        let online_cancel=Arc::new(AtomicBool::new(false));
+        let download_cancel=Arc::new(AtomicBool::new(false));
+        let local_cancel=Arc::new(AtomicBool::new(false));
+        backend.start_online_job(json!({"id":"refresh","kind":"discography","status":"running"}),online_cancel.clone());
+        backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}),download_cancel.clone());
+        backend.start_job(json!({"id":"scan","kind":"scan","status":"running"}),local_cancel.clone());
+        db.set_preference("tag-review:GB:123",&json!({"id":"123","artist":"Example","title":"Release","label":"Saved label","tracks_loaded":false,"track_count":1,"tracks":[]})).await.unwrap();
+        db.set_preference("subscriber-items:GB:123",&json!({"schema":2,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":"456","title":"Track","trackNumber":1,"volumeNumber":1,"credits":[]}]})).await.unwrap();
+
+        let args=json!({"route":"missing","limit":10});
+        let gate=backend.read_gate(&format!("table:{args}"));
+        let held=gate.lock().await;
+        let (task_backend,task_db)=(backend.clone(),db.clone());
+        let missing=tokio::spawn(async move {handle_rpc_call(None,&task_backend,&task_db,"table".into(),args).await});
+        tokio::task::yield_now().await;
+        let add=handle_rpc_call(None,&backend,&db,"queue.add".into(),json!({"selection":{"123":null}}));
+        tokio::time::timeout(std::time::Duration::from_secs(1),add).await.unwrap().unwrap();
+        let queue=tokio::time::timeout(std::time::Duration::from_secs(1),handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","limit":10}))).await.unwrap().unwrap();
+        assert_eq!(queue["total"],1);
+        assert_eq!(queue["rows"][0]["id"],"123");
+        assert!(!missing.is_finished());
+        let tracks=handle_rpc_call(None,&backend,&db,"release.ensure_tracks".into(),json!({"id":"123","market":"GB"})).await.unwrap();
+        assert_eq!(tracks["tracks"][0]["id"],"456");
+        assert_eq!(tracks["label"],"Saved label");
+        let updated=handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","limit":10})).await.unwrap();
+        assert_eq!(updated["rows"][0]["children"][0]["id"],"456");
+        assert_eq!(updated["rows"][0]["approved"],true);
+        db.connect().unwrap().execute("UPDATE queue SET payload=json_set(payload,'$.tracks',json('[]'),'$.tracks_loaded',json('false'),'$.selected_tracks',json('[{\"id\":\"456\"}]')),approved=0 WHERE id='123'",()).await.unwrap();
+        handle_rpc_call(None,&backend,&db,"release.ensure_tracks".into(),json!({"id":"123","market":"GB"})).await.unwrap();
+        let hydrated=handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","limit":10})).await.unwrap();
+        assert_eq!(hydrated["rows"][0]["children"][0]["id"],"456");
+        assert_eq!(hydrated["rows"][0]["approved"],false);
+        let mut queued=db.connect().unwrap().query("SELECT payload FROM queue WHERE id='123'",()).await.unwrap();
+        let payload:Value=serde_json::from_str(&queued.next().await.unwrap().unwrap().get::<String>(0).unwrap()).unwrap();
+        assert_eq!(payload["selected_tracks"][0]["id"],"456");
+        drop(queued);
+        // A disclosure only fills an absent list. Saved rows remain usable
+        // without authentication while the separate refresh rechecks them.
+        db.set_preference("desktop",&json!({"market":"US"})).await.unwrap();
+        db.set_preference("tag-review:US:789",&json!({"id":"789","title":"US cached release","tracks_loaded":true,"tracks":[{"id":"987","title":"US track"}]})).await.unwrap();
+        let default_market=handle_rpc_call(None,&backend,&db,"release.ensure_tracks".into(),json!({"id":"789"})).await.unwrap();
+        assert_eq!(default_market["title"],"US cached release");
+        assert_eq!(backend.online_job.lock().unwrap().as_ref().unwrap()["id"],"refresh");
+        handle_rpc_call(None,&backend,&db,"job.cancel".into(),json!({"kind":"discography"})).await.unwrap();
+        assert!(online_cancel.load(Ordering::Relaxed));
+        assert!(!download_cancel.load(Ordering::Relaxed));
+        assert!(!local_cancel.load(Ordering::Relaxed));
+        drop(held);
+        missing.await.unwrap().unwrap();
+        drop(gate);drop(backend);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_mutations_and_downloads_have_bidirectional_conflict_guards() {
+        let dir=std::env::temp_dir().join(format!("file-job-guards-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let backend=Arc::new(Backend::new());
+        for kind in ["apply","deep_apply","consolidate"] {
+            backend.start_job(json!({"id":kind,"kind":kind,"status":"running"}),Arc::new(AtomicBool::new(false)));
+            let error=handle_rpc_call(None,&backend,&db,"job.start".into(),json!({"kind":"download"})).await.unwrap_err();
+            assert!(error.contains("Files are being updated"));
+            backend.finish_job(json!({"id":kind,"kind":kind,"status":"complete"}));
+        }
+        backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}),Arc::new(AtomicBool::new(false)));
+        for kind in ["apply","deep_apply","consolidate"] {
+            let error=handle_rpc_call(None,&backend,&db,"job.start".into(),json!({"kind":kind})).await.unwrap_err();
+            assert!(error.contains("download is writing files"));
+        }
+        drop(backend);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn slow_state_reads_cannot_resurrect_completed_jobs() {
         let backend=Backend::new();

@@ -366,6 +366,31 @@ impl TursoDb {
         Ok(entries)
     }
 
+    /// Stable newest-first pagination across all worker channels. An insertion
+    /// during browsing cannot shift older pages, unlike OFFSET pagination.
+    pub async fn activity_history(&self, before_id: Option<i64>, limit: usize, search: Option<&str>) -> Result<Value, String> {
+        let limit = limit.clamp(1, 1000);
+        let search = search.unwrap_or("").trim();
+        let conn = self.connect()?;
+        let mut rows = conn.query(
+            "SELECT id,at,message,level,category,job_context FROM activity_logs WHERE id < ? AND (? = '' OR instr(lower(COALESCE(message,'') || ' ' || COALESCE(category,'') || ' ' || COALESCE(job_context,'')),lower(?)) > 0) ORDER BY id DESC LIMIT ?",
+            (before_id.unwrap_or(i64::MAX), search, search, (limit + 1) as i64),
+        ).await.map_err(|error|error.to_string())?;
+        let mut entries = Vec::with_capacity(limit + 1);
+        while let Some(row) = rows.next().await.map_err(|error|error.to_string())? {
+            let mut entry: Value = row.get::<String>(5).ok().and_then(|text|serde_json::from_str(&text).ok()).filter(Value::is_object).unwrap_or(json!({}));
+            entry["saved_id"] = json!(row.get::<i64>(0).map_err(|error|error.to_string())?);
+            for (index, key) in ["at", "message", "level", "category"].iter().enumerate() {
+                entry[*key] = json!(row.get::<String>(index + 1).unwrap_or_default());
+            }
+            entries.push(entry);
+        }
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next = has_more.then(|| entries.last().and_then(|entry|entry["saved_id"].as_i64())).flatten();
+        Ok(json!({"entries":entries,"next_before_id":next}))
+    }
+
     pub async fn clear_logs(&self) -> Result<(), String> {
         let conn = self.connect()?;
         conn.execute("DELETE FROM activity_logs", ())
@@ -4521,6 +4546,31 @@ mod tests {
         drop(store);
         std::fs::remove_dir_all(folder).unwrap();
     }
+    #[tokio::test]
+    async fn unified_activity_history_keeps_verbose_entries_and_stable_pagination() {
+        let dir=std::env::temp_dir().join(format!("unified-history-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let entries: Vec<_>=(1..=7).map(|index|json!({"at":format!("2026-10-01T10:00:0{index}Z"),"message":format!("Checked {index}"),"level":"info","category":if index%2==0 {"online"} else {"local"},"job_id":"same-refresh","job_kind":"discography"})).collect();
+        db.log_activity_entries(&entries).await.unwrap();
+        let latest=db.activity_history(None,3,None).await.unwrap();
+        assert_eq!(latest["entries"].as_array().unwrap().iter().map(|entry|entry["message"].as_str().unwrap()).collect::<Vec<_>>(),vec!["Checked 7","Checked 6","Checked 5"]);
+        let cursor=latest["next_before_id"].as_i64().unwrap();
+        db.log_activity("2026-10-01T10:00:08Z","New entry during browsing","info","download").await.unwrap();
+        let older=db.activity_history(Some(cursor),3,None).await.unwrap();
+        assert_eq!(older["entries"].as_array().unwrap().iter().map(|entry|entry["message"].as_str().unwrap()).collect::<Vec<_>>(),vec!["Checked 4","Checked 3","Checked 2"]);
+        let oldest=db.activity_history(older["next_before_id"].as_i64(),3,None).await.unwrap();
+        assert_eq!(oldest["entries"].as_array().unwrap().len(),1);
+        assert!(oldest["next_before_id"].is_null());
+        let online=db.activity_history(None,100,Some("ONLINE")).await.unwrap();
+        assert_eq!(online["entries"].as_array().unwrap().len(),3);
+        drop(db);
+        let reopened=TursoDb::open(dir.join("db")).await.unwrap();
+        assert_eq!(reopened.activity_history(None,100,None).await.unwrap()["entries"].as_array().unwrap().len(),8);
+        reopened.clear_logs().await.unwrap();
+        assert_eq!(reopened.activity_history(None,100,None).await.unwrap()["entries"],json!([]));
+        drop(reopened);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn clearing_one_activity_stream_preserves_the_others() {
         let path =

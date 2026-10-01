@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState, useRef, memo } from "react";
-import { Copy, Trash2, ChevronDown, ChevronRight } from "lucide-react";
+import { Copy, Trash2 } from "lucide-react";
 import { call, active, Job, Row, onlineKinds } from "./api";
 
 export type ActivityEntry = {
   at: string;
+  saved_id?: number;
   message: string;
   category?: string;
   level?: string;
@@ -16,7 +17,7 @@ export type ActivityStream = "online" | "local" | "downloads";
 
 export function streamFor(entry: ActivityEntry): ActivityStream {
   // A metadata request made during a local task still belongs to that task.
-  // Error categories and incidental words must not split one job across panels.
+  // Error categories and incidental words must not mislabel its worker.
   if (entry.job_kind === "download") return "downloads";
   if (entry.job_kind && onlineKinds.has(entry.job_kind)) return "online";
   if (entry.job_kind) return "local";
@@ -31,7 +32,7 @@ export function streamFor(entry: ActivityEntry): ActivityStream {
 }
 
 export function jobTitle(kind?: string): string {
-  const titles: Record<string, string> = {discography: "Refresh releases", release_artists: "Check release artists", cached_releases: "Recheck cached releases", check_availability: "Check release availability", link: "Link releases", match_artists: "Match artists", preview: "Review local changes", mqa: "MQA audit", queue_mqa: "Queue MQA replacements", queue_replacements: "Queue online replacements", check_replacements: "Check online replacements", release_details: "Fetch track details and credits", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Download music", scan: "Scan library", apply: "Apply reviewed changes", deep_review: "Find release matches", deep_preview: "Review release links", deep_apply: "Save reviewed release links", review_consolidation: "Review duplicate removal", consolidate: "Remove reviewed duplicates", manual_candidate: "Inspect a release match", connections: "Test connection", connect_account: "Connect account", connect_download: "Connect account", component_check: "Check streaming components", component_update: "Update streaming components", component_rollback: "Restore streaming components"};
+  const titles: Record<string, string> = {discography: "Refresh releases", release_artists: "Check release artists", cached_releases: "Recheck cached releases", check_availability: "Check release availability", link: "Link releases", match_artists: "Match artists", preview: "Review local changes", mqa: "MQA audit", queue_mqa: "Queue MQA replacements", queue_replacements: "Queue online replacements", check_replacements: "Check online replacements", release_details: "Fetch track details and credits", release_tracks: "Load track details", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Download music", scan: "Scan library", apply: "Apply reviewed changes", deep_review: "Find release matches", deep_preview: "Review release links", deep_apply: "Save reviewed release links", review_consolidation: "Review duplicate removal", consolidate: "Remove reviewed duplicates", manual_candidate: "Inspect a release match", connections: "Test connection", connect_account: "Connect account", connect_download: "Connect account", component_check: "Check streaming components", component_update: "Update streaming components", component_rollback: "Restore streaming components"};
   return titles[kind || ""] || kind?.replaceAll("_", " ") || "Task";
 }
 
@@ -71,10 +72,12 @@ export function compactProgress(percent: number | null | undefined): string {
 }
 
 const LogRow = memo(function LogRow({ entry }: { entry: ActivityEntry }) {
-  const category = entry.category || (entry.level === "error" ? "error" : "general");
-  return <div className={`log-row log-${category} ${entry.level === "error" ? "log-error" : ""}`}>
+  const stream = streamFor(entry);
+  const category = stream === "downloads" ? "download" : stream;
+  return <div className={`log-row log-${category} ${entry.level === "error" ? "log-error" : ""}`} data-job-id={entry.job_id}>
     <time title={stamp(entry.at)}>{new Date(entry.at).toLocaleTimeString()}</time>
-    <span className={`log-badge log-badge-${category}`}>{category.toUpperCase()}</span>
+    <span className={`log-badge log-badge-${category}`}>{stream === "downloads" ? "DOWNLOAD" : stream.toUpperCase()}</span>
+    <span className="log-job" title={entry.job_id ? `${jobTitle(entry.job_kind)} · ${entry.job_id}` : "Application"}>{entry.job_kind ? jobTitle(entry.job_kind) : "Application"}</span>
     <span className="log-message">{entry.message}</span>
   </div>;
 });
@@ -114,141 +117,41 @@ export function mergeActivitySnapshot(previous: ActivityEntry[], incoming: Activ
   }).sort((a,b) => compareTime(a.at,b.at));
 }
 
-export type ActivityGroup = {id: string; kind?: string; status?: string; entries: ActivityEntry[]; message: string; updated: string};
-
-export function groupActivity(entries: ActivityEntry[], job?: Job | null) {
-  const groups = new Map<string, ActivityGroup>();
-  const standalone: ActivityEntry[] = [];
-  for (const entry of entries) {
-    const id = entry.job_id || entry.progress_id;
-    if (!id) { standalone.push(entry); continue; }
-    const group = groups.get(id) || {id, kind: entry.job_kind, entries: [], message: "", updated: ""};
-    group.kind ||= entry.job_kind;
-    if (compareTime(entry.at, group.updated) >= 0 && (!terminal.has(group.status || "") || terminal.has(entry.job_status || ""))) {
-      group.status = entry.job_status || group.status;
-      group.message = entry.message;
-      group.updated = entry.at;
-    }
-    if (!entry.progress_id || group.entries.at(-1)?.message !== entry.message) group.entries.push(entry);
-    groups.set(id, group);
-  }
-  if (job?.id && (active(job) || groups.has(job.id))) {
-    const group = groups.get(job.id) || {id: job.id, entries: [], message: "", updated: ""};
-    Object.assign(group, {kind: job.kind, status: job.status, message: job.message});
-    group.updated ||= new Date(job.started * 1000).toISOString();
-    groups.set(job.id, group);
-  }
-  return {groups: [...groups.values()].sort((a,b) => compareTime(b.updated,a.updated)), standalone};
-}
-
-function JobHistory({id, recent, query, running}: {id: string; recent: ActivityEntry[]; query: string; running: boolean}) {
-  const [saved, setSaved] = useState<ActivityEntry[]>([]);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const sentinel = useRef<HTMLDivElement>(null);
-  const runningRef = useRef(running);
-  runningRef.current = running;
-  const loadRef = useRef<(() => void) | undefined>(undefined);
-  useEffect(() => {
-    let disposed = false, requesting = false, offset = 0, more = true;
-    const marker = sentinel.current;
-    const root = marker?.closest(".activity-log") || null;
-    let observer: IntersectionObserver | undefined;
-    async function load() {
-      if (disposed || requesting) return;
-      requesting = true;
-      try {
-        const rows = await call("logs.job", {id, offset}) as ActivityEntry[];
-        if (disposed) return;
-        offset += rows.length; more = rows.length === 1000;
-        setSaved(old => [...new Map([...old, ...rows].map(row => [entryKey(row), row])).values()]);
-        setError("");
-      } catch (e) {if (!disposed) setError(String(e));}
-      finally {requesting = false; if (!disposed) setLoading(false);}
-    }
-    // Append saved history, never clear it during polling or on job completion.
-    // Only an expanded, active job at the saved tail needs periodic requests.
-    loadRef.current = () => {if (!more) void load();};
-    void load();
-    const timer = window.setInterval(() => {if (runningRef.current && !more) void load();}, 2000);
-    observer = new IntersectionObserver(entries => {
-      if (more && entries.some(entry => entry.isIntersecting)) void load();
-    }, {root, rootMargin: "150px"});
-    if (marker) observer.observe(marker);
-    return () => {disposed = true; observer?.disconnect(); window.clearInterval(timer); loadRef.current = undefined;};
-  }, [id]);
-  useEffect(() => {if (!running) loadRef.current?.();}, [running]);
-  const archived = useMemo(() => [...new Map([...recent.filter(entry => !entry.progress_id), ...saved].map(entry => [entryKey(entry), entry])).values()].sort((a,b) => compareTime(a.at,b.at)), [saved,recent]);
-  const live = running ? [...recent].reverse().find(entry => entry.progress_id) : undefined;
-  const rows = live && !archived.some(entry => entry.message === live.message) ? [...archived,live] : archived;
-  const visible = rows.filter(entry => !query || entry.message.toLocaleLowerCase().includes(query));
-  return <div className="batch-children">
-    {visible.map(entry => <LogRow entry={entry} key={entryKey(entry)}/>)}
-    {!rows.length && <p className="history-feedback">{loading ? "Loading saved details…" : "No details recorded yet."}</p>}
-    {rows.length > 0 && !visible.length && <p className="history-feedback">No matching details in this job.</p>}
-    <div ref={sentinel} className="history-sentinel" aria-hidden="true"/>
-    {error && <p role="alert">Saved details could not load: {error}</p>}
-  </div>;
-}
-
-function StreamPanel({ stream, title, entries, monitor, job, onClear }: {
-  stream: ActivityStream;
-  title: string;
-  entries: ActivityEntry[];
-  monitor: Record<string, Row>;
-  job?: Job | null;
-  onClear: (stream: ActivityStream) => Promise<void>;
-}) {
-  const [search, setSearch] = useState("");
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [clearing, setClearing] = useState(false);
-  const q = search.trim().toLocaleLowerCase();
-  const filtered = useMemo(() => entries.filter(entry => !q || `${entry.message} ${entry.category || ""}`.toLocaleLowerCase().includes(q)), [entries, q]);
-  const items = useMemo(()=>stream === "downloads" ? Object.values(monitor) : [],[monitor,stream]);
-  const {groups, standalone: ungrouped} = useMemo(()=>{
-    const result=groupActivity(entries,job);
-    return {...result,groups:stream === "downloads" ? groupDownloads(result.groups,items,job) : result.groups};
-  },[entries,job,items,stream]);
-  const matchingMonitor = (item: Row) => !q || `${item.artist || ""} ${item.release || ""} ${item.title || ""} ${item.status || ""}`.toLocaleLowerCase().includes(q);
-  const visibleGroups = groups.filter(group => !q || expanded[group.id] || `${jobTitle(group.kind)} ${group.message}`.toLocaleLowerCase().includes(q) || group.entries.some(entry => entry.message.toLocaleLowerCase().includes(q)) || (stream === "downloads" && items.some(item => downloadJobId(item, job) === group.id && matchingMonitor(item))));
-  async function copy() {
-    const lines = filtered.map(entry => `[${stamp(entry.at)}] [${(entry.category || "general").toUpperCase()}] ${entry.message}`);
-    if (stream === "downloads") {
-      for (const item of items.filter(matchingMonitor)) lines.push(`[DOWNLOAD] ${item.kind === "batch" ? `${item.artist} — ${item.release}` : item.title}: ${item.status} ${item.percent ?? ""}%`);
-    }
-    await navigator.clipboard.writeText(lines.join("\n"));
-  }
-  return <section className="activity-panel" aria-label={title}>
-    <h2>{title}<span className="stream-count">{visibleGroups.length} {visibleGroups.length === 1 ? "job" : "jobs"}</span></h2>
-    <div className="stream-toolbar">
-      <input aria-label={`Search ${title.toLowerCase()}`} title="Search job titles, recent activity and saved details in expanded jobs" type="search" placeholder={`Search ${title.toLowerCase()}…`} value={search} onChange={event => setSearch(event.target.value)} />
-      <button aria-label={`Copy ${title.toLowerCase()}`} title="Copy filtered entries" onClick={copy}><Copy size={14}/></button>
-      <button aria-label={`Clear ${title.toLowerCase()}`} title="Clear this panel" disabled={clearing} onClick={async () => {setClearing(true); try {await onClear(stream); setExpanded({});} finally {setClearing(false);}}}><Trash2 size={14}/></button>
-    </div>
-    <div className="activity-log">
-      {visibleGroups.map(group => {
-        const running = job?.id === group.id && active(job);
-        const status = running ? job!.status : terminal.has(group.status || "") ? group.status : "interrupted";
-        const jobQuery = `${jobTitle(group.kind)} ${group.message}`.toLocaleLowerCase().includes(q) ? "" : q;
-        return <div className="batch-log" key={group.id}>
-          <button className="batch-toggle job-toggle" aria-expanded={Boolean(expanded[group.id])} onClick={() => setExpanded(old => ({...old, [group.id]: !old[group.id]}))}>
-            {expanded[group.id] ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
-            <strong>{jobTitle(group.kind)}</strong><span title={group.message}>{group.message}</span><span className={`status-badge status-${status}`}>{status}</span>
-          </button>
-          {expanded[group.id] && <>
-            {stream === "downloads" && <DownloadHistory items={items.filter(item => downloadJobId(item, job) === group.id)} query={jobQuery}/>}
-            <JobHistory id={group.id} recent={group.entries} query={jobQuery} running={running}/>
-          </>}
-        </div>;
-      })}
-      {ungrouped.filter(entry => !q || entry.message.toLocaleLowerCase().includes(q)).slice().reverse().map((entry, i) => <LogRow entry={entry} key={`${entry.at}-${i}`}/>)}
-      {!filtered.length && !visibleGroups.length && <div className="activity-empty">No {title.toLowerCase()} to show.</div>}
-    </div>
-  </section>;
-}
-
-const downloadJobId = (item: Row, job?: Job | null) => String(item.job_id || job?.id || "saved-downloads");
 const completeDownload = (status: string) => status === "complete" || status === "already downloaded";
+
+/** Archive pages and live snapshots share an identity; a late reply must never
+ * replace newer live progress or put a finished job back into a running state. */
+export function mergeActivityHistory(previous: ActivityEntry[], incoming: ActivityEntry[]): ActivityEntry[] {
+  const rows = new Map<string, ActivityEntry>();
+  for (const entry of [...previous, ...incoming]) {
+    const key = entryKey(entry), old = rows.get(key);
+    if (!old || compareTime(old.at, entry.at) <= 0) {
+      const next = {...old, ...entry};
+      if (!next.saved_id && old?.saved_id) next.saved_id = old.saved_id;
+      rows.set(key,next);
+    }
+  }
+  return [...rows.values()].sort((a,b) => compareTime(b.at,a.at) || (b.saved_id || 0) - (a.saved_id || 0));
+}
+
+export function downloadActivity(monitor: Record<string, Row>, job?: Job | null): ActivityEntry[] {
+  return Object.entries(monitor).map(([id,item]) => {
+    const status = item.status === "staged" ? "Writing tags" : String(item.status || "Waiting");
+    const tracks = item.kind === "batch"
+      ? `${item.completed_tracks || 0}/${item.total_tracks || 0} tracks`
+      : `Track ${item.index || 0}/${item.total_tracks || 0} · ${compactProgress(Number(item.percent || 0))}`;
+    const children = item.kind === "batch" ? Object.values(monitor).filter(track => track.kind === "track" && track.release_id === item.release_id && track.job_id === item.job_id) : [];
+    const bytes = children.length ? children.reduce((sum,track) => sum + Number(track.bytes || 0),0) : Number(item.bytes || 0);
+    const total = children.length ? children.reduce((sum,track) => sum + Number(track.estimated_total_bytes || track.total_bytes || track.bytes || 0),0) : Number(item.estimated_total_bytes || item.total_bytes || 0);
+    const size = `${(bytes / 1048576).toFixed(1)} MB${total > bytes ? ` / ~${(total / 1048576).toFixed(1)} MB` : ""}`;
+    const speed = item.bytes_per_second ? `${(item.bytes_per_second / 1048576).toFixed(1)} MB/s` : "";
+    const eta = item.eta_seconds != null ? `~${formatDuration(Number(item.eta_seconds))} remaining` : "";
+    const title = item.kind === "batch" ? `${item.artist || "Artist"} — ${item.release || "Release"}` : item.title || `Track ${item.id}`;
+    const time = Number(item.updated_at || 0);
+    const at = item.at || new Date(time ? time < 1e12 ? time * 1000 : time : (job?.started || 0) * 1000).toISOString();
+    return {at, message:[title, status, tracks, size, speed, eta, item.error].filter(Boolean).join(" · "), category:"download", level:item.status === "failed" ? "error" : "info", progress_id:`download:${id}`, job_id:String(item.job_id || job?.id || ""), job_kind:"download", job_status:completeDownload(item.status) ? "complete" : item.status};
+  });
+}
 
 export function mergeDownloadMonitor(previous: Record<string, Row>, incoming: Record<string, Row>): Record<string, Row> {
   const result = {...previous};
@@ -265,56 +168,7 @@ export function mergeDownloadMonitor(previous: Record<string, Row>, incoming: Re
   return Object.fromEntries(Object.entries(result).sort(([,a],[,b]) => Number(b.updated_at || 0)-Number(a.updated_at || 0)).slice(0,1000));
 }
 
-export function groupDownloads(groups: ActivityGroup[], items: Row[], job?: Job | null): ActivityGroup[] {
-  const result = new Map(groups.map(group => [group.id, group]));
-  for (const item of items) {
-    const id = downloadJobId(item, job);
-    if (!result.has(id)) {
-      const related = items.filter(row => downloadJobId(row, job) === id);
-      const status = related.some(row => row.status === "failed") ? "failed" : related.every(row => completeDownload(row.status)) ? "complete" : "interrupted";
-      result.set(id, {id, kind: "download", status, entries: [], message: "Saved download details", updated: String(item.at || "")});
-    }
-  }
-  return [...result.values()].sort((a,b) => compareTime(b.updated,a.updated));
-}
-
-function DownloadHistory({items, query}: {items: Row[]; query: string}) {
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const matches = (item: Row) => !query || `${item.artist || ""} ${item.release || ""} ${item.title || ""} ${item.status || ""}`.toLocaleLowerCase().includes(query);
-  const batches = items.filter(item => item.kind === "batch");
-  const standalone = items.filter(item => item.kind === "track" && !batches.some(batch => batch.release_id === item.release_id));
-  return <div className="download-job-details">
-    {batches.map(batch => {
-      const children = items.filter(item => item.kind === "track" && item.release_id === batch.release_id);
-      if (!matches(batch) && !children.some(matches)) return null;
-      const bytes = children.reduce((n, item) => n + Number(item.bytes || 0), 0);
-      const totalBytes = children.reduce((n, item) => n + Number(item.estimated_total_bytes || item.bytes || 0), 0);
-      const key = String(batch.release_id);
-      const show = expanded[key] !== false;
-      return <div className="download-batch" key={key}>
-        <button className="batch-toggle release-toggle" aria-expanded={show} onClick={() => setExpanded(old => ({...old, [key]: !show}))}>
-          {show ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
-          <strong>{batch.artist} — {batch.release}</strong>
-          <span>{batch.completed_tracks || 0}/{batch.total_tracks} tracks · {(bytes / 1048576).toFixed(1)} MB{totalBytes > bytes ? ` / ~${(totalBytes / 1048576).toFixed(1)} MB` : ""}</span>
-          <span className={`status-badge status-${batch.status === "failed" ? "failed" : batch.status === "complete" ? "complete" : "running"}`}>{batch.status}</span>
-        </button>
-        {show && children.filter(item => matches(batch) || matches(item)).map(item => <DownloadTrack item={item} key={item.id}/>)}
-      </div>;
-    })}
-    {standalone.filter(matches).map(item => <DownloadTrack item={item} key={`${item.release_id}:${item.id}`}/>)}
-  </div>;
-}
-
-function DownloadTrack({ item }: { item: Row }) {
-  const status = item.status === "staged" ? "Writing tags" : item.status;
-  return <div className="download-row">
-    <strong>{item.title}</strong>
-    <span>{item.index} of {item.total_tracks} · {item.percent || 0}% · {((item.bytes || 0) / 1048576).toFixed(1)} MB{item.estimated_total_bytes ? ` / ~${(item.estimated_total_bytes / 1048576).toFixed(1)} MB` : ""} · {item.bytes_per_second ? `${(item.bytes_per_second / 1048576).toFixed(1)} MB/s` : "—"} · {item.eta_seconds != null ? `${item.eta_seconds}s remaining` : "ETA —"}</span>
-    <span className={`status-badge status-${item.status === "failed" ? "failed" : completeDownload(item.status) ? "complete" : item.status === "cancelled" ? "cancelled" : "running"}`}>{status}{item.error ? ` · ${item.error}` : ""}</span>
-  </div>;
-}
-
-function WorkerStatus({ title, job, onCancel }: { title: string; job?: Job | null; onCancel: (kind: string) => void }) {
+function WorkerStatus({ title, job, monitor, onCancel }: { title: string; job?: Job | null; monitor: Record<string, Row>; onCancel: (kind: string) => void }) {
   const [completedId, setCompletedId] = useState("");
   useEffect(() => {
     if (!job || job.historical || active(job) || job.status !== "complete") {
@@ -328,15 +182,19 @@ function WorkerStatus({ title, job, onCancel }: { title: string; job?: Job | nul
     return () => window.clearTimeout(timer);
   }, [job?.id, job?.status, job?.finished, job?.historical]);
   const running = active(job);
-  const progress = workload(job, {}, Date.now());
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { if (!running) return; const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, [running]);
+  const progress = workload(job, monitor, now);
   const detail = running ? (job?.message || "Working") : completedId === job?.id ? "Task complete" : "Awaiting task...";
-  return <div className="card activity-status" role="status">
-    <div><small>{title}</small><h2>{running ? "Task in progress..." : detail}</h2>
+  return <section className="card activity-status" aria-label={`${title} worker`}>
+    <div><small>{title}</small><h2>{running ? jobTitle(job?.kind) : detail}</h2>
       {running && <><p title={job?.message}>{job?.message}</p><p title={progress?.label} className="job-progress-label">{progress?.label}</p><progress aria-label={`${title} progress`} max={100} value={progress?.percent ?? undefined}/></>}
     </div>
     {running && <button disabled={job?.status === "cancelling"} onClick={() => onCancel(job!.kind)}>{job?.status === "cancelling" ? "Cancelling…" : "Cancel task"}</button>}
-  </div>;
+  </section>;
 }
+
+type HistoryPage = { entries: ActivityEntry[]; next_before_id: number | null };
 
 export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onClear, onCancel }: {
   logs: ActivityEntry[];
@@ -344,24 +202,106 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
   job?: Job | null;
   onlineJob?: Job | null;
   downloadJob?: Job | null;
-  onClear: (stream: ActivityStream) => Promise<void>;
+  onClear: (stream: ActivityStream | "all") => Promise<void>;
   onCancel: (kind: string) => void;
 }) {
-  const streams = useMemo(() => ({
-    online: logs.filter(entry => streamFor(entry) === "online"),
-    local: logs.filter(entry => streamFor(entry) === "local"),
-    downloads: logs.filter(entry => streamFor(entry) === "downloads"),
-  }), [logs]);
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  const [saved, setSaved] = useState<ActivityEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [clearing, setClearing] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState(0);
+  const sentinel = useRef<HTMLDivElement>(null);
+  const requestGeneration = useRef(0);
+  const recentWork = useRef(0);
+  const working = active(job) || active(onlineJob) || active(downloadJob);
+  if (working) recentWork.current = Date.now();
+  useEffect(() => { const timer = window.setTimeout(() => setQuery(search.trim()), 250); return () => window.clearTimeout(timer); }, [search]);
+  useEffect(() => {
+    let disposed = false, requesting = false, before: number | null = null, initialized = false;
+    const generation = ++requestGeneration.current;
+    const current = () => !disposed && generation === requestGeneration.current;
+    const marker = sentinel.current;
+    const root = marker?.closest(".activity-log") || null;
+    async function load(older: boolean) {
+      if (!current() || requesting || older && (!initialized || before == null)) return;
+      requesting = true;
+      let loaded = false;
+      setLoading(true);
+      try {
+        const page = await call<HistoryPage>("logs.history", {limit:500, search:query || undefined, ...(older ? {before_id:before} : {})});
+        if (!current()) return;
+        setSaved(old => mergeActivityHistory(old, page.entries));
+        if (older || !initialized) before = page.next_before_id;
+        initialized = true;
+        loaded = true;
+        setError("");
+      } catch (e) { if (current()) setError(String(e)); }
+      finally {
+        requesting = false;
+        if (current()) {
+          setLoading(false);
+          // IntersectionObserver may already consider the sentinel visible
+          // before the first page arrives. Recheck after React lays out rows.
+          window.requestAnimationFrame(() => {
+            if (!loaded || !current() || before == null || !marker || !root) return;
+            const tail = marker.getBoundingClientRect(), viewport = root.getBoundingClientRect();
+            if (tail.top <= viewport.bottom + 200 && tail.bottom >= viewport.top) void load(true);
+          });
+        }
+      }
+    }
+    setSaved([]);
+    void load(false);
+    // Read only the latest page while a worker is active. Live snapshots remain
+    // visible immediately; buffered persistence and page loads never clear it.
+    const timer = window.setInterval(() => { if (Date.now() - recentWork.current < 15000) void load(false); }, 5000);
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) void load(true);
+    }, {root, rootMargin:"200px"});
+    if (marker) observer.observe(marker);
+    return () => { disposed = true; observer.disconnect(); window.clearInterval(timer); };
+  }, [query,historyRevision]);
+  const entries = useMemo(() => {
+    const all = mergeActivityHistory(saved, logs);
+    const finished = new Set(all.filter(entry => !entry.progress_id && terminal.has(entry.job_status || "")).map(entry => entry.job_id));
+    const retained = all.filter(entry => !entry.progress_id || !finished.has(entry.job_id));
+    return mergeActivityHistory(retained, downloadActivity(monitor,downloadJob));
+  }, [saved,logs,monitor,downloadJob]);
+  const filtered = useMemo(() => entries.filter(entry => !search.trim() || `${entry.message} ${jobTitle(entry.job_kind)} ${streamFor(entry)}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())), [entries,search]);
+  async function clear() {
+    setClearing(true);
+    // Reject any archive reply that began before Clear, including a slow page.
+    requestGeneration.current++;
+    try { await onClear("all"); setSaved([]); setError(""); }
+    catch (e) { setError(String(e)); }
+    finally { setClearing(false); setHistoryRevision(old => old + 1); }
+  }
+  async function copy() {
+    try { await navigator.clipboard.writeText(filtered.slice().reverse().map(entry => `[${stamp(entry.at)}] [${streamFor(entry).toUpperCase()}] ${entry.job_kind ? `${jobTitle(entry.job_kind)}: ` : ""}${entry.message}`).join("\n")); }
+    catch (e) { setError(String(e)); }
+  }
   return <div className="activity-view">
     <div className="activity-status-grid">
-      <WorkerStatus title="Online actions" job={onlineJob} onCancel={onCancel}/>
-      <WorkerStatus title="Local actions" job={job} onCancel={onCancel}/>
-      <WorkerStatus title="Downloads" job={downloadJob} onCancel={onCancel}/>
+      <WorkerStatus title="Local actions" job={job} monitor={monitor} onCancel={onCancel}/>
+      <WorkerStatus title="Online actions" job={onlineJob} monitor={monitor} onCancel={onCancel}/>
+      <WorkerStatus title="Downloads" job={downloadJob} monitor={monitor} onCancel={onCancel}/>
     </div>
-    <div className="activity-split">
-      <StreamPanel stream="online" title="Online actions" entries={streams.online} monitor={monitor} job={onlineJob} onClear={onClear}/>
-      <StreamPanel stream="local" title="Local actions" entries={streams.local} monitor={monitor} job={job} onClear={onClear}/>
-      <StreamPanel stream="downloads" title="Downloads" entries={streams.downloads} monitor={monitor} job={downloadJob} onClear={onClear}/>
-    </div>
+    <section className="activity-panel activity-unified" aria-label="Activity log">
+      <h2>All activity<span className="stream-count">Most recent first</span></h2>
+      <div className="stream-toolbar">
+        <input aria-label="Search activity" title="Search saved messages and current tasks" type="search" placeholder="Search activity…" value={search} onChange={event => setSearch(event.target.value)}/>
+        <button aria-label="Copy activity" title="Copy visible activity" onClick={copy}><Copy size={14}/></button>
+        <button aria-label="Clear activity" title="Clear saved and current activity" disabled={clearing} onClick={clear}><Trash2 size={14}/></button>
+      </div>
+      <div className="activity-log" role="log" aria-label="All actions" aria-live="off">
+        {filtered.map(entry => <LogRow entry={entry} key={entryKey(entry)}/>)}
+        {!filtered.length && <p className="activity-empty">{loading ? "Loading activity…" : search.trim() ? "No matching activity." : "Your activity will appear here."}</p>}
+        <div ref={sentinel} className="history-sentinel" aria-hidden="true"/>
+        {loading && filtered.length > 0 && <p className="history-feedback">Loading saved activity…</p>}
+        {error && <p className="history-feedback" role="alert">Activity could not load: {error}</p>}
+      </div>
+    </section>
   </div>;
 }

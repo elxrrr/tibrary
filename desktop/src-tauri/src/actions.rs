@@ -232,6 +232,46 @@ pub async fn release(db: &TursoDb, id: &str, market: &str, force: bool) -> Resul
     release_with_cancel(db,id,market,force,Arc::new(AtomicBool::new(false))).await
 }
 
+/// A row disclosure needs its audio track list, not a new whole-catalogue job.
+/// This shares the same per-release locks and credited item cache as refreshes
+/// and downloads, without occupying or cancelling their worker lanes.
+pub(crate) async fn ensure_release_tracks(db: &TursoDb, id: &str, market: &str, cancel: Arc<AtomicBool>) -> Result<Value, String> {
+    if id.is_empty() || !id.bytes().all(|byte|byte.is_ascii_digit()) { return Err("Choose a release with a valid online ID".into()); }
+    let gate = release_gate(format!("{}:{market}:{id}",db.path.display()));
+    let _guard = release_guard(gate,cancel.as_ref()).await?;
+    let mut value = db.get_detail(&json!({"release_id":id,"market":market})).await?;
+    if value["tracks_loaded"] == true && value["tracks"].as_array().is_some_and(|tracks|!tracks.is_empty()) {
+        value["track_count"] = json!(value["tracks"].as_array().unwrap().len());
+        // Older queue snapshots may still be summaries even when the central
+        // release is complete. A single conditional update preserves concurrent
+        // approvals/track selection and avoids a redundant metadata request.
+        let updated = db.connect()?.execute(
+            "UPDATE queue SET payload=json_set(payload,'$.tracks',json(?),'$.tracks_loaded',json('true'),'$.track_count',?) WHERE id=? AND json_valid(payload) AND (COALESCE(json_extract(payload,'$.tracks_loaded'),0) != 1 OR COALESCE(json_array_length(payload,'$.tracks'),0)=0)",
+            (value["tracks"].to_string(), value["track_count"].as_i64().unwrap_or(0), id),
+        ).await.map_err(|error|error.to_string())?;
+        if updated > 0 { db.bump_revision(); }
+        return Ok(value);
+    }
+    if value["title"] == "Release not found" { return Err("Refresh this release list before opening its tracks".into()); }
+    let http = crate::network::client(20)?;
+    let raw = crate::subscriber_metadata::load(db,&http,id,market,cancel,false).await?;
+    let mut tracks = crate::subscriber_metadata::tracks(&raw)?;
+    let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
+    crate::subscriber_metadata::supplement(&mut tracks,&old_tracks);
+    // Preserve optional fields already collected by a complete metadata pass;
+    // loading the disclosure must not claim unchecked catalogue fields are done.
+    if let Some(fingerprint) = raw["summary_fingerprint"].as_str() {
+        value["recommendation_snapshot"]["schema"] = json!(RECOMMENDATION_SCHEMA);
+        value["recommendation_snapshot"]["summary_fingerprint"] = json!(fingerprint);
+    }
+    value["tracks"] = serde_json::to_value(&tracks).map_err(|error|error.to_string())?;
+    value["tracks_loaded"] = json!(true);
+    value["track_count"] = json!(tracks.len());
+    value["track_metadata_source"] = json!("subscriber");
+    value["track_metadata_checked_at"] = raw["checked_at"].clone();
+    publish_release(db,id,market,value).await
+}
+
 pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, force: bool, cancel: Arc<AtomicBool>) -> Result<Value, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
         return Err("Select a release with a valid online ID".into());
