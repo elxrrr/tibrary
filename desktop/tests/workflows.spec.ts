@@ -268,7 +268,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
       await expect(page.getByRole("button",{name:/^Filter /})).toHaveCount(columns);
       await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
     }
-    if (name === "MQA audit") await expect(page.locator(".mqa-selection-summary")).not.toContainText("Checking selection");
+    if (name === "MQA audit") await expect(page.getByRole("button",{name:"Scan selected tracks",exact:true})).toBeEnabled();
     await expect(page.getByRole("alert")).toHaveCount(0);
     if (process.env.TIBRARY_SCREENSHOTS && screenshots[name]) {
       if (name === "Local duplicates") {
@@ -1116,7 +1116,7 @@ test("missing release defaults keep low matches inspectable without inflating ov
   await confidenceMenu.press("Escape");
   await expect(page.locator("tbody")).toContainText("Verified catalogue");
   await expect(page.locator("tbody")).not.toContainText("Unrelated catalogue");
-  await expect(page.getByText("2 releases matching filters",{exact:false})).toBeVisible();
+  await expect(page.locator(".table-footer")).toContainText("1–2 of 2");
   await columnAll(page,"Recommendation");
   await expect(page.locator("tbody")).toContainText("Unrelated catalogue");
   await expect(page.locator("tbody")).toContainText("Unmatched catalogue");
@@ -1196,7 +1196,7 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   await recommendationMenu.press("Escape");
   await columnOnly(page,"Type",["ALBUM"]);
   await expect(page.getByRole("button",{name:"Filter Type",exact:true})).toHaveClass(/active/);
-  await expect(page.getByText("30 releases matching filters",{exact:false})).toBeVisible();
+  await expect(page.locator(".table-footer")).toContainText("1–30 of 30");
   await expect(selected).toBeChecked();
   await expect(page.getByRole("button",{name:"Collapse Release 00",exact:true})).toHaveCount(1);
   const typeMenu=await columnMenu(page,"Type");
@@ -1205,9 +1205,9 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   if(process.env.TIBRARY_SCREENSHOTS) await page.screenshot({path:"/tmp/tibrary-column-checkbox-filters.png"});
   await columnValue(typeMenu,"EP").click();
   await expect(typeMenu).toBeVisible();
-  await expect(page.getByText("60 releases matching filters",{exact:false})).toBeVisible();
+  await expect(page.locator(".table-footer")).toContainText("1–60 of 60");
   await columnValue(typeMenu,"ALBUM").click();
-  await expect(page.getByText("30 releases matching filters",{exact:false})).toBeVisible();
+  await expect(page.locator(".table-footer")).toContainText("1–30 of 30");
   await typeMenu.getByRole("menuitem",{name:"Select all",exact:true}).click();
   await typeMenu.press("Escape");
   await expect(page.getByRole("button",{name:"Filter Type",exact:true})).not.toHaveClass(/active/);

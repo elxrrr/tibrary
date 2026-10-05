@@ -1404,22 +1404,10 @@ function App() {
             </>}
           </div>}
           {Object.keys(columnSelections).length > 0 && <button onClick={() => {setColumnSelections({});setOffset(0);}} title="Show all column values within the current view options">Reset column filters</button>}
-          <span>
-            {selected.size
-              ? `${selected.size} selected`
-              : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}${route === "missing" ? ` matching filters · ${(data.missing_total ?? data.total).toLocaleString()} missing, incomplete or queued in total` : ""}`}
-          </span>
+          {selected.size > 0 && <span>{selected.size} selected</span>}
+          {!selected.size && route === "missing" && <span>{(data.missing_total ?? data.total).toLocaleString()} missing, incomplete or queued in total</span>}
+          {route === "mqa" && pagination("table-pagination-top")}
         </div>
-        {route === "mqa" && <div className="mqa-table-meta">
-          <div className="mqa-selection-summary" role="status" aria-live="polite">
-            {mqaSummaryCurrent && !mqaScopePending ? <>
-              <span>{mqaSummary!.counts.detected} selected with MQA signals</span>
-              <span>{mqaSummary!.counts.unlinked} need an online match</span>
-              <span>{mqaSummary!.counts.ready} ready to queue</span>
-            </> : <span>Checking selection…</span>}
-          </div>
-          {pagination("table-pagination-top")}
-        </div>}
         {route === "missing" && <div className="table-scope-summary">{artistScope} · {timeline}</div>}
         {route === "local" && data.rows.length > 0 && (
           <div className="cluster-callout">

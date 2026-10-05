@@ -5148,7 +5148,7 @@ dependencies = [
 
 [[package]]
 name = "tibrary"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "aes",
  "base64 0.22.1",
