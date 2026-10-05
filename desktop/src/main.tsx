@@ -1327,6 +1327,22 @@ function App() {
       </div>
     );
   }
+  function pagination(className = "table-footer") {
+    const Container = className === "table-footer" ? "footer" : "nav";
+    return <Container className={className} aria-label="Table pagination">
+      <span>
+        {data.total
+          ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
+          : "No items"}
+        {route === "links" &&
+          ` · ${state?.stats.linked_releases || 0} complete releases / ${state?.stats.linked_tracks || 0} linked tracks`}
+      </span>
+      <div>
+        <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button>
+        <button disabled={offset + pageSize >= data.total} onClick={() => setOffset(offset + pageSize)}>Next</button>
+      </div>
+    </Container>;
+  }
   function tablePage() {
     return (
       <>
@@ -1394,13 +1410,15 @@ function App() {
               : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}${route === "missing" ? ` matching filters · ${(data.missing_total ?? data.total).toLocaleString()} missing, incomplete or queued in total` : ""}`}
           </span>
         </div>
-        {route === "mqa" && <div className="mqa-selection-summary" role="status" aria-live="polite">
-          {mqaSummaryCurrent && !mqaScopePending ? <>
-            <span>{mqaSummary!.counts.detected} selected with MQA signals</span>
-            <span>{mqaSummary!.counts.unlinked} need an online match</span>
-            <span>{mqaSummary!.counts.ready} ready to queue</span>
-          </> : <span>Checking selection…</span>}
-          <small>Scanning only reads audio. Replacements are downloaded after approval in the queue.</small>
+        {route === "mqa" && <div className="mqa-table-meta">
+          <div className="mqa-selection-summary" role="status" aria-live="polite">
+            {mqaSummaryCurrent && !mqaScopePending ? <>
+              <span>{mqaSummary!.counts.detected} selected with MQA signals</span>
+              <span>{mqaSummary!.counts.unlinked} need an online match</span>
+              <span>{mqaSummary!.counts.ready} ready to queue</span>
+            </> : <span>Checking selection…</span>}
+          </div>
+          {pagination("table-pagination-top")}
         </div>}
         {route === "missing" && <div className="table-scope-summary">{artistScope} · {timeline}</div>}
         {route === "local" && data.rows.length > 0 && (
@@ -1450,29 +1468,7 @@ function App() {
           loading={loading}
           busy={tree ? queueBusy : busy}
         />
-        <footer className="table-footer">
-          <span>
-            {data.total
-              ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
-              : "No items"}
-            {route === "links" &&
-              ` · ${state?.stats.linked_releases || 0} complete releases / ${state?.stats.linked_tracks || 0} linked tracks`}
-          </span>
-          <div>
-            <button
-              disabled={offset === 0}
-              onClick={() => setOffset(Math.max(0, offset - pageSize))}
-            >
-              Previous
-            </button>
-            <button
-              disabled={offset + pageSize >= data.total}
-              onClick={() => setOffset(offset + pageSize)}
-            >
-              Next
-            </button>
-          </div>
-        </footer>
+        {route !== "mqa" && pagination()}
         {route === "mqa" && <div className="mqa-actions">
           <ScanButton count={mqaSummaryCurrent ? mqaSummary!.counts.selected : selected.size} scope={mqaScope}
             disabled={localBusy || !root || mqaScopePending} selectionPending={!mqaSummaryCurrent}

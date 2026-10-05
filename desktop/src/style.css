@@ -602,10 +602,15 @@ main {
   font-size: 12px;
   color: var(--muted);
 }
-.mqa-selection-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin: -2px 0 12px; color: var(--muted); font-size: 12px; }
-.mqa-selection-summary small { flex-basis: 100%; font-size: 11px; }
-.mqa-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.mqa-table-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 20px; margin: -2px 0 10px; }
+.mqa-selection-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; color: var(--muted); font-size: 12px; }
+.table-pagination-top { display: flex; flex: none; align-items: center; gap: 12px; margin-left: auto; color: var(--muted); font-size: 11px; }
+.table-pagination-top > div { display: flex; gap: 6px; }
+.table-pagination-top button { height: 30px; padding: 5px 10px; font-size: 12px; }
+.mqa-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .mqa-replacement-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.mqa-actions > button, .mqa-replacement-actions > button, .mqa-actions .split-scan > button { height: 34px; padding-top: 0; padding-bottom: 0; }
+.mqa-actions .split-scan > button:first-child { min-width: 104px; }
 .split-scan { display: flex; position: relative; flex: none; }
 .split-scan > button:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .split-scan > .scan-scope-trigger { width: 30px; padding: 6px; justify-content: center; border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: 1px solid var(--line); }
