@@ -245,6 +245,7 @@ function App() {
     [copyright, setCopyright] = useState("All copyrights"),
     [releaseType, setReleaseType] = useState("All types");
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
+  const [systemAccent, setSystemAccent] = useState({name:"Multicolour",hex:"#007aff"});
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
   const [downloadMonitor, setDownloadMonitor] = useState<Record<string, Row>>({});
   const [tableReader] = useState(() => new CoalescedQuery<any>(setLoading, e => setError(String(e))));
@@ -363,8 +364,21 @@ function App() {
   }, [route]);
   useEffect(() => {
     document.documentElement.dataset.theme = state?.settings.theme || "system";
-    document.documentElement.dataset.highlight = settings?.general?.highlight_colour || "blue";
+    document.documentElement.dataset.highlight = settings?.general?.highlight_colour || "system";
   }, [state?.settings.theme, settings?.general?.highlight_colour]);
+  useEffect(() => {
+    if ((settings?.general?.highlight_colour || "system") !== "system") return;
+    let live = true;
+    const refresh = () => call<{name:string;hex:string}>("appearance.accent").then(accent => {
+      if (!live || !/^#[0-9a-f]{6}$/i.test(accent.hex)) return;
+      document.documentElement.style.setProperty("--system-accent",accent.hex);
+      setSystemAccent(previous => previous.name === accent.name && previous.hex === accent.hex ? previous : accent);
+    }).catch(() => {});
+    refresh();
+    const timer = window.setInterval(refresh,10000);
+    window.addEventListener("focus",refresh);
+    return () => {live=false;window.clearInterval(timer);window.removeEventListener("focus",refresh);};
+  }, [settings?.general?.highlight_colour,state?.settings.theme]);
   const pageSize = Number(settings?.general?.page_size || 50);
   useEffect(() => { setOffset(0); }, [pageSize]);
   const viewArgs = {
@@ -1577,7 +1591,14 @@ function App() {
         <>
           <section className="card">
             <h2>Application & display</h2>
-            {field("Highlight colour", "general", "highlight_colour", [{value:"blue",label:"Blue"},{value:"grey",label:"Grey"}])}
+            {field("Highlight colour", "general", "highlight_colour", [
+              {value:"system",label:`System (${systemAccent.name})`},
+              {value:"multicolour",label:"Multicolour"},
+              {value:"blue",label:"Blue"},{value:"purple",label:"Purple"},
+              {value:"pink",label:"Pink"},{value:"red",label:"Red"},
+              {value:"orange",label:"Orange"},{value:"yellow",label:"Yellow"},
+              {value:"green",label:"Green"},{value:"graphite",label:"Graphite"},
+            ])}
             {field("Colour theme", "general", "theme", [
               "system",
               "light",
@@ -1597,7 +1618,6 @@ function App() {
               ],
               true,
             )}
-            {field("Catalogue market", "general", "market")}
             <label className="setting-row">
               <span>Save activity logs</span>
               <input

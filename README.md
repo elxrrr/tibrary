@@ -20,6 +20,8 @@ A local-first music library manager for macOS, built with Rust and Tauri.
 
 Linking only updates the app database. File changes are reviewed separately; duplicate removal uses Trash. One subscriber account supplies catalogue metadata and downloads. Available metadata varies by release.
 
+Catalogue availability follows your account country. The default highlight colour follows macOS; the standard colours and Graphite can also be selected in Settings.
+
 ## Run on your Mac
 
 Install Xcode Command Line Tools, a current stable [Rust toolchain](https://rustup.rs/), and Node.js LTS. Then, from this repository:

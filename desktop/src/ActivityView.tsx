@@ -4,6 +4,7 @@ import { call, active, Job, Row, onlineKinds } from "./api";
 
 export type ActivityEntry = {
   at: string;
+  updated_at?: string;
   saved_id?: number;
   message: string;
   category?: string;
@@ -77,7 +78,7 @@ const LogRow = memo(function LogRow({ entry }: { entry: ActivityEntry }) {
   return <div className={`log-row log-${category} ${entry.level === "error" ? "log-error" : ""}`} data-job-id={entry.job_id}>
     <time title={stamp(entry.at)}>{new Date(entry.at).toLocaleTimeString()}</time>
     <span className={`log-badge log-badge-${category}`}>{stream === "downloads" ? "DOWNLOAD" : stream.toUpperCase()}</span>
-    <span className="log-job" title={entry.job_id ? `${jobTitle(entry.job_kind)} · ${entry.job_id}` : "Application"}>{entry.job_kind ? jobTitle(entry.job_kind) : "Application"}</span>
+    <span className="log-job" title={entry.job_kind ? jobTitle(entry.job_kind) : "Application"}>{entry.job_kind ? jobTitle(entry.job_kind) : "Application"}</span>
     <span className="log-message">{entry.message}</span>
   </div>;
 });
@@ -85,6 +86,14 @@ const LogRow = memo(function LogRow({ entry }: { entry: ActivityEntry }) {
 const terminal = new Set(["complete", "failed", "cancelled", "interrupted"]);
 const entryKey = (entry: ActivityEntry) => entry.progress_id ? `progress:${entry.progress_id}` : `${entry.job_id || ""}:${entry.at}:${entry.message}`;
 const compareTime = (a: string, b: string) => (Date.parse(a) || 0) - (Date.parse(b) || 0) || a.localeCompare(b);
+const updateTime = (entry: ActivityEntry) => entry.updated_at || entry.at;
+
+export function retireWorkerProgress(entries: ActivityEntry[]): ActivityEntry[] {
+  const finished = new Set(entries.filter(entry => entry.job_id && !entry.progress_id && terminal.has(entry.job_status || "")).map(entry => entry.job_id));
+  // Whole-job progress ends with the worker. Per-artist actions have their own
+  // progress identity and remain in the persisted chronological log.
+  return entries.filter(entry => !entry.progress_id || !finished.has(entry.progress_id));
+}
 
 // A snapshot can finish after a newer event, or temporarily omit a busy channel.
 // Merge it with observed rows; explicit Clear still removes the channel in App.
@@ -99,22 +108,15 @@ export function mergeActivitySnapshot(previous: ActivityEntry[], incoming: Activ
     const index = streamIndex(entry);
     if ((incomingEpochs[index] || 0) < (previousEpochs[index] || 0)) continue;
     const key = entryKey(entry), old = rows.get(key);
-    if (!old || compareTime(old.at, entry.at) <= 0) rows.set(key, entry);
-  }
-  const completed = new Map<string, string>();
-  for (const entry of rows.values()) if (entry.job_id && !entry.progress_id && terminal.has(entry.job_status || "")) {
-    completed.set(entry.job_id, [completed.get(entry.job_id) || "", entry.at].sort().at(-1)!);
+    if (!old || compareTime(updateTime(old), updateTime(entry)) <= 0) rows.set(key, entry);
   }
   const streams: Record<ActivityStream, ActivityEntry[]> = {online: [], local: [], downloads: []};
-  for (const entry of [...rows.values()].sort((a, b) => compareTime(a.at,b.at))) {
-    if (entry.progress_id && completed.has(entry.progress_id)) continue;
+  for (const entry of retireWorkerProgress([...rows.values()]).sort((a, b) => compareTime(a.at,b.at))) {
     streams[streamFor(entry)].push(entry);
   }
-  return Object.values(streams).flatMap(rows => {
-    const summaries = new Map<string, ActivityEntry>();
-    for (const entry of rows) if (entry.job_id && !entry.progress_id) summaries.set(entry.job_id, entry);
-    return [...new Map([...Array.from(summaries.values()).slice(-500), ...rows.slice(-1000)].map(entry => [entryKey(entry), entry])).values()];
-  }).sort((a,b) => compareTime(a.at,b.at));
+  // Keep a bounded, chronological live window. Older actions come from the
+  // persisted log when the user scrolls; jobs do not need separate summaries.
+  return Object.values(streams).flatMap(rows => rows.slice(-1000)).sort((a,b) => compareTime(a.at,b.at));
 }
 
 const completeDownload = (status: string) => status === "complete" || status === "already downloaded";
@@ -125,7 +127,7 @@ export function mergeActivityHistory(previous: ActivityEntry[], incoming: Activi
   const rows = new Map<string, ActivityEntry>();
   for (const entry of [...previous, ...incoming]) {
     const key = entryKey(entry), old = rows.get(key);
-    if (!old || compareTime(old.at, entry.at) <= 0) {
+    if (!old || compareTime(updateTime(old), updateTime(entry)) <= 0) {
       const next = {...old, ...entry};
       if (!next.saved_id && old?.saved_id) next.saved_id = old.saved_id;
       rows.set(key,next);
@@ -265,9 +267,7 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
   }, [query,historyRevision]);
   const entries = useMemo(() => {
     const all = mergeActivityHistory(saved, logs);
-    const finished = new Set(all.filter(entry => !entry.progress_id && terminal.has(entry.job_status || "")).map(entry => entry.job_id));
-    const retained = all.filter(entry => !entry.progress_id || !finished.has(entry.job_id));
-    return mergeActivityHistory(retained, downloadActivity(monitor,downloadJob));
+    return mergeActivityHistory(retireWorkerProgress(all), downloadActivity(monitor,downloadJob));
   }, [saved,logs,monitor,downloadJob]);
   const filtered = useMemo(() => entries.filter(entry => !search.trim() || `${entry.message} ${jobTitle(entry.job_kind)} ${streamFor(entry)}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())), [entries,search]);
   async function clear() {

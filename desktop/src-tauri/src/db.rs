@@ -214,12 +214,17 @@ impl TursoDb {
         // Additive migration: preserve existing activity and attach new entries to jobs.
         let mut columns = conn.query("PRAGMA table_info(activity_logs)", ()).await.map_err(|e|e.to_string())?;
         let mut has_context = false;
+        let mut has_activity_key = false;
         while let Some(row) = columns.next().await.map_err(|e|e.to_string())? {
-            has_context |= row.get::<String>(1).unwrap_or_default() == "job_context";
+            let column = row.get::<String>(1).unwrap_or_default();
+            has_context |= column == "job_context";
+            has_activity_key |= column == "activity_key";
         }
         drop(columns);
         if !has_context { conn.execute("ALTER TABLE activity_logs ADD COLUMN job_context TEXT", ()).await.map_err(|e|e.to_string())?; }
-        conn.execute("CREATE INDEX IF NOT EXISTS activity_job_history ON activity_logs(json_extract(job_context,'$.job_id'),id)", ()).await.map_err(|e|e.to_string())?;
+        if !has_activity_key { conn.execute("ALTER TABLE activity_logs ADD COLUMN activity_key TEXT", ()).await.map_err(|e|e.to_string())?; }
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS activity_entry_key ON activity_logs(activity_key)", ()).await.map_err(|e|e.to_string())?;
+        conn.execute("DROP INDEX IF EXISTS activity_job_history", ()).await.map_err(|e|e.to_string())?;
         Ok(())
     }
 
@@ -286,8 +291,8 @@ impl TursoDb {
         conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e| e.to_string())?;
         let result = async {
             for entry in entries { conn.execute(
-            "INSERT INTO activity_logs (at, message, level, category, job_context) VALUES (?, ?, ?, ?, ?)",
-            (entry["at"].as_str().unwrap_or(""), entry["message"].as_str().unwrap_or(""), entry["level"].as_str().unwrap_or("info"), entry["category"].as_str().unwrap_or("general"), json!({"job_id":entry["job_id"],"job_kind":entry["job_kind"],"job_status":entry["job_status"]}).to_string()),
+            "INSERT INTO activity_logs (at, message, level, category, job_context, activity_key) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(activity_key) DO UPDATE SET message=excluded.message,level=excluded.level,category=excluded.category,job_context=excluded.job_context",
+            (entry["at"].as_str().unwrap_or(""), entry["message"].as_str().unwrap_or(""), entry["level"].as_str().unwrap_or("info"), entry["category"].as_str().unwrap_or("general"), json!({"job_id":entry["job_id"],"job_kind":entry["job_kind"],"job_status":entry["job_status"],"progress_id":entry["progress_id"],"updated_at":entry["updated_at"]}).to_string(), entry["progress_id"].as_str().map(str::to_owned)),
         )
         .await
         .map_err(|e| e.to_string())?; }
@@ -298,71 +303,11 @@ impl TursoDb {
         result
     }
 
+    /// Restore ordinary log rows, with no per-job grouping or summaries.
     pub async fn load_recent_logs(&self, limit: usize) -> Result<Vec<Value>, String> {
-        let conn = self.connect()?;
-        let mut rows = conn
-            .query(
-                "SELECT at, message, level, category, job_context FROM activity_logs ORDER BY id DESC LIMIT ?",
-                (limit as i64,),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut logs = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
-            let at: String = row.get(0).unwrap_or_default();
-            let msg: String = row.get(1).unwrap_or_default();
-            let lvl: String = row.get(2).unwrap_or_else(|_| "info".to_string());
-            let cat: String = row.get(3).unwrap_or_else(|_| "general".to_string());
-            let context: Value = row.get::<String>(4).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-            logs.push(json!({
-                "job_id": context["job_id"], "job_kind":context["job_kind"], "job_status":context["job_status"],
-                "at": at,
-                "message": msg,
-                "level": lvl,
-                "category": cat,
-            }));
-        }
-        logs.reverse();
-        Ok(logs)
-    }
-
-    /// Restore the latest summary of each saved job, instead of letting one
-    /// verbose refresh crowd all previous jobs out of the startup history.
-    pub async fn load_activity_overview(&self, per_stream: usize) -> Result<Vec<Value>, String> {
-        let conn = self.connect()?;
-        let mut rows = conn.query(
-            "SELECT at,message,level,category,job_context FROM activity_logs WHERE id IN (SELECT MAX(id) FROM activity_logs GROUP BY CASE WHEN json_extract(job_context,'$.job_id') IS NOT NULL AND json_extract(job_context,'$.job_id') != '' THEN 'job:' || json_extract(job_context,'$.job_id') ELSE 'entry:' || id END) ORDER BY id DESC",
-            (),
-        ).await.map_err(|e|e.to_string())?;
-        let mut entries = Vec::new();
-        let mut counts = [0usize; 3];
-        while let Some(row) = rows.next().await.map_err(|e|e.to_string())? {
-            let mut entry: Value = row.get::<String>(4).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(json!({}));
-            for (index, key) in ["at","message","level","category"].iter().enumerate() {
-                entry[*key] = json!(row.get::<String>(index).unwrap_or_default());
-            }
-            let index = crate::activity_stream_index(crate::activity_stream(&entry));
-            if counts[index] < per_stream {
-                counts[index] += 1;
-                entries.push(entry);
-            }
-            if counts.iter().all(|count| *count >= per_stream) { break; }
-        }
+        let page = self.activity_history(None, limit, None).await?;
+        let mut entries = page["entries"].as_array().cloned().unwrap_or_default();
         entries.reverse();
-        Ok(entries)
-    }
-
-    pub async fn job_activity(&self, job_id: &str, offset: usize) -> Result<Vec<Value>, String> {
-        let conn = self.connect()?;
-        let mut rows = conn.query("SELECT at,message,level,category,job_context FROM activity_logs WHERE json_extract(job_context,'$.job_id')=? ORDER BY id LIMIT 1000 OFFSET ?", (job_id, offset as i64)).await.map_err(|e|e.to_string())?;
-        let mut entries = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e|e.to_string())? {
-            let mut entry: Value = row.get::<String>(4).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or(json!({}));
-            for (index, key) in ["at","message","level","category"].iter().enumerate() {
-                entry[*key] = json!(row.get::<String>(index).unwrap_or_default());
-            }
-            entries.push(entry);
-        }
         Ok(entries)
     }
 
@@ -2621,6 +2566,13 @@ impl TursoDb {
             if let Some(obj) = general.as_object_mut() {
                 obj.insert("persist_logs".to_string(), json!(true));
             }
+        }
+        let market = crate::account::catalogue_market(self, general["market"].as_str()).await?;
+        general["market"] = json!(market);
+        if general.get("highlight_colour").is_none() {
+            general["highlight_colour"] = json!("system");
+        } else if general["highlight_colour"] == "grey" {
+            general["highlight_colour"] = json!("graphite");
         }
         let mut provider_defaults = json!({
             "request_interval_ms": 750,

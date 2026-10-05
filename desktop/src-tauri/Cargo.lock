@@ -5148,7 +5148,7 @@ dependencies = [
 
 [[package]]
 name = "tibrary"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -5158,6 +5158,9 @@ dependencies = [
  "claxon",
  "ctr",
  "lofty",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "quick-xml 0.37.5",
  "rand 0.8.8",
  "reqwest 0.12.28",

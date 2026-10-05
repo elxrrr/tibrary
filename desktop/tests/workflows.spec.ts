@@ -556,10 +556,22 @@ test("activity has one verbose log and independent worker controls", async ({pag
 });
 
 test("display highlight preference changes focus palette", async ({page}) => {
+  await page.route("**/__test_rpc",async route => {
+    const request = route.request().postDataJSON();
+    await route.fulfill({json:request.method === "appearance.accent" ? {result:{name:"Pink",hex:"#ff2d55"}} : await rpc(request.method,request.args)});
+  });
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"General",exact:true}).click();
-  await page.getByLabel("Highlight colour").selectOption("grey");
-  await expect(page.locator("html")).toHaveAttribute("data-highlight", "grey");
+  const highlight = page.getByLabel("Highlight colour");
+  await expect(highlight).toHaveValue("system");
+  await expect(highlight).toContainText("System (Pink)");
+  await expect(highlight.locator("option")).toHaveText(["System (Pink)","Multicolour","Blue","Purple","Pink","Red","Orange","Yellow","Green","Graphite"]);
+  await expect.poll(() => page.locator("html").evaluate(element => getComputedStyle(element).getPropertyValue("--accent").trim())).toBe("#ff2d55");
+  await expect(page.getByLabel("Catalogue market")).toHaveCount(0);
+  await page.getByLabel("Highlight colour").selectOption("graphite");
+  await expect(page.locator("html")).toHaveAttribute("data-highlight", "graphite");
+  await page.getByLabel("Highlight colour").selectOption("orange");
+  await expect.poll(() => page.locator("html").evaluate(element => getComputedStyle(element).getPropertyValue("--accent").trim())).toBe("#ff9500");
 });
 
 test("startup always shows overview and does not replay a historical failure", async ({ page }) => {
@@ -1109,7 +1121,12 @@ test("completed job activity exposes persistent per-item details without expansi
   await page.goto("/");
   const job = (await rpc("job.start",{kind:"scan",args:{root:join(folder,"music"),force:true}})).result;
   await expect.poll(async()=> (await rpc("job.status")).result.job?.status).toBe("complete");
-  const history = (await rpc("logs.job",{id:job.id})).result;
+  let history:any[]=[];
+  await expect.poll(async()=> {
+    const saved=(await rpc("logs.history",{limit:500})).result.entries;
+    history=saved.filter((entry:any)=>entry.job_id === job.id);
+    return history.some((entry:any)=>entry.job_status === "complete");
+  }).toBe(true);
   expect(history.length).toBeGreaterThan(2);
   expect(history.every((entry:any)=>entry.job_id === job.id)).toBe(true);
   expect(history.some((entry:any)=>entry.message.includes("Reading local tags"))).toBe(true);

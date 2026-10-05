@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.6** · [Setup and screenshots](../../README.md)
+Version **0.9.7** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -53,7 +53,7 @@ A release is marked superseded only when cached evidence shows a newer available
 | Refresh track details and credits | Request a fresh check for a particular release. |
 | Recheck availability | Request a fresh market-availability check. |
 
-All online workflows use one subscriber connection. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Metadata found during tagging, linking or downloading is shared with the other tools. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
+All online workflows use one subscriber connection. The catalogue market comes from the account country and is remembered for offline browsing; it is no longer a manual setting. Sign-in and connection checks refresh the saved country, and online actions fill it once if an older session has no saved country. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Metadata found during tagging, linking or downloading is shared with the other tools. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
 
 Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
 
@@ -71,6 +71,8 @@ BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. M
 
 ### Downloads and activity
 
+Highlight colour defaults to **System**, following the macOS accent colour, including Multicolour. You can also choose Multicolour, Blue, Purple, Pink, Red, Orange, Yellow, Green or Graphite. Existing explicit choices are retained.
+
 Choose the destination, template and audio options in General. Approve releases or individual tracks in the queue before starting a download. Videos are excluded. Download progress is separate from local work. Stalled transfers can be cancelled; failed transfers remove their partial files. Downloads publish only after the release has been staged and destination collisions checked. File moves and tag updates keep an original until the database update succeeds. Replacements retain valid existing BPM/key tags when the matching recording has no new values.
 
 MQA replacements use the selected library's existing file paths, including multiple copies of a recording. Previous copies stay recoverable until the replacement audio and queue status are indexed. Recording, mix and duration conflicts stop the replacement for review.
@@ -79,7 +81,7 @@ MQA replacements use the selected library's existing file paths, including multi
 
 In Downloaded releases, checked releases or tracks limit the export without changing the saved queue. With no checked items, the export uses the saved completed-download selections.
 
-Activity shows one log, most recent first, with the worker and task named on each row. Search it to inspect individual checks and outcomes; older saved messages load as you scroll, including after reopening. Progress updates replace their existing row, and parallel download tracks show their own transfer progress. Three compact worker cards show item counts, percentage and a smoothed ETA where measurable, with independent cancellation controls. **Save activity logs** must remain enabled to retain history; clearing activity removes its saved entries.
+Activity shows one log, most recent first, with the worker and task named on each row. Search it to inspect individual checks and outcomes; older saved messages load as you scroll, including after reopening. Release refreshes maintain one saved entry per artist, updating its current stage and final outcome in place. A failed artist shows one error at the stage where it stopped; market codes and artist IDs are omitted. There are no expandable job groups or per-job history controls. Parallel download tracks show their own transfer progress. Three compact worker cards show item counts, percentage and a smoothed ETA where measurable, with independent cancellation controls. **Save activity logs** must remain enabled to retain history; clearing activity removes its saved entries.
 
 Pages load independently during refreshes. A changing catalogue does not discard an in-flight table result: usable rows appear first, followed by one coalesced update. Sorting, selection and expanded releases are retained. Queue approvals, exports and download previews remain available during catalogue updates and local scans. Release disclosure fetches only missing track details through the shared cache without replacing the current refresh task. Reviewed tag changes, moves and duplicate removal cannot overlap downloads; scans and metadata reads can.
 

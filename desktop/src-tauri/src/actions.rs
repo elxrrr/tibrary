@@ -645,6 +645,7 @@ pub async fn execute(
             {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(sess) = resp.json::<Value>().await {
+                        crate::account::save_account_market(db, &sess, None).await?;
                         if let Some(uid) = sess.get("userId").and_then(|v| v.as_i64()) {
                             user_detail = format!("Account ID: {}", uid);
                         }

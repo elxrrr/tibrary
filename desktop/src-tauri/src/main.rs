@@ -5,6 +5,7 @@ mod availability;
 mod network;
 mod progress;
 mod subscriber_metadata;
+mod appearance;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -49,6 +50,9 @@ fn completed_refresh_ids(saved: &Value, ids: &[String], market: &str, detailed: 
 fn reference_refresh_progress(backend: &Backend, message: &str, completed: usize, total: usize) {
     let job = backend.online_job.lock().unwrap().clone();
     if let Some(mut job) = job {
+        // These counts come from the reference producer, rather than a previous
+        // measured message. Preserve them through the shared progress adapter.
+        job.as_object_mut().unwrap().remove("progress_measured");
         job["completed"] = json!(completed);
         job["total"] = json!(total);
         job["progress_phase_override"] = json!("reference releases");
@@ -194,31 +198,28 @@ fn activity_stream_index(stream: &str) -> usize {
 #[derive(Default)]
 struct ActivityStreamBuffer {
     entries: Vec<Value>,
-    summaries: Vec<Value>,
 }
 
 impl ActivityStreamBuffer {
-    fn push(&mut self, entry: Value) {
-        if let Some(id) = entry["job_id"].as_str().filter(|id| !id.is_empty()) {
-            if let Some(index) = self.summaries.iter().position(|saved| saved["job_id"] == id) {
-                if self.summaries[index]["at"].as_str() <= entry["at"].as_str() {
-                    self.summaries.remove(index);
-                    self.summaries.push(entry.clone());
-                }
-            } else {
-                self.summaries.push(entry.clone());
+    fn push(&mut self, mut entry: Value) -> Value {
+        if let Some(existing) = self.entries.iter_mut().find(|saved| {
+            entry["progress_id"].as_str().is_some_and(|id| saved["progress_id"] == id)
+                || (saved["at"] == entry["at"] && saved["message"] == entry["message"] && saved["job_id"] == entry["job_id"])
+        }) {
+            if existing["updated_at"].as_str().unwrap_or("") > entry["updated_at"].as_str().unwrap_or("") {
+                return existing.clone();
             }
-            if self.summaries.len() > 500 { self.summaries.remove(0); }
+            entry["at"] = existing["at"].clone();
+            *existing = entry.clone();
+            return entry;
         }
-        self.entries.push(entry);
+        self.entries.push(entry.clone());
         if self.entries.len() > 1000 { self.entries.remove(0); }
+        entry
     }
 
     fn snapshot(&self) -> Vec<Value> {
-        let mut entries = self.entries.clone();
-        let present: std::collections::HashSet<_> = entries.iter().filter_map(|entry| entry["job_id"].as_str()).map(str::to_owned).collect();
-        entries.extend(self.summaries.iter().filter(|entry| !present.contains(entry["job_id"].as_str().unwrap_or(""))).cloned());
-        entries
+        self.entries.clone()
     }
 }
 
@@ -238,8 +239,8 @@ impl ActivityBuffers {
         }
     }
 
-    fn push(&self, entry: Value) {
-        self.buffer(activity_stream(&entry)).lock().unwrap().push(entry);
+    fn push(&self, entry: Value) -> Value {
+        self.buffer(activity_stream(&entry)).lock().unwrap().push(entry)
     }
 
     fn replace_progress(&self, id: &str, entry: Value) {
@@ -258,7 +259,6 @@ impl ActivityBuffers {
         for stream in [&self.online, &self.local, &self.downloads] {
             let mut buffer = stream.lock().unwrap();
             buffer.entries.retain(|entry| keep(entry));
-            buffer.summaries.retain(|entry| keep(entry));
         }
     }
 
@@ -393,7 +393,7 @@ impl Backend {
     async fn restore_activity(&self, db: &TursoDb) {
         if !self.logs.snapshot().is_empty() { return; }
         let before = self.activity_epochs();
-        if let Ok(saved) = db.load_activity_overview(500).await {
+        if let Ok(saved) = db.load_recent_logs(500).await {
             // A slow read must not replace logs from a newly started job, or
             // restore a panel explicitly cleared while this read was pending.
             for entry in saved {
@@ -459,7 +459,11 @@ impl Backend {
             "level": log_level,
             "category": cat
         });
-        self.logs.push(entry.clone());
+        self.record_activity(entry);
+    }
+
+    fn record_activity(&self, entry: Value) {
+        let entry = self.logs.push(entry);
 
         // Persist to database if initialized and logging persistence is enabled
         if self.persist_logs.load(Ordering::SeqCst) {
@@ -571,20 +575,34 @@ impl Backend {
         self.measure_progress(&mut job, message);
         if self.online_cancel.lock().unwrap().as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {job["status"]=json!("cancelling");}
         let id = job["id"].as_str().unwrap_or("online").to_string();
-        if current.as_ref().and_then(|j|j["message"].as_str()) != Some(message) {
+        if job["kind"] != "discography" && current.as_ref().and_then(|j|j["message"].as_str()) != Some(message) {
             self.log_with_job(message, "info", Some("online"), Some(&job));
         }
-        let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":message,"level":"info","category":"online","progress_id":id,"job_id":id,"job_kind":job["kind"],"job_status":job["status"]});
-        self.logs.replace_progress(&id, entry);
+        if job["kind"] != "discography" {
+            let entry = json!({"at":chrono::Utc::now().to_rfc3339(),"message":message,"level":"info","category":"online","progress_id":id,"job_id":id,"job_kind":job["kind"],"job_status":job["status"]});
+            self.logs.replace_progress(&id, entry);
+        }
         *current = Some(job.clone());
         job
+    }
+
+    fn refresh_artist_log(&self, artist_id: &str, message: &str, level: &str) {
+        self.refresh_artist_log_status(artist_id, message, level, if level == "error" { "failed" } else { "running" });
+    }
+
+    fn refresh_artist_log_status(&self, artist_id: &str, message: &str, level: &str, status: &str) {
+        let Some(job) = self.online_job.lock().unwrap().clone() else { return; };
+        let at = chrono::Utc::now().to_rfc3339();
+        self.record_activity(json!({"at":at,"updated_at":at,"message":message,"level":level,
+            "category":"online","progress_id":format!("{}:artist:{artist_id}",job["id"].as_str().unwrap_or("refresh")),
+            "job_id":job["id"],"job_kind":job["kind"],"job_status":status}));
     }
 
     pub fn finish_online_job(&self, mut job: Value) {
         self.progress_estimates.lock().unwrap().finish(&mut job);
         self.view_cache.lock().unwrap().clear();
         self.logs.retain(|entry| entry["progress_id"] != job["id"]);
-        if let Some(message) = job["message"].as_str() {
+        if let Some(message) = job["message"].as_str().filter(|_| job["error_logged"] != true) {
             self.log_with_job(
                 message,
                 if job["status"] == "failed" {
@@ -896,21 +914,32 @@ async fn handle_rpc_uncached(
             json!({"job":state.active_job.lock().unwrap().clone(),"online_job":state.online_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.snapshot(),"activity_epochs":state.activity_epochs(),"download_monitor":state.download_monitor.lock().unwrap().clone(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
         );
     }
-    if method == "table" || method == "detail" || method == "job.start" {
-        let preferences = db
-            .get_preference("desktop")
-            .await?
-            .or(db.get_preference("ui").await?)
-            .unwrap_or(Value::Null);
-        let market = preferences["market"]
+    if method == "appearance.accent" {
+        return serde_json::to_value(appearance::system_accent(app_handle).await).map_err(|error| error.to_string());
+    }
+    if method == "table" || method == "detail" || method == "job.start"
+        || method.starts_with("turso.") || method.starts_with("release.")
+        || method.starts_with("artists.") || method.starts_with("links.") || method.starts_with("queue.") {
+        let preferences = db.get_settings().await?;
+        let mut market = preferences["general"]["market"]
             .as_str()
             .unwrap_or("GB")
             .to_uppercase();
+        if (method == "job.start" && (is_online_job(args["kind"].as_str().unwrap_or("")) || args["kind"] == "download")
+                && !matches!(args["kind"].as_str(),Some("connections"|"connect_account"|"connect_download")))
+            || matches!(method.as_str(),"turso.discography"|"turso.tidal.artist"|"turso.tidal.search") {
+            let http = network::client(20)?;
+            market = account::ensure_account_market(db, &http, None).await?;
+        }
+        let account_market = db.get_preference("subscriber-account-market").await?
+            .is_some_and(|saved| saved["country_code"].as_str().and_then(account::normalize_market).is_some());
         if let Some(obj) = args.as_object_mut() {
-            obj.entry("market").or_insert(json!(market));
+            if account_market { obj.insert("market".into(),json!(market)); }
+            else { obj.entry("market").or_insert(json!(market)); }
         }
         if let Some(obj) = args.get_mut("args").and_then(Value::as_object_mut) {
-            obj.entry("market").or_insert(json!(market));
+            if account_market { obj.insert("market".into(),json!(market)); }
+            else { obj.entry("market").or_insert(json!(market)); }
         }
     }
     let _dispatch = if matches!(method.as_str(),"job.start"|"auth.reply"|"turso.tags.write"|"turso.scan"|"turso.discography") {
@@ -1326,11 +1355,6 @@ async fn handle_rpc_uncached(
     if method == "logs" {
         state.restore_activity(db).await;
         return Ok(json!(state.logs.snapshot()));
-    }
-    if method == "logs.job" {
-        let id = args["id"].as_str().ok_or("Missing job ID")?;
-        state.flush_activity().await;
-        return Ok(json!(db.job_activity(id, args["offset"].as_u64().unwrap_or(0) as usize).await?));
     }
     if method == "logs.history" {
         // Read the durable page immediately. The frontend merges live entries
@@ -1791,7 +1815,7 @@ async fn handle_rpc_uncached(
         let current = db.get_detail(&json!({"release_id":id,"market":market})).await?;
         let title = current["title"].as_str().unwrap_or(id);
         let context = json!({"id":uuid::Uuid::new_v4().to_string(),"kind":"release_tracks","status":"running"});
-        state.log_with_job(&format!("Loading selected release tracks · {title} · release ID {id} · {market} · saved data first"), "info", Some("online"), Some(&context));
+        state.log_with_job(&format!("Loading selected release tracks · {title} · saved data first"), "info", Some("online"), Some(&context));
         let cancel = Arc::new(AtomicBool::new(false));
         struct CancelOnDrop(Arc<AtomicBool>);
         impl Drop for CancelOnDrop { fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); } }
@@ -2248,7 +2272,7 @@ async fn handle_rpc_uncached(
             "id": job_id,
             "kind": "discography",
             "status": "running",
-            "message": format!("Checking release lists · {}/{} artists · {} · {}", completed.len(), total, market, if detailed { "new or changed track details and credits" } else { "new releases and market availability" }),
+            "message": format!("Checking release lists · {}/{} artists · {}", completed.len(), total, if detailed { "new or changed track details and credits" } else { "new releases and market availability" }),
             "completed": completed.len(), "total": total,
             "started": started,
             "result": null
@@ -2268,6 +2292,7 @@ async fn handle_rpc_uncached(
             let mut reused_details = 0usize;
             let mut checked_details = 0usize;
             let mut failure: Option<String> = None;
+            let mut failed_artist: Option<(String,String)> = None;
             let backend_prog = backend_task.clone();
             let mut last_published = None;
 
@@ -2309,11 +2334,11 @@ async fn handle_rpc_uncached(
                                 }
                                 let Some(result) = reference_workers.join_next().await else { break; };
                                 match result {
-                                    Ok((id, Ok(release))) => {
+                                    Ok((_id, Ok(release))) => {
                                         reference_checked += 1;
                                         let name = release["artist"].as_str().unwrap_or("Downloaded artist");
                                         let title = release["title"].as_str().unwrap_or("Downloaded release");
-                                        reference_refresh_progress(&backend_task, &format!("Downloaded reference checked · {reference_checked}/{} releases · {name} — {title} · release ID {id} · saved details reused where complete", references.len()), reference_checked, references.len());
+                                        reference_refresh_progress(&backend_task, &format!("Downloaded reference checked · {reference_checked}/{} releases · {name} — {title} · saved details reused where complete", references.len()), reference_checked, references.len());
                                         publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                                     }
                                     Ok((id, Err(error))) => {
@@ -2343,7 +2368,7 @@ async fn handle_rpc_uncached(
                 job.as_object_mut().unwrap().remove("progress_phase_override");
                 job["completed"] = json!(checked);
                 job["total"] = json!(total);
-                backend_task.update_online_job_progress(&format!("Checking release lists · {checked}/{total} artists · {market}"), job);
+                backend_task.update_online_job_progress(&format!("Checking release lists · {checked}/{total} artists"), job);
             }
             loop {
                 if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
@@ -2351,8 +2376,10 @@ async fn handle_rpc_uncached(
                     let Some(artist_id) = pending.pop_front() else { break; };
                     let mut worker = client.clone().with_cancel(cancel_flag.clone());
                     let worker_market = market.clone();
-                    let name = names.get(&artist_id).unwrap_or(&artist_id);
-                    backend_task.progress_for("discography", &format!("Checking release list · {name} · {checked}/{total} artists saved · {market}"));
+                    let name = names.get(&artist_id).map(String::as_str).unwrap_or("Linked artist");
+                    let message = format!("{checked}/{total} artists complete · {name} · Checking releases");
+                    backend_task.refresh_artist_log(&artist_id, &message, "info");
+                    backend_task.progress_for("discography", &message);
                     fetches.spawn(async move {
                         let result = worker.get_artist_catalogue_with_discovery(&artist_id, &worker_market, false, detailed).await;
                         (artist_id, result)
@@ -2364,8 +2391,9 @@ async fn handle_rpc_uncached(
                     Err(error) => { failure = Some(format!("Catalogue worker stopped: {error}")); break; }
                 };
                 if cancel_flag.load(Ordering::Relaxed) { break; }
-                let name = names.get(&artist_id).map(String::as_str).unwrap_or(&artist_id);
-                let msg = format!("Refreshing releases · {checked}/{total} artists complete · {name} · artist ID {artist_id} · {market} · {}", if detailed { "new or changed track details and credits" } else { "new releases and market availability" });
+                let name = names.get(&artist_id).map(String::as_str).unwrap_or("Linked artist");
+                failed_artist = Some((artist_id.clone(),name.to_owned()));
+                let msg = format!("{checked}/{total} artists complete · {name} · Checking {}", if detailed { "new or changed track details and credits" } else { "new releases and market availability" });
                 let prog_job = json!({
                     "id": j_id.clone(),
                     "kind": "discography",
@@ -2393,9 +2421,7 @@ async fn handle_rpc_uncached(
                             .save_catalogue_to_db(&db_clone, &market, &catalogue)
                             .await
                         {
-                            backend_task
-                                .log_for("discography", &format!("Could not save releases for {artist_id}: {e}"), "error");
-                            failure = Some(e);
+                            failure = Some(format!("Could not save releases: {e}"));
                             break;
                         } else {
                             publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
@@ -2406,7 +2432,9 @@ async fn handle_rpc_uncached(
                                 };
                                 let pending: Vec<_> = catalogue.releases.iter().filter(|release| !reused.contains(&release.id)).cloned().collect();
                                 reused_details += reused.len();
-                                backend_task.progress_for("discography", &format!("Recommendation data · {name} · {} unchanged releases reused · {} new, changed or incomplete releases to check · track lists, credits and DJ tags", reused.len(), pending.len()));
+                                let message = format!("{checked}/{total} artists complete · {name} · {} releases reused · Checking {} new or incomplete releases", reused.len(), pending.len());
+                                backend_task.refresh_artist_log(&artist_id, &message, "info");
+                                backend_task.progress_for("discography", &message);
                                 if !pending.is_empty() {
                                     // Each worker owns a complete enrichment pipeline and reads
                                     // its summary through the shared indexed cache selector.
@@ -2432,11 +2460,12 @@ async fn handle_rpc_uncached(
                                             Ok((title, Ok(_))) => {
                                                 completed_details += 1;
                                                 checked_details += 1;
-                                                let message = format!("Recommendation details saved · {name} · {title} · {completed_details}/{pending_count} releases · {} unchanged reused · {checked}/{total} artists complete", reused.len());
+                                                let message = format!("{checked}/{total} artists complete · {name} · Details and credits {completed_details}/{pending_count} releases · {title} · {} reused", reused.len());
+                                                backend_task.refresh_artist_log(&artist_id, &message, "info");
                                                 backend_task.progress_for("discography", &message);
                                                 publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                                             }
-                                            Ok((title, Err(error))) => { failure = Some(format!("{name} — {title}: {error}")); break; }
+                                            Ok((title, Err(error))) => { failure = Some(format!("{title}: {error}")); break; }
                                             Err(error) => { failure = Some(format!("Recommendation worker stopped: {error}")); break; }
                                         }
                                     }
@@ -2449,7 +2478,8 @@ async fn handle_rpc_uncached(
                             completed.push(artist_id.clone());
                             let mut saved_progress = prog_job.clone();
                             saved_progress["completed"] = json!(checked);
-                            let message = format!("Saved releases · {checked}/{total} artists complete · {name} · {} releases · {market}", catalogue.releases.len());
+                            let message = format!("{checked}/{total} artists complete · {name} · Updated {} releases", catalogue.releases.len());
+                            backend_task.refresh_artist_log_status(&artist_id, &message, "info", "complete");
                             saved_progress["message"] = json!(message);
                             let saved_progress = backend_prog.update_online_job_progress(&message, saved_progress.clone());
                             if let Some(ref app) = app_clone {
@@ -2460,12 +2490,11 @@ async fn handle_rpc_uncached(
                                 failure = Some(format!("Could not save refresh progress: {e}"));
                                 break;
                             }
+                            failed_artist = None;
                         }
                     }
                     Err(e) => {
-                        backend_task
-                            .log_for("discography", &format!("Could not refresh releases for {artist_id}: {e}"), "error");
-                        failure = Some(e);
+                        failure = Some(format!("Could not check releases: {e}"));
                         break;
                     }
                 }
@@ -2474,6 +2503,21 @@ async fn handle_rpc_uncached(
             fetches.abort_all();
             while fetches.join_next().await.is_some() {}
             let is_cancelled = cancel_flag.load(Ordering::Relaxed);
+            let error_logged = !is_cancelled && failure.is_some() && failed_artist.is_some();
+            if let (Some(error),Some((id,name))) = (&failure,&failed_artist) {
+                if !is_cancelled { backend_task.refresh_artist_log(id,&format!("{checked}/{total} artists complete · {name} · {error}"),"error"); }
+            }
+            if is_cancelled || failure.is_some() {
+                for id in ids.iter().filter(|id| !completed.contains(id)) {
+                    let logs = backend_task.logs.snapshot();
+                    let key = format!("{j_id}:artist:{id}");
+                    if logs.iter().any(|entry| entry["progress_id"] == key && entry["job_status"] == "running") {
+                        let name = names.get(id).map(String::as_str).unwrap_or("Linked artist");
+                        let state = if is_cancelled { "Paused; saved metadata retained" } else { "Stopped after another artist failed; saved metadata retained" };
+                        backend_task.refresh_artist_log_status(id,&format!("{checked}/{total} artists complete · {name} · {state}"),"info",if is_cancelled { "cancelled" } else { "interrupted" });
+                    }
+                }
+            }
             let status = if is_cancelled {
                 "cancelled"
             } else if failure.is_some() {
@@ -2489,7 +2533,7 @@ async fn handle_rpc_uncached(
                 if detailed {
                     format!("Recommendation update complete · {checked} artists checked · {reused_details} unchanged releases reused · {checked_details} new, changed or incomplete releases updated")
                 } else {
-                    format!("Release-list check complete · {checked} artists checked · new releases and {market} availability saved · existing track details retained")
+                    format!("Release-list check complete · {checked} artists checked · new releases and availability saved · existing track details retained")
                 }
             };
 
@@ -2499,6 +2543,7 @@ async fn handle_rpc_uncached(
             let final_job = json!({
                 "id": j_id,
                 "kind": "discography",
+                "error_logged": error_logged,
                 "status": status,
                 "message": message,
                 "started": started,
@@ -2972,6 +3017,9 @@ async fn handle_rpc_uncached(
             {
                 Ok(token) => {
                     crate::stream_download::save_token(db, &token).await?;
+                    if let Err(error) = account::refresh_account_market(db, &http, None).await {
+                        state.log_for("connect_account", &format!("Connected; account region check will be retried: {error}"), "warning");
+                    }
                     state.pending_pkce.lock().unwrap().take();
                     state.log_for("connect_account", "Streaming account connected · metadata and downloads ready", "info");
                     if let Some(app) = app_handle {
@@ -3075,7 +3123,7 @@ fn main() {
             let turso_db = TursoDb::open(&db_path).await.expect("Failed to open DB");
             let backend = Arc::new(Backend::new());
             backend.set_db(Arc::new(turso_db.clone()));
-            if let Ok(loaded) = turso_db.load_activity_overview(500).await {
+            if let Ok(loaded) = turso_db.load_recent_logs(500).await {
                 if !loaded.is_empty() {
                     backend.logs.load(loaded);
                 }
@@ -3138,7 +3186,7 @@ fn main() {
             backend
                 .persist_logs
                 .store(persist, std::sync::atomic::Ordering::SeqCst);
-            if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_activity_overview(500)) {
+            if let Ok(loaded) = tauri::async_runtime::block_on(turso_db.load_recent_logs(500)) {
                 if loaded.is_empty() {
                     backend.log_with_category(
                         &format!(
@@ -3224,6 +3272,47 @@ fn main() {
 
 #[cfg(test)]
 mod activity_tests {
+    #[tokio::test]
+    async fn artist_refresh_has_one_durable_row_and_one_error_at_the_failed_stage() {
+        let dir = std::env::temp_dir().join(format!("artist-log-{}",uuid::Uuid::new_v4()));
+        let db = Arc::new(super::TursoDb::open(dir.join("db")).await.unwrap());
+        let backend = super::Backend::new();
+        backend.set_db(db.clone());
+        backend.start_online_job(serde_json::json!({"id":"refresh","kind":"discography","status":"running","message":"Refresh started"}),std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        super::reference_refresh_progress(&backend,"Downloaded reference metadata · 0/4 releases",0,4);
+        super::reference_refresh_progress(&backend,"Downloaded reference checked · 2/4 releases",2,4);
+        let reference = backend.online_job.lock().unwrap().clone().unwrap();
+        assert_eq!(reference["completed"],2);
+        assert_eq!(reference["percent"],50.);
+        assert_eq!(reference["progress_phase"],"reference releases");
+        for n in 0..20 {
+            backend.refresh_artist_log("one",&format!("Example · Credits {n}/20 releases"),"info");
+            backend.progress_for("discography",&format!("Example · {n}/20 releases"));
+        }
+        backend.refresh_artist_log_status("one","Example · Updated 20 releases","info","complete");
+        backend.refresh_artist_log("two","Other Artist · Checking releases","info");
+        backend.refresh_artist_log("three","Third Artist · Checking releases","info");
+        backend.refresh_artist_log("two","Other Artist · Could not check credits: HTTP 429","error");
+        backend.refresh_artist_log_status("three","Third Artist · Stopped; saved metadata retained","info","interrupted");
+        backend.finish_online_job(serde_json::json!({"id":"refresh","kind":"discography","status":"failed","message":"Refresh stopped","error_logged":true}));
+        backend.flush_activity().await;
+        let page = db.activity_history(None,100,None).await.unwrap();
+        let rows = page["entries"].as_array().unwrap();
+        assert_eq!(rows.len(),4,"start plus one row for each artist; no repeated stage messages");
+        assert_eq!(rows.iter().filter(|entry|entry["level"] == "error").count(),1);
+        assert!(rows.iter().any(|entry|entry["message"] == "Example · Updated 20 releases"));
+        let live = backend.logs.snapshot();
+        let saved = rows.iter().find(|entry|entry["progress_id"] == "refresh:artist:one").unwrap();
+        assert_eq!(saved["job_status"],"complete");
+        assert_eq!(rows.iter().find(|entry|entry["progress_id"] == "refresh:artist:two").unwrap()["job_status"],"failed");
+        assert_eq!(rows.iter().find(|entry|entry["progress_id"] == "refresh:artist:three").unwrap()["job_status"],"interrupted");
+        assert_eq!(saved["at"],live.iter().find(|entry|entry["progress_id"] == saved["progress_id"]).unwrap()["at"]);
+        drop(backend); drop(db);
+        let reopened = super::TursoDb::open(dir.join("db")).await.unwrap();
+        assert_eq!(reopened.load_recent_logs(100).await.unwrap().len(),4);
+        drop(reopened); std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn slow_catalogue_reads_do_not_block_queue_updates_or_independent_workers() {
         let dir=std::env::temp_dir().join(format!("independent-reads-{}",uuid::Uuid::new_v4()));
@@ -3365,19 +3454,16 @@ mod activity_tests {
         drop(db);
 
         let reopened = TursoDb::open(dir.join("db")).await.unwrap();
-        let summaries = reopened.load_activity_overview(500).await.unwrap();
-        assert_eq!(summaries.len(), 3);
-        for (id, message) in [("local", "Local tags checked"), ("download", "Download complete"), ("online", "Release refresh complete")] {
-            let entry = summaries.iter().find(|entry| entry["job_id"] == id).unwrap();
-            assert_eq!(entry["job_status"], "complete");
-            assert_eq!(entry["message"], message);
-        }
-        let history = reopened.job_activity("online", 0).await.unwrap();
-        assert_eq!(history.len(), 652);
-        assert_eq!(history.first().unwrap()["message"], "Refresh started");
-        assert_eq!(history.last().unwrap()["message"], "Release refresh complete");
+        let summaries = reopened.load_recent_logs(500).await.unwrap();
+        assert_eq!(summaries.len(), 500);
+        assert_eq!(summaries.last().unwrap()["message"], "Release refresh complete");
+        let history = reopened.activity_history(None, 1000, None).await.unwrap();
+        let online: Vec<_> = history["entries"].as_array().unwrap().iter().filter(|entry| entry["job_id"] == "online").collect();
+        assert_eq!(online.len(), 652);
+        assert_eq!(online.first().unwrap()["message"], "Release refresh complete");
+        assert_eq!(online.last().unwrap()["message"], "Refresh started");
         reopened.clear_log_stream("online").await.unwrap();
-        assert_eq!(reopened.load_activity_overview(500).await.unwrap().len(), 2);
+        assert_eq!(reopened.load_recent_logs(500).await.unwrap().len(), 4);
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3470,7 +3556,7 @@ mod activity_tests {
         backend.finish_online_job(json!({"id":"online","kind":"discography","status":"complete","message":"Credits cached"}));
         backend.start_online_job(json!({"id":"verbose","kind":"discography","status":"running"}), Arc::new(AtomicBool::new(false)));
         for index in 0..1100 { backend.log_for("discography", &format!("Saved release {index}"), "info"); }
-        assert!(backend.logs.snapshot().iter().any(|entry| entry["job_id"] == "online" && entry["job_status"] == "complete"));
+        assert!(!backend.logs.snapshot().iter().any(|entry| entry["job_id"] == "online")); // Older rows are available through saved pagination.
         assert!(backend.logs.online.lock().unwrap().entries.len() <= 1000);
 
         backend.start_download_job(json!({"id":"download","kind":"download","status":"running"}), Arc::new(AtomicBool::new(false)));

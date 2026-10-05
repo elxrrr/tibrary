@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { compactProgress, workload, mergeActivityHistory, downloadActivity, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
+import { compactProgress, workload, mergeActivityHistory, downloadActivity, streamFor, mergeActivitySnapshot, mergeDownloadMonitor, retireWorkerProgress } from "./ActivityView";
 import { mergeJob } from "./api";
 
 it("preserves completion, cancellation and newer progress when request replies arrive late", () => {
@@ -61,6 +61,20 @@ it("routes all details and errors by the owning job rather than incidental messa
   expect(streamFor({at,message:"Catalogue request failed",category:"error",job_kind:"download"})).toBe("downloads");
 });
 
+it("updates one artist action without moving its time or resurrecting stale details, and keeps it after completion", () => {
+  const artist = {at:"2026-10-05T12:00:00Z",updated_at:"2026-10-05T12:00:01Z",message:"Checking Artist",progress_id:"refresh:artist:123",job_id:"refresh",job_kind:"discography",job_status:"running"};
+  const checked = {...artist,updated_at:"2026-10-05T12:00:03Z",message:"Artist · 8 releases checked"};
+  const next = {...artist,at:"2026-10-05T12:00:02Z",updated_at:"2026-10-05T12:00:02Z",progress_id:"refresh:artist:456",message:"Checking Next artist"};
+  const finished = {at:"2026-10-05T12:00:04Z",message:"Refresh complete",job_id:"refresh",job_kind:"discography",job_status:"complete"};
+  const worker = {...artist,progress_id:"refresh",message:"1/2 artists"};
+  const snapshot = mergeActivitySnapshot([artist,next,worker],[checked,finished]);
+  expect(snapshot.map(entry=>entry.message)).toEqual([checked.message,next.message,finished.message]);
+  const saved = mergeActivityHistory(snapshot,[artist]);
+  expect(saved.find(entry=>entry.progress_id === artist.progress_id)).toEqual(checked);
+  expect(saved.map(entry=>entry.message)).toEqual([finished.message,next.message,checked.message]);
+  expect(retireWorkerProgress([...saved,worker])).toEqual(saved);
+});
+
 it("keeps observed details through empty snapshots, late progress and deliberate channel clears", () => {
   const initial = {at:"2026-09-30T12:00:00Z",message:"Started",job_id:"refresh",job_kind:"discography",job_status:"running"};
   const progress = {...initial,at:"2026-09-30T12:00:01Z",message:"Artist 2 of 10",progress_id:"refresh"};
@@ -76,12 +90,14 @@ it("keeps observed details through empty snapshots, late progress and deliberate
   expect(mergeActivitySnapshot([],rows,[1,0,0],[0,0,0])).toEqual([]);
 });
 
-it("retains previous job summaries when one verbose job exceeds the recent detail limit", () => {
+it("keeps a flat recent window while older actions remain available through saved history", () => {
   const old = {at:"2026-09-30T10:00:00Z",message:"Files checked",job_id:"old",job_kind:"scan",job_status:"complete"};
   const details = Array.from({length:1100},(_,i)=>({at:new Date(Date.parse("2026-09-30T12:00:00Z")+i*1000).toISOString(),message:`File ${i}`,job_id:"new",job_kind:"scan",job_status:"running"}));
   const rows = mergeActivitySnapshot([old],details);
-  expect(rows).toHaveLength(1001);
-  expect(rows.some(entry=>entry.job_id === "old")).toBe(true);
+  expect(rows).toHaveLength(1000);
+  expect(rows[0].message).toBe("File 100");
+  expect(rows.at(-1)?.message).toBe("File 1099");
+  expect(mergeActivityHistory(rows,[old]).some(entry=>entry.job_id === "old")).toBe(true);
 });
 
 it("keeps independent transfer lines and prevents late snapshots regressing transfer state", () => {
