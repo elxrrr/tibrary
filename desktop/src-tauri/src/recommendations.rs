@@ -54,6 +54,9 @@ pub struct RecommendationEvidence {
     pub credited_main_tracks: usize,
     pub foreign_main_tracks: usize,
     pub conflicting_track_artists: bool,
+    pub checked_without_identity_support: bool,
+    pub reference_creative_recordings: usize,
+    pub checked_creative_tracks: usize,
 }
 
 fn value_strings(value: &Value) -> Vec<&str> {
@@ -358,11 +361,20 @@ impl ArtistReferenceProfile {
         corpus: &ReferenceCorpus,
     ) -> RecommendationEvidence {
         let mut evidence = RecommendationEvidence::default();
+        let mut specific_label_match = false;
+        let mut specific_rights_match = false;
+        evidence.reference_creative_recordings = self.contributors.iter()
+            .filter(|(credit, _)| credit.role != "technical"
+                && (!corpus.common_person(credit) || self.album_artists.contains(&credit.name)))
+            .flat_map(|(_, recordings)| recordings.iter()).collect::<HashSet<_>>().len();
+        let candidate_has_label = metadata_strings(release, &["label", "record_label", "recordlabel"])
+            .into_iter().any(|value| meaningful_entity(&crate::matching::name_key(value)));
         for label in metadata_strings(release, &["label", "record_label", "recordlabel"]) {
             let key = crate::matching::name_key(label);
             if let Some(editions) = self.labels.get(&key) {
                 evidence.label_match = true;
                 let common = corpus.common_entity(&key, &corpus.labels);
+                specific_label_match |= !common;
                 evidence.common_label |= common;
                 evidence.label_supported |= !common && editions.len() >= 2;
             }
@@ -378,11 +390,14 @@ impl ArtistReferenceProfile {
         for track in tracks.into_iter().flatten() {
             candidate_rights.extend(metadata_strings(track, &["copyright"]));
         }
+        let candidate_has_rights = candidate_rights.iter()
+            .any(|value| meaningful_entity(&rights_holder_key(value)));
         for rights in candidate_rights {
             let key = rights_holder_key(rights);
             if let Some(editions) = self.rights.get(&key) {
                 evidence.rights_continuity = true;
                 let common = corpus.common_entity(&key, &corpus.rights);
+                specific_rights_match |= !common;
                 evidence.common_rights |= common;
                 evidence.rights_match |= !common && editions.len() >= 2;
             }
@@ -445,7 +460,11 @@ impl ArtistReferenceProfile {
             if !isrc.is_empty() && self.recordings.contains(&isrc) {
                 evidence.recordings += 1;
             }
-            for candidate in structured_credits(&track["credits"]) {
+            let credits = structured_credits(&track["credits"]);
+            if credits.iter().any(|credit| credit.role != "technical") {
+                evidence.checked_creative_tracks += 1;
+            }
+            for candidate in credits {
                 let name_key = (candidate.role, candidate.name.clone());
                 let supported = candidate
                     .id
@@ -501,8 +520,31 @@ impl ArtistReferenceProfile {
             && !known_artist_appears
             && evidence.recordings == 0
             && evidence.contributors == 0;
+        // A completed, populated check can contradict artist-page attribution.
+        // Missing, failed or stale checks remain neutral. Creative roles must
+        // match: the same artist ID as a composer is not a producer credit.
+        let complete = release["tracks_loaded"] == true
+            && release["recommendation_track_snapshot_conflict"] != true
+            && tracks.is_some_and(|tracks| !tracks.is_empty()
+                && release["track_count"].as_u64() == Some(tracks.len() as u64)
+                && tracks.iter().all(|track| track["credits_complete"] == true));
+        let reference_has_rights = self.labels.keys().chain(self.rights.keys())
+            .any(|key| meaningful_entity(key));
+        evidence.checked_without_identity_support = complete
+            && evidence.reference_creative_recordings >= 2
+            && reference_has_rights
+            && evidence.checked_creative_tracks > 0
+            && (candidate_has_label || candidate_has_rights)
+            && !specific_label_match
+            && !specific_rights_match
+            && evidence.recordings == 0
+            && evidence.contributors == 0;
         evidence
     }
+}
+
+fn meaningful_entity(key: &str) -> bool {
+    !matches!(key, "" | "unknown" | "none" | "na" | "notavailable" | "unspecified")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -612,9 +654,14 @@ pub fn recommendation_score_with_evidence(
         score += 5;
         reasons.push("Provider marks the release official".into());
     }
+    if evidence.checked_without_identity_support {
+        score = score.min(49);
+        reasons.push(format!("All track credits checked; no shared recording, writing/production contributor, specific label or copyright holder with {} independent downloaded reference recordings. Artist-page attribution alone does not establish a match", evidence.reference_creative_recordings));
+    }
     let strong = primary
         && !conflict
         && !evidence.conflicting_track_artists
+        && !evidence.checked_without_identity_support
         && !compilation
         && !unofficial
         && (evidence.label_supported
@@ -632,7 +679,8 @@ pub fn recommendation_score_with_evidence(
         "Unmatched"
     } else if strong && score >= 85 {
         "Recommended"
-    } else if conflict || unofficial || compilation || evidence.conflicting_track_artists {
+    } else if conflict || unofficial || compilation || evidence.conflicting_track_artists
+        || evidence.checked_without_identity_support {
         "Suspect"
     } else {
         "Potential"
@@ -1038,6 +1086,84 @@ mod tests {
                 .contributors,
             1
         );
+    }
+
+    #[test]
+    fn complete_disjoint_singles_cannot_use_a_contaminated_artist_id_as_identity() {
+        let mut profile = ArtistReferenceProfile::default();
+        for (key, copyright) in [("one", "2025 This Never Happened"), ("two", "2026 Colorize (Enhanced)")] {
+            profile.add_verified_recording(key, &serde_json::json!({"isrc":format!("GB{key}"), "credits":[
+                {"name":"Dragan Roganovic","role":"Composer","contributor_id":"writer"},
+                {"name":"Dirty South","role":"Producer","contributor_id":"3518839"}
+            ]}), &serde_json::json!({"title":key,"copyright":copyright,"artist_ids":["3518839"]}));
+        }
+        for credits in [
+            serde_json::json!([{"name":"Domonique Parker","role":"Composer","contributor_id":"other"}]),
+            serde_json::json!([{"name":"Dirty South","role":"Composer","contributor_id":"3518839"},
+                {"name":"Steve Joines","role":"Lyricist","contributor_id":"unrelated"}]),
+        ] {
+            // Both a single and a two-track drop on the very same artist page.
+            for total in [1, 2] {
+                let tracks: Vec<_> = (0..total).map(|n| serde_json::json!({
+                    "isrc":format!("US{n}"),"artists":[{"name":"Dirty South","id":"3518839","type":"MAIN"}],
+                    "credits":credits,"credits_complete":true
+                })).collect();
+                let release = serde_json::json!({"tracks_loaded":true,"track_count":total,"copyright":"2026 ZoeBoy Records"});
+                let evidence = profile.evidence(&release, Some(&tracks), &ReferenceCorpus::default());
+                assert!(!evidence.conflicting_track_artists);
+                assert_eq!(evidence.contributors, 0);
+                assert!(evidence.checked_without_identity_support);
+                let (score, badge, _) = recommendation_score_with_evidence(true, false, true, &evidence, false, false, true);
+                assert_eq!(badge, "Suspect");
+                assert!(score < 50);
+            }
+        }
+    }
+
+    #[test]
+    fn absence_of_evidence_requires_complete_populated_checks_and_a_reference_history() {
+        let mut profile = ArtistReferenceProfile::default();
+        for key in ["one", "two"] {
+            profile.add_verified_recording(key, &serde_json::json!({"isrc":format!("GB{key}"),"credits":[
+                {"name":"Known Writer","role":"Composer","contributor_id":"writer"}
+            ]}), &serde_json::json!({"title":key,"copyright":"2025 This Never Happened"}));
+        }
+        let release = serde_json::json!({"tracks_loaded":true,"track_count":1,"copyright":"2026 New Label"});
+        let track = serde_json::json!({"isrc":"US123","credits_complete":true,"credits":[
+            {"name":"Other Writer","role":"Composer","contributor_id":"other"}
+        ]});
+        let classify = |profile: &ArtistReferenceProfile, release: &Value, track: &Value| {
+            let evidence = profile.evidence(release, Some(&vec![track.clone()]), &ReferenceCorpus::default());
+            recommendation_score_with_evidence(true, false, true, &evidence, false, false, false).1
+        };
+        assert_eq!(classify(&profile, &release, &track), "Suspect");
+        for (field, value) in [("tracks_loaded", serde_json::json!(false)),
+            ("track_count", serde_json::json!(2)),
+            ("recommendation_track_snapshot_conflict", serde_json::json!(true)),
+            ("copyright", serde_json::json!("unknown"))] {
+            let mut incomplete = release.clone();
+            incomplete[field] = value;
+            assert_eq!(classify(&profile, &incomplete, &track), "Potential", "{field}");
+        }
+        for (field, value) in [("credits_complete", serde_json::json!(false)),
+            ("credits", serde_json::json!([]))] {
+            let mut incomplete = track.clone();
+            incomplete[field] = value;
+            incomplete["credits_checked_at"] = serde_json::json!(123456); // A failed check is not completion.
+            assert_eq!(classify(&profile, &release, &incomplete), "Potential", "{field}");
+        }
+        let mut same_writer = track.clone();
+        same_writer["credits"] = serde_json::json!([{"name":"Known Writer","role":"Composer","contributor_id":"writer"}]);
+        assert_eq!(classify(&profile, &release, &same_writer), "Potential"); // New labels are allowed.
+        let mut same_recording = track.clone();
+        same_recording["isrc"] = serde_json::json!("GBone");
+        assert_eq!(classify(&profile, &release, &same_recording), "Potential");
+        let mut same_rights = release.clone();
+        same_rights["copyright"] = serde_json::json!("2026 This Never Happened");
+        assert_ne!(classify(&profile, &same_rights, &track), "Suspect");
+        let mut weak = ArtistReferenceProfile::default();
+        weak.add_verified_recording("only-one", &same_writer, &same_rights);
+        assert_eq!(classify(&weak, &release, &track), "Potential");
     }
 
     #[test]

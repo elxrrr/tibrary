@@ -172,6 +172,7 @@ const releaseColumns: Column[] = [
   { key: "status", label: "Coverage" },
   { key: "recommendation", label: "Recommendation" },
 ];
+const defaultRecommendation = "Recommended and potential";
 function Modal({
   title,
   children,
@@ -240,7 +241,7 @@ function App() {
     [preview, setPreview] = useState<string | undefined>(),
     [timeline, setTimeline] = useState("Newer than newest owned"),
     [artistScope, setArtistScope] = useState("My album artists"),
-    [recommendation, setRecommendation] = useState("All recommendations"),
+    [recommendation, setRecommendation] = useState(defaultRecommendation),
     [copyright, setCopyright] = useState("All copyrights"),
     [releaseType, setReleaseType] = useState("All types");
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
@@ -269,7 +270,8 @@ function App() {
   useEffect(() => {
     if (route !== "overview" || !state) { overviewReader.clear(); return; }
     const args = {route: "missing", timeline: "All missing releases", status: "all",
-      sort: "date", direction: "desc", limit: 20, artist_scope: "My album artists"};
+      sort: "date", direction: "desc", limit: 20, artist_scope: "My album artists",
+      recommendation: defaultRecommendation};
     overviewReader.request({key:JSON.stringify(args), revision:state.revision,
       read:()=>call("table",args), publish:result=>{setLatestMissing(result.rows); setMissingReleaseCount(result.total);}});
   }, [route, state?.revision]);
@@ -768,7 +770,7 @@ function App() {
     Icon: any = Music2,
   ) {
     return (
-      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
+      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation(defaultRecommendation); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
         <span className="metric-title">
           <Icon size={18} />
           {title}
@@ -901,7 +903,7 @@ function App() {
           <section className="card latest-missing-card">
             <div className="section-heading">
               <h2>Latest missing releases</h2>
-              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation("All recommendations"); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
+              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation(defaultRecommendation); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
                 View missing releases
               </button>
             </div>
@@ -1276,11 +1278,12 @@ function App() {
             </select>
             <select
               aria-label="Recommendation"
-              title="Confidence from recording matches, rights holders and role-specific credits shared with verified local music. Potential may mean insufficient metadata rather than a mismatch; inspect metadata for the evidence."
+              title="The normal view includes Recommended and Potential releases and excludes Suspect / Low match and Unmatched. Confidence uses recording matches, rights holders and role-specific credits shared with verified local music. Complete metadata with no shared identity evidence is Low match; incomplete evidence may remain Potential. Choose All recommendations to inspect every result."
               value={recommendation}
               onChange={(e) => { setRecommendation(e.target.value); setOffset(0); }}
             >
               {[
+                defaultRecommendation,
                 "All recommendations",
                 "Recommended",
                 "Potential",

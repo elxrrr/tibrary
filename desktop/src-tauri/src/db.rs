@@ -2434,7 +2434,9 @@ impl TursoDb {
             let rf_clean = rf.trim();
             if rf_clean != "All recommendations" && rf_clean != "all" && !rf_clean.is_empty() {
                 rows.retain(|r| {
-                    if rf_clean == "Suspect / Low match" {
+                    if rf_clean == "Recommended and potential" {
+                        matches!(r.recommendation.as_str(), "Recommended" | "Potential")
+                    } else if rf_clean == "Suspect / Low match" {
                         r.recommendation == "Suspect"
                     } else {
                         r.recommendation == rf_clean
@@ -4206,7 +4208,7 @@ fn recommendation_metadata_evidence(release: &Value) -> Vec<String> {
     let tracks = release["tracks"].as_array();
     let loaded = release["tracks_loaded"] == true && tracks.is_some_and(|tracks|!tracks.is_empty());
     let (checked, total) = tracks.map(|tracks|(
-        tracks.iter().filter(|track|track["credits_complete"] == true || track["credits_checked_at"].as_i64().is_some_and(|at|at > 0)).count(), tracks.len()
+        tracks.iter().filter(|track|track["credits_complete"] == true).count(), tracks.len()
     )).unwrap_or_default();
     let mut evidence = Vec::new();
     if release["recommendation_track_snapshot_conflict"] == true {
@@ -4412,6 +4414,8 @@ mod tests {
         let scoped = store.get_missing_rows_scoped("GB",Some("All missing releases"),Some("Recommended"),Some("My album artists"),None,None,None,None,None,0,10).await.unwrap();
         assert_eq!(scoped.total,1);
         assert_eq!(scoped.rows[0].id,"300");
+        let normal = store.get_missing_rows_scoped("GB",Some("All missing releases"),Some("Recommended and potential"),Some("My album artists"),None,None,None,None,None,0,10).await.unwrap();
+        assert_eq!(normal.total,2,"the normal view includes both corroborated and not-yet-checked releases");
         let legacy_scope = store.get_missing_rows("GB",Some("All missing releases"),Some("My album artists"),None,None,None,None,None,0,10).await.unwrap();
         assert_eq!(legacy_scope.total,2,"legacy scope-only filters remain compatible");
 
@@ -4482,6 +4486,8 @@ mod tests {
         let checked_empty = serde_json::json!({"tracks_loaded":true,"tracks":[{"id":"11","credits_complete":true,"credits":[]}],"recommendation_snapshot":{"optional_status":"complete"}});
         let evidence = super::recommendation_metadata_evidence(&checked_empty);
         assert!(evidence.iter().any(|reason|reason.contains("credits checked for all 1 tracks; 0")));
+        let failed_check = serde_json::json!({"tracks_loaded":true,"tracks":[{"id":"11","credits_complete":false,"credits_checked_at":123,"credits":[]}]});
+        assert!(super::recommendation_metadata_evidence(&failed_check).iter().any(|reason|reason.contains("0/1 tracks; recommendation evidence is incomplete")));
         let full_listing = serde_json::json!({"id":"1","title":"Current","track_count":1,"tracks_loaded":true,"label":"Known Label","genres":["Old genre"],"tracks":[{"id":"11","credits_complete":true,"credits":[]}]});
         let partial_cache = serde_json::json!({"id":"1","title":"Current","track_count":1,"tracks_loaded":false,"tracks":[],"label":null,"genres":[],"catalogue_metadata_status":{"fields":{"genres":"not_supplied"}}});
         let retained = super::recommendation_candidate_overlay(&full_listing,partial_cache);

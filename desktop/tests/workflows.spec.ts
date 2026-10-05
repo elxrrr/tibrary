@@ -573,7 +573,7 @@ test("startup always shows overview and does not replay a historical failure", a
   await page.goto("/");
   await expect(page.getByRole("heading", {name:"Overview",exact:true})).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
-  const missing = await rpc("table", {route:"missing",timeline:"All missing releases",status:"all",limit:20,recommendation:"My album artists"});
+  const missing = await rpc("table", {route:"missing",timeline:"All missing releases",status:"all",limit:20,artist_scope:"My album artists",recommendation:"Recommended and potential"});
   await expect(page.locator(".metric").filter({hasText:"Missing releases"})).toContainText(String(missing.result.total));
 });
 
@@ -784,6 +784,51 @@ test("missing release filters, bidirectional sort and paging preserve the releas
   await page.getByRole("textbox",{name:"Filter table",exact:true}).fill("Night Maps");
   await expect(page.locator("tbody")).toContainText("Night Maps");
   await expect(page.locator("tbody")).not.toContainText("Between Stations");
+});
+
+test("missing release defaults keep low matches inspectable without inflating overview", async ({page}) => {
+  const queries:any[]=[];
+  const rows=[
+    {id:"verified-release",artist:"North Assembly",release:"Verified catalogue",date:"2026-01-02",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Recommended"},
+    {id:"potential-release",artist:"North Assembly",release:"Incomplete evidence",date:"2026-01-01",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Potential"},
+    {id:"low-match-release",artist:"North Assembly",release:"Unrelated catalogue",date:"2026-01-01",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Suspect / Low match"},
+    {id:"unmatched-release",artist:"North Assembly",release:"Unmatched catalogue",date:"2026-01-01",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Unmatched"},
+  ];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="table" && request.args.route==="missing") {
+      queries.push(request.args);
+      const selected=request.args.recommendation==="Recommended and potential"
+        ? rows.filter(row=>["Recommended","Potential"].includes(row.recommendation))
+        : request.args.recommendation==="All recommendations" ? rows
+        : rows.filter(row=>row.recommendation===request.args.recommendation);
+      await route.fulfill({json:{result:{rows:selected,total:selected.length,missing_total:selected.length}}});
+      return;
+    }
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  const latest=page.getByRole("region",{name:"Latest missing releases",exact:true});
+  await expect(latest).toContainText("Verified catalogue");
+  await expect(latest).toContainText("Incomplete evidence");
+  await expect(latest).not.toContainText("Unrelated catalogue");
+  const metric=page.locator(".metric").filter({hasText:"Missing releases"});
+  await expect(metric.locator("strong")).toHaveText("2");
+  await metric.click();
+  const confidence=page.getByRole("combobox",{name:"Recommendation",exact:true});
+  await expect(confidence).toHaveValue("Recommended and potential");
+  await expect(page.getByRole("combobox",{name:"Album artist scope",exact:true})).toHaveValue("My album artists");
+  await expect(page.getByRole("combobox",{name:"Release timeline",exact:true})).toHaveValue("All missing releases");
+  await expect(page.locator("tbody")).toContainText("Verified catalogue");
+  await expect(page.locator("tbody")).not.toContainText("Unrelated catalogue");
+  await expect(page.getByText("2 releases matching filters",{exact:false})).toBeVisible();
+  await confidence.selectOption("All recommendations");
+  await expect(page.locator("tbody")).toContainText("Unrelated catalogue");
+  await expect(page.locator("tbody")).toContainText("Unmatched catalogue");
+  await confidence.selectOption("Suspect / Low match");
+  await expect(page.locator("tbody")).toContainText("Unrelated catalogue");
+  await expect(page.locator("tbody")).not.toContainText("Verified catalogue");
+  expect(queries[0].recommendation).toBe("Recommended and potential");
 });
 
 test("missing release metadata shows saved credits and independent confidence filters", async ({page}) => {
