@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.8** · [Setup and screenshots](../../README.md)
+Version **0.9.9** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -35,6 +35,10 @@ Artist matching starts from local **Album Artist** tags. Compilation placeholder
 Recording matches use ISRC, title, duration, release structure and track positions. Linking writes associations to the database, not file tags. Multiple compatible editions can supply metadata, but conflicting totals, mixes or recording evidence require review.
 
 Missing releases defaults to **My album artists** and **Recommended and potential**, using album-level artist IDs and the same confidence filter as Overview. Artist scope and recommendation confidence have separate filters, so you can combine **My album artists** with **Recommended**, or inspect other appearances and low-confidence results. Recommendation references come from present local files and their verified online links. Contributor IDs and roles, independent recordings, labels and copyright holders strengthen a match; common distributors, technical credits and genres provide context. Conflicting artists, compilations and unofficial releases cannot become Recommended. A fully checked release with populated creative credits and rights/label metadata, but no shared recording, creative contributor in the same role, specific label or copyright holder, is **Suspect / Low match** when there are at least two independent downloaded creative-credit references. An artist-page ID alone cannot override this check. Incomplete, stale or empty credit checks remain neutral; a label change alone does not disqualify a release. Low-match results remain inspectable through **All recommendations** or **Suspect / Low match**.
+
+The Overview count includes all missing, incomplete and queued releases within **My album artists → Recommended and potential**, regardless of the filters currently used on the Missing releases page. Clicking that card opens the same scope.
+
+Right-click a table header for sorting and relevant filters, or click its filter icon. These use the same filters as the controls above the table. Keyboard users can focus the header and press **Shift+F10**; **Escape** closes the menu.
 
 A release is marked superseded only when cached evidence shows a newer available release contains all its recordings. Exclusive mixes remain protected; superseded items remain inspectable.
 

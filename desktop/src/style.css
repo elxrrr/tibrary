@@ -31,8 +31,12 @@
   --line: color-mix(in srgb, CanvasText 16%, Canvas);
   --accent: var(--system-accent, #007aff);
   --accent-soft: color-mix(in srgb, var(--accent) 12%, Canvas);
-  --selected: color-mix(in srgb, CanvasText 10%, Canvas);
+  --accent-hover: color-mix(in srgb, var(--accent) 9%, var(--card));
+  --accent-selected: color-mix(in srgb, var(--accent) 18%, var(--card));
+  --accent-border: color-mix(in srgb, var(--accent) 46%, var(--line));
+  --selected: var(--accent-selected);
   --workspace-gap: 16px;
+  accent-color: var(--accent);
 }
 :root[data-highlight="blue"], :root[data-highlight="multicolour"] { --accent: #007aff; }
 :root[data-highlight="purple"] { --accent: #af52de; }
@@ -86,21 +90,21 @@ button {
   transition: background 0.1s;
 }
 button:hover:not(:disabled) {
-  background: var(--surface);
+  background: var(--accent-hover);
 }
 button:disabled {
   opacity: 0.42;
   cursor: default;
 }
 button.primary {
-  background: color-mix(in srgb, var(--text) 14%, var(--card));
+  background: var(--accent-selected);
   color: var(--text);
-  border-color: color-mix(in srgb, var(--text) 24%, var(--line));
+  border-color: var(--accent-border);
   font-weight: 600;
 }
 button.primary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--text) 22%, var(--card));
-  border-color: color-mix(in srgb, var(--text) 32%, var(--line));
+  background: color-mix(in srgb, var(--accent) 26%, var(--card));
+  border-color: var(--accent);
 }
 input,
 select {
@@ -128,8 +132,13 @@ input[type="checkbox"] {
   margin: 0;
   cursor: pointer;
 }
+input:not([type="checkbox"]):hover:not(:disabled),
+select:hover:not(:disabled) {
+  border-color: var(--accent-border);
+}
 input:focus-visible,
 select:focus-visible,
+textarea:focus-visible,
 button:focus-visible,
 tr:focus-visible {
   outline: 2px solid var(--accent);
@@ -208,7 +217,7 @@ aside {
 #app-sidebar[hidden] { display: none; }
 .window-navigation { display: flex; align-items: center; gap: 2px; width: fit-content; margin-left: 110px; height: 60px; }
 .window-navigation button { width: 30px; height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; color: var(--muted); }
-.window-navigation button:hover:not(:disabled) { background: var(--card); color: var(--text); }
+.window-navigation button:hover:not(:disabled) { background: var(--accent-hover); color: var(--text); }
 .nav-item {
   justify-content: flex-start;
   background: transparent;
@@ -221,8 +230,8 @@ aside {
   font-weight: 500;
 }
 .nav-item.current,
-.nav-heading button.current {
-  background: var(--card);
+.nav-heading > button:last-child.current {
+  background: var(--accent-selected);
   box-shadow: 0 1px 3px #0000000c;
   color: var(--text);
 }
@@ -252,6 +261,15 @@ aside {
   font-size: 12px;
   font-weight: 650;
   gap: 9px;
+}
+.nav-item:hover:not(:disabled),
+.nav-heading > button:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--text);
+}
+.nav-item.current:hover:not(:disabled),
+.nav-heading > button:last-child.current:hover:not(:disabled) {
+  background: var(--accent-selected);
 }
 .sidebar-bottom {
   margin-top: auto;
@@ -552,6 +570,7 @@ main {
   background: var(--accent-soft);
   border-color: var(--accent);
 }
+.action-card.chosen:hover:not(:disabled) { background: var(--accent-selected); }
 .action-card strong {
   padding-right: 12px;
   font-size: 12px;
@@ -632,6 +651,15 @@ th button {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+th:is([aria-sort="ascending"], [aria-sort="descending"]) > button,
+th:is([aria-sort="ascending"], [aria-sort="descending"]) .table-header-actions > button:first-child {
+  color: color-mix(in srgb, var(--accent) 65%, var(--text));
+}
+.table-header-actions { display: flex; align-items: center; min-width: 0; height: 100%; }
+.table-header-actions > button:first-child { flex: 1; min-width: 0; }
+th .column-filter-button { flex: none; width: 27px; height: 27px; margin-right: 4px; padding: 5px; border-radius: 5px; justify-content: center; color: var(--muted); }
+th .column-filter-button.active { color: color-mix(in srgb, var(--accent) 65%, var(--text)); background: var(--accent-soft); }
+th .column-filter-button:hover:not(:disabled) { background: var(--accent-selected); }
 td {
   padding: 9px 10px;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 45%, transparent);
@@ -647,7 +675,10 @@ tr.selected {
   background: var(--selected);
 }
 tr:hover {
-  background: var(--surface);
+  background: var(--accent-hover);
+}
+tr.selected:hover {
+  background: var(--selected);
 }
 tr.inactive {
   color: var(--muted);
@@ -665,6 +696,8 @@ tr.child td {
   padding-top: 7px;
   padding-bottom: 7px;
 }
+tr.child:hover { background: var(--accent-hover); }
+tr.child.selected { background: var(--selected); }
 .track-position {
   display: inline-block;
   min-width: 62px;
@@ -897,6 +930,8 @@ summary {
   font-weight: 550;
   font-size: 12px;
 }
+summary:hover { background: var(--accent-hover); border-radius: 5px; }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .tokens {
   display: flex;
   gap: 8px;
@@ -926,9 +961,9 @@ summary {
   align-items: center;
 }
 .status-badge.status-running {
-  background: rgba(59, 130, 246, 0.15);
-  color: #3b82f6;
-  border: 1px solid rgba(59, 130, 246, 0.35);
+  background: var(--accent-soft);
+  color: color-mix(in srgb, var(--accent) 65%, var(--text));
+  border: 1px solid var(--accent-border);
 }
 .status-badge.status-failed,
 .status-badge.status-error {
@@ -1174,7 +1209,7 @@ dialog p {
   background: transparent;
   font-size: 12px;
 }
-.context-menu button:hover {
+.context-menu button:hover:not(:disabled) {
   background: var(--selected);
 }
 .context-menu hr {
@@ -1182,6 +1217,7 @@ dialog p {
   border-top: 1px solid var(--line);
   margin: 5px;
 }
+.header-context-menu .header-menu-label { padding: 6px 10px 4px; color: var(--muted); font-size: 11px; font-weight: 600; }
 .menu-scrim {
   position: fixed;
   inset: 0;

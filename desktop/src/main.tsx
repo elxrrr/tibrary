@@ -47,7 +47,7 @@ import {
   mergeJob,
   onlineKinds,
 } from "./api";
-import { DataTable, Column } from "./DataTable";
+import { DataTable, Column, HeaderFilter } from "./DataTable";
 import { ActivityView, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
 import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
@@ -173,6 +173,21 @@ const releaseColumns: Column[] = [
   { key: "recommendation", label: "Recommendation" },
 ];
 const defaultRecommendation = "Recommended and potential";
+const defaultArtistScope = "My album artists";
+const overviewMissingFilters = {timeline: "All missing releases", status: "all", artist_scope: defaultArtistScope, recommendation: defaultRecommendation};
+const releaseTimelines = ["Newer than newest owned", "Between newest two owned", "All missing releases", "Incomplete albums", "All releases"];
+const artistScopes = [defaultArtistScope, "All artist appearances", "Other artist appearances", "Artist credits not checked"];
+const recommendations = [defaultRecommendation, "All recommendations", "Recommended", "Potential", "Suspect / Low match", "Unmatched", "Superseded"];
+const releaseTypes = ["All types", "ALBUM", "EP", "SINGLE"];
+function tableFilters(route: string): {value:string;label:string}[] {
+  const options = [{value:"all",label:route === "artists" ? "All artists" : route === "missing" ? "Available and unchecked" : "All items"}];
+  if (["correct", "organise", "metadata", "artwork", "mqa"].includes(route)) options.push({value:"affected",label:"Affected files only"});
+  if (route === "links") options.push(...[["unlinked","Unlinked tracks"],["choice","Needs an edition choice"],["linked","Linked tracks"],["ignored","Ignored tracks"]].map(([value,label])=>({value,label})));
+  if (route === "artists") options.push(...[["unresolved","Unresolved artists"],["matched","Matched artists"],["review","Needs review"]].map(([value,label])=>({value,label})));
+  if (route === "missing") options.push(...["Missing release", "Owned partial", "Owned complete", "Queued", "Ignored", "Unavailable"].map(value=>({value,label:value})));
+  if (route === "favourites") options.push(...["Missing locally", "In library", "Local only"].map(value=>({value,label:value})));
+  return options;
+}
 function Modal({
   title,
   children,
@@ -242,9 +257,8 @@ function App() {
   const [action, setAction] = useState("dates"),
     [preview, setPreview] = useState<string | undefined>(),
     [timeline, setTimeline] = useState("Newer than newest owned"),
-    [artistScope, setArtistScope] = useState("My album artists"),
+    [artistScope, setArtistScope] = useState(defaultArtistScope),
     [recommendation, setRecommendation] = useState(defaultRecommendation),
-    [copyright, setCopyright] = useState("All copyrights"),
     [releaseType, setReleaseType] = useState("All types");
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
   const [systemAccent, setSystemAccent] = useState({name:"Multicolour",hex:"#007aff"});
@@ -272,9 +286,8 @@ function App() {
   }, [state?.job?.status, state?.online_job?.status, state?.download_job?.status]);
   useEffect(() => {
     if (!["overview", "complete"].includes(route) || !state) { overviewReader.clear(); return; }
-    const args = {route: "missing", timeline: "All missing releases", status: "all",
-      sort: "date", direction: "desc", limit: 20, artist_scope: "My album artists",
-      recommendation: defaultRecommendation};
+    const args = {route: "missing", ...overviewMissingFilters,
+      sort: "date", direction: "desc", limit: 20};
     overviewReader.request({key:JSON.stringify(args), revision:state.revision,
       read:()=>call("table",args), publish:result=>{setLatestMissing(result.rows); setMissingReleaseCount(result.total);}});
   }, [route, state?.revision]);
@@ -407,7 +420,6 @@ function App() {
     timeline,
     recommendation,
     artist_scope: artistScope,
-    copyright,
     type: releaseType,
   };
   useEffect(() => {
@@ -437,7 +449,6 @@ function App() {
     timeline,
     recommendation,
     artistScope,
-    copyright,
     releaseType,
     pageSize,
     state?.revision,
@@ -788,6 +799,31 @@ function App() {
               { key: "evidence", label: "Evidence" },
             ]
           : fileColumns;
+  const filterOptions = tableFilters(route);
+  const headerFilters: Record<string, HeaderFilter> = {};
+  function headerChoice(label: string, value: string, options: string[], update: (value: string) => void, unfiltered = options[0]): HeaderFilter {
+    return {label, value, active:value !== unfiltered, options:options.map(value=>({value,label:value})), onChange:value=>{update(value);setOffset(0);}};
+  }
+  if (filterOptions.length > 1) {
+    const key = columns.some(column=>column.key === "status") ? "status" : "evidence";
+    headerFilters[key] = {label: "Table filter", value:filter, options:filterOptions, onChange:value=>{setFilter(value);setOffset(0);}};
+  }
+  if (route === "missing") {
+    headerFilters.artist = headerChoice("Album artist scope", artistScope, artistScopes, setArtistScope, "All artist appearances");
+    headerFilters.date = headerChoice("Release timeline", timeline, releaseTimelines, setTimeline, "All releases");
+    headerFilters.type = headerChoice("Release type", releaseType, releaseTypes, setReleaseType);
+    headerFilters.recommendation = headerChoice("Recommendation", recommendation, recommendations, setRecommendation, "All recommendations");
+  }
+  function openMissingReleases() {
+    setTimeline(overviewMissingFilters.timeline);
+    setFilter(overviewMissingFilters.status);
+    setArtistScope(overviewMissingFilters.artist_scope);
+    setRecommendation(overviewMissingFilters.recommendation);
+    setReleaseType("All types");
+    setQuery("");
+    setOffset(0);
+    setRoute("missing");
+  }
   function card(
     title: string,
     value: any,
@@ -796,7 +832,7 @@ function App() {
     Icon: any = Music2,
   ) {
     return (
-      <button className="metric" onClick={() => { if (target === "missing") { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation(defaultRecommendation); setReleaseType("All types"); setQuery(""); setOffset(0); } setRoute(target); }}>
+      <button className="metric" title={target === "missing" ? "My album artists · Recommended and Potential · all missing, incomplete and queued releases" : undefined} onClick={() => target === "missing" ? openMissingReleases() : setRoute(target)}>
         <span className="metric-title">
           <Icon size={18} />
           {title}
@@ -834,7 +870,7 @@ function App() {
               {card(
                 "Missing releases",
                 missingReleaseCount?.toLocaleString(),
-                "From your linked album artists",
+                "My album artists · Recommended and Potential",
                 "missing",
                 Disc,
               )}
@@ -932,7 +968,7 @@ function App() {
           <section className="card latest-missing-card">
             <div className="section-heading">
               <h2>Latest missing releases</h2>
-              <button onClick={() => { setTimeline("All missing releases"); setFilter("all"); setArtistScope("My album artists"); setRecommendation(defaultRecommendation); setReleaseType("All types"); setQuery(""); setOffset(0); setSort("date"); setDirection("desc"); setRoute("missing"); }}>
+              <button onClick={() => { openMissingReleases(); setSort("date"); setDirection("desc"); }}>
                 View missing releases
               </button>
             </div>
@@ -1287,13 +1323,7 @@ function App() {
                 setOffset(0);
               }}
             >
-              {[
-                "Newer than newest owned",
-                "Between newest two owned",
-                "All missing releases",
-                "Incomplete albums",
-                "All releases",
-              ].map((v) => (
+              {releaseTimelines.map((v) => (
                 <option key={v}>{v}</option>
               ))}
             </select>
@@ -1303,7 +1333,7 @@ function App() {
               value={artistScope}
               onChange={(e) => { setArtistScope(e.target.value); setOffset(0); }}
             >
-              {["All artist appearances", "My album artists", "Other artist appearances", "Artist credits not checked"].map(v => <option key={v}>{v}</option>)}
+              {artistScopes.map(v => <option key={v}>{v}</option>)}
             </select>
             <select
               aria-label="Recommendation"
@@ -1311,28 +1341,7 @@ function App() {
               value={recommendation}
               onChange={(e) => { setRecommendation(e.target.value); setOffset(0); }}
             >
-              {[
-                defaultRecommendation,
-                "All recommendations",
-                "Recommended",
-                "Potential",
-                "Suspect / Low match",
-                "Unmatched",
-                "Superseded",
-              ].map((v) => (
-                <option key={v}>{v}</option>
-              ))}
-            </select>
-            <select
-              aria-label="Copyright match"
-              value={copyright}
-              onChange={(e) => { setCopyright(e.target.value); setOffset(0); }}
-            >
-              {[
-                "All copyrights",
-                "Matching local copyrights",
-                "No copyright match",
-              ].map((v) => (
+              {recommendations.map((v) => (
                 <option key={v}>{v}</option>
               ))}
             </select>
@@ -1341,7 +1350,7 @@ function App() {
               value={releaseType}
               onChange={(e) => { setReleaseType(e.target.value); setOffset(0); }}
             >
-              {["All types", "ALBUM", "EP", "SINGLE"].map((v) => (
+              {releaseTypes.map((v) => (
                 <option key={v}>{v}</option>
               ))}
             </select>
@@ -1368,40 +1377,7 @@ function App() {
               setOffset(0);
             }}
           >
-            <option value="all">
-              {route === "artists" ? "All artists" : route === "missing" ? "Available and unchecked" : "All items"}
-            </option>
-            {["correct", "organise", "metadata", "artwork", "mqa"].includes(
-              route,
-            ) && <option value="affected">Affected files only</option>}
-            {route === "links" && (
-              <>
-                <option value="unlinked">Unlinked tracks</option>
-                <option value="choice">Needs an edition choice</option>
-                <option value="linked">Linked tracks</option>
-                <option value="ignored">Ignored tracks</option>
-              </>
-            )}
-            {route === "missing" &&
-              [
-                "Missing release",
-                "Owned partial",
-                "Owned complete",
-                "Queued",
-                "Ignored",
-                "Unavailable",
-              ].map((v) => <option key={v}>{v}</option>)}
-            {route === "artists" && (
-              <>
-                <option value="unresolved">Unresolved artists</option>
-                <option value="matched">Matched artists</option>
-                <option value="review">Needs review</option>
-              </>
-            )}
-            {route === "favourites" &&
-              ["Missing locally", "In library", "Local only"].map((v) => (
-                <option key={v}>{v}</option>
-              ))}
+            {filterOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
           <span>
             {selected.size
@@ -1432,13 +1408,14 @@ function App() {
         <DataTable
           rows={data.rows}
           columns={columns}
+          headerFilters={headerFilters}
           selected={selected}
           onSelect={setSelected}
           sort={sort}
           direction={direction}
-          onSort={(key) => {
+          onSort={(key, requestedDirection) => {
             setSort(key);
-            setDirection(sort === key && direction === "asc" ? "desc" : "asc");
+            setDirection(requestedDirection || (sort === key && direction === "asc" ? "desc" : "asc"));
             setOffset(0);
           }}
           tree={tree}

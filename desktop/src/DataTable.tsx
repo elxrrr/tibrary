@@ -1,14 +1,30 @@
-import { useEffect, useRef, useState, Fragment } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useId, Fragment } from "react";
+import { createPortal } from "react-dom";
 import {
   ArrowDown,
   ArrowUp,
   ChevronDown,
   ChevronRight,
+  Check as CheckIcon,
+  Filter,
   MoreHorizontal,
 } from "lucide-react";
 import { Row, readable } from "./api";
 import { Selection, parentState, toggleChild, toggleParent } from "./selection";
 export type Column = { key: string; label: string };
+export type HeaderFilter = {
+  label: string;
+  value: string;
+  active?: boolean;
+  options: { value: string; label: string }[];
+  onChange: (value: string) => void;
+};
+type HeaderMenu = {
+  column: Column;
+  x: number;
+  y: number;
+  trigger: HTMLElement;
+};
 function Check({
   state,
   onChange,
@@ -57,6 +73,7 @@ export function DataTable({
   onMenu,
   loading,
   busy,
+  headerFilters,
 }: {
   rows: Row[];
   columns: Column[];
@@ -64,7 +81,7 @@ export function DataTable({
   onSelect: (s: Set<string>) => void;
   sort: string;
   direction: string;
-  onSort: (key: string) => void;
+  onSort: (key: string, direction?: "asc" | "desc") => void;
   tree?: boolean;
   grouped?: boolean;
   treeSelection?: Selection;
@@ -77,10 +94,109 @@ export function DataTable({
   onMenu: (r: Row, x: number, y: number) => void;
   loading: boolean;
   busy: boolean;
+  headerFilters?: Record<string, HeaderFilter>;
 }) {
   const [anchor, setAnchor] = useState<number | null>(null);
+  const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
+  const [menuPosition, setMenuPosition] = useState({ left: 8, top: 8 });
+  const headerMenuRef = useRef<HTMLDivElement>(null);
+  const headerMenuLabelId = useId();
   const scroller = useRef<HTMLDivElement>(null);
   useEffect(() => setAnchor(null), [rows]);
+  function closeHeaderMenu() {
+    const trigger = headerMenu?.trigger;
+    setHeaderMenu(null);
+    if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+  }
+  function openHeaderMenu(column: Column, x: number, y: number, trigger: HTMLElement) {
+    setMenuPosition({ left: Math.max(8, x), top: Math.max(8, y) });
+    setHeaderMenu({ column, x, y, trigger });
+  }
+  useLayoutEffect(() => {
+    if (!headerMenu || !headerMenuRef.current) return;
+    const menu = headerMenuRef.current;
+    function placeMenu() {
+      const box = menu.getBoundingClientRect();
+      setMenuPosition({
+        left: Math.max(8, Math.min(headerMenu!.x, window.innerWidth - box.width - 8)),
+        top: Math.max(8, Math.min(headerMenu!.y, window.innerHeight - box.height - 8)),
+      });
+    }
+    placeMenu();
+    menu.querySelector<HTMLButtonElement>("button")?.focus({ preventScroll: true });
+    window.addEventListener("resize", placeMenu);
+    return () => window.removeEventListener("resize", placeMenu);
+  }, [headerMenu]);
+  useEffect(() => {
+    if (headerMenu && !columns.some((column) => column.key === headerMenu.column.key))
+      closeHeaderMenu();
+  }, [columns, headerMenu]);
+  const menuFilter = headerMenu ? headerFilters?.[headerMenu.column.key] : undefined;
+  const headerContextMenu = headerMenu && createPortal(
+    <>
+      <div className="menu-scrim" onClick={closeHeaderMenu} />
+      <div
+        ref={headerMenuRef}
+        role="menu"
+        aria-label={`${headerMenu.column.label} column options`}
+        className="context-menu header-context-menu"
+        style={{ ...menuPosition, maxHeight: "calc(100vh - 16px)", overflowY: "auto" }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" || event.key === "Tab") {
+            if (event.key === "Escape") event.preventDefault();
+            event.stopPropagation();
+            closeHeaderMenu();
+            return;
+          }
+          const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+          const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+          let next: number | undefined;
+          if (event.key === "ArrowDown") next = (index + 1) % buttons.length;
+          if (event.key === "ArrowUp") next = (index + buttons.length - 1) % buttons.length;
+          if (event.key === "Home") next = 0;
+          if (event.key === "End") next = buttons.length - 1;
+          if (next !== undefined) {
+            event.preventDefault();
+            event.stopPropagation();
+            buttons[next]?.focus();
+          }
+        }}
+      >
+        {(["asc", "desc"] as const).map((order) => <button
+          key={order}
+          role="menuitemradio"
+          aria-checked={sort === headerMenu.column.key && direction === order}
+          onClick={() => {
+            const key = headerMenu.column.key;
+            closeHeaderMenu();
+            if (sort !== key || direction !== order) onSort(key, order);
+          }}
+        >
+          <CheckIcon aria-hidden="true" size={14} style={{ opacity: sort === headerMenu.column.key && direction === order ? 1 : 0 }} />
+          Sort {order === "asc" ? "ascending" : "descending"}
+        </button>)}
+        {menuFilter && <>
+          <hr />
+          <div id={headerMenuLabelId} className="header-menu-label">{menuFilter.label}</div>
+          <div role="group" aria-labelledby={headerMenuLabelId}>
+            {menuFilter.options.map((option) => <button
+              key={option.value}
+              role="menuitemradio"
+              aria-checked={menuFilter.value === option.value}
+              onClick={() => {
+                closeHeaderMenu();
+                if (menuFilter.value !== option.value) menuFilter.onChange(option.value);
+              }}
+            >
+              <CheckIcon aria-hidden="true" size={14} style={{ opacity: menuFilter.value === option.value ? 1 : 0 }} />
+              {option.label}
+            </button>)}
+          </div>
+        </>}
+      </div>
+    </>,
+    document.body,
+  );
   function select(row: Row, index: number, event: React.MouseEvent) {
     const next =
       event.metaKey || event.ctrlKey || event.shiftKey
@@ -147,6 +263,22 @@ export function DataTable({
             {columns.map((c) => (
               <th
                 key={c.key}
+                title="Click to sort. Right-click for column options."
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const trigger = (event.target as HTMLElement).closest("button") || event.currentTarget.querySelector("button");
+                  if (trigger) openHeaderMenu(c, event.clientX, event.clientY, trigger);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "ContextMenu" && !(event.key === "F10" && event.shiftKey)) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const trigger = (event.target as HTMLElement).closest("button") || event.currentTarget.querySelector("button");
+                  if (!trigger) return;
+                  const box = trigger.getBoundingClientRect();
+                  openHeaderMenu(c, box.left, box.bottom, trigger);
+                }}
                 aria-sort={
                   sort === c.key
                     ? direction === "asc"
@@ -155,7 +287,7 @@ export function DataTable({
                     : "none"
                 }
               >
-                <button onClick={() => onSort(c.key)}>
+                <div className="table-header-actions"><button onClick={() => onSort(c.key)}>
                   {c.label}
                   {sort === c.key ? (
                     direction === "asc" ? (
@@ -165,6 +297,20 @@ export function DataTable({
                     )
                   ) : null}
                 </button>
+                {headerFilters?.[c.key] && <button
+                  className={"column-filter-button " + ((headerFilters[c.key].active ?? headerFilters[c.key].value !== headerFilters[c.key].options[0]?.value) ? "active" : "")}
+                  aria-label={`Filter ${c.label}`}
+                  title={`${headerFilters[c.key].label}: ${headerFilters[c.key].options.find(option=>option.value === headerFilters[c.key].value)?.label || headerFilters[c.key].value}`}
+                  aria-haspopup="menu"
+                  aria-expanded={headerMenu?.column.key === c.key}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (headerMenu?.column.key === c.key) { closeHeaderMenu(); return; }
+                    const box = event.currentTarget.getBoundingClientRect();
+                    openHeaderMenu(c, box.left, box.bottom, event.currentTarget);
+                  }}
+                ><Filter aria-hidden="true" size={13} /></button>}
+                </div>
               </th>
             ))}
             <th className="more" />
@@ -374,6 +520,7 @@ export function DataTable({
           </p>
         </div>
       )}
+      {headerContextMenu}
     </div>
   );
 }

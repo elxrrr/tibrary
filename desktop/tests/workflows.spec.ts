@@ -61,7 +61,12 @@ c.commit()`, join(folder,"db")]);
     await route.fulfill({ json: await rpc(r.method, r.args) });
   });
 });
-test.afterEach(async () => {
+test.afterEach(async ({ page }) => {
+  // Retire intercepted requests before closing the disposable backend. A quick
+  // startup test can end with an independent dashboard read still in flight;
+  // only replies arriving during teardown are ignored after the page closes.
+  await page.unrouteAll({behavior:"ignoreErrors"});
+  await page.close();
   child.stdin.end();
   await new Promise<void>((resolve) => child.on("exit", () => resolve()));
   rmSync(folder, { recursive: true, force: true });
@@ -875,15 +880,18 @@ test("missing release defaults keep low matches inspectable without inflating ov
     {id:"potential-release",artist:"North Assembly",release:"Incomplete evidence",date:"2026-01-01",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Potential"},
     {id:"low-match-release",artist:"North Assembly",release:"Unrelated catalogue",date:"2026-01-01",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Suspect / Low match"},
     {id:"unmatched-release",artist:"North Assembly",release:"Unmatched catalogue",date:"2026-01-01",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Unmatched"},
+    {id:"other-artist-release",artist:"Guest Artist",release:"Other artist catalogue",date:"2026-01-03",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Recommended",scope:"Other artist appearances"},
+    {id:"unchecked-artist-release",artist:"Unknown Artist",release:"Unchecked artist catalogue",date:"2026-01-03",type:"SINGLE",tracks:1,status:"Missing release",recommendation:"Potential",scope:"Artist credits not checked"},
   ];
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
     if(request.method==="table" && request.args.route==="missing") {
       queries.push(request.args);
+      const scoped=rows.filter(row=>request.args.artist_scope!=="My album artists" || !row.scope);
       const selected=request.args.recommendation==="Recommended and potential"
-        ? rows.filter(row=>["Recommended","Potential"].includes(row.recommendation))
-        : request.args.recommendation==="All recommendations" ? rows
-        : rows.filter(row=>row.recommendation===request.args.recommendation);
+        ? scoped.filter(row=>["Recommended","Potential"].includes(row.recommendation))
+        : request.args.recommendation==="All recommendations" ? scoped
+        : scoped.filter(row=>row.recommendation===request.args.recommendation);
       await route.fulfill({json:{result:{rows:selected,total:selected.length,missing_total:selected.length}}});
       return;
     }
@@ -894,13 +902,17 @@ test("missing release defaults keep low matches inspectable without inflating ov
   await expect(latest).toContainText("Verified catalogue");
   await expect(latest).toContainText("Incomplete evidence");
   await expect(latest).not.toContainText("Unrelated catalogue");
+  await expect(latest).not.toContainText("Other artist catalogue");
+  await expect(latest).not.toContainText("Unchecked artist catalogue");
   const metric=page.locator(".metric").filter({hasText:"Missing releases"});
   await expect(metric.locator("strong")).toHaveText("2");
+  await expect(metric).toContainText("My album artists · Recommended and Potential");
   await metric.click();
   const confidence=page.getByRole("combobox",{name:"Recommendation",exact:true});
   await expect(confidence).toHaveValue("Recommended and potential");
   await expect(page.getByRole("combobox",{name:"Album artist scope",exact:true})).toHaveValue("My album artists");
   await expect(page.getByRole("combobox",{name:"Release timeline",exact:true})).toHaveValue("All missing releases");
+  await expect(page.getByRole("combobox",{name:"Copyright match",exact:true})).toHaveCount(0);
   await expect(page.locator("tbody")).toContainText("Verified catalogue");
   await expect(page.locator("tbody")).not.toContainText("Unrelated catalogue");
   await expect(page.getByText("2 releases matching filters",{exact:false})).toBeVisible();
@@ -911,6 +923,84 @@ test("missing release defaults keep low matches inspectable without inflating ov
   await expect(page.locator("tbody")).toContainText("Unrelated catalogue");
   await expect(page.locator("tbody")).not.toContainText("Verified catalogue");
   expect(queries[0].recommendation).toBe("Recommended and potential");
+  expect(queries[0].artist_scope).toBe("My album artists");
+  expect(queries.every(args=>!("copyright" in args))).toBe(true);
+  await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
+  await expect(metric.locator("strong")).toHaveText("2");
+});
+
+test("column menus filter, sort and preserve table interaction state", async ({page}) => {
+  await rpc("settings.save",{section:"general",values:{page_size:100}});
+  const rows=Array.from({length:60},(_,index)=>({id:`header-release-${index}`,artist:"North Assembly",release:`Release ${String(index).padStart(2,"0")}`,date:"2026-01-01",type:index%2 ? "EP" : "ALBUM",tracks:1,status:"Missing release",recommendation:"Potential",expanded_available:true,children:[{id:`header-track-${index}`,title:`Track ${index}`,position:"01",duration:180}]}));
+  const queries:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="table" && request.args.route==="missing") {
+      queries.push(request.args);
+      const selected=rows.filter(row=>request.args.type==="All types" || !request.args.type || row.type===request.args.type);
+      selected.sort((a:any,b:any)=>String(a[request.args.sort]||"").localeCompare(String(b[request.args.sort]||""))*(request.args.direction==="desc" ? -1 : 1));
+      await route.fulfill({json:{result:{rows:selected,total:selected.length,missing_total:selected.length}}});
+      return;
+    }
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  const selected=page.getByRole("checkbox",{name:"Select Release 00",exact:true});
+  await expect(page.getByRole("button",{name:"Filter Album artist",exact:true})).toHaveClass(/active/);
+  await expect(page.getByRole("button",{name:"Filter Recommendation",exact:true})).toHaveClass(/active/);
+  await selected.check();
+  await page.getByRole("button",{name:"Expand Release 00",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track Track 0",exact:true})).toBeChecked();
+  const scroller=page.locator(".table-scroll");
+  await scroller.evaluate(element=>{element.scrollTop=180;});
+  const scroll=await scroller.evaluate(element=>element.scrollTop);
+  expect(scroll).toBeGreaterThan(0);
+  const releaseHeader=page.getByRole("columnheader",{name:"Release",exact:true});
+  const releaseSort=releaseHeader.getByRole("button",{name:"Release",exact:true});
+  await releaseSort.focus();
+  await releaseSort.press("Shift+F10");
+  const menu=page.getByRole("menu",{name:"Release column options"});
+  await expect(menu).toBeVisible();
+  await menu.press("End");
+  await expect(menu.getByRole("menuitemradio",{name:"Sort descending",exact:true})).toBeFocused();
+  await menu.press("Escape");
+  await expect(releaseSort).toBeFocused();
+  expect(await scroller.evaluate(element=>element.scrollTop)).toBe(scroll);
+  await releaseHeader.click({button:"right"});
+  await menu.getByRole("menuitemradio",{name:"Sort descending",exact:true}).click();
+  await expect(releaseHeader).toHaveAttribute("aria-sort","descending");
+  await expect(page.locator("tbody tr").first()).toContainText("Release 59");
+  await expect(page.getByRole("button",{name:"Collapse Release 00",exact:true})).toHaveCount(1);
+  await expect(selected).toBeChecked();
+  const count=queries.length;
+  await releaseHeader.click({button:"right"});
+  await expect(menu.getByRole("menuitemradio",{name:"Sort descending",exact:true})).toHaveAttribute("aria-checked","true");
+  await menu.getByRole("menuitemradio",{name:"Sort descending",exact:true}).click();
+  expect(queries.length).toBe(count);
+  await page.getByRole("button",{name:"Filter Recommendation",exact:true}).click();
+  const recommendationMenu=page.getByRole("menu",{name:"Recommendation column options"});
+  const bounds=(await recommendationMenu.boundingBox())!;
+  expect(bounds.x+bounds.width).toBeLessThanOrEqual(1600);
+  await recommendationMenu.getByRole("menuitemradio",{name:"Potential",exact:true}).click();
+  await expect(page.getByRole("combobox",{name:"Recommendation",exact:true})).toHaveValue("Potential");
+  await page.getByRole("button",{name:"Filter Type",exact:true}).click();
+  await page.getByRole("menu",{name:"Type column options"}).getByRole("menuitemradio",{name:"ALBUM",exact:true}).click();
+  await expect(page.getByRole("combobox",{name:"Release type",exact:true})).toHaveValue("ALBUM");
+  await expect(page.getByRole("button",{name:"Filter Type",exact:true})).toHaveClass(/active/);
+  await expect(page.getByText("30 releases matching filters",{exact:false})).toBeVisible();
+  await page.getByRole("combobox",{name:"Release type",exact:true}).selectOption("All types");
+  await expect(page.getByRole("button",{name:"Filter Type",exact:true})).not.toHaveClass(/active/);
+  await page.getByRole("button",{name:"Filter Type",exact:true}).click();
+  const typeMenu=page.getByRole("menu",{name:"Type column options"});
+  await expect(typeMenu.getByRole("menuitemradio",{name:"All types",exact:true})).toHaveAttribute("aria-checked","true");
+  await typeMenu.press("Escape");
+  expect(queries.some(args=>args.type==="ALBUM" && args.recommendation==="Potential")).toBe(true);
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await page.getByRole("button",{name:"Filter Status",exact:true}).click();
+  await page.getByRole("menu",{name:"Status column options"}).getByRole("menuitemradio",{name:"Linked tracks",exact:true}).click();
+  await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveValue("linked");
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("missing release metadata shows saved credits and independent confidence filters", async ({page}) => {
