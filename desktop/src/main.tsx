@@ -204,6 +204,8 @@ function App() {
   const initialRoute: string = "overview";
   const [state, setState] = useState<AppState | null>(null),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
+  const currentRoot = useRef(root);
+  currentRoot.current = root;
   const [navigation, setNavigation] = useState({ pages: ["overview"], index: 0 });
   const route = navigation.pages[navigation.index];
   const setRoute = useCallback((target: string) => {
@@ -269,7 +271,7 @@ function App() {
     return () => window.clearInterval(timer);
   }, [state?.job?.status, state?.online_job?.status, state?.download_job?.status]);
   useEffect(() => {
-    if (route !== "overview" || !state) { overviewReader.clear(); return; }
+    if (!["overview", "complete"].includes(route) || !state) { overviewReader.clear(); return; }
     const args = {route: "missing", timeline: "All missing releases", status: "all",
       sort: "date", direction: "desc", limit: 20, artist_scope: "My album artists",
       recommendation: defaultRecommendation};
@@ -312,7 +314,17 @@ function App() {
   async function refresh(targetRoot?: string) {
     try {
       const activeRoot = targetRoot !== undefined ? targetRoot : root;
+      if (!stateRef.current) {
+        const initial = await call<AppState>("state", {bootstrap:true, ...(activeRoot ? {root:activeRoot} : {})});
+        if (currentRoot.current !== activeRoot) return;
+        stateRef.current = initial;
+        setState(initial);
+        const selectedRoot = initial.roots.some(library => library.root === activeRoot) ? activeRoot : initial.roots[0]?.root || "";
+        if (selectedRoot !== activeRoot) { setRoot(selectedRoot); return; }
+      }
       const s = await call<AppState>("state", activeRoot ? { root: activeRoot } : {});
+      // A slow read from the previous library must not replace the new view.
+      if (currentRoot.current !== activeRoot) return;
       const epochs = mergeActivityEpochs(s.activity_epochs);
       setState(previous => previous ? {...s, revision:Math.max(previous.revision,s.revision), logs:mergeActivitySnapshot(previous.logs,s.logs,previous.activity_epochs,s.activity_epochs), activity_epochs:[0,1,2].map(i=>Math.max(previous.activity_epochs?.[i] || 0,s.activity_epochs?.[i] || 0)), job:mergeJob(previous.job,s.job), online_job:mergeJob(previous.online_job,s.online_job), download_job:mergeJob(previous.download_job,s.download_job)} : s);
       if (s.download_monitor && epochs.downloadsAccepted) setDownloadMonitor(old => mergeDownloadMonitor(epochs.downloadsCleared ? {} : old,s.download_monitor!));
@@ -797,6 +809,9 @@ function App() {
   }
   function dashboard() {
     const s = state?.stats || {};
+    const libraries = root ? state?.roots.filter(library => library.root === root) : state?.roots;
+    const indexed = state?.stats_pending ? libraries?.reduce((count,library) => count + library.tracks,0) : s.track_count;
+    const linked = state?.stats_pending ? libraries?.reduce((count,library) => count + library.linked,0) : s.linked_tracks;
     const group = groups.find((g) => g.id === route);
     return (
       <div className={route === "overview" ? "overview-dashboard" : "dashboard"}>
@@ -805,13 +820,13 @@ function App() {
             <>
               {card(
                 "Local tracks",
-                `${(s.linked_tracks || 0).toLocaleString()} / ${(s.track_count || 0).toLocaleString()}`,
+                indexed == null ? null : `${(linked || 0).toLocaleString()} / ${indexed.toLocaleString()}`,
                 "Linked tracks / indexed locally",
                 "files",
               )}
               {card(
                 "Linked releases",
-                `${s.linked_releases || 0} / ${s.release_count || 0}`,
+                state?.stats_pending || !state ? null : `${s.linked_releases || 0} / ${s.release_count || 0}`,
                 "Whole-release associations",
                 "links",
                 Link,
@@ -854,7 +869,7 @@ function App() {
                               ].includes(id)
                             ? `${s[id] ?? "—"} ${["local", "online"].includes(id) ? "opportunities" : "files to review"}`
                             : id === "missing"
-                              ? `${(s.missing_releases ?? s.missing ?? 0).toLocaleString()} releases`
+                              ? missingReleaseCount == null ? null : `${missingReleaseCount.toLocaleString()} releases`
                               : id === "downloaded"
                                 ? `${s.downloaded || 0} releases`
                                 : "Open",

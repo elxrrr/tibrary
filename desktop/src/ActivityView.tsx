@@ -32,10 +32,31 @@ export function streamFor(entry: ActivityEntry): ActivityStream {
   return "local";
 }
 
+const actionTitles: Record<string, string> = {discography: "Refresh releases", favourites: "Sync favourite artists", release_artists: "Check release artists", cached_releases: "Recheck cached releases", check_availability: "Check release availability", link: "Link releases", match_artists: "Match artists", preview: "Review local changes", mqa: "MQA audit", queue_mqa: "Queue MQA replacements", queue_replacements: "Queue online replacements", check_replacements: "Check online replacements", release_details: "Fetch track details and credits", release_tracks: "Load track details", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Download music", scan: "Scan library", apply: "Apply reviewed changes", deep_review: "Find release matches", deep_preview: "Review release links", deep_apply: "Save reviewed release links", review_consolidation: "Review duplicate removal", consolidate: "Remove reviewed duplicates", manual_candidate: "Inspect a release match", connections: "Test connection", connect_account: "Connect account", connect_download: "Connect account", component_check: "Check streaming components", component_update: "Update streaming components", component_rollback: "Restore streaming components"};
+
 export function jobTitle(kind?: string): string {
-  const titles: Record<string, string> = {discography: "Refresh releases", release_artists: "Check release artists", cached_releases: "Recheck cached releases", check_availability: "Check release availability", link: "Link releases", match_artists: "Match artists", preview: "Review local changes", mqa: "MQA audit", queue_mqa: "Queue MQA replacements", queue_replacements: "Queue online replacements", check_replacements: "Check online replacements", release_details: "Fetch track details and credits", release_tracks: "Load track details", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Download music", scan: "Scan library", apply: "Apply reviewed changes", deep_review: "Find release matches", deep_preview: "Review release links", deep_apply: "Save reviewed release links", review_consolidation: "Review duplicate removal", consolidate: "Remove reviewed duplicates", manual_candidate: "Inspect a release match", connections: "Test connection", connect_account: "Connect account", connect_download: "Connect account", component_check: "Check streaming components", component_update: "Update streaming components", component_rollback: "Restore streaming components"};
-  return titles[kind || ""] || kind?.replaceAll("_", " ") || "Task";
+  return actionTitles[kind || ""] || kind?.replaceAll("_", " ") || "Task";
 }
+
+export function activityFilterParameters(filter: string): {stream?: ActivityStream; job_kinds?: string[]; unassigned?: true} {
+  if (filter === "all") return {};
+  if (filter.startsWith("stream:")) return {stream:filter.slice(7) as ActivityStream};
+  if (filter === "application") return {unassigned:true};
+  return {job_kinds:filter === "connect_account" ? ["connect_account","connect_download"] : [filter]};
+}
+
+export function matchesActivityFilter(entry: ActivityEntry, filter: string): boolean {
+  const parameters = activityFilterParameters(filter);
+  if (parameters.stream) return streamFor(entry) === parameters.stream;
+  if (parameters.unassigned) return !entry.job_kind;
+  return !parameters.job_kinds || parameters.job_kinds.includes(entry.job_kind || "");
+}
+
+const actionGroups = (["local","online","downloads"] as ActivityStream[]).map(stream => ({
+  label:stream === "downloads" ? "Download actions" : `${stream === "local" ? "Local" : "Online"} actions`,
+  actions:Object.keys(actionTitles).filter(kind => kind !== "connect_download" && streamFor({at:"",message:"",job_kind:kind}) === stream)
+    .sort((a,b) => jobTitle(a).localeCompare(jobTitle(b))),
+}));
 
 function stamp(at: string): string {
   const date = new Date(at);
@@ -209,6 +230,7 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
 }) {
   const [search, setSearch] = useState("");
   const [query, setQuery] = useState("");
+  const [actionFilter, setActionFilter] = useState("all");
   const [saved, setSaved] = useState<ActivityEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -232,7 +254,7 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
       let loaded = false;
       setLoading(true);
       try {
-        const page = await call<HistoryPage>("logs.history", {limit:500, search:query || undefined, ...(older ? {before_id:before} : {})});
+        const page = await call<HistoryPage>("logs.history", {limit:500, search:query || undefined, ...activityFilterParameters(actionFilter), ...(older ? {before_id:before} : {})});
         if (!current()) return;
         setSaved(old => mergeActivityHistory(old, page.entries));
         if (older || !initialized) before = page.next_before_id;
@@ -255,6 +277,7 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
       }
     }
     setSaved([]);
+    if (root) root.scrollTop = 0;
     void load(false);
     // Read only the latest page while a worker is active. Live snapshots remain
     // visible immediately; buffered persistence and page loads never clear it.
@@ -264,12 +287,12 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
     }, {root, rootMargin:"200px"});
     if (marker) observer.observe(marker);
     return () => { disposed = true; observer.disconnect(); window.clearInterval(timer); };
-  }, [query,historyRevision]);
+  }, [query,actionFilter,historyRevision]);
   const entries = useMemo(() => {
     const all = mergeActivityHistory(saved, logs);
     return mergeActivityHistory(retireWorkerProgress(all), downloadActivity(monitor,downloadJob));
   }, [saved,logs,monitor,downloadJob]);
-  const filtered = useMemo(() => entries.filter(entry => !search.trim() || `${entry.message} ${jobTitle(entry.job_kind)} ${streamFor(entry)}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())), [entries,search]);
+  const filtered = useMemo(() => entries.filter(entry => matchesActivityFilter(entry,actionFilter) && (!search.trim() || `${entry.message} ${jobTitle(entry.job_kind)} ${streamFor(entry)}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()))), [entries,search,actionFilter]);
   async function clear() {
     setClearing(true);
     // Reject any archive reply that began before Clear, including a slow page.
@@ -292,12 +315,20 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
       <h2>All activity<span className="stream-count">Most recent first</span></h2>
       <div className="stream-toolbar">
         <input aria-label="Search activity" title="Search saved messages and current tasks" type="search" placeholder="Search activity…" value={search} onChange={event => setSearch(event.target.value)}/>
+        <select className="activity-action-filter" aria-label="Action type" title="Filter current and saved activity by the action that produced it" value={actionFilter} onChange={event => setActionFilter(event.target.value)}>
+          <option value="all">All actions</option>
+          <option value="stream:local">Local actions</option>
+          <option value="stream:online">Online actions</option>
+          <option value="stream:downloads">Downloads</option>
+          {actionGroups.map(group => <optgroup label={group.label} key={group.label}>{group.actions.map(kind => <option key={kind} value={kind}>{jobTitle(kind)}</option>)}</optgroup>)}
+          <option value="application">Application</option>
+        </select>
         <button aria-label="Copy activity" title="Copy visible activity" onClick={copy}><Copy size={14}/></button>
         <button aria-label="Clear activity" title="Clear saved and current activity" disabled={clearing} onClick={clear}><Trash2 size={14}/></button>
       </div>
       <div className="activity-log" role="log" aria-label="All actions" aria-live="off">
         {filtered.map(entry => <LogRow entry={entry} key={entryKey(entry)}/>)}
-        {!filtered.length && <p className="activity-empty">{loading ? "Loading activity…" : search.trim() ? "No matching activity." : "Your activity will appear here."}</p>}
+        {!filtered.length && <p className="activity-empty">{loading ? "Loading activity…" : search.trim() || actionFilter !== "all" ? "No matching activity." : "Your activity will appear here."}</p>}
         <div ref={sentinel} className="history-sentinel" aria-hidden="true"/>
         {loading && filtered.length > 0 && <p className="history-feedback">Loading saved activity…</p>}
         {error && <p className="history-feedback" role="alert">Activity could not load: {error}</p>}

@@ -314,12 +314,23 @@ impl TursoDb {
     /// Stable newest-first pagination across all worker channels. An insertion
     /// during browsing cannot shift older pages, unlike OFFSET pagination.
     pub async fn activity_history(&self, before_id: Option<i64>, limit: usize, search: Option<&str>) -> Result<Value, String> {
+        self.activity_history_filtered(before_id, limit, search, None, &[], false).await
+    }
+
+    pub async fn activity_history_filtered(&self, before_id: Option<i64>, limit: usize, search: Option<&str>, stream: Option<&str>, job_kinds: &[String], unassigned: bool) -> Result<Value, String> {
         let limit = limit.clamp(1, 1000);
         let search = search.unwrap_or("").trim();
+        let stream = stream.unwrap_or("");
+        if !["", "local", "online", "downloads"].contains(&stream) { return Err("Unknown activity type".into()); }
+        let online_kinds = serde_json::to_string(crate::ONLINE_JOB_KINDS).map_err(|error|error.to_string())?;
+        let kinds = serde_json::to_string(job_kinds).map_err(|error|error.to_string())?;
+        // Job ownership wins over incidental wording; legacy rows use the
+        // same category and message fallback as the visible activity log.
+        let channel = "CASE WHEN json_extract(job_context,'$.job_kind')='download' THEN 'downloads' WHEN json_extract(job_context,'$.job_kind') IN (SELECT value FROM json_each(?4)) THEN 'online' WHEN COALESCE(json_extract(job_context,'$.job_kind'),'') != '' THEN 'local' WHEN lower(COALESCE(category,''))='download' THEN 'downloads' WHEN lower(COALESCE(category,'')) IN ('linking','online') THEN 'online' WHEN lower(COALESCE(category,'')) IN ('scan','cleanup','local') THEN 'local' WHEN lower(COALESCE(message,'')) LIKE '%download%' OR lower(COALESCE(message,'')) LIKE '%fetching track%' OR lower(COALESCE(message,'')) LIKE '%saving track%' THEN 'downloads' WHEN lower(COALESCE(message,'')) LIKE '%catalogue%' OR lower(COALESCE(message,'')) LIKE '%api%' OR lower(COALESCE(message,'')) LIKE '%remote%' OR lower(COALESCE(message,'')) LIKE '%artist search%' OR lower(COALESCE(message,'')) LIKE '%releases%' OR lower(COALESCE(message,'')) LIKE '%metadata source%' THEN 'online' ELSE 'local' END";
         let conn = self.connect()?;
         let mut rows = conn.query(
-            "SELECT id,at,message,level,category,job_context FROM activity_logs WHERE id < ? AND (? = '' OR instr(lower(COALESCE(message,'') || ' ' || COALESCE(category,'') || ' ' || COALESCE(job_context,'')),lower(?)) > 0) ORDER BY id DESC LIMIT ?",
-            (before_id.unwrap_or(i64::MAX), search, search, (limit + 1) as i64),
+            &format!("SELECT id,at,message,level,category,job_context FROM activity_logs WHERE id < ?1 AND (?2 = '' OR instr(lower(COALESCE(message,'') || ' ' || COALESCE(category,'') || ' ' || COALESCE(job_context,'')),lower(?2)) > 0) AND (?3 = '' OR {channel} = ?3) AND (json_array_length(?5)=0 OR json_extract(job_context,'$.job_kind') IN (SELECT value FROM json_each(?5))) AND (?6=0 OR COALESCE(json_extract(job_context,'$.job_kind'),'')='') ORDER BY id DESC LIMIT ?7"),
+            (before_id.unwrap_or(i64::MAX), search, stream, online_kinds.as_str(), kinds.as_str(), i64::from(unassigned), (limit + 1) as i64),
         ).await.map_err(|error|error.to_string())?;
         let mut entries = Vec::with_capacity(limit + 1);
         while let Some(row) = rows.next().await.map_err(|error|error.to_string())? {
@@ -366,6 +377,11 @@ impl TursoDb {
 
     pub async fn list_roots(&self, market: &str) -> Result<Vec<RootRecord>, String> {
         let conn = self.connect()?;
+        let active_links = self.get_active_links(&conn, market).await?;
+        self.list_roots_with_links(&conn, &active_links).await
+    }
+
+    async fn list_roots_with_links(&self, conn: &Connection, active_links: &HashSet<String>) -> Result<Vec<RootRecord>, String> {
         let mut rows = conn
             .query(
                 "SELECT root, scanned_at, status FROM roots ORDER BY root",
@@ -382,8 +398,6 @@ impl TursoDb {
             roots.push((root, scanned_at, status));
         }
 
-        // Gather track link counts per root
-        let active_links = self.get_active_links(&conn, market).await?;
         let mut result = Vec::new();
         for (root, scanned_at, status) in roots {
             let clean = root.trim_end_matches('/');
@@ -755,8 +769,16 @@ impl TursoDb {
     }
 
     pub async fn get_stats(&self, market: &str, root: Option<&str>) -> Result<StatsRecord, String> {
+        self.get_stats_inner(market, root, None, true).await
+    }
+
+    async fn get_stats_inner(&self, market: &str, root: Option<&str>, known_links: Option<&HashSet<String>>, include_missing: bool) -> Result<StatsRecord, String> {
         let conn = self.connect()?;
-        let active_links = self.get_active_links(&conn, market).await?;
+        let owned_links;
+        let active_links = if let Some(links) = known_links { links } else {
+            owned_links = self.get_active_links(&conn, market).await?;
+            &owned_links
+        };
 
         // Query files
         let clean_root = root.map(|r| r.trim_end_matches('/').to_string());
@@ -931,7 +953,7 @@ impl TursoDb {
             }
         }
 
-        let missing_releases = match self
+        let missing_releases = if include_missing { match self
             .get_missing_rows(
                 market,
                 Some("All missing releases"),
@@ -948,7 +970,7 @@ impl TursoDb {
         {
             Ok(page) => page.total,
             Err(_) => 0,
-        };
+        } } else { 0 };
 
         Ok(StatsRecord {
             track_count,
@@ -2474,26 +2496,37 @@ impl TursoDb {
         logs: &[Value],
         root: Option<&str>,
     ) -> Result<Value, String> {
+        self.get_state_inner(active_job, logs, root, false).await
+    }
+
+    pub async fn get_initial_state(&self, active_job: Option<Value>, logs: &[Value], root: Option<&str>) -> Result<Value, String> {
+        self.get_state_inner(active_job, logs, root, true).await
+    }
+
+    async fn get_state_inner(&self, active_job: Option<Value>, logs: &[Value], root: Option<&str>, initial: bool) -> Result<Value, String> {
         let settings = self.get_settings().await?;
         let market = settings["general"]
             .get("market")
             .and_then(|v| v.as_str())
             .unwrap_or("GB");
 
-        let roots = self.list_roots(market).await.unwrap_or_default();
-        let stats_record = self.get_stats(market, root).await.unwrap_or_default();
+        let conn = self.connect()?;
+        let active_links = self.get_active_links(&conn, market).await?;
+        let roots = self.list_roots_with_links(&conn, &active_links).await?;
+        // Navigation and local metrics must not wait for a cold recommendation
+        // build. The dedicated missing-release table supplies that count.
+        let stats_record = if initial { StatsRecord::default() } else {
+            self.get_stats_inner(market, root, Some(&active_links), false).await?
+        };
 
         let mut stats_val = serde_json::to_value(&stats_record).unwrap_or(json!({}));
         if let Some(obj) = stats_val.as_object_mut() {
             obj.insert("files".to_string(), json!(stats_record.track_count));
             obj.insert("linked".to_string(), json!(stats_record.linked_tracks));
-            obj.insert("missing".to_string(), json!(stats_record.missing_releases));
-            obj.insert(
-                "missing_releases".to_string(),
-                json!(stats_record.missing_releases),
-            );
+            obj.remove("missing_releases");
             obj.insert("correct".to_string(), json!(stats_record.correct));
         }
+        if initial { stats_val = json!({}); }
 
         let stream_tok = crate::stream_download::load_saved_token(self).await;
         let is_connected = stream_tok.is_some();
@@ -2540,6 +2573,7 @@ impl TursoDb {
             "revision": self.revision.load(std::sync::atomic::Ordering::SeqCst),
             "roots": roots,
             "stats": stats_val,
+            "stats_pending": initial,
             "job": reported_job,
             "logs": logs,
             "settings": settings["general"],
@@ -4521,12 +4555,44 @@ mod tests {
         assert!(oldest["next_before_id"].is_null());
         let online=db.activity_history(None,100,Some("ONLINE")).await.unwrap();
         assert_eq!(online["entries"].as_array().unwrap().len(),3);
+        let by_type = db.activity_history_filtered(None,2,None,None,&["discography".into()],false).await.unwrap();
+        assert_eq!(by_type["entries"].as_array().unwrap().len(),2);
+        let older_type = db.activity_history_filtered(by_type["next_before_id"].as_i64(),2,Some("Checked"),Some("online"),&["discography".into()],false).await.unwrap();
+        assert_eq!(older_type["entries"][0]["message"],"Checked 5");
+        let downloads = db.activity_history_filtered(None,1,None,Some("downloads"),&[],false).await.unwrap();
+        assert_eq!(downloads["entries"][0]["message"],"New entry during browsing");
+        let application = db.activity_history_filtered(None,100,None,None,&[],true).await.unwrap();
+        assert_eq!(application["entries"].as_array().unwrap().len(),1);
         drop(db);
         let reopened=TursoDb::open(dir.join("db")).await.unwrap();
         assert_eq!(reopened.activity_history(None,100,None).await.unwrap()["entries"].as_array().unwrap().len(),8);
         reopened.clear_logs().await.unwrap();
         assert_eq!(reopened.activity_history(None,100,None).await.unwrap()["entries"],json!([]));
         drop(reopened);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn library_state_does_not_wait_for_recommendation_builds() {
+        let dir=std::env::temp_dir().join(format!("library-startup-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        db.add_root("/sample/music").await.unwrap();
+        let metadata=json!({"album_artist":"Example","artist":"Example","album":"Release","title":"Track","tracknumber":"01","tracktotal":"01","discnumber":"01","disctotal":"01"}).to_string();
+        db.connect().unwrap().execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES('/sample/music/Release/01.flac','/sample/music',1,1,?,1)",(metadata.as_str(),)).await.unwrap();
+        db.save_track_link("/sample/music/Release/01.flac","GB","[0,0,1,1]",&json!({"status":"linked","ids":{"album_id":"1","track_id":"2"}}).to_string()).await.unwrap();
+        let recommendation_build = db.missing_rows_gate.lock().await;
+        let initial=tokio::time::timeout(std::time::Duration::from_secs(1),db.get_initial_state(None,&[],Some("/sample/music"))).await.unwrap().unwrap();
+        assert_eq!(initial["roots"][0]["tracks"],1);
+        assert_eq!(initial["roots"][0]["linked"],1);
+        assert_eq!(initial["stats_pending"],true);
+        assert_eq!(initial["stats"],json!({}));
+        let full=tokio::time::timeout(std::time::Duration::from_secs(1),db.get_state(None,&[],Some("/sample/music"))).await.unwrap().unwrap();
+        assert_eq!(full["stats"]["track_count"],1);
+        assert_eq!(full["stats"]["linked_tracks"],1);
+        assert_eq!(full["stats"]["linked_releases"],1);
+        assert_eq!(full["stats_pending"],false);
+        assert!(full["stats"].get("missing_releases").is_none());
+        assert!(db.missing_rows_cache.lock().unwrap().is_empty());
+        drop(recommendation_build);drop(db);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

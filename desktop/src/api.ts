@@ -22,6 +22,7 @@ export type AppState = {
   revision: number;
   roots: Row[];
   stats: Record<string, number>;
+  stats_pending?: boolean;
   job: Job | null;
   online_job?: Job | null;
   catalogue_refresh?: { ids: string[]; completed: string[]; market: string; detailed: boolean; status: string };

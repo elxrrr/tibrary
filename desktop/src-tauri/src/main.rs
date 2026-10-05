@@ -1322,7 +1322,9 @@ async fn handle_rpc_uncached(
         state.restore_activity(db).await;
         let logs = state.logs.snapshot();
         let root = args.get("root").and_then(|v| v.as_str());
-        let mut snapshot = db.get_state(active, &logs, root).await?;
+        let mut snapshot = if args["bootstrap"] == true {
+            db.get_initial_state(active, &logs, root).await?
+        } else { db.get_state(active, &logs, root).await? };
         snapshot["catalogue_refresh"] = db.get_preference("catalogue-refresh-checkpoint").await?.unwrap_or(Value::Null);
         refresh_runtime_state(state,&mut snapshot);
         return Ok(snapshot);
@@ -1360,7 +1362,8 @@ async fn handle_rpc_uncached(
         // Read the durable page immediately. The frontend merges live entries
         // while the asynchronous writer catches up; ongoing jobs must never
         // delay opening their activity history.
-        return db.activity_history(args["before_id"].as_i64(), args["limit"].as_u64().unwrap_or(500) as usize, args["search"].as_str()).await;
+        let kinds: Vec<String> = serde_json::from_value(args["job_kinds"].clone()).unwrap_or_default();
+        return db.activity_history_filtered(args["before_id"].as_i64(), args["limit"].as_u64().unwrap_or(500) as usize, args["search"].as_str(), args["stream"].as_str(), &kinds, args["unassigned"] == true).await;
     }
     if method == "logs.clear" {
         let stream = args.get("stream").and_then(Value::as_str).unwrap_or("all");

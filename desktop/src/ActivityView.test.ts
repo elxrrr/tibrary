@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { compactProgress, workload, mergeActivityHistory, downloadActivity, streamFor, mergeActivitySnapshot, mergeDownloadMonitor, retireWorkerProgress } from "./ActivityView";
+import { compactProgress, workload, mergeActivityHistory, downloadActivity, streamFor, mergeActivitySnapshot, mergeDownloadMonitor, retireWorkerProgress, activityFilterParameters, matchesActivityFilter } from "./ActivityView";
 import { mergeJob } from "./api";
 
 it("preserves completion, cancellation and newer progress when request replies arrive late", () => {
@@ -59,6 +59,23 @@ it("routes all details and errors by the owning job rather than incidental messa
   expect(streamFor({at,message:"Download track details failed",category:"error",job_kind:"discography"})).toBe("online");
   expect(streamFor({at,message:"Online title applied",category:"online",job_kind:"apply"})).toBe("local");
   expect(streamFor({at,message:"Catalogue request failed",category:"error",job_kind:"download"})).toBe("downloads");
+});
+
+it("filters named actions and worker scopes consistently for live and archived rows", () => {
+  const apply = {at:"2026-10-06T12:00:00Z",message:"Online tags applied",category:"online",job_kind:"apply"};
+  expect(activityFilterParameters("all")).toEqual({});
+  expect(activityFilterParameters("apply")).toEqual({job_kinds:["apply"]});
+  expect(activityFilterParameters("stream:online")).toEqual({stream:"online"});
+  expect(activityFilterParameters("application")).toEqual({unassigned:true});
+  expect(matchesActivityFilter(apply,"all")).toBe(true);
+  expect(matchesActivityFilter(apply,"apply")).toBe(true);
+  expect(matchesActivityFilter(apply,"stream:local")).toBe(true);
+  expect(matchesActivityFilter(apply,"stream:online")).toBe(false);
+  expect(matchesActivityFilter(apply,"link")).toBe(false);
+  expect(matchesActivityFilter(apply,"application")).toBe(false);
+  expect(matchesActivityFilter({...apply,job_kind:undefined},"application")).toBe(true);
+  expect(activityFilterParameters("connect_account")).toEqual({job_kinds:["connect_account","connect_download"]});
+  expect(matchesActivityFilter({...apply,job_kind:"connect_download"},"connect_account")).toBe(true);
 });
 
 it("updates one artist action without moving its time or resurrecting stale details, and keeps it after completion", () => {

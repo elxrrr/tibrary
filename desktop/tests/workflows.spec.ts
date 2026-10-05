@@ -555,6 +555,52 @@ test("activity has one verbose log and independent worker controls", async ({pag
   await expect(panel.getByRole("button",{name:/saved history|more details/})).toHaveCount(0);
 });
 
+test("activity action filters search saved history beyond the recent page and keep the log flat", async ({page}) => {
+  const old = [
+    {saved_id:1,at:"2026-09-30T12:00:00Z",message:"Adjusted first date",job_kind:"apply",category:"local"},
+    {saved_id:2,at:"2026-09-30T12:00:01Z",message:"Adjusted second date",job_kind:"apply",category:"local"},
+    {saved_id:3,at:"2026-09-30T12:00:02Z",message:"Reviewed changes",job_kind:"preview",category:"local"},
+  ];
+  const entries=[...old,...Array.from({length:502},(_,i)=>({saved_id:i+4,at:new Date(Date.parse("2026-10-05T12:00:00Z")+i*1000).toISOString(),message:`Updated artist ${i+1}`,job_kind:"discography",category:"online"}))];
+  const live={at:"2026-10-05T14:00:00Z",message:"Checking local files",job_kind:"scan",category:"local"};
+  const requests:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if (request.method === "logs.history") {
+      requests.push(request.args);
+      const candidates=entries.filter(entry=>(!request.args.before_id || entry.saved_id<request.args.before_id)
+        && (!request.args.job_kinds || request.args.job_kinds.includes(entry.job_kind))
+        && (!request.args.stream || entry.category===request.args.stream)
+        && (!request.args.search || entry.message.includes(request.args.search))).slice().reverse();
+      const pageEntries=candidates.slice(0,500);
+      return route.fulfill({json:{result:{entries:pageEntries,next_before_id:candidates.length>500 ? pageEntries.at(-1)!.saved_id : null}}});
+    }
+    const response=await rpc(request.method,request.args);
+    if (request.method === "state" && response.result) Object.assign(response.result,{job:null,online_job:null,download_job:null,logs:[live],download_monitor:{},activity_epochs:[0,0,0]});
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Activity",exact:true}).click();
+  const panel=page.getByRole("region",{name:"Activity log",exact:true});
+  await expect(panel.locator(".log-row")).toHaveCount(501);
+  await expect(panel).not.toContainText("Adjusted first date");
+  const filter=panel.getByRole("combobox",{name:"Action type"});
+  await filter.selectOption("apply");
+  await expect(panel.locator(".log-row")).toHaveCount(2);
+  await expect(panel).toContainText("Adjusted first date");
+  expect(requests.at(-1).job_kinds).toEqual(["apply"]);
+  await filter.selectOption("stream:local");
+  await expect(panel.locator(".log-row")).toHaveCount(4);
+  await expect(panel).toContainText("Checking local files");
+  expect(requests.at(-1).stream).toBe("local");
+  await panel.getByRole("searchbox").fill("Adjusted first date");
+  await expect(panel.locator(".log-row")).toHaveCount(1);
+  await expect.poll(()=>requests.at(-1).search).toBe("Adjusted first date");
+  expect(requests.at(-1).stream).toBe("local");
+  await expect(panel.locator(".batch-toggle")).toHaveCount(0);
+  await expect(page.getByRole("region",{name:"Downloads worker",exact:true})).toBeVisible();
+});
+
 test("display highlight preference changes focus palette", async ({page}) => {
   await page.route("**/__test_rpc",async route => {
     const request = route.request().postDataJSON();
@@ -587,6 +633,30 @@ test("startup always shows overview and does not replay a historical failure", a
   await expect(page.getByRole("alert")).toHaveCount(0);
   const missing = await rpc("table", {route:"missing",timeline:"All missing releases",status:"all",limit:20,artist_scope:"My album artists",recommendation:"Recommended and potential"});
   await expect(page.locator(".metric").filter({hasText:"Missing releases"})).toContainText(String(missing.result.total));
+});
+
+test("libraries and local tables load while dashboard statistics are still pending", async ({page}) => {
+  await page.addInitScript(() => localStorage.removeItem("tibrary.root"));
+  let releaseStats!:()=>void, reads=0;
+  const pendingStats=new Promise<void>(resolve=>{releaseStats=resolve;});
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    const response=await rpc(request.method,request.args);
+    if(request.method === "state" && !request.args.bootstrap) { reads++; await pendingStats; }
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  try {
+    await expect(page.getByRole("combobox",{name:"Active library"})).toHaveValue(join(folder,"music"));
+    await expect(page.getByRole("combobox",{name:"Active library"})).not.toContainText("Loading libraries");
+    await expect(page.locator(".metric").filter({hasText:"Local tracks"})).toContainText("2 / 2");
+    await expect(page.locator(".metric").filter({hasText:"Linked releases"}).locator("strong")).toHaveText("—");
+    await page.locator(".metric").filter({hasText:"Local tracks"}).click();
+    await expect(page.locator("tbody")).toContainText("First Light");
+    expect(reads).toBe(1);
+  } finally { releaseStats(); }
+  await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
+  await expect(page.locator(".metric").filter({hasText:"Linked releases"}).locator("strong")).toHaveText("1 / 1");
 });
 
 test("release details and download review show cached track names and exact approvals", async ({ page }) => {
