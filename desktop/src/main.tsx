@@ -245,7 +245,7 @@ function App() {
     [toast, setToast] = useState(""),
     [closing, setClosing] = useState(false),
     [stopped, setStopped] = useState(false);
-  const [data, setData] = useState<{ rows: Row[]; total: number; missing_total?: number; scanned?: boolean }>({
+  const [data, setData] = useState<{ rows: Row[]; total: number; track_total?: number; missing_total?: number; scanned?: boolean }>({
       rows: [],
       total: 0,
     }),
@@ -466,6 +466,7 @@ function App() {
     artist_scope: artistScope,
     type: "All types",
     include_unavailable: route === "missing",
+    group_releases: route === "links",
   };
   useEffect(() => {
     if (!state || (root && !state.roots.some((r) => r.root === root))
@@ -667,7 +668,9 @@ function App() {
   async function loadDetail(row: Row) {
     setMenu(null);
     try {
-      if (tree) {
+      if (row.link_group) {
+        setDetail({local_release:row});
+      } else if (tree) {
         const value = await call("detail", { release_id: row.parent || row.id });
         setDetail({
           release: { ...value, release: value.release || value.title,
@@ -809,6 +812,14 @@ function App() {
   }
   const columns: Column[] = tree
     ? releaseColumns
+    : route === "links"
+      ? [
+          {key:"artist",label:"Album artist"},
+          {key:"release",label:"Release"},
+          {key:"tracks",label:"Tracks"},
+          {key:"status",label:"Status"},
+          {key:"evidence",label:"Evidence"},
+        ]
     : route === "artists"
       ? [
           { key: "artist", label: "Album artist" },
@@ -1090,7 +1101,7 @@ function App() {
   }
   function selectedDetail() {
     const id = [...selected][0];
-    if (id) loadDetail(data.rows.find(row => row.id === id) || {id, artist:id});
+    if (id) loadDetail(data.rows.flatMap(row => row.link_group ? row.children || [] : [row]).find(row => row.id === id) || {id, artist:id});
   }
   function tableActions() {
     const localOptions: ActionButtonOption[] = [
@@ -1198,6 +1209,7 @@ function App() {
         {data.total
           ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
           : "No items"}
+        {route === "links" && data.total > 0 && ` releases · ${(data.track_total || 0).toLocaleString()} tracks`}
       </span>
       <div>
         <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button>
@@ -1260,6 +1272,7 @@ function App() {
           }}
           tree={tree}
           grouped={route === "local"}
+          fileGroups={route === "links"}
           treeSelection={selection}
           onTreeSelect={selectTree}
           expanded={expanded}
@@ -1687,7 +1700,7 @@ function App() {
   function contextMenu() {
     if (!menu) return null;
     const r = menu.row;
-    const ids = selected.has(r.id) ? [...selected] : [r.id];
+    const ids: string[] = r.link_group ? (selected.size ? [...selected] : (r.children || []).map((child: Row) => child.id)) : selected.has(r.id) ? [...selected] : [r.id];
     return (
       <>
         <div className="menu-scrim" onClick={() => setMenu(null)} />
@@ -2072,7 +2085,7 @@ function App() {
       {detail && (
         <Modal
           title={
-            detail.artist && !detail.tags
+            detail.local_release ? "Local release details" : detail.artist && !detail.tags
               ? "Artist candidates"
               : detail.release
                 ? "Release details"
@@ -2082,6 +2095,19 @@ function App() {
           onClose={() => setDetail(null)}
         >
           <div className="modal-body">
+            {detail.local_release && <section className="metadata-source">
+              <h3>{detail.local_release.artist} — {detail.local_release.release}</h3>
+              <p>{detail.local_release.path}</p><p>{detail.local_release.evidence}</p>
+              <button onClick={() => reveal(detail.local_release.path).catch(notifyError)}>Show in Finder</button>
+              <div className="metadata-table"><table aria-label={`Tracks in ${detail.local_release.release}`}>
+                <thead><tr><th>Track</th><th>Disc · track</th><th>Status</th><th>Evidence</th><th/></tr></thead>
+                <tbody>{(detail.local_release.children || []).map((track: Row) => <tr key={track.id}>
+                  <td>{track.title}</td><td>{track.position}</td><td><span className={"badge " + String(track.status).toLowerCase().replaceAll(" ","-")}>{track.status}</span></td>
+                  <td title={track.evidence}>{track.evidence || "Not checked"}</td>
+                  <td><button onClick={() => loadDetail(track)}>Choose match</button></td>
+                </tr>)}</tbody>
+              </table></div>
+            </section>}
             {detail.tags && (
               <>
                 <div className="detail-heading">

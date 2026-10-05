@@ -69,6 +69,7 @@ export function DataTable({
   onSort,
   tree,
   grouped,
+  fileGroups,
   treeSelection,
   onTreeSelect,
   onExpand,
@@ -91,6 +92,8 @@ export function DataTable({
   onSort: (key: string, direction?: "asc" | "desc") => void;
   tree?: boolean;
   grouped?: boolean;
+  /** Local releases whose child selections are actual file IDs, not release IDs. */
+  fileGroups?: boolean;
   treeSelection?: Selection;
   onTreeSelect?: (s: Selection) => void;
   onExpand?: (r: Row) => void;
@@ -105,6 +108,7 @@ export function DataTable({
   selectionLabel?: (row: Row) => string;
 }) {
   const [anchor, setAnchor] = useState<number | null>(null);
+  const fileAnchor = useRef<string | null>(null);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
   const [menuPosition, setMenuPosition] = useState({ left: 8, top: 8 });
   const [facetSearch, setFacetSearch] = useState("");
@@ -288,6 +292,19 @@ export function DataTable({
     document.body,
   );
   function select(row: Row, index: number, event: React.MouseEvent) {
+    if (fileGroups) {
+      const visible = rows.flatMap(parent => [parent, ...(expanded.has(parent.id) ? parent.children || [] : [])]);
+      const target = visible.findIndex(item => item.id === row.id);
+      const start = visible.findIndex(item => item.id === fileAnchor.current);
+      const next = event.metaKey || event.ctrlKey || event.shiftKey ? new Set(selected) : new Set<string>();
+      const range = event.shiftKey && start >= 0 ? visible.slice(Math.min(start,target), Math.max(start,target) + 1) : [row];
+      const ids = range.flatMap(item => item.link_group ? (item.children || []).map((child: Row) => child.id) : [item.id]);
+      const remove = !event.shiftKey && (event.metaKey || event.ctrlKey) && ids.every(id => selected.has(id));
+      ids.forEach(id => remove ? next.delete(id) : next.add(id));
+      fileAnchor.current = row.id;
+      onSelect(next);
+      return;
+    }
     const next =
       event.metaKey || event.ctrlKey || event.shiftKey
         ? new Set(selected)
@@ -306,14 +323,26 @@ export function DataTable({
     const count = children.filter((c: Row) => selected.has(c.id)).length;
     return count ? count === children.length ? "checked" : "mixed" : "empty";
   }
-  const checked = rows.filter((r) =>
+  function toggleFiles(row: Row, yes: boolean) {
+    const next = new Set(selected);
+    (row.children || []).forEach((child: Row) => yes ? next.add(child.id) : next.delete(child.id));
+    onSelect(next);
+  }
+  function selectForMenu(row: Row) {
+    if (fileGroups && row.link_group) {
+      if (groupState(row) === "empty") onSelect(new Set((row.children || []).map((child: Row) => child.id)));
+    } else if (!selected.has(row.id)) onSelect(new Set([row.id]));
+  }
+  const visibleStates = rows.map((r) =>
     tree
       ? parentState(
           treeSelection?.[r.id],
           (r.children || []).map((c: Row) => c.id),
-        ) === "checked"
-      : grouped ? groupState(r) === "checked" : selected.has(r.id),
-  ).length;
+        )
+      : grouped || fileGroups ? groupState(r) : selected.has(r.id) ? "checked" : "empty",
+  );
+  const checked = visibleStates.filter(state => state === "checked").length;
+  const anySelected = visibleStates.some(state => state !== "empty");
   return (
     <div
       ref={scroller}
@@ -329,7 +358,7 @@ export function DataTable({
                 state={
                   rows.length && checked === rows.length
                     ? "checked"
-                    : checked
+                    : anySelected
                       ? "mixed"
                       : "empty"
                 }
@@ -342,7 +371,8 @@ export function DataTable({
                   } else {
                     const next = new Set(selected);
                     rows.forEach((r) => {
-                      yes ? next.add(r.id) : next.delete(r.id);
+                      if (fileGroups) (r.children || []).forEach((child: Row) => yes ? next.add(child.id) : next.delete(child.id));
+                      else yes ? next.add(r.id) : next.delete(r.id);
                       if (grouped) (r.children || []).forEach((c: Row) => next.delete(c.id));
                     });
                     onSelect(next);
@@ -413,14 +443,14 @@ export function DataTable({
                   treeSelection?.[r.id],
                   (r.children || []).map((c: Row) => c.id),
                 )
-              : grouped ? groupState(r) : selected.has(r.id)
+              : grouped || fileGroups ? groupState(r) : selected.has(r.id)
                 ? "checked"
                 : "empty";
             return (
               <Fragment key={r.id}>
                 <tr
                   className={
-                    (selected.has(r.id) ? "selected " : "") +
+                    (selected.has(r.id) || (fileGroups && state === "checked") ? "selected " : "") +
                     (r.ignored || (tree && state === "empty") ? "inactive" : "")
                   }
                   tabIndex={0}
@@ -434,6 +464,7 @@ export function DataTable({
                     if (e.key === "Enter") onDetail(r);
                     if (e.key === " ") {
                       e.preventDefault();
+                      if (fileGroups) { toggleFiles(r,state !== "checked"); return; }
                       const s = new Set(selected);
                       s.has(r.id) ? s.delete(r.id) : s.add(r.id);
                       onSelect(s);
@@ -441,7 +472,7 @@ export function DataTable({
                   }}
                   onContextMenu={(e) => {
                     e.preventDefault();
-                    if (!selected.has(r.id)) onSelect(new Set([r.id]));
+                    selectForMenu(r);
                     onMenu(r, e.clientX, e.clientY);
                   }}
                 >
@@ -455,6 +486,7 @@ export function DataTable({
                           onTreeSelect(
                             toggleParent(treeSelection || {}, r.id, yes),
                           );
+                        else if (fileGroups) toggleFiles(r,yes);
                         else {
                           const next = new Set(selected);
                           yes ? next.add(r.id) : next.delete(r.id);
@@ -466,7 +498,7 @@ export function DataTable({
                   </td>
                   {columns.map((c, j) => (
                     <td key={c.key} title={readable(r[c.key])}>
-                      {j === 0 && (tree || grouped) ? (
+                      {j === 0 && (tree || grouped || fileGroups) ? (
                         <button
                           className="disclosure"
                           aria-label={`${expanded.has(r.id) ? "Collapse" : "Expand"} ${r.release}`}
@@ -510,7 +542,7 @@ export function DataTable({
                       aria-label={`Actions for ${r.release || r.title || r.artist}`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (!selected.has(r.id)) onSelect(new Set([r.id]));
+                        selectForMenu(r);
                         onMenu(r, e.clientX, e.clientY);
                       }}
                     >
@@ -518,6 +550,27 @@ export function DataTable({
                     </button>
                   </td>
                 </tr>
+                {fileGroups && expanded.has(r.id) && (r.children || []).map((child: Row) => (
+                  <tr key={child.id} tabIndex={0} className={"child " + (selected.has(child.id) ? "selected " : "") + (child.ignored ? "inactive" : "")}
+                    onClick={event => select(child,i,event)}
+                    onDoubleClick={event => {if (!(event.target as Element).closest("button,input")) onDetail(child);}}
+                    onKeyDown={event => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key === "Enter") onDetail(child);
+                      if (event.key === " ") {event.preventDefault();const next=new Set(selected);next.has(child.id)?next.delete(child.id):next.add(child.id);onSelect(next);}
+                    }}
+                    onContextMenu={event => {event.preventDefault();selectForMenu(child);onMenu(child,event.clientX,event.clientY);}}>
+                    <td className="check"><Check label={`Select track ${child.title}`} state={selected.has(child.id) ? "checked" : "empty"}
+                      onChange={yes => {const next=new Set(selected);yes?next.add(child.id):next.delete(child.id);onSelect(next);}} /></td>
+                    {columns.map(column => {
+                      const value=column.key === "artist" ? "" : column.key === "release" ? child.title : column.key === "tracks" ? child.position : child[column.key];
+                      return <td key={column.key} className={column.key === "tracks" ? "track-position" : undefined} title={column.key === "tracks" ? `Disc · track: ${child.position}` : readable(value)}>
+                        {column.key === "status" ? <span className={"badge " + String(value).toLowerCase().replaceAll(" ","-")}>{readable(value)}</span> : readable(value)}
+                      </td>;
+                    })}
+                    <td className="more"><button aria-label={`Actions for track ${child.title}`} onClick={event=>{event.stopPropagation();selectForMenu(child);onMenu(child,event.clientX,event.clientY);}}><MoreHorizontal size={16}/></button></td>
+                  </tr>
+                ))}
                 {grouped && expanded.has(r.id) && (r.children || []).map((child: Row) => (
                   <tr key={child.id} className={"child " + (selected.has(child.id) ? "selected" : "")}
                     onClick={e => {const next=e.metaKey||e.ctrlKey||e.shiftKey ? new Set(selected):new Set<string>();next.add(child.id);onSelect(next);}}

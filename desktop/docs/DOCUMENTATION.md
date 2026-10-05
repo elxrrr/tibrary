@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.17** · [Setup and screenshots](../../README.md)
+Version **0.9.18** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -33,6 +33,8 @@ Reviewed moves keep their links and ignore choices; equivalent number formatting
 ### Linking and recommendations
 
 Artist matching starts from local **Album Artist** tags. Compilation placeholders such as “Various artists” are excluded from the artist inbox. Confirmed artists are skipped during unresolved matching; select them explicitly to recheck or unlink.
+
+Link releases shows one expandable row per local release folder. Disc folders are combined; separate editions stay separate. Expand a release to inspect or select its tracks. Selecting a release selects its matching tracks; filters apply before grouping, and the page reports both release and track counts. Recheck, ignore and unlink use the selected file paths.
 
 Recording matches use ISRC, title, duration, release structure and track positions. Linking writes associations to the database, not file tags. Multiple compatible editions can supply metadata, but conflicting totals, mixes or recording evidence require review.
 

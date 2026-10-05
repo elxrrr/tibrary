@@ -51,6 +51,12 @@ async function actionOption(page: Page, trigger: string, option: string, role: "
   await page.getByRole("button", {name: trigger, exact: true}).click();
   await page.getByRole(role, {name: option, exact: true}).click();
 }
+async function localTrackRow(page: Page, title: string, release = "Blue Hours"): Promise<Locator> {
+  const expander = page.getByRole("button", {name: new RegExp(`^(Expand|Collapse) ${release.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`)});
+  await expect(expander).toBeVisible();
+  if (await expander.getAttribute("aria-expanded") !== "true") await expander.click();
+  return page.locator("tbody tr").filter({has: page.getByRole("checkbox", {name: `Select track ${title}`, exact: true})});
+}
 async function expectTrackPositionInTracks(page: Page, title: string, position: string) {
   const row = page.locator("tbody tr").filter({has: page.getByRole("checkbox", {name: `Select track ${title}`, exact: true})});
   await expect(row.locator("td").nth(1)).toHaveText(title);
@@ -105,6 +111,22 @@ c.execute("UPDATE mappings SET tidal_id=NULL,status='review'")
 for artist, in c.execute("SELECT artist FROM mappings").fetchall():
  c.execute("INSERT OR REPLACE INTO match_reviews(artist,payload) VALUES(?,?)",(artist,json.dumps({"candidates":[{"artist":{"id":"900001","name":"North Assembly"},"evidence":"Saved candidate"}]})))
 c.commit()`, join(folder,"db")]);
+  }
+  if (test.info().title.startsWith("link releases group local files")) {
+    // Create extra real files before the disposable backend opens its database.
+    execFileSync("python3", ["-c", `import json,sqlite3,sys
+from pathlib import Path
+from seed_desktop import write_flac
+library=Path(sys.argv[2]); c=sqlite3.connect(sys.argv[1])
+for disc,title,track_id in [(1,'Signal','91000200'),(2,'Afterimage','91000201')]:
+ path=library/'North Assembly'/'Night Maps (2022)'/f'Disc {disc}'/f'{title}.flac'
+ write_flac(path,'North Assembly','Night Maps',title,1,1)
+ path.write_bytes(path.read_bytes().replace(b'DISCNUMBER=1/1',f'DISCNUMBER={disc}/2'.encode()))
+ metadata={'albumartist':['North Assembly'],'artist':['North Assembly'],'album':['Night Maps'],'title':[title],'tracknumber':['1/1'],'discnumber':[f'{disc}/2'],'date':['2022-09-16'],'duration':180.0,'tidal_album_id':'910002','tidal_track_id':track_id}
+ c.execute('INSERT INTO local_files VALUES (?,?,?,?,?,NULL,1)',(str(path),str(library),path.stat().st_size,path.stat().st_mtime_ns,json.dumps(metadata)))
+c.commit()`, join(folder,"db"), join(folder,"music")], {
+      env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
+    });
   }
   child = spawn(
     join(root, "desktop/src-tauri/target/debug/tibrary"),
@@ -447,7 +469,91 @@ test("multiple file context action affects only selected files", async ({
   await ignoredMenu.press("Escape");
   await expect(page.locator("tbody tr")).toHaveCount(0);
   await columnOnly(page, "Status", ["Ignored"]);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await page.getByRole("button", {name:"Expand Blue Hours",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+test("link releases group local files and keep selected track actions scoped", async ({page}) => {
+  // A second real-file release spans disc folders. Grouping must retain the
+  // whole local release while actions receive only individual file paths.
+  const root=join(folder,"music");
+  const paths=[join(root,"North Assembly/Night Maps (2022)/Disc 1/Signal.flac"),join(root,"North Assembly/Night Maps (2022)/Disc 2/Afterimage.flac")];
+  const args={route:"links",root,group_releases:true,sort:"release",direction:"asc",limit:1};
+  const first=(await rpc("table",args)).result, second=(await rpc("table",{...args,offset:1})).result;
+  expect(first.total).toBe(2);
+  expect(first.rows[0].release).toBe("Blue Hours");
+  expect(first.rows[0].children).toHaveLength(2);
+  expect(second.rows[0].release).toBe("Night Maps");
+  expect(second.rows[0].children.map((row:any)=>row.path).sort()).toEqual(paths.sort());
+  const filtered=(await rpc("table",{...args,column_filters:{release:{include:["Night Maps"]}}})).result;
+  expect(filtered.total).toBe(1);
+  expect(filtered.rows[0].children).toHaveLength(2);
+  const facet=(await rpc("table.facets",{...args,column:"release",limit:100})).result;
+  expect(facet.options.map((option:any)=>option.value)).toEqual(["Blue Hours","Night Maps"]);
+  const requests:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start" && request.args.kind==="link") {
+      requests.push(request);
+      await route.fulfill({json:{result:{id:"group-scope-check",kind:"link",status:"complete",message:"Selected files checked"}}});
+      return;
+    }
+    if(["tracks.ignore","tracks.unlink"].includes(request.method)) requests.push(request);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await columnAll(page,"Status");
   await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–2 of 2");
+  const parent=page.getByRole("checkbox",{name:"Select Blue Hours",exact:true});
+  await parent.check();
+  const firstTrack=await localTrackRow(page,"First Light");
+  const firstCheck=firstTrack.getByRole("checkbox",{name:"Select track First Light",exact:true});
+  const driftCheck=page.getByRole("checkbox",{name:"Select track Drift",exact:true});
+  const localPosition=first.rows[0].children.find((row:any)=>row.title==="First Light").position;
+  const trackPosition=firstTrack.getByRole("cell",{name:localPosition,exact:true});
+  const tracksHeader=page.getByRole("columnheader").filter({has:page.getByRole("button",{name:"Tracks",exact:true})});
+  await expect(trackPosition).toBeVisible();
+  expect((await trackPosition.boundingBox())!.x).toBeCloseTo((await tracksHeader.boundingBox())!.x,0);
+  await expect(firstTrack.locator("td").nth(2)).toHaveText("First Light");
+  await expect(firstCheck).toBeChecked();
+  await expect(driftCheck).toBeChecked();
+  await firstCheck.uncheck();
+  await expect(parent).toHaveJSProperty("indeterminate",true);
+  await expect(page.getByRole("checkbox",{name:"Select visible rows",exact:true})).toHaveJSProperty("indeterminate",true);
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await expect(driftCheck).toBeChecked();
+  await expect(firstCheck).not.toBeChecked();
+  if(process.env.TIBRARY_SCREENSHOTS) {
+    await page.screenshot({path:"/tmp/tibrary-expanded-linked-releases-0.9.18.png"});
+    await page.screenshot({path:"docs/imgs/link_releases.png"});
+  }
+  const driftPath=join(root,"Drift.flac");
+  await page.getByRole("button",{name:"Recheck 1 selected",exact:true}).click();
+  await expect.poll(()=>requests.length).toBe(1);
+  expect(requests[0].args.args.ids).toEqual([driftPath]);
+  await page.getByRole("button",{name:"Actions for track Drift",exact:true}).click();
+  await page.getByRole("menuitem",{name:"Unlink 1 selected tracks",exact:true}).click();
+  await expect.poll(()=>requests.length).toBe(2);
+  expect(requests[1].args.ids).toEqual([driftPath]);
+  await page.getByRole("button",{name:"Clear selection",exact:true}).click();
+  await firstCheck.check();
+  await page.getByRole("button",{name:"Actions for track First Light",exact:true}).click();
+  await page.getByRole("menuitem",{name:"Ignore 1 selected tracks",exact:true}).click();
+  await expect.poll(()=>requests.length).toBe(3);
+  expect(requests[2].args.ids).toEqual([join(root,"First Light.flac")]);
+  await columnOnly(page,"Status",["Ignored"]);
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–1 of 1");
+  await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).toHaveCount(0);
+  const ignored=(await rpc("table",{...args,column_filters:{status:{include:["Ignored"]}}})).result;
+  expect(ignored.rows[0].children.map((row:any)=>row.path)).toEqual([join(root,"First Light.flac")]);
+  expect(requests.every(request=>!(request.args.ids || request.args.args.ids).some((id:string)=>id.startsWith("local-release:")))).toBe(true);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 test("dark settings fit a full window and retain defaults", async ({
@@ -807,7 +913,7 @@ test("metadata and settings use readable views without implementation panels", a
   await expect(page.getByRole("heading",{name:"About Tibrary"})).toHaveCount(0);
   await page.locator("aside").getByRole("button", {name:"Link releases",exact:true}).click();
   await columnAll(page, "Status");
-  await page.locator("tbody tr").first().dblclick();
+  await (await localTrackRow(page,"First Light")).dblclick();
   await page.getByText("All saved tags & DJ checks",{exact:true}).click();
   await expect(page.getByRole("table",{name:"Local file tags"})).toBeVisible();
   await expect(page.getByRole("dialog").locator("pre")).toHaveCount(0);
@@ -1268,7 +1374,7 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   expect(queries.some(args=>args.column_filters?.type?.include?.join()==="ALBUM" && args.column_filters?.recommendation?.include?.join()==="Potential")).toBe(true);
   await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
   await columnOnly(page,"Status",["Linked"]);
-  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
@@ -1312,7 +1418,7 @@ test("real table facets filter before paging and share checkbox rules across wor
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await sidebar.getByRole("button",{name:"Link releases",exact:true}).click();
   await columnOnly(page,"Status",["Linked"]);
-  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
   await sidebar.getByRole("button",{name:"Correct tags",exact:true}).click();
   await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
   await expect(page.locator("tbody tr")).toHaveCount(2);
@@ -1641,7 +1747,7 @@ test("table headers remain opaque in light and dark themes, including dialogs", 
     expect(await header.evaluate(el=>getComputedStyle(el).backgroundColor)).toMatch(/^rgb\(/);
     expect(await header.evaluate(el=>getComputedStyle(el).opacity)).toBe("1");
   }
-  await page.locator("tbody tr").first().dblclick();
+  await (await localTrackRow(page,"First Light")).dblclick();
   await page.getByText("All saved tags & DJ checks",{exact:true}).click();
   const header=page.getByRole("dialog").locator("th").first();
   expect(await header.evaluate(el=>getComputedStyle(el).backgroundColor)).toMatch(/^rgb\(/);

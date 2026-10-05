@@ -1,7 +1,9 @@
 //! Shared table filtering, including facets over the complete scoped dataset.
 //! Values match the frontend's `readable` formatter, including missing cells.
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
+use unicode_normalization::UnicodeNormalization;
 use crate::{actions, db::TursoDb, duplicates, workflows, preview_inputs, compare_table_cell, Backend};
 
 #[derive(Debug, Default)]
@@ -88,6 +90,115 @@ pub fn facets(page: &Value, filters: &ColumnFilters, column: &str, search: &str,
     json!({"options":options.into_iter().skip(offset).take(limit).map(|(value,count)|
         json!({"label":if value.is_empty(){"Blank"}else{value.as_str()},"value":value,"count":count}))
         .collect::<Vec<_>>(),"total":total,"offset":offset,"revision":page["revision"]})
+}
+
+fn matches_link_child(row: &Value, filters: &ColumnFilters, except: Option<&str>) -> bool {
+    filters.iter().all(|(column, selection)| {
+        if column == "tracks" || except == Some(column.as_str()) { return true; }
+        let value = readable(&row[column]);
+        selection.include.as_ref().is_none_or(|included| included.contains(&value))
+            && !selection.exclude.contains(&value)
+    })
+}
+
+fn matches_link_count(row: &Value, filters: &ColumnFilters) -> bool {
+    filters.get("tracks").is_none_or(|selection| {
+        let value = readable(&row["tracks"]);
+        selection.include.as_ref().is_none_or(|included| included.contains(&value))
+            && !selection.exclude.contains(&value)
+    })
+}
+
+fn link_position(row: &Value) -> (u32, u32) {
+    // LinkRow positions include padded numbers and release totals. Compare the
+    // indices, not their string width (Disc 2 must precede Disc 10).
+    let position = row["position"].as_str().unwrap_or("");
+    let index = |label: &str| position.split(label).nth(1)
+        .and_then(|part| part.trim().split('/').next())
+        .and_then(|number| number.trim().parse::<u32>().ok()).unwrap_or(0);
+    (index("Disc "), index("Track "))
+}
+
+/// Link releases is a presentation of local release folders. Existing flat
+/// LinkRows remain the source of truth for track filters, links and file actions.
+fn link_release_groups(page: &Value, filters: &ColumnFilters, except: Option<&str>) -> Vec<Value> {
+    let mut groups = BTreeMap::<(String, String, String), Vec<Value>>::new();
+    for row in page["rows"].as_array().into_iter().flatten()
+        .filter(|row| matches_link_child(row, filters, except))
+    {
+        let folder = duplicates::extract_release_folder(row["path"].as_str().unwrap_or(""))
+            .nfc().collect::<String>();
+        let canonical = |key: &str| row[key].as_str().unwrap_or("")
+            .trim().nfc().collect::<String>().to_lowercase();
+        groups.entry((folder, canonical("artist"), canonical("release")))
+            .or_default().push(row.clone());
+    }
+    groups.into_iter().map(|(key, mut children)| {
+        children.sort_by(|left, right| link_position(left).cmp(&link_position(right))
+            .then_with(|| compare_table_cell(left, right, "id")));
+        let count = children.len();
+        let mut linked = 0;
+        let mut choices = 0;
+        let mut ignored = 0;
+        let mut unlinked = 0;
+        for child in &children {
+            match child["status"].as_str().unwrap_or("") {
+                "Ignored" => ignored += 1,
+                "Linked" => linked += 1,
+                "Needs choice" => choices += 1,
+                _ => unlinked += 1,
+            }
+        }
+        let status = if ignored == count { "Ignored" }
+            else if choices > 0 { "Needs choice" }
+            else if unlinked > 0 { "Unlinked" }
+            else { "Linked" };
+        let mut summary = vec![format!("{count} {}", if count == 1 { "track" } else { "tracks" })];
+        for (number, label) in [(linked, "linked"), (choices, if choices == 1 { "needs choice" } else { "need choice" }),
+            (unlinked, "unlinked"), (ignored, "ignored")]
+        {
+            if number > 0 { summary.push(format!("{number} {label}")); }
+        }
+        let identity = serde_json::to_vec(&key).expect("release key serializes");
+        let id = format!("local-release:{:x}", Sha256::digest(identity));
+        let track_ids: Vec<_> = children.iter().map(|child| child["id"].clone()).collect();
+        json!({"id":id,"artist":children[0]["artist"],"release":children[0]["release"],
+            "tracks":count,"status":status,"evidence":summary.join(" · "),"path":key.0,
+            "track_ids":track_ids,"children":children,"expanded_available":true,"link_group":true,
+            "ignored":ignored == count})
+    }).collect()
+}
+
+fn grouped_link_page(mut page: Value, filters: &ColumnFilters, args: &Value, offset: usize, limit: usize) -> Value {
+    let mut rows = link_release_groups(&page, filters, None);
+    rows.retain(|row| matches_link_count(row, filters));
+    let key = args["sort"].as_str().unwrap_or("artist");
+    let descending = args["direction"] == "desc";
+    rows.sort_by(|left, right| {
+        let order = compare_table_cell(left, right, key);
+        (if descending { order.reverse() } else { order })
+            .then_with(|| compare_table_cell(left, right, "artist"))
+            .then_with(|| compare_table_cell(left, right, "release"))
+            .then_with(|| compare_table_cell(left, right, "path"))
+            .then_with(|| compare_table_cell(left, right, "id"))
+    });
+    page["total"] = json!(rows.len());
+    page["track_total"] = json!(rows.iter().map(|row| row["tracks"].as_u64().unwrap_or(0)).sum::<u64>());
+    page["offset"] = json!(offset);
+    page["rows"] = json!(rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>());
+    page
+}
+
+fn grouped_link_facets(page: &Value, filters: &ColumnFilters, column: &str, search: &str, offset: usize, limit: usize) -> Value {
+    let mut groups = link_release_groups(page, filters, Some(column));
+    if column != "tracks" { groups.retain(|row| matches_link_count(row, filters)); }
+    // Counts are a release-level column. All other values and counts continue
+    // to describe the matching tracks, including different statuses in one release.
+    let rows = if column == "tracks" { groups } else {
+        groups.into_iter().flat_map(|mut group| group["children"].as_array_mut()
+            .map(std::mem::take).unwrap_or_default()).collect()
+    };
+    facets(&json!({"rows":rows,"revision":page["revision"]}), &ColumnFilters::new(), column, search, offset, limit)
 }
 
 /// The table source always retains its existing scope/search rules. Column
@@ -519,6 +630,7 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
 
 pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_facet: bool) -> Result<Value, String> {
     let filters = parse(args.get("column_filters"))?;
+    let grouped_links = args["route"] == "links" && args["group_releases"] == true;
     let normalize = |mut page: Value| {
         if let Some(rows) = page["rows"].as_array_mut() {
             // Before a metadata/artwork preview exists, its fallback rows are
@@ -544,7 +656,7 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
 
     let mut source_args = args.clone();
     if let Some(source) = source_args.as_object_mut() {
-        for key in ["column_filters", "column", "facet_search"] { source.remove(key); }
+        for key in ["column_filters", "column", "facet_search", "group_releases"] { source.remove(key); }
         source.insert("offset".into(), json!(0));
         source.insert("limit".into(), json!(usize::MAX));
     }
@@ -567,7 +679,13 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         }
         page
     };
-    Ok(if let Some(column) = column {
+    Ok(if grouped_links {
+        if let Some(column) = column {
+            grouped_link_facets(&page,&filters,column,args["facet_search"].as_str().unwrap_or(""),offset,limit.min(500))
+        } else {
+            grouped_link_page(page,&filters,args,offset,limit)
+        }
+    } else if let Some(column) = column {
         facets(&page,&filters,column,args["facet_search"].as_str().unwrap_or(""),offset,limit.min(500))
     } else {
         filter_page(page,&filters,offset,limit)
@@ -577,6 +695,88 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn link_row(path: &str, position: &str, status: &str) -> Value {
+        json!({"id":path,"path":path,"artist":"Artist","release":"Release","title":"Track",
+            "position":position,"status":status,"evidence":"Exact recording","ignored":status == "Ignored"})
+    }
+
+    #[test]
+    fn link_groups_merge_discs_but_keep_separate_release_folders_and_original_children() {
+        let later = link_row("/Music/Artist/Release/Disc 2/01.flac", "Disc 02/02 · Track 01/01", "Needs choice");
+        let first = link_row("/Music/Artist/Release/Disc 1/01.flac", "Disc 01/02 · Track 01/01", "Linked");
+        let other = link_row("/Music/Artist/Release deluxe/01.flac", "Disc 01/01 · Track 01/01", "Unlinked");
+        let page = json!({"rows":[later,first,other],"revision":4});
+        let groups = link_release_groups(&page, &ColumnFilters::new(), None);
+        assert_eq!(groups.len(), 2, "the local edition folder is part of the identity");
+        let release = groups.iter().find(|group| group["path"] == "/Music/Artist/Release").unwrap();
+        assert_eq!(release["tracks"], 2);
+        assert_eq!(release["status"], "Needs choice");
+        assert_eq!(release["evidence"], "2 tracks · 1 linked · 1 needs choice");
+        assert_eq!(release["children"], json!([first,later]), "file-action data stays unchanged");
+        assert_eq!(release["track_ids"], json!([first["id"],later["id"]]));
+        let filtered = parse(Some(&json!({"status":{"include":["Needs choice"]}}))).unwrap();
+        let filtered_groups = link_release_groups(&page, &filtered, None);
+        assert_eq!(filtered_groups[0]["id"], release["id"], "filtering does not change an expansion identity");
+    }
+
+    #[test]
+    fn link_groups_filter_tracks_before_paging_whole_releases() {
+        let page = json!({"rows":[
+            link_row("/Music/Artist/A/01.flac", "Disc 01/01 · Track 01/03", "Linked"),
+            link_row("/Music/Artist/A/02.flac", "Disc 01/01 · Track 02/03", "Unlinked"),
+            link_row("/Music/Artist/A/03.flac", "Disc 01/01 · Track 03/03", "Unlinked"),
+            link_row("/Music/Artist/B/01.flac", "Disc 01/01 · Track 01/02", "Linked"),
+            link_row("/Music/Artist/B/02.flac", "Disc 01/01 · Track 02/02", "Unlinked")
+        ],"revision":7,"preview_id":null});
+        let filters = parse(Some(&json!({"status":{"exclude":["Linked"]}}))).unwrap();
+        let args = json!({"sort":"tracks","direction":"desc"});
+        let first = grouped_link_page(page.clone(), &filters, &args, 0, 1);
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["track_total"], 3);
+        assert_eq!(first["rows"][0]["children"].as_array().unwrap().len(), 2);
+        assert!(first["rows"][0]["children"].as_array().unwrap().iter().all(|child| child["status"] == "Unlinked"));
+        let second = grouped_link_page(page, &filters, &args, 1, 1);
+        assert_eq!(second["rows"][0]["tracks"], 1);
+        assert_eq!(second["offset"], 1);
+        assert_eq!(second["revision"], 7);
+    }
+
+    #[test]
+    fn link_groups_sort_track_counts_and_disc_track_indices_numerically() {
+        let mut rows: Vec<_> = (1..=12).rev().map(|track| link_row(
+            &format!("/Music/Artist/Large/{track}.flac"),
+            &format!("Disc 1/1 · Track {track}/12"), "Linked")).collect();
+        rows.push(link_row("/Music/Artist/Small/CD 10/01.flac", "Disc 10/10 · Track 1/1", "Linked"));
+        rows.push(link_row("/Music/Artist/Small/CD 2/01.flac", "Disc 2/10 · Track 1/1", "Linked"));
+        let page = json!({"rows":rows});
+        let result = grouped_link_page(page.clone(), &ColumnFilters::new(), &json!({"sort":"tracks"}), 0, 10);
+        assert_eq!(result["rows"][0]["tracks"], 2);
+        assert_eq!(result["rows"][0]["children"][0]["position"], "Disc 2/10 · Track 1/1");
+        assert_eq!(result["rows"][1]["children"][1]["position"], "Disc 1/1 · Track 2/12");
+        let reversed = grouped_link_page(page, &ColumnFilters::new(), &json!({"sort":"tracks","direction":"desc"}), 0, 10);
+        assert_eq!(reversed["rows"][0]["tracks"], 12);
+    }
+
+    #[test]
+    fn link_facets_keep_track_statuses_and_honor_release_count_filters() {
+        let page = json!({"rows":[
+            link_row("/Music/Artist/A/01.flac", "Disc 01/01 · Track 01/02", "Unlinked"),
+            link_row("/Music/Artist/A/02.flac", "Disc 01/01 · Track 02/02", "Needs choice"),
+            link_row("/Music/Artist/B/01.flac", "Disc 01/01 · Track 01/01", "Linked")
+        ],"revision":9});
+        let filters = parse(Some(&json!({"tracks":{"include":["2"]},"status":{"exclude":["Linked"]}}))).unwrap();
+        let statuses = grouped_link_facets(&page, &filters, "status", "", 0, 100);
+        assert_eq!(statuses["total"], 2);
+        assert!(statuses["options"].as_array().unwrap().iter().all(|option| option["value"] != "Linked"));
+        let counts = grouped_link_facets(&page, &filters, "tracks", "", 0, 100);
+        assert_eq!(counts["options"], json!([{"value":"2","label":"2","count":1}]));
+        let only_small = parse(Some(&json!({"tracks":{"include":["1"]}}))).unwrap();
+        let small = grouped_link_page(page, &only_small, &json!({}), 0, 10);
+        assert_eq!(small["total"], 1);
+        assert_eq!(small["track_total"], 1);
+        assert_eq!(small["rows"][0]["status"], "Linked");
+    }
 
     #[test]
     fn filters_use_or_within_columns_and_and_between_columns_before_paging() {
