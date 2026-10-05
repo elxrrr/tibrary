@@ -47,7 +47,7 @@ import {
   mergeJob,
   onlineKinds,
 } from "./api";
-import { DataTable, Column, HeaderFilter } from "./DataTable";
+import { DataTable, Column, HeaderFilter, ColumnSelection, ColumnFilterOptions } from "./DataTable";
 import { ActivityView, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
 import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
@@ -177,16 +177,11 @@ const defaultArtistScope = "My album artists";
 const overviewMissingFilters = {timeline: "All missing releases", status: "all", artist_scope: defaultArtistScope, recommendation: defaultRecommendation};
 const releaseTimelines = ["Newer than newest owned", "Between newest two owned", "All missing releases", "Incomplete albums", "All releases"];
 const artistScopes = [defaultArtistScope, "All artist appearances", "Other artist appearances", "Artist credits not checked"];
-const recommendations = [defaultRecommendation, "All recommendations", "Recommended", "Potential", "Suspect / Low match", "Unmatched", "Superseded"];
-const releaseTypes = ["All types", "ALBUM", "EP", "SINGLE"];
-function tableFilters(route: string): {value:string;label:string}[] {
-  const options = [{value:"all",label:route === "artists" ? "All artists" : route === "missing" ? "Available and unchecked" : "All items"}];
-  if (["correct", "organise", "metadata", "artwork", "mqa"].includes(route)) options.push({value:"affected",label:"Affected files only"});
-  if (route === "links") options.push(...[["unlinked","Unlinked tracks"],["choice","Needs an edition choice"],["linked","Linked tracks"],["ignored","Ignored tracks"]].map(([value,label])=>({value,label})));
-  if (route === "artists") options.push(...[["unresolved","Unresolved artists"],["matched","Matched artists"],["review","Needs review"]].map(([value,label])=>({value,label})));
-  if (route === "missing") options.push(...["Missing release", "Owned partial", "Owned complete", "Queued", "Ignored", "Unavailable"].map(value=>({value,label:value})));
-  if (route === "favourites") options.push(...["Missing locally", "In library", "Local only"].map(value=>({value,label:value})));
-  return options;
+type ColumnSelections = Record<string, ColumnSelection>;
+function defaultColumnSelections(route: string): ColumnSelections {
+  if (route === "missing") return {recommendation:{include:["Recommended", "Potential"]},status:{exclude:["Unavailable"]}};
+  if (route === "links") return {status:{exclude:["Linked", "Ignored"]}};
+  return {};
 }
 function Modal({
   title,
@@ -245,7 +240,9 @@ function App() {
     }),
     [loading, setLoading] = useState(false),
     [query, setQuery] = useState(""),
-    [filter, setFilter] = useState("all"),
+    [affectedOnly, setAffectedOnly] = useState(false),
+    [columnSelections, setColumnSelections] = useState<ColumnSelections>(() => defaultColumnSelections(initialRoute)),
+    [viewOptionsOpen, setViewOptionsOpen] = useState(false),
     [sort, setSort] = useState(initialRoute === "missing" ? "date" : "artist"),
     [direction, setDirection] = useState(
       initialRoute === "missing" ? "desc" : "asc",
@@ -257,9 +254,13 @@ function App() {
   const [action, setAction] = useState("dates"),
     [preview, setPreview] = useState<string | undefined>(),
     [timeline, setTimeline] = useState("Newer than newest owned"),
-    [artistScope, setArtistScope] = useState(defaultArtistScope),
-    [recommendation, setRecommendation] = useState(defaultRecommendation),
-    [releaseType, setReleaseType] = useState("All types");
+    [artistScope, setArtistScope] = useState(defaultArtistScope);
+  const viewOptionsButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!viewOptionsOpen) return;
+    document.querySelector<HTMLInputElement>('.table-view-options input:checked')?.focus({preventScroll:true});
+    return () => { if (viewOptionsButton.current?.isConnected) viewOptionsButton.current.focus({preventScroll:true}); };
+  }, [viewOptionsOpen]);
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
   const [systemAccent, setSystemAccent] = useState({name:"Multicolour",hex:"#007aff"});
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
@@ -369,13 +370,9 @@ function App() {
     setSelected(new Set());
     setOffset(0);
     setQuery("");
-    setFilter(
-      ["correct", "organise"].includes(route)
-        ? "affected"
-        : route === "links"
-          ? "unlinked"
-          : "all",
-    );
+    setAffectedOnly(["correct", "organise"].includes(route));
+    setColumnSelections(defaultColumnSelections(route));
+    setViewOptionsOpen(false);
     if (route === "missing") {
       setSort("date");
       setDirection("desc");
@@ -412,15 +409,17 @@ function App() {
     offset,
     limit: pageSize,
     search: query,
-    filter,
+    filter: affectedOnly ? "affected" : "all",
+    column_filters: columnSelections,
     sort,
     direction,
     action,
     preview_id: preview,
     timeline,
-    recommendation,
+    recommendation: "All recommendations",
     artist_scope: artistScope,
-    type: releaseType,
+    type: "All types",
+    include_unavailable: route === "missing",
   };
   useEffect(() => {
     if (!state || (root && !state.roots.some((r) => r.root === root))
@@ -441,15 +440,14 @@ function App() {
     root,
     offset,
     query,
-    filter,
+    affectedOnly,
+    columnSelections,
     sort,
     direction,
     action,
     preview,
     timeline,
-    recommendation,
     artistScope,
-    releaseType,
     pageSize,
     state?.revision,
   ]);
@@ -556,7 +554,7 @@ function App() {
         call("preview", { id: j.result.preview_id })
           .then(setDeep)
           .catch(notifyError);
-      else if (root === j.result.root && route === target) setFilter("affected");
+      else if (root === j.result.root && route === target) setAffectedOnly(true);
     }
     if (["apply", "deep_apply", "consolidate"].includes(j.kind)) {
       setPreview(undefined);
@@ -799,27 +797,32 @@ function App() {
               { key: "evidence", label: "Evidence" },
             ]
           : fileColumns;
-  const filterOptions = tableFilters(route);
   const headerFilters: Record<string, HeaderFilter> = {};
-  function headerChoice(label: string, value: string, options: string[], update: (value: string) => void, unfiltered = options[0]): HeaderFilter {
-    return {label, value, active:value !== unfiltered, options:options.map(value=>({value,label:value})), onChange:value=>{update(value);setOffset(0);}};
-  }
-  if (filterOptions.length > 1) {
-    const key = columns.some(column=>column.key === "status") ? "status" : "evidence";
-    headerFilters[key] = {label: "Table filter", value:filter, options:filterOptions, onChange:value=>{setFilter(value);setOffset(0);}};
-  }
-  if (route === "missing") {
-    headerFilters.artist = headerChoice("Album artist scope", artistScope, artistScopes, setArtistScope, "All artist appearances");
-    headerFilters.date = headerChoice("Release timeline", timeline, releaseTimelines, setTimeline, "All releases");
-    headerFilters.type = headerChoice("Release type", releaseType, releaseTypes, setReleaseType);
-    headerFilters.recommendation = headerChoice("Recommendation", recommendation, recommendations, setRecommendation, "All recommendations");
+  for (const column of columns) {
+    const otherSelections = {...columnSelections};
+    delete otherSelections[column.key];
+    const facetArgs = {...viewArgs, offset:0, limit:100, column:column.key, column_filters:otherSelections};
+    headerFilters[column.key] = {
+      label:`${column.label} values`,
+      selection:columnSelections[column.key],
+      optionsKey:JSON.stringify({...facetArgs, revision:state?.revision, refresh:tableRefresh}),
+      loadOptions:search => call<ColumnFilterOptions>("table.facets", {...facetArgs, facet_search:search}),
+      onChange:selection => {
+        setColumnSelections(previous => {
+          const next = {...previous};
+          if (selection === undefined) delete next[column.key];
+          else next[column.key] = selection;
+          return next;
+        });
+        setOffset(0);
+      },
+    };
   }
   function openMissingReleases() {
     setTimeline(overviewMissingFilters.timeline);
-    setFilter(overviewMissingFilters.status);
     setArtistScope(overviewMissingFilters.artist_scope);
-    setRecommendation(overviewMissingFilters.recommendation);
-    setReleaseType("All types");
+    setAffectedOnly(false);
+    setColumnSelections(defaultColumnSelections("missing"));
     setQuery("");
     setOffset(0);
     setRoute("missing");
@@ -1300,7 +1303,8 @@ function App() {
                     setAction(id);
                     setPreview(undefined);
                     setSelected(new Set());
-                    setFilter("affected");
+                    setAffectedOnly(true);
+                    setColumnSelections({});
                   }}
                 >
                   <Tags size={18} />
@@ -1313,49 +1317,6 @@ function App() {
           </div>
         )}
         {toolbar()}
-        {route === "missing" && (
-          <div className="filters secondary">
-            <select
-              aria-label="Release timeline"
-              value={timeline}
-              onChange={(e) => {
-                setTimeline(e.target.value);
-                setOffset(0);
-              }}
-            >
-              {releaseTimelines.map((v) => (
-                <option key={v}>{v}</option>
-              ))}
-            </select>
-            <select
-              aria-label="Album artist scope"
-              title="Choose releases credited to your linked album artists, other appearances, or releases whose album artist has not been checked. This works alongside the recommendation filter."
-              value={artistScope}
-              onChange={(e) => { setArtistScope(e.target.value); setOffset(0); }}
-            >
-              {artistScopes.map(v => <option key={v}>{v}</option>)}
-            </select>
-            <select
-              aria-label="Recommendation"
-              title="The normal view includes Recommended and Potential releases and excludes Suspect / Low match and Unmatched. Confidence uses recording matches, rights holders and role-specific credits shared with verified local music. Complete metadata with no shared identity evidence is Low match; incomplete evidence may remain Potential. Choose All recommendations to inspect every result."
-              value={recommendation}
-              onChange={(e) => { setRecommendation(e.target.value); setOffset(0); }}
-            >
-              {recommendations.map((v) => (
-                <option key={v}>{v}</option>
-              ))}
-            </select>
-            <select
-              aria-label="Release type"
-              value={releaseType}
-              onChange={(e) => { setReleaseType(e.target.value); setOffset(0); }}
-            >
-              {releaseTypes.map((v) => (
-                <option key={v}>{v}</option>
-              ))}
-            </select>
-          </div>
-        )}
         <div className="filters">
           <label className="search">
             <Search size={16} />
@@ -1369,22 +1330,37 @@ function App() {
               }}
             />
           </label>
-          <select
-            aria-label="Table filter"
-            value={filter}
-            onChange={(e) => {
-              setFilter(e.target.value);
-              setOffset(0);
-            }}
-          >
-            {filterOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-          </select>
+          {["correct", "organise", "metadata", "artwork", "mqa"].includes(route) && <label className="affected-filter">
+            <input type="checkbox" checked={affectedOnly} onChange={event => {setAffectedOnly(event.target.checked);setOffset(0);}} />
+            Affected files only
+          </label>}
+          {route === "missing" && <div className="table-view-control">
+            <button ref={viewOptionsButton} aria-haspopup="dialog" aria-expanded={viewOptionsOpen} onClick={() => setViewOptionsOpen(open=>!open)} title={`${artistScope} · ${timeline}`}>
+              <SlidersHorizontal size={15} /> View options
+            </button>
+            {viewOptionsOpen && <>
+              <div className="view-options-scrim" onClick={() => setViewOptionsOpen(false)} />
+              <div className="table-view-options" role="dialog" aria-label="Table view options" onKeyDown={event => {if(event.key === "Escape") {event.stopPropagation();setViewOptionsOpen(false);}}}>
+                <header><strong>View options</strong><button aria-label="Close view options" onClick={() => setViewOptionsOpen(false)}><X size={16} /></button></header>
+                <fieldset role="radiogroup" aria-label="Album artist scope">
+                  <legend>Album artist scope</legend>
+                  {artistScopes.map(value => <label key={value}><input type="radio" name="artist-scope" checked={artistScope === value} onChange={() => {setArtistScope(value);setOffset(0);}} />{value}</label>)}
+                </fieldset>
+                <fieldset role="radiogroup" aria-label="Release timeline">
+                  <legend>Release range</legend>
+                  {releaseTimelines.map(value => <label key={value}><input type="radio" name="release-timeline" checked={timeline === value} onChange={() => {setTimeline(value);setOffset(0);}} />{value}</label>)}
+                </fieldset>
+              </div>
+            </>}
+          </div>}
+          {Object.keys(columnSelections).length > 0 && <button onClick={() => {setColumnSelections({});setOffset(0);}} title="Show all column values within the current view options">Reset column filters</button>}
           <span>
             {selected.size
               ? `${selected.size} selected`
               : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}${route === "missing" ? ` matching filters · ${(data.missing_total ?? data.total).toLocaleString()} missing, incomplete or queued in total` : ""}`}
           </span>
         </div>
+        {route === "missing" && <div className="table-scope-summary">{artistScope} · {timeline}</div>}
         {route === "local" && data.rows.length > 0 && (
           <div className="cluster-callout">
             <div className="cluster-callout-text">

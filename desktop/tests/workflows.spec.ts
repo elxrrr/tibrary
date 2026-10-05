@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, Page, Locator } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,6 +13,61 @@ async function rpc(method: string, args: any = {}) {
     pending.set(id, resolve);
     child.stdin.write(JSON.stringify({ id, method, args }) + "\n");
   });
+}
+// Column menus use real dataset values, including rows outside the current page.
+async function columnMenu(page: Page, label: string): Promise<Locator> {
+  await page.getByRole("button", {name: `Filter ${label}`, exact: true}).click();
+  const menu = page.getByRole("menu", {name: `${label} column options`, exact: true});
+  await expect(menu).toBeVisible();
+  return menu;
+}
+function columnValue(menu: Locator, value: string): Locator {
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return menu.getByRole("menuitemcheckbox").filter({hasText: new RegExp(`^${escaped}(?:\\s*[\\d,]+)?$`)});
+}
+async function columnOnly(page: Page, label: string, values: string[]) {
+  const menu = await columnMenu(page, label);
+  // Wait for the full facet list before an empty include set changes the table.
+  for (const value of values) await expect(columnValue(menu, value)).toBeVisible();
+  await menu.getByRole("menuitem", {name: "Clear selection", exact: true}).click();
+  for (const value of values) {
+    await columnValue(menu, value).click();
+    await expect(columnValue(menu, value)).toHaveAttribute("aria-checked", "true");
+  }
+  await menu.press("Escape");
+}
+async function columnAll(page: Page, label: string) {
+  const menu = await columnMenu(page, label);
+  await menu.getByRole("menuitem", {name: "Select all", exact: true}).click();
+  await menu.press("Escape");
+}
+async function viewOption(page: Page, label: string, value: string) {
+  await page.getByRole("button", {name: "View options", exact: true}).click();
+  const dialog = page.getByRole("dialog", {name: "Table view options", exact: true});
+  await dialog.getByRole("radiogroup", {name: label, exact: true}).getByRole("radio", {name: value, exact: true}).check();
+  await dialog.getByRole("button", {name: "Close view options", exact: true}).click();
+}
+function displayColumnValue(value: any): string {
+  return value == null ? "—" : typeof value === "object" ? Array.isArray(value)
+    ? value.map(displayColumnValue).join(" · ")
+    : Object.entries(value).map(([key, item]) => `${key.replaceAll("_", " ")}: ${displayColumnValue(item)}`).join(" · ") : String(value);
+}
+function filteredMockRows(rows: any[], args: any, skip?: string): any[] {
+  return rows.filter(row => Object.entries(args.column_filters || {}).every(([key, selection]: [string, any]) => {
+    if (key === skip) return true;
+    const value = displayColumnValue(row[key]);
+    return (selection.include === undefined || selection.include.includes(value)) && !selection.exclude?.includes(value);
+  }));
+}
+function mockFacets(rows: any[], args: any) {
+  const counts = new Map<string, number>();
+  for (const row of filteredMockRows(rows, args, args.column)) {
+    const value = displayColumnValue(row[args.column]);
+    if (args.facet_search && !value.toLowerCase().includes(args.facet_search.toLowerCase())) continue;
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  const options = [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([value, count]) => ({value, label: value, count}));
+  return {options: options.slice(0, args.limit || 100), total: options.length};
 }
 test.beforeEach(async ({ page }) => {
   folder = realpathSync(mkdtempSync(join(tmpdir(), "tibrary-browser-")));
@@ -104,7 +159,7 @@ test("tables publish usable results while catalogue revisions keep advancing", a
   await page.goto("/");
   await expect(page.getByRole("heading",{name:"Overview",exact:true})).toBeVisible();
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
-  await page.getByRole("combobox",{name:"Release timeline"}).selectOption("All missing releases");
+  await viewOption(page, "Release timeline", "All missing releases");
   await page.evaluate(()=>{(window as any).refreshTestTimer=setInterval(()=>(window as any).emitBackendEvent({event:"changed"}),80);});
   try {
     await expect(page.locator("tbody")).toContainText("Night Maps",{timeout:1800});
@@ -207,11 +262,12 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     await expect(
       page.getByRole("heading", { name, exact: true }).first(),
     ).toBeVisible();
-    if (await page.locator(".table-scroll").count())
-      await expect(page.locator(".table-scroll")).toHaveAttribute(
-        "aria-busy",
-        "false",
-      );
+    if (await page.locator(".table-scroll").count()) {
+      await expect(page.locator(".table-scroll")).toHaveAttribute("aria-busy", "false");
+      const columns=await page.locator(".table-header-actions").count();
+      await expect(page.getByRole("button",{name:/^Filter /})).toHaveCount(columns);
+      await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
+    }
     await expect(page.getByRole("alert")).toHaveCount(0);
     if (process.env.TIBRARY_SCREENSHOTS && screenshots[name]) {
       if (name === "Local duplicates") {
@@ -256,7 +312,7 @@ test("local table sorting and filters are usable", async ({ page }) => {
     .locator("aside")
     .getByRole("button", { name: "Link releases", exact: true })
     .click();
-  await page.getByRole("combobox", { name: "Table filter" }).selectOption("all");
+  await columnAll(page, "Status");
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("button", { name: "Release", exact: true }).click();
   await page.getByRole("button", { name: "Release", exact: true }).click();
@@ -329,18 +385,18 @@ test("multiple file context action affects only selected files", async ({
     .locator("aside")
     .getByRole("button", { name: "Link releases", exact: true })
     .click();
-  await page.getByRole("combobox", { name: "Table filter" }).selectOption("all");
+  await columnAll(page, "Status");
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("checkbox", { name: "Select visible rows" }).check();
   await page.locator("tbody tr").first().click({ button: "right" });
   await page
     .getByRole("menuitem", { name: "Ignore 2 selected tracks" })
     .click();
-  await page.getByRole("combobox", { name: "Table filter" }).selectOption("unlinked");
+  const ignoredMenu = await columnMenu(page, "Status");
+  await ignoredMenu.getByRole("menuitem", {name:"Clear selection",exact:true}).click();
+  await ignoredMenu.press("Escape");
   await expect(page.locator("tbody tr")).toHaveCount(0);
-  await page
-    .getByRole("combobox", { name: "Table filter" })
-    .selectOption("ignored");
+  await columnOnly(page, "Status", ["Ignored"]);
   await expect(page.locator("tbody tr")).toHaveCount(2);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
@@ -387,9 +443,7 @@ test("missing releases queue only the selected audio tracks", async ({
     .locator("aside")
     .getByRole("button", { name: "Missing releases", exact: true })
     .click();
-  await page
-    .getByRole("combobox", { name: "Release timeline" })
-    .selectOption("All missing releases");
+  await viewOption(page, "Release timeline", "All missing releases");
   await page
     .getByRole("button", { name: "Expand Blue Hours", exact: true })
     .click();
@@ -513,6 +567,9 @@ test("audit results survive navigation and unknown actions fail explicitly", asy
   await page.locator("aside").getByRole("button", {name: "MQA audit", exact: true}).click();
   const restored = await rpc("table", {route: "mqa", root: join(folder, "music")});
   expect(restored.result.rows).toEqual(first.result.rows);
+  const status=first.result.rows[0].status;
+  await columnOnly(page,"Status",[status]);
+  await expect(page.locator("tbody tr")).toHaveCount(first.result.rows.filter((row:any)=>row.status===status).length);
   expect((await rpc("job.start", {kind: "unknown_action"})).error).toBeTruthy();
 });
 
@@ -698,7 +755,7 @@ test("metadata and settings use readable views without implementation panels", a
   await page.locator("aside").getByRole("button", {name:"General",exact:true}).click();
   await expect(page.getByRole("heading",{name:"About Tibrary"})).toHaveCount(0);
   await page.locator("aside").getByRole("button", {name:"Link releases",exact:true}).click();
-  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await columnAll(page, "Status");
   await page.locator("tbody tr").first().dblclick();
   await page.getByText("All saved tags & DJ checks",{exact:true}).click();
   await expect(page.getByRole("table",{name:"Local file tags"})).toBeVisible();
@@ -717,7 +774,7 @@ test("automatic correction previews can be applied and all-files view remains av
   await expect.poll(async()=> (await rpc("job.status")).result?.job?.status).toBe("complete");
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect(page.locator("tbody tr")).toHaveCount(0);
-  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await page.getByRole("checkbox", {name:"Affected files only",exact:true}).uncheck();
   await expect(page.locator("tbody tr")).toHaveCount(2);
 });
 
@@ -864,10 +921,10 @@ test("missing release filters, bidirectional sort and paging preserve the releas
   expect(reverse.rows.map((r:any)=>r.id)).toEqual(all.rows.map((r:any)=>r.id).reverse());
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
-  await page.getByRole("combobox",{name:"Release type",exact:true}).selectOption("EP");
+  await columnOnly(page, "Type", ["EP"]);
   await expect(page.locator("tbody")).toContainText("Between Stations");
   await expect(page.locator("tbody")).not.toContainText("Night Maps");
-  await page.getByRole("combobox",{name:"Release type",exact:true}).selectOption("All types");
+  await columnAll(page, "Type");
   await page.getByRole("textbox",{name:"Filter table",exact:true}).fill("Night Maps");
   await expect(page.locator("tbody")).toContainText("Night Maps");
   await expect(page.locator("tbody")).not.toContainText("Between Stations");
@@ -885,13 +942,17 @@ test("missing release defaults keep low matches inspectable without inflating ov
   ];
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
-    if(request.method==="table" && request.args.route==="missing") {
-      queries.push(request.args);
+    if(["table","table.facets"].includes(request.method) && request.args.route==="missing") {
       const scoped=rows.filter(row=>request.args.artist_scope!=="My album artists" || !row.scope);
-      const selected=request.args.recommendation==="Recommended and potential"
+      if (request.method === "table.facets") {
+        await route.fulfill({json:{result:mockFacets(scoped,request.args)}});
+        return;
+      }
+      queries.push(request.args);
+      const confidence=request.args.recommendation==="Recommended and potential"
         ? scoped.filter(row=>["Recommended","Potential"].includes(row.recommendation))
-        : request.args.recommendation==="All recommendations" ? scoped
-        : scoped.filter(row=>row.recommendation===request.args.recommendation);
+        : scoped;
+      const selected=filteredMockRows(confidence,request.args);
       await route.fulfill({json:{result:{rows:selected,total:selected.length,missing_total:selected.length}}});
       return;
     }
@@ -908,18 +969,26 @@ test("missing release defaults keep low matches inspectable without inflating ov
   await expect(metric.locator("strong")).toHaveText("2");
   await expect(metric).toContainText("My album artists · Recommended and Potential");
   await metric.click();
-  const confidence=page.getByRole("combobox",{name:"Recommendation",exact:true});
-  await expect(confidence).toHaveValue("Recommended and potential");
-  await expect(page.getByRole("combobox",{name:"Album artist scope",exact:true})).toHaveValue("My album artists");
-  await expect(page.getByRole("combobox",{name:"Release timeline",exact:true})).toHaveValue("All missing releases");
+  await expect(page.getByRole("combobox",{name:"Recommendation",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
   await expect(page.getByRole("combobox",{name:"Copyright match",exact:true})).toHaveCount(0);
+  await page.getByRole("button",{name:"View options",exact:true}).click();
+  const options=page.getByRole("dialog",{name:"Table view options",exact:true});
+  await expect(options.getByRole("radio",{name:"My album artists",exact:true})).toBeChecked();
+  await expect(options.getByRole("radio",{name:"All missing releases",exact:true})).toBeChecked();
+  await options.getByRole("button",{name:"Close view options",exact:true}).click();
+  const confidenceMenu=await columnMenu(page,"Recommendation");
+  await expect(columnValue(confidenceMenu,"Recommended")).toHaveAttribute("aria-checked","true");
+  await expect(columnValue(confidenceMenu,"Potential")).toHaveAttribute("aria-checked","true");
+  await expect(columnValue(confidenceMenu,"Suspect / Low match")).toHaveAttribute("aria-checked","false");
+  await confidenceMenu.press("Escape");
   await expect(page.locator("tbody")).toContainText("Verified catalogue");
   await expect(page.locator("tbody")).not.toContainText("Unrelated catalogue");
   await expect(page.getByText("2 releases matching filters",{exact:false})).toBeVisible();
-  await confidence.selectOption("All recommendations");
+  await columnAll(page,"Recommendation");
   await expect(page.locator("tbody")).toContainText("Unrelated catalogue");
   await expect(page.locator("tbody")).toContainText("Unmatched catalogue");
-  await confidence.selectOption("Suspect / Low match");
+  await columnOnly(page,"Recommendation",["Suspect / Low match"]);
   await expect(page.locator("tbody")).toContainText("Unrelated catalogue");
   await expect(page.locator("tbody")).not.toContainText("Verified catalogue");
   expect(queries[0].recommendation).toBe("Recommended and potential");
@@ -935,9 +1004,13 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   const queries:any[]=[];
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
-    if(request.method==="table" && request.args.route==="missing") {
+    if(["table","table.facets"].includes(request.method) && request.args.route==="missing") {
+      if (request.method === "table.facets") {
+        await route.fulfill({json:{result:mockFacets(rows,request.args)}});
+        return;
+      }
       queries.push(request.args);
-      const selected=rows.filter(row=>request.args.type==="All types" || !request.args.type || row.type===request.args.type);
+      const selected=filteredMockRows(rows,request.args);
       selected.sort((a:any,b:any)=>String(a[request.args.sort]||"").localeCompare(String(b[request.args.sort]||""))*(request.args.direction==="desc" ? -1 : 1));
       await route.fulfill({json:{result:{rows:selected,total:selected.length,missing_total:selected.length}}});
       return;
@@ -947,7 +1020,7 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
   const selected=page.getByRole("checkbox",{name:"Select Release 00",exact:true});
-  await expect(page.getByRole("button",{name:"Filter Album artist",exact:true})).toHaveClass(/active/);
+  await expect(page.getByRole("button",{name:"Filter Album artist",exact:true})).not.toHaveClass(/active/);
   await expect(page.getByRole("button",{name:"Filter Recommendation",exact:true})).toHaveClass(/active/);
   await selected.check();
   await page.getByRole("button",{name:"Expand Release 00",exact:true}).click();
@@ -956,13 +1029,13 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   await scroller.evaluate(element=>{element.scrollTop=180;});
   const scroll=await scroller.evaluate(element=>element.scrollTop);
   expect(scroll).toBeGreaterThan(0);
-  const releaseHeader=page.getByRole("columnheader",{name:"Release",exact:true});
+  const releaseHeader=page.locator("th").filter({has:page.getByRole("button",{name:"Release",exact:true})});
   const releaseSort=releaseHeader.getByRole("button",{name:"Release",exact:true});
   await releaseSort.focus();
   await releaseSort.press("Shift+F10");
   const menu=page.getByRole("menu",{name:"Release column options"});
   await expect(menu).toBeVisible();
-  await menu.press("End");
+  await menu.press("ArrowDown");
   await expect(menu.getByRole("menuitemradio",{name:"Sort descending",exact:true})).toBeFocused();
   await menu.press("Escape");
   await expect(releaseSort).toBeFocused();
@@ -982,24 +1055,94 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   const recommendationMenu=page.getByRole("menu",{name:"Recommendation column options"});
   const bounds=(await recommendationMenu.boundingBox())!;
   expect(bounds.x+bounds.width).toBeLessThanOrEqual(1600);
-  await recommendationMenu.getByRole("menuitemradio",{name:"Potential",exact:true}).click();
-  await expect(page.getByRole("combobox",{name:"Recommendation",exact:true})).toHaveValue("Potential");
-  await page.getByRole("button",{name:"Filter Type",exact:true}).click();
-  await page.getByRole("menu",{name:"Type column options"}).getByRole("menuitemradio",{name:"ALBUM",exact:true}).click();
-  await expect(page.getByRole("combobox",{name:"Release type",exact:true})).toHaveValue("ALBUM");
+  await expect(columnValue(recommendationMenu,"Potential")).toHaveAttribute("aria-checked","true");
+  await recommendationMenu.getByRole("menuitem",{name:"Clear selection",exact:true}).click();
+  await expect(columnValue(recommendationMenu,"Potential")).toHaveAttribute("aria-checked","false");
+  await expect(page.locator("tbody tr")).toHaveCount(0);
+  await columnValue(recommendationMenu,"Potential").click();
+  await expect(recommendationMenu).toBeVisible();
+  await recommendationMenu.press("Escape");
+  await columnOnly(page,"Type",["ALBUM"]);
   await expect(page.getByRole("button",{name:"Filter Type",exact:true})).toHaveClass(/active/);
   await expect(page.getByText("30 releases matching filters",{exact:false})).toBeVisible();
-  await page.getByRole("combobox",{name:"Release type",exact:true}).selectOption("All types");
-  await expect(page.getByRole("button",{name:"Filter Type",exact:true})).not.toHaveClass(/active/);
-  await page.getByRole("button",{name:"Filter Type",exact:true}).click();
-  const typeMenu=page.getByRole("menu",{name:"Type column options"});
-  await expect(typeMenu.getByRole("menuitemradio",{name:"All types",exact:true})).toHaveAttribute("aria-checked","true");
+  await expect(selected).toBeChecked();
+  await expect(page.getByRole("button",{name:"Collapse Release 00",exact:true})).toHaveCount(1);
+  const typeMenu=await columnMenu(page,"Type");
+  await expect(columnValue(typeMenu,"ALBUM")).toHaveAttribute("aria-checked","true");
+  await expect(columnValue(typeMenu,"EP")).toHaveAttribute("aria-checked","false");
+  if(process.env.TIBRARY_SCREENSHOTS) await page.screenshot({path:"/tmp/tibrary-column-checkbox-filters.png"});
+  await columnValue(typeMenu,"EP").click();
+  await expect(typeMenu).toBeVisible();
+  await expect(page.getByText("60 releases matching filters",{exact:false})).toBeVisible();
+  await columnValue(typeMenu,"ALBUM").click();
+  await expect(page.getByText("30 releases matching filters",{exact:false})).toBeVisible();
+  await typeMenu.getByRole("menuitem",{name:"Select all",exact:true}).click();
   await typeMenu.press("Escape");
-  expect(queries.some(args=>args.type==="ALBUM" && args.recommendation==="Potential")).toBe(true);
+  await expect(page.getByRole("button",{name:"Filter Type",exact:true})).not.toHaveClass(/active/);
+  expect(queries.some(args=>args.column_filters?.type?.include?.join()==="ALBUM" && args.column_filters?.recommendation?.include?.join()==="Potential")).toBe(true);
   await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
-  await page.getByRole("button",{name:"Filter Status",exact:true}).click();
-  await page.getByRole("menu",{name:"Status column options"}).getByRole("menuitemradio",{name:"Linked tracks",exact:true}).click();
-  await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveValue("linked");
+  await columnOnly(page,"Status",["Linked"]);
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("real table facets filter before paging and share checkbox rules across workflows", async ({page}) => {
+  const root=join(folder,"music");
+  const args={route:"queue",root,filter:"all",sort:"release",direction:"asc",limit:1};
+  const first=(await rpc("table",args)).result;
+  expect(first.rows).toHaveLength(1);
+  expect(first.total).toBe(6);
+  const facets=(await rpc("table.facets",{...args,column:"release",limit:100})).result;
+  expect(facets.total).toBe(6);
+  expect(facets.options.map((option:any)=>option.value)).toContain("Night Maps");
+  const chosen={release:{include:["Night Maps","Distant Rooms"]}};
+  const filtered=(await rpc("table",{...args,column_filters:chosen})).result;
+  expect(filtered.total).toBe(2);
+  const second=(await rpc("table",{...args,column_filters:chosen,offset:1})).result;
+  expect([filtered.rows[0].release,second.rows[0].release].sort()).toEqual(["Distant Rooms","Night Maps"]);
+  const selfFacet=(await rpc("table.facets",{...args,column:"release",column_filters:chosen,limit:100})).result;
+  expect(selfFacet.total).toBe(6);
+  const none=(await rpc("table",{...args,column_filters:{...chosen,type:{include:["EP"]}}})).result;
+  expect(none.total).toBe(0);
+  const exclusion=(await rpc("table",{...args,column_filters:{release:{exclude:["Blue Hours"]}}})).result;
+  expect(exclusion.total).toBe(5);
+  const artists=(await rpc("table.facets",{route:"artists",root,column:"status"})).result;
+  expect(artists.options.map((option:any)=>option.value)).toEqual(["Confirmed"]);
+  const links=(await rpc("table.facets",{route:"links",root,column:"status"})).result;
+  expect(links.options.map((option:any)=>option.value)).toEqual(["Linked"]);
+  await page.goto("/");
+  const sidebar=page.locator("aside");
+  await sidebar.getByRole("button",{name:"Download queue",exact:true}).click();
+  await columnOnly(page,"Release",["Distant Rooms","Night Maps"]);
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await page.getByRole("checkbox",{name:"Select Night Maps",exact:true}).check();
+  await page.getByRole("button",{name:"Expand Night Maps",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track Signal",exact:true})).toBeChecked();
+  await columnOnly(page,"Type",["ALBUM"]);
+  await expect(page.getByRole("checkbox",{name:"Select Night Maps",exact:true})).toBeChecked();
+  await expect(page.getByRole("button",{name:"Collapse Night Maps",exact:true})).toBeVisible();
+  await sidebar.getByRole("button",{name:"Link artists",exact:true}).click();
+  await columnOnly(page,"Match status",["Confirmed"]);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await sidebar.getByRole("button",{name:"Link releases",exact:true}).click();
+  await columnOnly(page,"Status",["Linked"]);
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await sidebar.getByRole("button",{name:"Correct tags",exact:true}).click();
+  await page.getByRole("button",{name:/Track & disc numbers/}).click();
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  const tagMenu=await columnMenu(page,"Proposed tag changes");
+  await expect(tagMenu.getByRole("menuitemcheckbox").first()).toBeVisible();
+  expect(await tagMenu.getByRole("menuitemcheckbox").count()).toBeGreaterThan(0);
+  await tagMenu.press("Escape");
+  const artistMenu=await columnMenu(page,"Album artist");
+  await expect(columnValue(artistMenu,"North Assembly")).toHaveAttribute("aria-checked","true");
+  await columnValue(artistMenu,"North Assembly").click();
+  await expect(page.locator("tbody tr")).toHaveCount(0);
+  await expect(columnValue(artistMenu,"North Assembly")).toHaveAttribute("aria-checked","false");
+  await columnValue(artistMenu,"North Assembly").click();
+  await artistMenu.press("Escape");
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
@@ -1027,10 +1170,10 @@ test("missing release metadata shows saved credits and independent confidence fi
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
-  await page.getByRole("combobox",{name:"Release timeline",exact:true}).selectOption("All missing releases");
-  await page.getByRole("combobox",{name:"Recommendation",exact:true}).selectOption("Recommended");
-  await expect.poll(()=>queries.some(args=>args.artist_scope==="My album artists" && args.recommendation==="Recommended")).toBe(true);
-  await page.getByRole("combobox",{name:"Recommendation",exact:true}).selectOption("All recommendations");
+  await viewOption(page, "Release timeline", "All missing releases");
+  await columnOnly(page,"Recommendation",["Potential"]);
+  await expect.poll(()=>queries.some(args=>args.artist_scope==="My album artists" && args.column_filters?.recommendation?.include?.join()==="Potential")).toBe(true);
+  await columnAll(page,"Recommendation");
   const row=page.locator("tbody tr").filter({hasText:"Night Maps"}).first();
   await expect(row).toBeVisible();
   await row.click({button:"right"});
@@ -1090,7 +1233,7 @@ test("catalogue refresh publishes partial results without resetting table state 
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
-  await page.getByRole("combobox",{name:"Release timeline"}).selectOption("All missing releases");
+  await viewOption(page, "Release timeline", "All missing releases");
   await page.getByRole("button",{name:"Coverage",exact:true}).click();
   await page.getByRole("button",{name:"Coverage",exact:true}).click();
   await expect(page.locator("th[aria-sort='descending']")).toContainText("Coverage");
@@ -1139,12 +1282,16 @@ test("missing release availability checks use the requested scope and preserve u
   await page.goto("/");
   const sidebar=page.locator("aside");
   await sidebar.getByRole("button",{name:"Missing releases",exact:true}).click();
-  await page.getByRole("combobox",{name:"Release timeline"}).selectOption("All missing releases");
+  await viewOption(page, "Release timeline", "All missing releases");
   await expect(page.locator("tbody")).not.toContainText("Private Weather");
-  await page.getByRole("combobox",{name:"Table filter"}).selectOption("Unavailable");
+  await columnAll(page,"Recommendation");
+  await viewOption(page,"Album artist scope","All artist appearances");
+  await columnOnly(page,"Coverage",["Unavailable"]);
   await expect(page.locator("tbody")).toContainText("Private Weather");
-  await expect(page.getByRole("combobox",{name:"Release timeline"})).toHaveValue("All missing releases");
-  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await expect(page.getByText("All missing releases",{exact:false}).first()).toBeVisible();
+  await columnAll(page, "Coverage");
+  await viewOption(page,"Album artist scope","My album artists");
+  await columnOnly(page,"Coverage",["Missing release","Owned partial"]);
   await page.getByRole("checkbox",{name:"Select Blue Hours",exact:true}).check();
   await page.getByRole("button",{name:"Check availability",exact:true}).click();
   await expect.poll(()=>checks.length).toBe(1);
@@ -1243,13 +1390,14 @@ test("General contains connection and separate template/audio cards; artist revi
   await expect(page.locator("tbody tr")).toHaveCount(1);
   const artist = (await rpc("table",{route:"artists",root:join(folder,"music")})).result.rows[0].id;
   await rpc("artists.choose",{artist,ids:["900001"]});
-  await page.getByRole("combobox",{name:"Table filter"}).selectOption("review");
-  await expect(page.locator("tbody tr")).toHaveCount(0);
-  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  const needsReview=(await rpc("table",{route:"artists",root:join(folder,"music"),filter:"review"})).result;
+  expect(needsReview.total).toBe(0);
+  await columnOnly(page, "Match status", ["Confirmed"]);
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await page.locator("tbody tr").first().click({button:"right"});
   await expect(page.getByRole("menuitem",{name:"Recheck selected artists"})).toBeVisible();
   await page.getByRole("menuitem",{name:"Unlink selected artists"}).click();
+  await columnAll(page,"Match status");
   await expect(page.locator("tbody tr")).toContainText("Unresolved");
   expect((await rpc("turso.stats",{root:join(folder,"music")})).result.track_count).toBe(2);
 });
@@ -1301,7 +1449,7 @@ test("completed job activity exposes persistent per-item details without expansi
 test("table headers remain opaque in light and dark themes, including dialogs", async ({page}) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
-  await page.getByRole("combobox",{name:"Table filter"}).selectOption("all");
+  await columnAll(page, "Status");
   for (const theme of ["light","dark"]) {
     await page.evaluate(theme => {document.documentElement.dataset.theme=theme},theme);
     const header=page.getByRole("columnheader").first();

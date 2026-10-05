@@ -2339,6 +2339,27 @@ impl TursoDb {
         offset: usize,
         limit: usize,
     ) -> Result<TablePage<MissingRow>, String> {
+        self.get_missing_rows_scoped_including_unavailable(market,timeline,recommendation,artist_scope,status_filter,type_filter,search,sort,direction,offset,limit,false).await
+    }
+
+    /// Header facets can inspect unavailable releases alongside available ones,
+    /// while keeping the same artist scope, search and release timeline.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_missing_rows_scoped_including_unavailable(
+        &self,
+        market: &str,
+        timeline: Option<&str>,
+        recommendation: Option<&str>,
+        artist_scope: Option<&str>,
+        status_filter: Option<&str>,
+        type_filter: Option<&str>,
+        search: Option<&str>,
+        sort: Option<&str>,
+        direction: Option<&str>,
+        offset: usize,
+        limit: usize,
+        include_unavailable: bool,
+    ) -> Result<TablePage<MissingRow>, String> {
         let build_guard = self.missing_rows_gate.lock().await;
         let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
         let key = format!("{market}:{}", chrono::Utc::now().format("%Y-%m-%d"));
@@ -2363,7 +2384,7 @@ impl TursoDb {
 
         // Apply filters
         let inspecting_unavailable = status_filter == Some("Unavailable");
-        if !inspecting_unavailable {
+        if !inspecting_unavailable && !include_unavailable {
             rows.retain(|row| row.available != Some(false));
         }
         if let Some(sf) = status_filter {
@@ -2415,14 +2436,14 @@ impl TursoDb {
         if let Some(tl) = timeline.filter(|_| !inspecting_unavailable) {
             if tl == "Newer than newest owned" {
                 rows.retain(|r| {
-                    ["Missing release", "Owned partial", "Queued"].contains(&r.status.as_str())
+                    (["Missing release", "Owned partial", "Queued"].contains(&r.status.as_str()) || (include_unavailable && r.status == "Unavailable"))
                         && r.newest_local_date
                             .as_deref()
                             .is_none_or(|newest| compare_release_dates(&r.date, newest).is_gt())
                 });
             } else if tl == "Between newest two owned" {
                 rows.retain(|r| {
-                    ["Missing release", "Owned partial", "Queued"].contains(&r.status.as_str())
+                    (["Missing release", "Owned partial", "Queued"].contains(&r.status.as_str()) || (include_unavailable && r.status == "Unavailable"))
                         && r.newest_local_date
                             .as_deref()
                             .is_some_and(|newest| !compare_release_dates(&r.date, newest).is_gt())
@@ -2435,6 +2456,7 @@ impl TursoDb {
                     r.status == "Missing release"
                         || r.status == "Owned partial"
                         || r.status == "Queued"
+                        || (include_unavailable && r.status == "Unavailable")
                 });
             } else if tl == "Incomplete albums" {
                 rows.retain(|r| {

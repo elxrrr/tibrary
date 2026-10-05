@@ -49,7 +49,9 @@ npm --prefix desktop run tauri dev
 4. Browse **Complete library → Missing releases** and queue the music you want.
 5. Use **Update library** for missing tags, artwork and replacements.
 
-Use **Check local changes** after editing files outside the app, and **Update missing releases** to discover new music and fill gaps in online metadata. Recommendation updates first complete metadata for your downloaded, linked releases, then fill candidate gaps. Tools share their cached results; unchanged tags and checked track credits are reused. Metadata views show which fields were checked, and artist scope and recommendation confidence can be filtered separately. The normal view includes Recommended and Potential releases; fully checked releases with no shared identity evidence are available under **Suspect / Low match** or **All recommendations**. Your database does not need resetting.
+Use **Check local changes** after editing files outside the app, and **Update missing releases** to discover new music and fill gaps in online metadata. Recommendation updates first complete metadata for your downloaded, linked releases, then fill candidate gaps. Tools share their cached results; unchanged tags and checked track credits are reused. Metadata views show which fields were checked, and artist scope and recommendation confidence can be filtered separately. The normal view includes Recommended and Potential releases; fully checked releases with no shared identity evidence are available by checking **Suspect** or **Select all** in the Recommendation column menu. Your database does not need resetting.
+
+Filter any main table using checkmarked values in its column headers; multiple values and columns can be combined. Missing releases keeps album-artist scope and release range in **View options**.
 
 Browse cached releases and manage the queue while updates run. Expanding a release loads missing track details on demand; downloads and local scans run independently. File-changing operations wait for active downloads to finish.
 

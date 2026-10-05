@@ -6,6 +6,7 @@ mod network;
 mod progress;
 mod subscriber_metadata;
 mod appearance;
+mod table_filters;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -861,7 +862,7 @@ async fn handle_rpc_call(
         return Err("Finish the quit confirmation before starting another task".into());
     }
 
-    let cacheable = method == "table" || method == "state";
+    let cacheable = matches!(method.as_str(), "table" | "table.facets" | "state");
     let key = format!("{method}:{}", args);
     let gate = cacheable.then(|| state.read_gate(&key));
     let _read = match gate.as_ref() { Some(gate) => Some(gate.lock().await), None => None };
@@ -917,7 +918,7 @@ async fn handle_rpc_uncached(
     if method == "appearance.accent" {
         return serde_json::to_value(appearance::system_accent(app_handle).await).map_err(|error| error.to_string());
     }
-    if method == "table" || method == "detail" || method == "job.start"
+    if matches!(method.as_str(), "table" | "table.facets" | "detail" | "job.start")
         || method.starts_with("turso.") || method.starts_with("release.")
         || method.starts_with("artists.") || method.starts_with("links.") || method.starts_with("queue.") {
         let preferences = db.get_settings().await?;
@@ -1387,425 +1388,10 @@ async fn handle_rpc_uncached(
     }
 
     // TABLE ROUTES
-    if method == "turso.links"
-        || (method == "table"
-            && (args.get("route").and_then(|v| v.as_str()) == Some("links")
-                || args.get("route").and_then(|v| v.as_str()) == Some("files")))
-    {
-        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
-        let root_opt = args.get("root").and_then(|v| v.as_str());
-        let root = if let Some(r) = root_opt {
-            r.to_string()
-        } else {
-            let roots = db.list_roots(market).await?;
-            roots.into_iter().next().map(|r| r.root).unwrap_or_default()
-        };
-        if root.is_empty() {
-            return Ok(json!({
-                "rows": [],
-                "total": 0,
-                "offset": 0,
-                "revision": 0,
-                "preview_id": null
-            }));
-        }
-        let filter = args.get("filter").and_then(|v| v.as_str());
-        let search = args.get("search").and_then(|v| v.as_str());
-        let sort = args.get("sort").and_then(|v| v.as_str());
-        let direction = args.get("direction").and_then(|v| v.as_str());
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-
-        let page = db
-            .get_link_rows(
-                market, &root, filter, search, sort, direction, offset, limit,
-            )
-            .await?;
-        return serde_json::to_value(page).map_err(|e| e.to_string());
-    }
-    if method == "turso.missing"
-        || (method == "table" && args.get("route").and_then(|v| v.as_str()) == Some("missing"))
-    {
-        let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
-        let timeline = args.get("timeline").and_then(|v| v.as_str());
-        let recommendation = args.get("recommendation").and_then(|v| v.as_str());
-        let status_filter = args
-            .get("status")
-            .and_then(|v| v.as_str())
-            .or_else(|| args.get("filter").and_then(|v| v.as_str()));
-        let type_filter = args.get("type").and_then(|v| v.as_str());
-        let search = args.get("search").and_then(|v| v.as_str());
-        let sort = args.get("sort").and_then(|v| v.as_str());
-        let direction = args.get("direction").and_then(|v| v.as_str());
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-
-        let page = db
-            .get_missing_rows_scoped(
-                market,
-                timeline,
-                recommendation,
-                args.get("artist_scope").and_then(Value::as_str),
-                status_filter,
-                type_filter,
-                search,
-                sort,
-                direction,
-                offset,
-                limit,
-            )
-            .await?;
-        let missing = db.get_missing_rows(market, Some("All missing releases"), None, None, None, None, None, None, 0, 0).await?;
-        let mut value = serde_json::to_value(page).map_err(|e|e.to_string())?;
-        value["missing_total"] = json!(missing.total);
-        return Ok(value);
-    }
-    if method == "table" {
-        let route = args
-            .get("route")
-            .and_then(|v| v.as_str())
-            .unwrap_or("files");
-        let search = args.get("search").and_then(|v| v.as_str());
-        let sort = args.get("sort").and_then(|v| v.as_str());
-        let direction = args.get("direction").and_then(|v| v.as_str());
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-        let filter = args.get("filter").and_then(|v| v.as_str());
-
-        let operation = if route == "correct" || route == "organise" {
-            args["action"].as_str().unwrap_or("dates")
-        } else {
-            route
-        };
-        let mut preview = {
-            let previews = state.previews.lock().unwrap();
-            args["preview_id"]
-                .as_str()
-                .and_then(|id| previews.get(id))
-                .or_else(|| {
-                    previews
-                        .values()
-                        .filter(|p| {
-                            p["root"] == args["root"] && p["operation"].as_str() == Some(operation)
-                        })
-                        .max_by_key(|p| p["created"].as_i64().unwrap_or(0))
-                })
-                .cloned()
-        };
-        if matches!(route,"correct"|"organise") {
-            let source=preview_inputs(db,operation).await?;
-            preview=preview.filter(|p|p["source_inputs"]==source && p["root"]==args["root"] && p["operation"]==operation);
-        }
-        let mut cached_rows = if let Some(ref p) = preview {
-            p["rows"].as_array().cloned()
-        } else if ["mqa", "local", "online"].contains(&route) {
-            Some(
-                db.get_preference(&format!(
-                    "desktop-{route}:{}",
-                    args["root"].as_str().unwrap_or("")
-                ))
-                .await?
-                .and_then(|v| v.as_array().cloned())
-                .unwrap_or_default(),
-            )
-        } else {
-            None
-        };
-        let local_manifest_saved = if route == "local" {
-            db.get_preference(&format!(
-                "desktop-local-manifest:{}",
-                args["root"].as_str().unwrap_or("")
-            ))
-            .await?
-        } else {
-            None
-        };
-        if route == "local"
-            && (local_manifest_saved.is_some()
-                || cached_rows.as_ref().is_some_and(|rows| !rows.is_empty()))
-        {
-            let root = args["root"].as_str().unwrap_or("");
-            let current = duplicates::indexed_manifest_fingerprint(db, root).await?;
-            let saved = local_manifest_saved
-                .as_ref()
-                .and_then(|value| value.as_str());
-            if saved != Some(current.as_str()) {
-                let indexed = actions::files(db, root).await?;
-                let rows = duplicates::clusters_to_group_rows(
-                    &duplicates::find_duplicate_clusters(&indexed),
-                );
-                db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
-                    .await?;
-                db.set_preference(&format!("desktop-local-manifest:{root}"), &json!(current))
-                    .await?;
-                cached_rows = Some(rows);
-            }
-        }
-        if route == "mqa" {
-            let root = args["root"].as_str().unwrap_or("");
-            let current = duplicates::indexed_manifest_fingerprint(db, root).await?;
-            let saved = db.get_preference(&format!("desktop-mqa-manifest:{root}")).await?;
-            if saved.as_ref().and_then(Value::as_str) != Some(current.as_str()) {
-                let indexed = actions::files(db, root).await?;
-                let rows = actions::cached_mqa_rows(db, &indexed).await?;
-                db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows)).await?;
-                db.set_preference(&format!("desktop-mqa-manifest:{root}"), &json!(current)).await?;
-                cached_rows = Some(rows);
-            }
-        }
-        if route == "local"
-            && cached_rows.as_ref().is_some_and(|rows| {
-                rows.iter()
-                    .any(|row| row.get("date").is_none() || row.get("children").is_none())
-            })
-        {
-            let root = args["root"].as_str().unwrap_or("");
-            let indexed = actions::files(db, root).await?;
-            let mut rows = cached_rows.take().unwrap_or_default();
-            if rows.iter().any(|row| row.get("children").is_none()) {
-                rows = duplicates::clusters_to_group_rows(&duplicates::find_duplicate_clusters(
-                    &indexed,
-                ));
-            } else {
-                let dates: HashMap<String, String> = indexed
-                    .iter()
-                    .filter_map(|file| {
-                        let tags = workflows::extract_tags_map(&file.metadata);
-                        Some((
-                            duplicates::extract_release_folder(&file.path),
-                            tags.get("date")?.clone(),
-                        ))
-                    })
-                    .collect();
-                for row in &mut rows {
-                    row["date"] = json!(row["path"]
-                        .as_str()
-                        .and_then(|path| dates.get(path))
-                        .cloned()
-                        .unwrap_or_default());
-                    if let Some(children) = row["children"].as_array_mut() {
-                        for child in children {
-                            child["date"] = json!(child["path"]
-                                .as_str()
-                                .and_then(|path| dates.get(path))
-                                .cloned()
-                                .unwrap_or_default());
-                        }
-                    }
-                }
-            }
-            db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
-                .await?;
-            cached_rows = Some(rows);
-        }
-        if let Some(mut rows) = cached_rows {
-            if filter == Some("affected") {
-                rows.retain(|r| r["affected"] == true);
-            }
-            if let Some(q) = search.filter(|s| !s.is_empty()) {
-                let q = q.to_lowercase();
-                rows.retain(|r| r.to_string().to_lowercase().contains(&q));
-            }
-            let sort = sort.unwrap_or("artist");
-            rows.sort_by(|a, b| compare_table_cell(a, b, sort));
-            if direction == Some("desc") {
-                rows.reverse();
-            }
-            let total = rows.len();
-            return Ok(
-                json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,"offset":offset,"revision":db.revision.load(Ordering::SeqCst),"preview_id":preview.as_ref().map(|p|p["id"].clone()),"scanned":route == "local" && (local_manifest_saved.is_some() || total > 0)}),
-            );
-        }
-        if route == "queue" || route == "downloaded" {
-            let page = db
-                .get_queue_rows(route, filter, search, sort, direction, offset, limit)
-                .await?;
-            return serde_json::to_value(page).map_err(|e| e.to_string());
-        }
-        if route == "artists" {
-            let root = args.get("root").and_then(|v| v.as_str());
-            let page = db
-                .get_artist_rows(root, filter, search, sort, direction, offset, limit)
-                .await?;
-            return serde_json::to_value(page).map_err(|e| e.to_string());
-        }
-        if route == "favourites" {
-            let page = db
-                .get_favourite_rows(
-                    args.get("root").and_then(Value::as_str),
-                    filter.unwrap_or("all"),
-                    search.unwrap_or(""),
-                    sort.unwrap_or("artist"),
-                    direction.unwrap_or("asc"),
-                    offset,
-                    limit,
-                )
-                .await?;
-            return serde_json::to_value(page).map_err(|e| e.to_string());
-        }
-        if route == "correct" || route == "organise" {
-            let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
-            let root_opt = args.get("root").and_then(|v| v.as_str());
-            let root = if let Some(r) = root_opt {
-                r.to_string()
-            } else {
-                let roots = db.list_roots(market).await?;
-                roots.into_iter().next().map(|r| r.root).unwrap_or_default()
-            };
-            let action =
-                args.get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(if route == "correct" {
-                        "dates"
-                    } else {
-                        "organise"
-                    });
-            let files = actions::files(db, &root).await?;
-            let settings = db.get_settings().await.unwrap_or(json!({}));
-            let template_str = settings
-                .get("organisation")
-                .and_then(|v| v.get("template"))
-                .and_then(|v| v.as_str());
-            let plans = workflows::plan_cached(db, &files, action, template_str).await?;
-            let file_index: HashMap<_, _> = files
-                .iter()
-                .map(|file| (file.path.as_str(), file))
-                .collect();
-            let preview_id = uuid::Uuid::new_v4().to_string();
-            let mut rows: Vec<Value> = plans.iter().filter_map(|plan| {
-                let file = file_index.get(plan.path.as_str())?;
-                let description = if plan.target.is_some() { "Move or rename file to match its tags" } else { "Standardise local tags" };
-                Some(json!({"id":plan.path,"path":plan.path,"artist":plan.artist,"release":plan.album,"title":plan.title,
-                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"folder_operation":crate::organisation::folder_operation(&plan.path, plan.target.as_deref()),"evidence":if plan.issues.is_empty() { description.to_string() } else { plan.issues.join("; ") },
-                    "affected":!plan.changes.is_empty() || plan.target.is_some(),"status":if plan.changes.is_empty() && plan.target.is_none() { "Needs review" } else { "Needs update" },"size":file.size,"mtime":file.mtime,
-                    "item":{"path":plan.path,"target":plan.target,"tags":plan.changes}}))
-            }).collect();
-            let affected_paths: std::collections::HashSet<String> =
-                plans.iter().map(|plan| plan.path.clone()).collect();
-            for file in &files {
-                if affected_paths.contains(&file.path) {
-                    continue;
-                }
-                let tags = workflows::extract_tags_map(&file.metadata);
-                rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),
-                    "release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":{},"target":null,"folder_operation":"No change",
-                    "affected":false,"status":"No change","evidence":"No changes needed for this operation"}));
-            }
-            let source=preview_inputs(db,action).await?;
-            {
-                let mut previews=state.previews.lock().unwrap();
-                previews.retain(|_,p|p["root"]!=root || p["operation"]!=action);
-                previews.insert(preview_id.clone(), json!({"id":preview_id,
-                    "created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":plans.len(),"source_inputs":source}));
-            }
-            if filter == Some("affected") {
-                rows.retain(|row| row["affected"] == true);
-            }
-            if let Some(q) = search.filter(|q| !q.is_empty()) {
-                let query = q.to_lowercase();
-                rows.retain(|row| row.to_string().to_lowercase().contains(&query));
-            }
-            let key = sort.unwrap_or("artist");
-            rows.sort_by(|a, b| compare_table_cell(a, b, key));
-            if direction == Some("desc") {
-                rows.reverse();
-            }
-            let total = rows.len();
-            return Ok(
-                json!({"rows":rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":total,
-                "offset":offset,"revision":db.revision.load(Ordering::SeqCst),"preview_id":preview_id}),
-            );
-        }
-
-        if route == "metadata" || route == "artwork" || route == "mqa" {
-            let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
-            let root_opt = args.get("root").and_then(|v| v.as_str());
-            let root = if let Some(r) = root_opt {
-                r.to_string()
-            } else {
-                let roots = db.list_roots(market).await?;
-                roots.into_iter().next().map(|r| r.root).unwrap_or_default()
-            };
-            if root.is_empty() {
-                return Ok(json!({
-                    "rows": [],
-                    "total": 0,
-                    "offset": 0,
-                    "revision": 0,
-                    "preview_id": null
-                }));
-            }
-            let page = db
-                .get_link_rows(
-                    market, &root, filter, search, sort, direction, offset, limit,
-                )
-                .await?;
-            return serde_json::to_value(page).map_err(|e| e.to_string());
-        }
-
-        if route == "local" {
-            let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
-            let root_opt = args.get("root").and_then(|v| v.as_str());
-            let root = if let Some(r) = root_opt {
-                r.to_string()
-            } else {
-                let roots = db.list_roots(market).await?;
-                roots.into_iter().next().map(|r| r.root).unwrap_or_default()
-            };
-            if root.is_empty() {
-                return Ok(json!({
-                    "rows": [],
-                    "total": 0,
-                    "offset": 0,
-                    "revision": 0,
-                    "preview_id": null
-                }));
-            }
-            let files = actions::files(db, &root).await?;
-            let clusters = duplicates::find_duplicate_clusters(&files);
-            let mut rows = duplicates::clusters_to_link_rows(&clusters);
-
-            if let Some(q) = search {
-                let q_lower = q.to_lowercase();
-                rows.retain(|r| {
-                    r.artist.to_lowercase().contains(&q_lower)
-                        || r.release.to_lowercase().contains(&q_lower)
-                        || r.target.to_lowercase().contains(&q_lower)
-                        || r.evidence.to_lowercase().contains(&q_lower)
-                });
-            }
-
-            if let Some(key) = sort {
-                rows.sort_by(|a, b| {
-                    let left = serde_json::to_value(a).unwrap_or(Value::Null);
-                    let right = serde_json::to_value(b).unwrap_or(Value::Null);
-                    let order = compare_table_cell(&left, &right, key);
-                    if direction == Some("desc") {
-                        order.reverse()
-                    } else {
-                        order
-                    }
-                });
-            }
-            let total = rows.len();
-            let page_rows = rows.into_iter().skip(offset).take(limit).collect();
-            return serde_json::to_value(crate::db::TablePage {
-                rows: page_rows,
-                total,
-                offset,
-                revision: 0,
-                preview_id: Some("local_duplicates".to_string()),
-            })
-            .map_err(|e| e.to_string());
-        }
-
-        return Ok(json!({
-            "rows": [],
-            "total": 0,
-            "offset": 0,
-            "revision": 0,
-            "preview_id": null
-        }));
+    if matches!(method.as_str(), "table" | "table.facets" | "turso.links" | "turso.missing") {
+        if method == "turso.links" { args["route"] = json!("links"); }
+        if method == "turso.missing" { args["route"] = json!("missing"); }
+        return table_filters::table_result(state, db, &args, method == "table.facets").await;
     }
 
     // DETAILS & PREVIEW
@@ -3271,6 +2857,100 @@ fn main() {
                     });
                 });
         });
+}
+
+#[cfg(test)]
+mod table_filter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn every_table_route_filters_complete_cached_rows_and_facets_before_pagination() {
+        let dir = std::env::temp_dir().join(format!("table-column-filters-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        let root = "/table-fixture";
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO roots(root,status) VALUES(?,'complete')",(root,)).await.unwrap();
+        let cached = json!([
+            {"id":"one","artist":"One","release":"A","date":"2020","children":[],"status":"Needs update","affected":true},
+            {"id":"two","artist":"One","release":"B","date":"2021","children":[],"status":"No change","affected":false},
+            {"id":"three","artist":"Two","release":"C","date":"2022","children":[],"status":"Needs update","affected":true}
+        ]);
+        for (index,artist) in ["One","One","Two"].iter().enumerate() {
+            let path = format!("{root}/{index}.flac");
+            let metadata = json!({"albumartist":artist,"artist":artist,"album":"Local","title":format!("Track {index}"),"date":"2020","tracknumber":format!("{}",index+1),"tracktotal":"3","discnumber":"1","disctotal":"1"});
+            conn.execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES(?,?,1,1,?,1)",(path.as_str(),root,metadata.to_string())).await.unwrap();
+        }
+        conn.execute("INSERT INTO ignored_local_files(path) VALUES(?)",(format!("{root}/1.flac"),)).await.unwrap();
+        conn.execute("INSERT INTO favourite_artists(cache_id,payload) VALUES('user',?)",(json!([{"id":"o","name":"One"},{"id":"t","name":"Two"}]).to_string(),)).await.unwrap();
+        for (name,id) in [("One","o"),("Two","t")] {
+            conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES(?,?,'confirmed')",(name,id)).await.unwrap();
+            let releases:Vec<_> = (0..if name == "One" {2}else{1}).map(|index|json!({"id":format!("{id}{index}"),"title":format!("Remote {index}"),"artist":name,"date":"2023-01-01","type":"ALBUM","track_count":2,"available":index==0,"tracks":[]})).collect();
+            conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES(?,'GB',?)",(id,json!({"name":name,"releases":releases}).to_string())).await.unwrap();
+            for release in releases { db.set_preference(&format!("release-artists:GB:{}",release["id"].as_str().unwrap()),&json!({"ids":[id],"names":[name],"checked_at":1})).await.unwrap(); }
+        }
+        for index in 0..120 {
+            let payload = json!({"artist":if index%2==0{"One"}else{"Two"},"title":format!("Queued {index:03}"),"date":"2023","track_count":1,"tracks_loaded":index==119});
+            conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES(?,?,1,'queued')",(format!("q{index}"),payload.to_string())).await.unwrap();
+        }
+        for index in 0..3 {
+            conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES(?,?,1,'downloaded')",(format!("d{index}"),json!({"artist":if index<2{"One"}else{"Two"},"title":format!("Downloaded {index}"),"date":"2023","track_count":1}).to_string())).await.unwrap();
+        }
+        for route in ["local","online","mqa"] {
+            db.set_preference(&format!("desktop-{route}:{root}"),&cached).await.unwrap();
+        }
+        let manifest = duplicates::indexed_manifest_fingerprint(&db,root).await.unwrap();
+        for route in ["local","mqa"] { db.set_preference(&format!("desktop-{route}-manifest:{root}"),&json!(manifest)).await.unwrap(); }
+        for operation in ["dates","organise"] {
+            backend.previews.lock().unwrap().insert(operation.into(),json!({"id":operation,"root":root,"operation":operation,"created":1,"rows":cached,"source_inputs":preview_inputs(&db,operation).await.unwrap()}));
+        }
+
+        for (route,expected) in [("files",2),("links",2),("artists",1),("favourites",1),("correct",2),("organise",2),("metadata",2),("artwork",2),("mqa",2),("local",2),("online",2),("missing",1),("queue",60),("downloaded",2)] {
+            let args = json!({"route":route,"root":root,"filter":"all","timeline":"All missing releases","recommendation":"All recommendations","type":"All types","action":if route=="organise"{"organise"}else{"dates"},"sort":"artist","direction":"asc","offset":0,"limit":1,"column_filters":{"artist":{"include":["One"]}}});
+            let page = handle_rpc_call(None,&backend,&db,"table".into(),args.clone()).await.unwrap();
+            assert_eq!(page["total"],expected,"{route} must filter all rows, not just its first page");
+            assert_eq!(page["rows"].as_array().unwrap().len(),1,"{route}");
+            assert_eq!(page["rows"][0]["artist"],"One","{route}");
+            let mut facet_args=args.clone();facet_args["column"]=json!("artist");facet_args["limit"]=json!(100);
+            let facets=handle_rpc_call(None,&backend,&db,"table.facets".into(),facet_args).await.unwrap();
+            assert_eq!(facets["total"],2,"{route} must retain its own unchecked value");
+            assert_eq!(facets["options"][0]["count"],expected,"{route}");
+        }
+        let after_first_page = handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","sort":"release","offset":55,"limit":5,"column_filters":{"artist":{"include":["One"]}}})).await.unwrap();
+        for route in ["metadata", "artwork"] {
+            let pending = handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":route,"root":root,"filter":"affected"})).await.unwrap();
+            assert_eq!(pending["total"],0,"{route} must not classify unchanged fallback files as proposed changes");
+        }
+        assert_eq!(after_first_page["total"],60);
+        assert_eq!(after_first_page["rows"].as_array().unwrap().len(),5);
+        assert_eq!(after_first_page["rows"][0]["release"],"Queued 110");
+        let unfiltered_sorted = handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","sort":"expanded_available","direction":"desc","offset":0,"limit":1})).await.unwrap();
+        assert_eq!(unfiltered_sorted["rows"][0]["id"],"q119","a column not handled by the old database sorter must sort the entire dataset");
+        let selected_sorted = handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","sort":"expanded_available","direction":"desc","offset":0,"limit":1,"column_filters":{"artist":{"include":["One","Two"]}}})).await.unwrap();
+        assert_eq!(unfiltered_sorted["rows"],selected_sorted["rows"],"Select all uses the same global ordering as column selections");
+        let multiple = handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","limit":1000,"column_filters":{"artist":{"include":["One","Two"]},"release":{"include":["Queued 110","Queued 111"],"exclude":["Queued 111"]}}})).await.unwrap();
+        assert_eq!(multiple["total"],1);
+        assert_eq!(multiple["rows"][0]["release"],"Queued 110");
+        let all_none = handle_rpc_call(None,&backend,&db,"table".into(),json!({"route":"queue","column_filters":{"artist":{"include":[]}}})).await.unwrap();
+        assert_eq!(all_none["total"],0);
+        let ignored = handle_rpc_call(None,&backend,&db,"table.facets".into(),json!({"route":"links","root":root,"filter":"all","column":"status","column_filters":{"status":{"exclude":["Ignored"]}}})).await.unwrap();
+        assert!(ignored["options"].as_array().unwrap().iter().any(|option|option["value"]=="Ignored"));
+        let include_unavailable = handle_rpc_call(None,&backend,&db,"table.facets".into(),json!({"route":"missing","timeline":"All missing releases","artist_scope":"My album artists","include_unavailable":true,"column":"status","column_filters":{"status":{"exclude":["Unavailable"]}}})).await.unwrap();
+        assert!(include_unavailable["options"].as_array().unwrap().iter().any(|option|option["value"]=="Unavailable"));
+        let no_artist = handle_rpc_call(None,&backend,&db,"table.facets".into(),json!({"route":"missing","timeline":"All missing releases","artist_scope":"Other artist appearances","include_unavailable":true,"column":"status"})).await.unwrap();
+        assert_eq!(no_artist["total"],0,"unavailable rows must still obey album artist scope");
+        let search = handle_rpc_call(None,&backend,&db,"table.facets".into(),json!({"route":"queue","search":"Queued 11","column":"release","facet_search":"8","column_filters":{"artist":{"include":["One"]}}})).await.unwrap();
+        assert_eq!(search["total"],1);
+        assert_eq!(search["options"][0]["value"],"Queued 118");
+        let cache_args=json!({"route":"queue","root":root,"filter":"all","timeline":"All missing releases","recommendation":"All recommendations","type":"All types","action":"dates","sort":"artist","direction":"asc","offset":0,"limit":100,"column":"artist","column_filters":{"artist":{"include":["One"]}}});
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('extra',?,1,'queued')",(json!({"artist":"One","title":"Extra","date":"2023","track_count":1}).to_string(),)).await.unwrap();
+        let reused=handle_rpc_call(None,&backend,&db,"table.facets".into(),cache_args.clone()).await.unwrap();
+        assert_eq!(reused["options"][0]["count"],60,"column changes reuse the shared snapshot until its revision changes");
+        db.bump_revision();
+        let changed=handle_rpc_call(None,&backend,&db,"table.facets".into(),cache_args).await.unwrap();
+        assert_eq!(changed["options"][0]["count"],61,"normal database invalidation refreshes the same facet source");
+        drop(conn);drop(backend);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg(test)]

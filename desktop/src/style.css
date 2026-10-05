@@ -602,13 +602,18 @@ main {
   font-size: 12px;
   color: var(--muted);
 }
-.filters select {
-  max-width: 220px;
-}
-.filters.secondary select {
-  flex: 1;
-  max-width: none;
-}
+.affected-filter { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.table-scope-summary { margin: -3px 0 10px; color: var(--muted); font-size: 11px; }
+.table-view-control { position: relative; }
+.view-options-scrim { position: fixed; inset: 0; z-index: 39; }
+.table-view-options { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; width: 295px; max-width: calc(100vw - 32px); padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); box-shadow: 0 8px 26px #0004; }
+.table-view-options header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.table-view-options header button { width: 27px; height: 27px; padding: 4px; justify-content: center; }
+.table-view-options fieldset { margin: 0; padding: 8px 0; border: 0; }
+.table-view-options fieldset + fieldset { border-top: 1px solid var(--line); }
+.table-view-options legend { padding: 0 0 4px; color: var(--muted); font-size: 11px; font-weight: 600; }
+.table-view-options label { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: 5px; font-size: 12px; cursor: pointer; }
+.table-view-options label:hover { background: var(--accent-soft); }
 .table-scroll {
   flex: 1;
   min-height: 150px;
@@ -1218,6 +1223,11 @@ dialog p {
   margin: 5px;
 }
 .header-context-menu .header-menu-label { padding: 6px 10px 4px; color: var(--muted); font-size: 11px; font-weight: 600; }
+.header-context-menu .column-filter-controls { gap: 4px; margin: 0 6px 6px; }
+.header-context-menu .column-filter-controls button { width: auto; flex: 1; justify-content: center; border: 1px solid var(--line); font-size: 11px; padding: 6px; }
+.header-context-menu .column-filter-values button { gap: 8px; }
+.header-context-menu .column-filter-count { flex: none; font-size: 11px; }
+.header-context-menu .column-filter-search { font-size: 12px; }
 .menu-scrim {
   position: fixed;
   inset: 0;

@@ -11,19 +11,25 @@ import {
 } from "lucide-react";
 import { Row, readable } from "./api";
 import { Selection, parentState, toggleChild, toggleParent } from "./selection";
+import { ColumnSelection, columnSelectionLabel, columnValueSelected, toggleColumnValue } from "./columnFilters";
+export type { ColumnSelection } from "./columnFilters";
 export type Column = { key: string; label: string };
+export type ColumnFilterOption = { value: string; label: string; count?: number };
+export type ColumnFilterOptions = { options: ColumnFilterOption[]; total: number };
 export type HeaderFilter = {
   label: string;
-  value: string;
-  active?: boolean;
-  options: { value: string; label: string }[];
-  onChange: (value: string) => void;
+  selection?: ColumnSelection;
+  /** Changes when data or other column filters change, excluding this filter. */
+  optionsKey?: string;
+  loadOptions: (search: string) => Promise<ColumnFilterOptions>;
+  onChange: (selection: ColumnSelection | undefined) => void;
 };
 type HeaderMenu = {
   column: Column;
   x: number;
   y: number;
   trigger: HTMLElement;
+  instance: number;
 };
 function Check({
   state,
@@ -99,9 +105,22 @@ export function DataTable({
   const [anchor, setAnchor] = useState<number | null>(null);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
   const [menuPosition, setMenuPosition] = useState({ left: 8, top: 8 });
+  const [facetSearch, setFacetSearch] = useState("");
+  const [facetOptions, setFacetOptions] = useState<ColumnFilterOptions | null>(null);
+  const [facetLoading, setFacetLoading] = useState(false);
+  const [facetError, setFacetError] = useState("");
+  const [facetRetry, setFacetRetry] = useState(0);
+  const facetRequest = useRef(0);
+  const menuInstance = useRef(0);
   const headerMenuRef = useRef<HTMLDivElement>(null);
   const headerMenuLabelId = useId();
   const scroller = useRef<HTMLDivElement>(null);
+  const menuFilter = headerMenu ? headerFilters?.[headerMenu.column.key] : undefined;
+  const latestMenuFilter = useRef(menuFilter);
+  latestMenuFilter.current = menuFilter;
+  const menuColumnKey = headerMenu?.column.key;
+  const menuHasFilter = !!menuFilter;
+  const menuOptionsKey = menuFilter?.optionsKey;
   useEffect(() => setAnchor(null), [rows]);
   function closeHeaderMenu() {
     const trigger = headerMenu?.trigger;
@@ -109,29 +128,73 @@ export function DataTable({
     if (trigger?.isConnected) trigger.focus({ preventScroll: true });
   }
   function openHeaderMenu(column: Column, x: number, y: number, trigger: HTMLElement) {
+    setFacetSearch("");
+    setFacetOptions(null);
+    setFacetError("");
     setMenuPosition({ left: Math.max(8, x), top: Math.max(8, y) });
-    setHeaderMenu({ column, x, y, trigger });
+    setHeaderMenu({ column, x, y, trigger, instance: ++menuInstance.current });
   }
+  useEffect(() => {
+    const request = ++facetRequest.current;
+    if (!menuColumnKey || !menuHasFilter) return;
+    setFacetLoading(true);
+    setFacetError("");
+    const timer = window.setTimeout(() => {
+      const filter = latestMenuFilter.current;
+      if (!filter || request !== facetRequest.current) return;
+      Promise.resolve().then(() => filter.loadOptions(facetSearch)).then(result => {
+        if (request !== facetRequest.current) return;
+        setFacetOptions(result);
+        setFacetLoading(false);
+      }).catch(error => {
+        if (request !== facetRequest.current) return;
+        setFacetError(error instanceof Error ? error.message : String(error));
+        setFacetLoading(false);
+      });
+    }, facetSearch ? 150 : 0);
+    return () => {
+      window.clearTimeout(timer);
+      if (facetRequest.current === request) facetRequest.current++;
+    };
+  }, [menuColumnKey, headerMenu?.instance, menuHasFilter, menuOptionsKey, facetSearch, facetRetry]);
   useLayoutEffect(() => {
     if (!headerMenu || !headerMenuRef.current) return;
     const menu = headerMenuRef.current;
     function placeMenu() {
       const box = menu.getBoundingClientRect();
-      setMenuPosition({
+      const position = {
         left: Math.max(8, Math.min(headerMenu!.x, window.innerWidth - box.width - 8)),
         top: Math.max(8, Math.min(headerMenu!.y, window.innerHeight - box.height - 8)),
-      });
+      };
+      setMenuPosition(previous => previous.left === position.left && previous.top === position.top ? previous : position);
     }
     placeMenu();
     menu.querySelector<HTMLButtonElement>("button")?.focus({ preventScroll: true });
+    const observer = new ResizeObserver(placeMenu);
+    observer.observe(menu);
     window.addEventListener("resize", placeMenu);
-    return () => window.removeEventListener("resize", placeMenu);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", placeMenu);
+    };
   }, [headerMenu]);
   useEffect(() => {
     if (headerMenu && !columns.some((column) => column.key === headerMenu.column.key))
       closeHeaderMenu();
   }, [columns, headerMenu]);
-  const menuFilter = headerMenu ? headerFilters?.[headerMenu.column.key] : undefined;
+  useEffect(() => {
+    if (!headerMenu) return;
+    // WebKit does not always focus a clicked menu button. Filtering can also
+    // replace the focused row, so Escape must work even when focus leaves it.
+    function dismiss(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeHeaderMenu();
+    }
+    window.addEventListener("keydown", dismiss, true);
+    return () => window.removeEventListener("keydown", dismiss, true);
+  }, [headerMenu]);
   const headerContextMenu = headerMenu && createPortal(
     <>
       <div className="menu-scrim" onClick={closeHeaderMenu} />
@@ -140,7 +203,7 @@ export function DataTable({
         role="menu"
         aria-label={`${headerMenu.column.label} column options`}
         className="context-menu header-context-menu"
-        style={{ ...menuPosition, maxHeight: "calc(100vh - 16px)", overflowY: "auto" }}
+        style={{ ...menuPosition, width: "min(300px, calc(100vw - 16px))", minWidth: 0, maxHeight: "calc(100vh - 16px)", overflowY: "auto" }}
         onKeyDown={(event) => {
           if (event.key === "Escape" || event.key === "Tab") {
             if (event.key === "Escape") event.preventDefault();
@@ -150,9 +213,10 @@ export function DataTable({
           }
           const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
           const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+          if (event.target instanceof HTMLInputElement && !["ArrowDown", "ArrowUp"].includes(event.key)) return;
           let next: number | undefined;
           if (event.key === "ArrowDown") next = (index + 1) % buttons.length;
-          if (event.key === "ArrowUp") next = (index + buttons.length - 1) % buttons.length;
+          if (event.key === "ArrowUp") next = index < 0 ? buttons.length - 1 : (index + buttons.length - 1) % buttons.length;
           if (event.key === "Home") next = 0;
           if (event.key === "End") next = buttons.length - 1;
           if (next !== undefined) {
@@ -178,20 +242,44 @@ export function DataTable({
         {menuFilter && <>
           <hr />
           <div id={headerMenuLabelId} className="header-menu-label">{menuFilter.label}</div>
-          <div role="group" aria-labelledby={headerMenuLabelId}>
-            {menuFilter.options.map((option) => <button
+          <input
+            className="column-filter-search"
+            type="search"
+            aria-label={`Find ${headerMenu.column.label} values`}
+            placeholder="Find values…"
+            value={facetSearch}
+            onChange={event => setFacetSearch(event.target.value)}
+            style={{ width: "calc(100% - 12px)", margin: "4px 6px 6px", minWidth: 0 }}
+          />
+          <div className="column-filter-controls" style={{ display: "flex" }}>
+            <button role="menuitem" onClick={() => menuFilter.onChange(undefined)}>Select all</button>
+            <button role="menuitem" onClick={() => menuFilter.onChange({ include: [] })}>Clear selection</button>
+          </div>
+          <div role="group" aria-labelledby={headerMenuLabelId} className="column-filter-values" style={{ maxHeight: "min(300px, 40vh)", overflowY: "auto" }}>
+            {(facetOptions?.options || []).map((option) => <button
               key={option.value}
-              role="menuitemradio"
-              aria-checked={menuFilter.value === option.value}
+              role="menuitemcheckbox"
+              aria-checked={columnValueSelected(menuFilter.selection, option.value)}
               onClick={() => {
-                closeHeaderMenu();
-                if (menuFilter.value !== option.value) menuFilter.onChange(option.value);
+                menuFilter.onChange(toggleColumnValue(menuFilter.selection, option.value, !columnValueSelected(menuFilter.selection, option.value)));
               }}
             >
-              <CheckIcon aria-hidden="true" size={14} style={{ opacity: menuFilter.value === option.value ? 1 : 0 }} />
-              {option.label}
+              <CheckIcon aria-hidden="true" size={14} style={{ flexShrink: 0, opacity: columnValueSelected(menuFilter.selection, option.value) ? 1 : 0 }} />
+              <span className="column-filter-value" title={option.label} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.label}</span>
+              {option.count !== undefined && <span className="column-filter-count" style={{ marginLeft: "auto", color: "var(--muted)", fontVariantNumeric: "tabular-nums" }}>{option.count.toLocaleString()}</span>}
             </button>)}
           </div>
+          {facetLoading && <div className="header-menu-label" role="status">Loading values…</div>}
+          {!facetLoading && facetError && <>
+            <div className="header-menu-label" role="alert" title={facetError}>Could not load column values.</div>
+            <button role="menuitem" onClick={() => setFacetRetry(value => value + 1)}>Try again</button>
+          </>}
+          {!facetLoading && !facetError && facetOptions && <div className="header-menu-label" role="status">
+            {!facetOptions.total ? "No matching values" : facetOptions.total > facetOptions.options.length
+              ? `Showing ${facetOptions.options.length.toLocaleString()} of ${facetOptions.total.toLocaleString()} values. Search to find more.`
+              : `${facetOptions.total.toLocaleString()} ${facetOptions.total === 1 ? "value" : "values"}`}
+            {menuFilter.selection !== undefined && ` · ${columnSelectionLabel(menuFilter.selection)}`}
+          </div>}
         </>}
       </div>
     </>,
@@ -298,9 +386,9 @@ export function DataTable({
                   ) : null}
                 </button>
                 {headerFilters?.[c.key] && <button
-                  className={"column-filter-button " + ((headerFilters[c.key].active ?? headerFilters[c.key].value !== headerFilters[c.key].options[0]?.value) ? "active" : "")}
+                  className={"column-filter-button " + (headerFilters[c.key].selection !== undefined ? "active" : "")}
                   aria-label={`Filter ${c.label}`}
-                  title={`${headerFilters[c.key].label}: ${headerFilters[c.key].options.find(option=>option.value === headerFilters[c.key].value)?.label || headerFilters[c.key].value}`}
+                  title={`${headerFilters[c.key].label}: ${columnSelectionLabel(headerFilters[c.key].selection)}`}
                   aria-haspopup="menu"
                   aria-expanded={headerMenu?.column.key === c.key}
                   onClick={(event) => {
