@@ -525,68 +525,6 @@ main {
 .card .toolbar {
   margin: 16px 0 0;
 }
-.update-options {
-  position: relative;
-  margin: 0;
-  padding: 0;
-  background: var(--card);
-}
-.update-options > summary {
-  padding: 7px 12px;
-  min-height: 33px;
-  line-height: 17px;
-  list-style-position: inside;
-}
-.update-options-menu {
-  position: absolute;
-  z-index: 25;
-  top: calc(100% + 6px);
-  left: 0;
-  min-width: 245px;
-  display: grid;
-  gap: 4px;
-  padding: 6px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--card);
-  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
-}
-.update-options-menu > button { text-align: left; justify-content: flex-start; }
-.action-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 10px;
-  margin-bottom: 16px;
-}
-.action-card {
-  padding: 13px 14px;
-  white-space: normal;
-  text-align: left;
-  display: grid;
-  grid-template-columns: 20px 1fr;
-  align-items: start;
-  justify-content: start;
-  position: relative;
-  gap: 7px 10px;
-}
-.action-card small {
-  grid-column: 2;
-  font-size: 11px;
-}
-.action-card > svg:last-child:not(:first-child) {
-  position: absolute;
-  right: 9px;
-  top: 12px;
-}
-.action-card.chosen {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-}
-.action-card.chosen:hover:not(:disabled) { background: var(--accent-selected); }
-.action-card strong {
-  padding-right: 12px;
-  font-size: 12px;
-}
 .filters {
   display: flex;
   gap: 10px;
@@ -617,10 +555,21 @@ main {
 .table-pagination-top { display: flex; flex: none; align-items: center; gap: 12px; margin-left: auto; color: var(--muted); font-size: 11px; }
 .table-pagination-top > div { display: flex; gap: 6px; }
 .table-pagination-top button { height: 30px; padding: 5px 10px; font-size: 12px; }
-.mqa-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-.mqa-replacement-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
-.mqa-actions > button, .mqa-replacement-actions > button, .mqa-actions .split-scan > button { height: 34px; padding-top: 0; padding-bottom: 0; }
+.table-actions { display: flex; flex: none; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; min-height: 34px; }
+.table-result-actions, .mqa-replacement-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.table-actions > button, .table-result-actions > button, .mqa-replacement-actions > button, .table-actions .split-scan > button, .table-actions .split-action > button { height: 34px; padding-top: 0; padding-bottom: 0; }
 .mqa-actions .split-scan > button:first-child { min-width: 104px; }
+.reset-column-filters { width: 33px; height: 33px; padding: 0; flex: none; }
+.split-action { display: inline-flex; flex: none; }
+.split-action.has-options > button:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split-action > .action-menu-trigger { width: 30px; padding: 6px; justify-content: center; border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: 0; }
+.action-menu { z-index: 200; width: 305px; padding: 5px; border: 1px solid var(--line); border-radius: 9px; background: var(--card); box-shadow: 0 8px 26px #0004; overscroll-behavior: contain; }
+.action-menu > button { display: flex; align-items: center; width: 100%; text-align: left; white-space: normal; padding: 8px 7px; border: 0; background: none; gap: 8px; }
+.action-menu > button:hover:not(:disabled), .action-menu > button:focus-visible { background: var(--accent-hover); }
+.action-menu-check { width: 16px; flex: none; color: var(--accent); }
+.action-menu strong, .action-menu small { display: block; }
+.action-menu strong { font-size: 12px; font-weight: 550; }
+.action-menu small { margin-top: 2px; font-size: 11px; line-height: 1.4; color: var(--muted); }
 .split-scan { display: flex; position: relative; flex: none; }
 .split-scan > button:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .split-scan > .scan-scope-trigger { width: 30px; padding: 6px; justify-content: center; border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: 1px solid var(--line); }
@@ -631,7 +580,6 @@ main {
 .scan-scope-menu strong, .scan-scope-menu small { display: block; }
 .scan-scope-menu strong { font-size: 12px; font-weight: 550; }
 .scan-scope-menu small { margin-top: 2px; font-size: 11px; color: var(--muted); }
-.table-scope-summary { margin: -3px 0 10px; color: var(--muted); font-size: 11px; }
 .table-view-control { position: relative; }
 .view-options-scrim { position: fixed; inset: 0; z-index: 39; }
 .table-view-options { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; width: 295px; max-width: calc(100vw - 32px); padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); box-shadow: 0 8px 26px #0004; }
@@ -813,27 +761,6 @@ tr.child.selected { background: var(--selected); }
   font-weight: 600;
   border: 1px solid #7c3aed33;
 }
-.cluster-callout {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 14px;
-  margin-bottom: 12px;
-  background: color-mix(in srgb, var(--surface) 85%, #7c3aed 15%);
-  border: 1px solid color-mix(in srgb, var(--line) 60%, #7c3aed 40%);
-  border-radius: 8px;
-  font-size: 12px;
-}
-.cluster-callout-text {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.cluster-callout-text svg {
-  color: #8b5cf6;
-  flex-shrink: 0;
-}
 .review-cluster-item {
   border-left: 3px solid #8b5cf6;
 }
@@ -847,23 +774,6 @@ tr.child.selected { background: var(--selected); }
 }
 .empty p {
   margin-top: 7px;
-}
-.table-footer {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding-top: 12px;
-  color: var(--muted);
-  font-size: 11px;
-  gap: 10px;
-}
-.table-footer > div {
-  display: flex;
-  gap: 7px;
-}
-.table-footer button {
-  font-size: 11px;
-  padding: 5px 10px;
 }
 .notice {
   display: flex;
@@ -1292,9 +1202,6 @@ dialog p {
   .header-actions {
     flex-direction: column;
     align-items: flex-end;
-  }
-  .action-grid {
-    grid-template-columns: repeat(2, 1fr);
   }
   .metrics {
     grid-template-columns: repeat(2, 1fr);

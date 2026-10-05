@@ -47,6 +47,10 @@ async function viewOption(page: Page, label: string, value: string) {
   await dialog.getByRole("radiogroup", {name: label, exact: true}).getByRole("radio", {name: value, exact: true}).check();
   await dialog.getByRole("button", {name: "Close view options", exact: true}).click();
 }
+async function actionOption(page: Page, trigger: string, option: string, role: "menuitem" | "menuitemradio" = "menuitem") {
+  await page.getByRole("button", {name: trigger, exact: true}).click();
+  await page.getByRole(role, {name: option, exact: true}).click();
+}
 function displayColumnValue(value: any): string {
   return value == null ? "—" : typeof value === "object" ? Array.isArray(value)
     ? value.map(displayColumnValue).join(" · ")
@@ -208,7 +212,7 @@ test("queue approvals and lazy tracks stay usable during independent scans and r
   await expect(dialog).not.toContainText("First Light");
   await expect(dialog.getByRole("button",{name:"Start download",exact:true})).toBeEnabled();
   await dialog.getByRole("button",{name:"Cancel",exact:true}).click();
-  await page.getByRole("button",{name:"Export",exact:true}).click();
+  await actionOption(page, "Download options", "Export");
   await expect(page.getByRole("dialog")).toContainText("tidal.com/track/");
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
@@ -267,6 +271,15 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
       const columns=await page.locator(".table-header-actions").count();
       await expect(page.getByRole("button",{name:/^Filter /})).toHaveCount(columns);
       await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
+      const pagination=page.getByRole("navigation",{name:"Table pagination",exact:true});
+      const actions=page.getByRole("group",{name:"Table actions",exact:true});
+      await expect(pagination).toBeVisible();
+      await expect(actions).toBeVisible();
+      const tableBox=(await page.locator(".table-scroll").boundingBox())!;
+      const paginationBox=(await pagination.boundingBox())!, actionsBox=(await actions.boundingBox())!;
+      expect(paginationBox.y+paginationBox.height).toBeLessThanOrEqual(tableBox.y+1);
+      expect(actionsBox.y).toBeGreaterThanOrEqual(tableBox.y+tableBox.height-1);
+      await expect(page.locator(".action-grid, .table-footer")).toHaveCount(0);
     }
     if (name === "MQA audit") await expect(page.getByRole("button",{name:"Scan selected tracks",exact:true})).toBeEnabled();
     await expect(page.getByRole("alert")).toHaveCount(0);
@@ -284,6 +297,28 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
       await page.screenshot({path:`docs/imgs/${screenshots[name]}.png`});
     }
   }
+  await page.setViewportSize({width:980,height:680});
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  const updateOptions=page.getByRole("button",{name:"Release update options",exact:true});
+  await updateOptions.click();
+  const updateMenu=page.getByRole("menu",{name:"Release update options",exact:true});
+  await expect(updateMenu).toBeVisible();
+  const menuBox=(await updateMenu.boundingBox())!, triggerBox=(await updateOptions.boundingBox())!;
+  expect(menuBox.y+menuBox.height).toBeLessThanOrEqual(triggerBox.y);
+  expect(menuBox.x).toBeGreaterThanOrEqual(0);
+  expect(menuBox.x+menuBox.width).toBeLessThanOrEqual(980);
+  for (const key of ["Home","End"] as const) {
+    await updateMenu.press(key);
+    const item=key === "Home" ? updateMenu.locator("button:not(:disabled)").first() : updateMenu.locator("button:not(:disabled)").last();
+    await expect(item).toBeFocused();
+    const itemBox=(await item.boundingBox())!;
+    expect(itemBox.y).toBeGreaterThanOrEqual(menuBox.y);
+    expect(itemBox.y+itemBox.height).toBeLessThanOrEqual(menuBox.y+menuBox.height);
+    expect(await page.evaluate(()=>window.scrollY)).toBe(0);
+  }
+  await updateMenu.press("Escape");
+  await expect(updateOptions).toBeFocused();
+  await expect(updateMenu).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 
@@ -346,7 +381,7 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
   await expect(parent).toHaveJSProperty("indeterminate", true);
   await expect.poll(async () => (await rpc("queue.export",{format:"text"})).result?.text)
     .toBe("https://tidal.com/track/91000101\nhttps://tidal.com/track/91000102\n");
-  await page.getByRole("button",{name:"Export",exact:true}).click();
+  await actionOption(page, "Download options", "Export");
   await expect(page.getByRole("textbox",{name:"Download links"})).toHaveValue("https://tidal.com/track/91000101\nhttps://tidal.com/track/91000102\n");
   await expect(page.getByRole("dialog")).not.toContainText("JSON");
   await page.getByRole("button",{name:"Close",exact:true}).click();
@@ -529,7 +564,7 @@ test("overview restores the library and shows cached missing releases", async ({
 test("reviewed number corrections run through the UI and survive navigation", async ({ page }) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button", { name: "Correct tags", exact: true }).click();
-  await page.getByRole("button", { name: /Track & disc numbers/ }).click();
+  await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
   await page.getByRole("button", { name: "Preview changes", exact: true }).click();
   await expect(page.getByRole("button", { name: "Preview changes", exact: true })).toBeEnabled();
   await page.getByRole("checkbox", { name: "Select visible rows" }).check();
@@ -768,7 +803,14 @@ test("metadata and settings use readable views without implementation panels", a
 test("automatic correction previews can be applied and all-files view remains available", async ({page}) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Correct tags",exact:true}).click();
-  await page.getByRole("button",{name:/Track & disc numbers/}).click();
+  await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
+  await expect(page.getByRole("button",{name:"Preview changes",exact:true})).toHaveText("Preview track & disc numbers");
+  await page.getByRole("button",{name:"Choose correction",exact:true}).click();
+  const correctionMenu=page.getByRole("menu",{name:"Choose correction",exact:true});
+  await expect(correctionMenu.getByRole("menuitemradio",{checked:true})).toHaveCount(1);
+  await expect(correctionMenu.getByRole("menuitemradio",{name:"Track & disc numbers",exact:true})).toHaveAttribute("aria-checked","true");
+  await correctionMenu.press("Escape");
+  await expect(page.getByRole("button",{name:/Review & apply/})).toHaveCount(1);
   await expect(page.locator("tbody tr")).toHaveCount(2);
   await page.getByRole("checkbox",{name:"Select visible rows"}).check();
   await page.getByRole("button",{name:/Review & apply/}).click();
@@ -967,7 +1009,7 @@ test("local change checks reuse indexed tags and keep dependent controls gated a
   await expect.poll(()=>scans.length).toBe(1);
   expect(scans[0].force).not.toBe(true);
   await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
-  await expect(page.getByRole("button",{name:"Check local changes",exact:true})).toBeDisabled();
+  await expect(page.getByRole("button",{name:"Linking options",exact:true})).toBeDisabled();
   await expect(page.getByRole("button",{name:"Link unresolved tracks",exact:true})).toBeDisabled();
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
   await expect(page.getByRole("button",{name:"Update missing releases",exact:true})).toBeDisabled();
@@ -1005,8 +1047,7 @@ test("cached release recheck reports activity and preserves release order and to
   const args = {route:"missing",timeline:"All missing releases",sort:"date",direction:"desc",limit:100};
   const before = (await rpc("table",args)).result;
   expect(before.total).toBe(before.missing_total);
-  await page.getByText("More update options",{exact:true}).click();
-  await page.getByRole("button",{name:"Recalculate saved results",exact:true}).click();
+  await actionOption(page, "Release update options", "Recalculate saved results");
   await expect.poll(async () => (await rpc("job.status")).result.online_job?.status).toBe("complete");
   const after = (await rpc("table",args)).result;
   expect(after.rows.map((row:any)=>row.id)).toEqual(before.rows.map((row:any)=>row.id));
@@ -1116,7 +1157,7 @@ test("missing release defaults keep low matches inspectable without inflating ov
   await confidenceMenu.press("Escape");
   await expect(page.locator("tbody")).toContainText("Verified catalogue");
   await expect(page.locator("tbody")).not.toContainText("Unrelated catalogue");
-  await expect(page.locator(".table-footer")).toContainText("1–2 of 2");
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–2 of 2");
   await columnAll(page,"Recommendation");
   await expect(page.locator("tbody")).toContainText("Unrelated catalogue");
   await expect(page.locator("tbody")).toContainText("Unmatched catalogue");
@@ -1196,7 +1237,7 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   await recommendationMenu.press("Escape");
   await columnOnly(page,"Type",["ALBUM"]);
   await expect(page.getByRole("button",{name:"Filter Type",exact:true})).toHaveClass(/active/);
-  await expect(page.locator(".table-footer")).toContainText("1–30 of 30");
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–30 of 30");
   await expect(selected).toBeChecked();
   await expect(page.getByRole("button",{name:"Collapse Release 00",exact:true})).toHaveCount(1);
   const typeMenu=await columnMenu(page,"Type");
@@ -1205,9 +1246,9 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   if(process.env.TIBRARY_SCREENSHOTS) await page.screenshot({path:"/tmp/tibrary-column-checkbox-filters.png"});
   await columnValue(typeMenu,"EP").click();
   await expect(typeMenu).toBeVisible();
-  await expect(page.locator(".table-footer")).toContainText("1–60 of 60");
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–60 of 60");
   await columnValue(typeMenu,"ALBUM").click();
-  await expect(page.locator(".table-footer")).toContainText("1–30 of 30");
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–30 of 30");
   await typeMenu.getByRole("menuitem",{name:"Select all",exact:true}).click();
   await typeMenu.press("Escape");
   await expect(page.getByRole("button",{name:"Filter Type",exact:true})).not.toHaveClass(/active/);
@@ -1260,7 +1301,7 @@ test("real table facets filter before paging and share checkbox rules across wor
   await columnOnly(page,"Status",["Linked"]);
   await expect(page.locator("tbody tr")).toHaveCount(2);
   await sidebar.getByRole("button",{name:"Correct tags",exact:true}).click();
-  await page.getByRole("button",{name:/Track & disc numbers/}).click();
+  await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
   await expect(page.locator("tbody tr")).toHaveCount(2);
   const tagMenu=await columnMenu(page,"Proposed tag changes");
   await expect(tagMenu.getByRole("menuitemcheckbox").first()).toBeVisible();
@@ -1420,23 +1461,23 @@ test("missing release availability checks use the requested scope and preserve u
   await viewOption(page,"Album artist scope","All artist appearances");
   await columnOnly(page,"Coverage",["Unavailable"]);
   await expect(page.locator("tbody")).toContainText("Private Weather");
-  await expect(page.getByText("All missing releases",{exact:false}).first()).toBeVisible();
+  await expect(page.getByRole("button",{name:"View options",exact:true})).toHaveAttribute("title",/All missing releases/);
   await columnAll(page, "Coverage");
   await viewOption(page,"Album artist scope","My album artists");
   await columnOnly(page,"Coverage",["Missing release","Owned partial"]);
   await page.getByRole("checkbox",{name:"Select Blue Hours",exact:true}).check();
-  await page.getByRole("button",{name:"Check availability",exact:true}).click();
+  await actionOption(page, "Release update options", "Check availability");
   await expect.poll(()=>checks.length).toBe(1);
   expect(checks[0].ids).toEqual(["910001"]);
   expect(checks[0].force).toBeUndefined();
-  await expect(page.getByRole("button",{name:"Check availability",exact:true})).toBeDisabled();
+  await expect(page.getByRole("button",{name:"Release update options",exact:true})).toBeDisabled();
   await sidebar.getByRole("button",{name:"Overview",exact:true}).click();
   await expect(page.getByRole("button",{name:"Show activity: Check release availability",exact:true})).toBeVisible();
   job={...job,status:"complete",completed:1,message:"Availability check complete · cached results saved"};
   await sidebar.getByRole("button",{name:"Missing releases",exact:true}).click();
-  await expect(page.getByRole("button",{name:"Check availability",exact:true})).toBeEnabled();
+  await expect(page.getByRole("button",{name:"Release update options",exact:true})).toBeEnabled();
   const visible=(await rpc("table",{route:"missing",timeline:"All missing releases",recommendation:"My album artists",filter:"all",limit:50})).result.rows;
-  await page.getByRole("button",{name:"Check availability",exact:true}).click();
+  await actionOption(page, "Release update options", "Check availability");
   await expect.poll(()=>checks.length).toBe(2);
   expect([...checks[1].ids].sort()).toEqual(visible.map((row:any)=>row.id).sort());
   await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
@@ -1445,13 +1486,11 @@ test("missing release availability checks use the requested scope and preserve u
   await expect.poll(()=>checks.length).toBe(3);
   expect(checks[2].ids).toEqual(["910001"]);
   expect(checks[2].force).toBe(true);
-  await page.getByText("More update options",{exact:true}).click();
-  await page.getByRole("button",{name:"Check saved release availability",exact:true}).click();
+  await actionOption(page, "Release update options", "Check saved release availability");
   await expect.poll(()=>checks.length).toBe(4);
   expect(checks[3].ids).toBeUndefined();
   expect(checks[3].force).toBeUndefined();
-  await page.getByText("More update options",{exact:true}).click();
-  await page.getByRole("button",{name:"Recheck saved availability online",exact:true}).click();
+  await actionOption(page, "Release update options", "Recheck saved availability online");
   await expect.poll(()=>checks.length).toBe(5);
   expect(checks[4].ids).toBeUndefined();
   expect(checks[4].force).toBe(true);

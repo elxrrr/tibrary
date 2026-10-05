@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.15** · [Setup and screenshots](../../README.md)
+Version **0.9.16** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -16,9 +16,11 @@ Libraries and their indexed/linked track counts load first. Local dashboard stat
 | Settings → General | Manage the subscriber connection, libraries, appearance, downloads and matching preferences. |
 | Settings → Activity | Search one saved activity log; inspect detailed checks and cancel individual workers. |
 
+Table pages keep search, column filters and pagination above the table, with workflow actions below. Use the arrow beside an action to choose a correction, scan scope or related check; choosing a correction does not apply it. Secondary actions explain whether they use selected rows, the visible page or the whole library.
+
 ### Local changes
 
-Select one correction or organisation operation, then review the affected files before applying it. Previews use the shared local index and are reused until their inputs change. Tag corrections and folder moves are separate actions. Folder previews show current and proposed paths, including whitespace changes.
+Use the arrow beside **Preview** to choose one correction or organisation operation, then preview and review the affected files before applying it. Previews use the shared local index and are reused until their inputs change. Tag corrections and folder moves are separate actions. Folder previews show current and proposed paths, including whitespace changes.
 
 Track/disc matching treats `01` and `1` equally. Number corrections use padded tags and flag impossible totals such as `04/1`. Consistent local or cached online evidence can supply replacement totals; ambiguous cases require review.
 
@@ -50,13 +52,13 @@ A release is marked superseded only when cached evidence shows a newer available
 | --- | --- |
 | Check local changes | Update the shared index after editing files outside Tibrary; reuse unchanged tags. |
 | Update missing releases | Fill missing evidence for your downloaded, linked releases first, then check artist release lists and complete new, changed or incomplete candidates. |
-| More update options → Check release lists only | Check for new releases without collecting additional track details. |
-| More update options → Fill missing release artists | Fill album artist evidence for older cached releases. |
-| Check availability | Check selected releases, or the visible page; reuse recent market checks. |
-| More update options → Check saved release availability | Check all saved missing releases for your linked album artists using cached checks where possible. |
-| More update options → Recheck saved availability online | Request fresh checks, including previously unavailable releases; bypass cached availability. |
-| More update options → Recalculate saved results | Recalculate ownership and recommendations locally, without API requests. |
-| Reread all tags in General | Force a complete tag read if an external editor preserved file size and modification time. |
+| Release update options → Check release lists only | Check for new releases without collecting additional track details. |
+| Release update options → Fill missing release artists | Fill album artist evidence for older cached releases. |
+| Release update options → Check availability | Check selected releases, or the visible page; reuse recent market checks. |
+| Release update options → Check saved release availability | Check all saved missing releases for your linked album artists using cached checks where possible. |
+| Release update options → Recheck saved availability online | Request fresh checks, including previously unavailable releases; bypass cached availability. |
+| Release update options → Recalculate saved results | Recalculate ownership and recommendations locally, without API requests. |
+| Reread all tags in General or a local scan menu | Force a complete tag read if an external editor preserved file size and modification time. |
 | Get missing metadata in a release’s metadata view | Complete that release’s missing metadata, reusing checked track details and credits. |
 | Refresh track details and credits | Request a fresh check for a particular release. |
 | Recheck availability | Request a fresh market-availability check. |
@@ -85,7 +87,7 @@ Choose the destination, template and audio options in General. Approve releases 
 
 MQA replacements use the selected library's existing file paths, including multiple copies of a recording. Previous copies stay recoverable until the replacement audio and queue status are indexed. Recording, mix and duration conflicts stop the replacement for review.
 
-**Export** saves a plain-text list of media URLs, one per line, for an external downloader. Whole approved releases produce album URLs; individually approved tracks produce track URLs. Unapproved and empty selections are omitted. Tidaler accepts this list with `tidaler dl --list acquisition-queue.txt`.
+The arrow beside **Download** includes **Export**; Downloaded releases keeps its own Export action. **Export** saves a plain-text list of media URLs, one per line, for an external downloader. Whole approved releases produce album URLs; individually approved tracks produce track URLs. Unapproved and empty selections are omitted. Tidaler accepts this list with `tidaler dl --list acquisition-queue.txt`.
 
 In Downloaded releases, checked releases or tracks limit the export without changing the saved queue. With no checked items, the export uses the saved completed-download selections.
 

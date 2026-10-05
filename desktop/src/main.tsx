@@ -17,10 +17,10 @@ import {
   Disc,
   Download,
   Folder,
+  FilterX,
   Heart,
   House,
   Image,
-  Layers,
   Link,
   LoaderCircle,
   Music2,
@@ -53,6 +53,7 @@ import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import { CoalescedQuery } from "./query";
 import { ScanButton, ScanScope } from "./ScanButton";
+import { ActionButton, ActionButtonOption } from "./ActionButton";
 import "./style.css";
 import { version as appVersion } from "../package.json";
 const groups = [
@@ -1080,297 +1081,133 @@ function App() {
       </div>
     );
   }
-  function toolbar() {
-    return (
-      <div className="toolbar">
-        {[
-          "files",
-          "correct",
-          "organise",
-          "metadata",
-          "artwork",
-          "links",
-        ].includes(route) && (
-          <button disabled={localBusy || !root} onClick={() => run("scan")} title="Update the shared index after editing files outside the app. Only new or changed file tags are read.">
-            <RefreshCw size={15} />
-            Check local changes
-          </button>
-        )}
-        {["correct", "organise"].includes(route) && (
-          <>
-            <button
-              className="primary"
-              disabled={busy || !root}
-              onClick={() => run("preview", { action })}
-            >
-              Preview {action === "organise" ? "moves" : "changes"}
-            </button>
-            <button
-              disabled={busy || !preview || !selected.size}
-              onClick={prepareApply}
-            >
-              Review & apply ({selected.size})
-            </button>
-          </>
-        )}
-        {route === "links" && (
-          <>
-            <button
-              className="primary"
-              disabled={busy || !root}
-              onClick={() => run("link", scope())}
-            >
-              {selected.size
-                ? `Recheck ${selected.size} selected`
-                : "Link unresolved tracks"}
-            </button>
-            <button
-              disabled={busy || !root}
-              onClick={() => run("link", { editions_only: true })}
-            >
-              Recheck edition choices
-            </button>
-            <button
-              disabled={!selected.size}
-              onClick={() => loadDetail({ id: [...selected][0] })}
-            >
-              Choose match
-            </button>
-            <button
-              disabled={busy || !selected.size}
-              onClick={() => run("deep_review", scope())}
-            >
-              Extended review
-            </button>
-          </>
-        )}
-        {route === "artists" && (
-          <>
-            <button
-              className="primary"
-              disabled={busy}
-              onClick={() =>
-                run(
-                  "match_artists",
-                  selected.size ? { artists: [...selected] } : {},
-                )
-              }
-            >
-              {selected.size
-                ? "Match selected artists"
-                : "Match artist"}
-            </button>
-            <button disabled={!selected.size} onClick={() => loadDetail({id: [...selected][0]})}>Review match</button>
-            <button disabled={busy || !selected.size} onClick={() => unlinkArtists([...selected])}>Unlink selected artists</button>
-          </>
-        )}
-        {["metadata", "artwork"].includes(route) && (
-          <>
-            <button
-              className="primary"
-              disabled={busy || !root}
-              onClick={() => run(route, scope())}
-              title={route === "metadata" ? "Read verified recording links and shared cached metadata, then fetch missing release details, credits and available BPM/key data. This creates a preview; files change only after you review and apply it." : "Reuse cached cover information and artwork inspections, then fetch genuine high-resolution covers for linked releases. This creates a preview; files change only after you review and apply it."}
-            >
-              {route === "metadata"
-                ? "Find missing tags (online)"
-                : "Find artwork (online)"}
-            </button>
-            <button
-              disabled={localBusy || active(state?.download_job) || !preview || !selected.size}
-              onClick={prepareApply}
-            >
-              Review & apply ({selected.size})
-            </button>
-          </>
-        )}
-        {["local", "online"].includes(route) && (
-          <>
-            <button
-              className="primary"
-              disabled={busy || !root}
-              onClick={() =>
-                run(route === "local" ? "local_duplicates" : "optimizations", {
-                  scope: route === "local" ? "local" : "remote",
-                })
-              }
-            >
-              {route === "local" ? "Check local duplicates" : "Find cached replacements"}
-            </button>
-            {route === "local" && data.rows.some((r: any) => r.status === "Chained duplicate") && (
-              <button
-                disabled={busy}
-                onClick={() => {
-                  const chained = data.rows
-                    .filter((r: any) => r.status === "Chained duplicate")
-                    .map((r: any) => r.id);
-                  setSelected(new Set(chained));
-                }}
-              >
-                Select all chained ({data.rows.filter((r: any) => r.status === "Chained duplicate").length})
-              </button>
-            )}
-            {route === "online" && (
-              <button
-                disabled={busy || !root}
-                onClick={() => run("check_replacements", { scope: "remote" })}
-              >
-                Search online replacements
-              </button>
-            )}
-            <button
-              disabled={busy || route === "online" || !selected.size}
-              onClick={() =>
-                run("review_consolidation", {
-                  ids: [...selected],
-                  scope: route === "local" ? "local" : "remote",
-                })
-              }
-            >
-              Review duplicate removal {selected.size ? `(${selected.size})` : ""}
-            </button>
-            {route === "online" && (
-              <button
-                disabled={busy || !selected.size}
-                onClick={() =>
-                  run("queue_replacements", { ids: [...selected] })
-                }
-              >
-                Queue replacement releases
-              </button>
-            )}
-          </>
-        )}
-        {route === "favourites" && (
-          <><button disabled={busy || !root} onClick={() => run("match_artists")}>Match local artists</button>
-          <button
-            className="primary"
-            disabled={busy}
-            onClick={() => run("favourites")}
-          >
-            Refresh favourite artists
-          </button></>
-        )}
-        {route === "missing" && (
-          <>
-            <button
-              className="primary"
-              disabled={busy}
-              onClick={() => run("discography", { detailed: true })}
-              title="Complete missing reference metadata for your downloaded, linked releases first. Then check artist release lists and fill new, changed or incomplete candidate details: tracks, contributor credits, available catalogue tags and BPM/key. Checked credits are reused. The first fill can take hours; choose Check release lists only for a lighter discovery check. No audio is downloaded."
-            >
-              Update missing releases
-            </button>
-            <button
-              disabled={busy || loading || (!data.rows.length && !Object.keys(selectedReleases(selection)).length)}
-              onClick={() => run("check_availability", {
-                ids: Object.keys(selectedReleases(selection)).length
-                  ? Object.keys(selectedReleases(selection))
-                  : data.rows.map(row => row.id),
-              })}
-              title="Check selected releases, or this page of visible releases when none are selected. Recent market checks are reused; confirmed unavailable releases leave the default view."
-            >
-              Check availability
-            </button>
-            {state?.catalogue_refresh && state.catalogue_refresh.status !== "complete" && state.catalogue_refresh.completed.length < state.catalogue_refresh.ids.length && !active(state.online_job) && (
-              <button disabled={busy} onClick={() => run("discography", { ...state.catalogue_refresh, resume: true })}>
-                Resume refresh ({state.catalogue_refresh.completed.length}/{state.catalogue_refresh.ids.length})
-              </button>
-            )}
-            <details className="update-options">
-              <summary>More update options</summary>
-              <div className="update-options-menu">
-                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("discography");}} title="A faster discovery check: refresh linked artist release lists and market availability, reusing saved track details. New releases can appear before their full recommendation evidence is collected. No audio is downloaded.">Check release lists only</button>
-                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("release_artists", { timeline });}} title="Fill missing album artist evidence for older saved releases; reuse existing checks.">Fill missing release artists</button>
-                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("check_availability");}} title="Check all saved missing releases for your linked album artists. Recent market checks are reused; no audio is downloaded.">Check saved release availability</button>
-                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("check_availability", {force:true});}} title="Request fresh market checks for all saved missing releases, including previously unavailable releases. Bypass cached availability checks; no audio is downloaded.">Recheck saved availability online</button>
-                <button disabled={busy} onClick={event => {event.currentTarget.closest("details")?.removeAttribute("open"); run("cached_releases");}} title="Recalculate ownership and recommendations from the shared database without contacting the service.">Recalculate saved results</button>
-              </div>
-            </details>
-            <button
-              disabled={
-                queueBusy || !Object.keys(selectedReleases(selection)).length
-              }
-              onClick={() =>
-                mutate("queue.add", { selection: selectedReleases(selection) })
-              }
-            >
-              Queue selected ({Object.keys(selectedReleases(selection)).length})
-            </button>
-          </>
-        )}
-        {route === "queue" && (
-          <>
-            <button
-              className="primary"
-              disabled={downloadBusy || !state?.stats.approved_queue}
-              onClick={async () => {
-                setSubmitting(true);
-                try { setReview({ operation: "download", rows: await call("queue.preview") }); }
-                catch (e) { notifyError(e); }
-                finally { setSubmitting(false); }
-              }}
-            >
-              <ArrowDownToLine size={16} />
-              Download
-            </button>
-            <button disabled={submitting} onClick={() => openExport("queue")}>
-              Export
-            </button>
-          </>
-        )}
-        {route === "downloaded" && (
-          <button disabled={submitting} onClick={() => openExport("downloaded")}>
-            Export
-          </button>
-        )}
-      </div>
-    );
+  function chooseOperation(operation: string) {
+    setAction(operation);
+    setPreview(undefined);
+    setSelected(new Set());
+    setColumnSelections(defaultColumnSelections(route));
+    setOffset(0);
   }
-  function pagination(className = "table-footer") {
-    const Container = className === "table-footer" ? "footer" : "nav";
-    return <Container className={className} aria-label="Table pagination">
+  function selectedDetail() {
+    const id = [...selected][0];
+    if (id) loadDetail(data.rows.find(row => row.id === id) || {id, artist:id});
+  }
+  function tableActions() {
+    const localOptions: ActionButtonOption[] = [
+      {id:"local-changes",label:"Check local changes",note:"Update the shared index for added, changed or removed files. Unchanged tags are reused.",disabled:localBusy || !root,onClick:() => run("scan")},
+      {id:"reread-tags",label:"Reread all tags",note:"Read every file again after external edits. Music files stay unchanged.",disabled:localBusy || !root,onClick:() => run("scan", {force:true})},
+    ];
+    const selectedReleaseCount = Object.keys(selectedReleases(selection)).length;
+    const clear = !tree && selected.size > 0 && <button onClick={() => setSelected(new Set())}>Clear selection</button>;
+    const apply = <button disabled={localBusy || active(state?.download_job) || !preview || !selected.size} onClick={prepareApply}>Review & apply ({selected.size})</button>;
+    let controls: React.ReactNode;
+    if (["correct", "organise"].includes(route)) {
+      const operations = route === "correct" ? actions : organisationActions;
+      const name = operations.find(([id]) => id === action)?.[1] || operations[0][1];
+      const label = action === "dates" ? "Preview dates" : action === "numbers" ? "Preview track & disc numbers" : action === "keys" ? "Preview musical keys" : action === "lyrics" ? "Preview lyric removal" : `Preview ${name.toLowerCase()}`;
+      controls = <><ActionButton label={label} ariaLabel={route === "organise" ? "Preview moves" : "Preview changes"}
+        onClick={() => run("preview", {action})} disabled={busy || !root}
+        busy={active(state?.job) && state?.job?.kind === "preview"} busyLabel="Preparing preview…"
+        menuLabel={route === "correct" ? "Choose correction" : "Choose organisation action"}
+        title="Preview one operation at a time. Files change only after you review and apply the selected proposals."
+        options={[...operations.map(([id,label,note]) => ({id,label,note,selected:action === id,onClick:() => chooseOperation(id)})),...localOptions]} />
+        {clear}<div className="table-result-actions">{apply}</div></>;
+    } else if (route === "files") {
+      controls = <><ActionButton label="Check local changes" onClick={() => run("scan")} disabled={localBusy || !root}
+        busy={active(state?.job) && state?.job?.kind === "scan"} busyLabel="Checking local changes…"
+        menuLabel="Local scan options" title={localOptions[0].note} options={localOptions.slice(1)} />{clear}</>;
+    } else if (route === "links") {
+      controls = <><ActionButton label={selected.size ? `Recheck ${selected.size} selected` : "Link unresolved tracks"}
+        onClick={() => run("link",scope())} disabled={submitting || !root || (busy && localBusy)} actionDisabled={busy} menuLabel="Linking options"
+        title="Match selected tracks, or only unresolved tracks when nothing is selected. Saves links without changing music files."
+        options={[
+          {id:"editions",label:"Recheck edition choices",note:"Recheck only unresolved tracks that need an edition choice across this library.",disabled:busy,onClick:() => run("link",{editions_only:true})},
+          {id:"extended",label:"Extended review",note:"Review the selected tracks with extended matching evidence.",disabled:busy || !selected.size,onClick:() => run("deep_review",scope())},
+          ...localOptions,
+        ]} />{clear}<div className="table-result-actions"><button disabled={!selected.size} onClick={selectedDetail}>Choose match</button></div></>;
+    } else if (route === "artists") {
+      controls = <><ActionButton label={selected.size ? "Match selected artists" : "Match artist"}
+        onClick={() => run("match_artists",selected.size ? {artists:[...selected]} : {})} disabled={submitting || !root || (busy && localBusy)} actionDisabled={busy}
+        menuLabel="Artist matching options" title="Match selected album artists, or unresolved album artists when nothing is selected."
+        options={[
+          {id:"unresolved",label:"Match unresolved artists",note:"Reuse confirmed artists and check only artists that still need a match.",disabled:busy,onClick:() => run("match_artists")},
+          {id:"unlink",label:"Unlink selected artists",note:"Remove artist associations. File tags and recording links stay unchanged.",disabled:busy || !selected.size,onClick:() => unlinkArtists([...selected])},
+          ...localOptions,
+        ]} />{clear}<div className="table-result-actions"><button disabled={!selected.size} onClick={selectedDetail}>Review match</button></div></>;
+    } else if (["metadata", "artwork"].includes(route)) {
+      controls = <><ActionButton label={route === "metadata" ? "Find missing tags (online)" : "Find artwork (online)"}
+        onClick={() => run(route,scope())} disabled={submitting || !root || (busy && localBusy)} actionDisabled={busy}
+        title={route === "metadata" ? "Reuse verified links and cached metadata, then fill missing credits, tags and available BPM/key. Files change only after review and approval." : "Reuse saved cover information, then find genuine 1280 × 1280 covers for linked tracks. Files change only after review and approval."}
+        menuLabel={route === "metadata" ? "Metadata lookup options" : "Artwork lookup options"}
+        options={[
+          {id:"all",label:route === "metadata" ? "Find missing tags for all files" : "Find artwork for all files",note:"Use every indexed file in this library, reusing completed checks where possible.",disabled:busy,onClick:() => run(route)},
+          ...localOptions,
+        ]} />{clear}<div className="table-result-actions">{apply}</div></>;
+    } else if (["local", "online"].includes(route)) {
+      const local = route === "local";
+      controls = <><ActionButton label={local ? "Check local duplicates" : "Find cached replacements"}
+        onClick={() => run(local ? "local_duplicates" : "optimizations",{scope:local ? "local" : "remote"})}
+        disabled={busy || !root} menuLabel={local ? "Duplicate check options" : "Replacement search options"}
+        title={local ? "Find releases fully contained in another local release, using the shared tag index. Review before moving redundant audio to Trash." : "Find complete online replacements using saved catalogue data. Makes no network requests."}
+        options={local ? [
+          {id:"chained",label:"Select chained duplicates",note:"Select chained duplicate groups on this page for one removal review.",disabled:loading || !data.rows.some(row => row.status === "Chained duplicate"),onClick:() => setSelected(new Set(data.rows.filter(row => row.status === "Chained duplicate").map(row => row.id)))},
+          ...localOptions,
+        ] : [
+          {id:"online",label:"Search online replacements",note:"Fill missing catalogue evidence before checking for larger releases that preserve your recordings.",onClick:() => run("check_replacements",{scope:"remote"})},
+          ...localOptions,
+        ]} />{clear}<div className="table-result-actions">{local
+          ? <button disabled={busy || !selected.size} onClick={() => run("review_consolidation",{ids:[...selected],scope:"local"})}>Review duplicate removal {selected.size ? `(${selected.size})` : ""}</button>
+          : <button disabled={busy || !selected.size} onClick={() => run("queue_replacements",{ids:[...selected]})}>Queue replacement releases {selected.size ? `(${selected.size})` : ""}</button>}</div></>;
+    } else if (route === "favourites") {
+      controls = <><ActionButton label="Refresh favourite artists" onClick={() => run("favourites")} disabled={submitting || (busy && localBusy)} actionDisabled={busy}
+        menuLabel="Favourite artist options" title="Refresh online favourites and compare them with linked local album artists."
+        options={[{id:"match",label:"Match local artists",note:"Match unresolved local album artists to their online identities.",disabled:busy || !root,onClick:() => run("match_artists")},...localOptions]} />{clear}</>;
+    } else if (route === "missing") {
+      const refresh = state?.catalogue_refresh;
+      const resumable = refresh && refresh.status !== "complete" && refresh.completed.length < refresh.ids.length;
+      controls = <><ActionButton label="Update missing releases" onClick={() => run("discography",{detailed:true})} disabled={busy}
+        menuLabel="Release update options"
+        title="Check linked artists' release lists and fill missing track details, credits and recommendation evidence. Saved complete checks are reused; no audio is downloaded."
+        options={[
+          ...(resumable ? [{id:"resume",label:`Resume refresh (${refresh.completed.length}/${refresh.ids.length})`,note:"Continue the saved refresh from the last completed artist.",onClick:() => run("discography",{...refresh,resume:true})}] : []),
+          {id:"lists",label:"Check release lists only",note:"A quicker discovery check that reuses saved track details and credits. No audio is downloaded.",onClick:() => run("discography")},
+          {id:"artists",label:"Fill missing release artists",note:"Complete missing album artist evidence for saved releases in the current release range.",onClick:() => run("release_artists",{timeline})},
+          {id:"selected-availability",label:"Check availability",note:selectedReleaseCount ? "Check the selected releases, reusing recent availability checks." : "Check the releases on this page, reusing recent availability checks.",disabled:loading || (!data.rows.length && !selectedReleaseCount),onClick:() => run("check_availability",{ids:selectedReleaseCount ? Object.keys(selectedReleases(selection)) : data.rows.map(row => row.id)})},
+          {id:"saved-availability",label:"Check saved release availability",note:"Check all saved missing releases for linked album artists, reusing recent checks.",onClick:() => run("check_availability")},
+          {id:"fresh-availability",label:"Recheck saved availability online",note:"Request fresh availability for all saved releases, including unavailable ones. Bypasses saved availability checks.",onClick:() => run("check_availability",{force:true})},
+          {id:"cached",label:"Recalculate saved results",note:"Update ownership and recommendations from the central cache. Makes no network requests.",onClick:() => run("cached_releases")},
+        ]} /><div className="table-result-actions"><button disabled={queueBusy || !selectedReleaseCount}
+          onClick={() => mutate("queue.add",{selection:selectedReleases(selection)})}>Queue selected ({selectedReleaseCount})</button></div></>;
+    } else if (route === "queue") {
+      controls = <ActionButton label={active(state?.download_job) ? "Downloading…" : "Download"} ariaLabel="Download"
+        disabled={submitting} actionDisabled={downloadBusy || !state?.stats.approved_queue}
+        onClick={async () => {
+          setSubmitting(true);
+          try {setReview({operation:"download",rows:await call("queue.preview")});}
+          catch(e) {notifyError(e);} finally {setSubmitting(false);}
+        }} menuLabel="Download options" title="Review and download all approved audio tracks in the queue, including approvals on other pages."
+        options={[{id:"export",label:"Export",note:"Save queued release or track links as a text list for an external downloader.",onClick:() => openExport("queue")}]} />;
+    } else if (route === "downloaded") {
+      controls = <button disabled={submitting} onClick={() => openExport("downloaded")}>Export</button>;
+    }
+    return <div className="table-actions" role="group" aria-label="Table actions" key={route}>{controls}</div>;
+  }
+  function pagination() {
+    return <nav className="table-pagination-top" aria-label="Table pagination">
       <span>
         {data.total
           ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
           : "No items"}
-        {route === "links" &&
-          ` · ${state?.stats.linked_releases || 0} complete releases / ${state?.stats.linked_tracks || 0} linked tracks`}
       </span>
       <div>
         <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button>
         <button disabled={offset + pageSize >= data.total} onClick={() => setOffset(offset + pageSize)}>Next</button>
       </div>
-    </Container>;
+    </nav>;
   }
   function tablePage() {
     return (
       <>
-        {["correct", "organise"].includes(route) && (
-          <div className="action-grid">
-            {(route === "correct" ? actions : organisationActions).map(
-              ([id, name, note]) => (
-                <button
-                  key={id}
-                  className={"action-card " + (action === id ? "chosen" : "")}
-                  disabled={busy}
-                  onClick={() => {
-                    setAction(id);
-                    setPreview(undefined);
-                    setSelected(new Set());
-                    setColumnSelections(defaultColumnSelections(route));
-                  }}
-                >
-                  <Tags size={18} />
-                  <strong>{name}</strong>
-                  <small>{note}</small>
-                  {action === id && <Check size={16} />}
-                </button>
-              ),
-            )}
-          </div>
-        )}
-        {route !== "mqa" && toolbar()}
         <div className="filters">
           <label className="search">
             <Search size={16} />
@@ -1403,32 +1240,10 @@ function App() {
               </div>
             </>}
           </div>}
-          {Object.keys(columnSelections).length > 0 && <button onClick={() => {setColumnSelections({});setOffset(0);}} title="Show all column values within the current view options">Reset column filters</button>}
+          {Object.keys(columnSelections).length > 0 && <button className="reset-column-filters" aria-label="Reset column filters" onClick={() => {setColumnSelections({});setOffset(0);}} title="Reset column filters: show all column values within the current view options"><FilterX size={16} /></button>}
           {selected.size > 0 && <span>{selected.size} selected</span>}
-          {!selected.size && route === "missing" && <span>{(data.missing_total ?? data.total).toLocaleString()} missing, incomplete or queued in total</span>}
-          {route === "mqa" && pagination("table-pagination-top")}
+          {pagination()}
         </div>
-        {route === "missing" && <div className="table-scope-summary">{artistScope} · {timeline}</div>}
-        {route === "local" && data.rows.length > 0 && (
-          <div className="cluster-callout">
-            <div className="cluster-callout-text">
-              <Layers size={16} />
-              <span>
-                <strong>Absorbable Duplicates Found:</strong> Older releases, singles, and EPs are fully contained within larger albums. You can safely trash redundant tracks while keeping complete versions.
-              </span>
-            </div>
-            {data.rows.some((row: Row) => row.status === "Chained duplicate") && <button
-              onClick={() => {
-                const chained = data.rows
-                  .filter((r: any) => r.status === "Chained duplicate")
-                  .map((r: any) => r.id);
-                setSelected(new Set(chained));
-              }}
-            >
-              Select all chained ({data.rows.filter((r: any) => r.status === "Chained duplicate").length})
-            </button>}
-          </div>
-        )}
         <DataTable
           rows={data.rows}
           columns={columns}
@@ -1456,8 +1271,8 @@ function App() {
           loading={loading}
           busy={tree ? queueBusy : busy}
         />
-        {route !== "mqa" && pagination()}
-        {route === "mqa" && <div className="mqa-actions">
+        {route !== "mqa" && tableActions()}
+        {route === "mqa" && <div className="mqa-actions table-actions" role="group" aria-label="Table actions">
           <ScanButton count={mqaSummaryCurrent ? mqaSummary!.counts.selected : selected.size} scope={mqaScope}
             disabled={localBusy || !root || mqaScopePending} selectionPending={!mqaSummaryCurrent}
             scanning={active(state?.job) && state?.job?.kind === "mqa"}
