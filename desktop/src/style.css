@@ -492,29 +492,6 @@ main {
 .empty-note {
   padding: 18px 0;
 }
-.workflow-guide h2 {
-  margin: 28px 0 16px;
-}
-.workflow-guide > div {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-}
-.workflow-guide button {
-  padding: 16px;
-  white-space: normal;
-  justify-content: flex-start;
-  text-align: left;
-}
-.workflow-guide button span {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--muted);
-  margin-right: 3px;
-}
-.workflow-guide button svg {
-  margin-left: auto;
-}
 .toolbar {
   display: flex;
   gap: 8px;
@@ -702,6 +679,8 @@ tr.child td.track-title { padding-left: 32px; }
   border-radius: 0;
   vertical-align: middle;
 }
+.hierarchy-name { overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.hierarchy-name:hover:not(:disabled) { color: var(--accent) !important; text-decoration: underline; text-underline-offset: 3px; }
 .badge {
   font-size: 10px;
   display: inline-block;
@@ -740,6 +719,7 @@ tr.child td.track-title { padding-left: 32px; }
 .badge.needs-review,
 .badge.review,
 .badge.unresolved,
+.badge.not-linked,
 .badge.multi-duplicate,
 .badge.duplicate {
   background: #bf94321a;
@@ -1018,17 +998,20 @@ dialog {
   border-radius: 14px;
   box-shadow: 0 20px 100px #0005;
   padding: 0;
-  width: min(640px, 90vw);
-  max-height: 85vh;
+  width: min(840px, calc(100vw - 48px));
+  max-height: calc(100dvh - 48px);
+  overflow: hidden;
 }
+dialog[open] { display: flex; flex-direction: column; }
 dialog.wide {
-  width: min(960px, 90vw);
+  width: min(1440px, calc(100vw - 64px));
 }
 dialog::backdrop {
   background: #0d15294d;
   backdrop-filter: blur(3px);
 }
 dialog header {
+  flex: none;
   padding: 18px 22px;
   display: flex;
   align-items: center;
@@ -1041,11 +1024,14 @@ dialog header button {
   background: none;
 }
 dialog .modal-body {
+  flex: 1;
+  min-height: 0;
   padding: 20px 22px;
   overflow: auto;
-  max-height: 64vh;
+  max-height: none;
 }
 dialog footer {
+  flex: none;
   padding: 15px 22px;
   border-top: 1px solid var(--line);
   display: flex;
@@ -1205,9 +1191,6 @@ dialog p {
   .settings-grid {
     grid-template-columns: 1fr;
   }
-  .workflow-guide > div {
-    grid-template-columns: repeat(2, 1fr);
-  }
 }
 @media (prefers-reduced-motion: reduce) {
   * {
@@ -1226,10 +1209,15 @@ dialog p {
   overscroll-behavior-y: contain;
   scrollbar-gutter: stable;
 }
-.overview-page { display: flex; flex-direction: column; }
-.overview-dashboard { display: flex; flex-direction: column; flex-shrink: 0; }
-.latest-missing-card { display: flex; flex-direction: column; flex-shrink: 0; }
-.latest-missing-card .overview-list { height: auto; max-height: 320px; flex: 0 0 auto; }
+.overview-page { display: flex; flex-direction: column; overflow: hidden; }
+.overview-dashboard { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 16px; }
+.overview-dashboard .metrics { flex: none; margin-bottom: 0; }
+.overview-dashboard > .card { margin-bottom: 0; padding: 16px; }
+.libraries-card { flex: none; }
+.libraries-card .overview-list { max-height: 128px; }
+.latest-missing-card { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.latest-missing-card .section-heading { flex: none; }
+.latest-missing-card .overview-list { height: auto; max-height: none; min-height: 0; flex: 1; }
 .overview-list > .library-row {
   height: 64px;
   box-sizing: border-box;

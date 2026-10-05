@@ -51,7 +51,13 @@ async function actionOption(page: Page, trigger: string, option: string, role: "
   await page.getByRole("button", {name: trigger, exact: true}).click();
   await page.getByRole(role, {name: option, exact: true}).click();
 }
-async function localTrackRow(page: Page, title: string, release = "Blue Hours"): Promise<Locator> {
+async function expandLocalArtist(page: Page, artist = "North Assembly") {
+  const expander = page.getByRole("button", {name: new RegExp(`^(Expand|Collapse) ${artist.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`)});
+  await expect(expander).toBeVisible();
+  if (await expander.getAttribute("aria-expanded") !== "true") await expander.click();
+}
+async function localTrackRow(page: Page, title: string, release = "Blue Hours", artist = "North Assembly"): Promise<Locator> {
+  await expandLocalArtist(page, artist);
   const expander = page.getByRole("button", {name: new RegExp(`^(Expand|Collapse) ${release.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`)});
   await expect(expander).toBeVisible();
   if (await expander.getAttribute("aria-expanded") !== "true") await expander.click();
@@ -112,7 +118,7 @@ for artist, in c.execute("SELECT artist FROM mappings").fetchall():
  c.execute("INSERT OR REPLACE INTO match_reviews(artist,payload) VALUES(?,?)",(artist,json.dumps({"candidates":[{"artist":{"id":"900001","name":"North Assembly"},"evidence":"Saved candidate"}]})))
 c.commit()`, join(folder,"db")]);
   }
-  if (test.info().title.startsWith("link releases group local files")) {
+  if (test.info().title.startsWith("link releases group local files") || test.info().title.startsWith("artist hierarchy")) {
     // Create extra real files before the disposable backend opens its database.
     execFileSync("python3", ["-c", `import json,sqlite3,sys
 from pathlib import Path
@@ -125,6 +131,22 @@ for disc,title,track_id in [(1,'Signal','91000200'),(2,'Afterimage','91000201')]
  metadata={'albumartist':['North Assembly'],'artist':['North Assembly'],'album':['Night Maps'],'title':[title],'tracknumber':['1/1'],'discnumber':[f'{disc}/2'],'date':['2022-09-16'],'duration':180.0,'tidal_album_id':'910002','tidal_track_id':track_id}
  c.execute('INSERT INTO local_files VALUES (?,?,?,?,?,NULL,1)',(str(path),str(library),path.stat().st_size,path.stat().st_mtime_ns,json.dumps(metadata)))
 c.commit()`, join(folder,"db"), join(folder,"music")], {
+      env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
+    });
+  }
+  if (test.info().title.startsWith("artist hierarchy")) {
+    execFileSync("python3", ["-c", `import json,sqlite3,sys
+from pathlib import Path
+from seed_desktop import write_flac
+library=Path(sys.argv[2]); c=sqlite3.connect(sys.argv[1])
+for artist,performer,album,title,track,total in [('Various Artists','First Performer','Night Sessions','Opening',1,2),('Various Artists','Second Performer','Night Sessions','Closing',2,2),('New Local','New Local','Home Tape','Sketch',1,1)]:
+ path=library/artist/f'{album} (2024)'/f'{title}.flac'
+ write_flac(path,artist,album,title,track,total)
+ metadata={'albumartist':[artist],'artist':[performer],'album':[album],'title':[title],'tracknumber':[f'{track}/{total}'],'discnumber':['1/1'],'date':['2024-01-05'],'duration':180.0}
+ c.execute('INSERT INTO local_files VALUES (?,?,?,?,?,NULL,1)',(str(path),str(library),path.stat().st_size,path.stat().st_mtime_ns,json.dumps(metadata)))
+c.execute('CREATE TABLE IF NOT EXISTS favourite_artists(cache_id TEXT PRIMARY KEY,payload TEXT,fetched TEXT)')
+c.execute('INSERT INTO favourite_artists VALUES(?,?,?)',('test',json.dumps([{'id':'900001','name':'North Assembly Online'},{'id':'900099','name':'Remote Favourite'}]),'2026-10-05'))
+c.commit()`, join(folder,"db"), join(folder,"music")],{
       env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
     });
   }
@@ -268,6 +290,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     await expect(page.getByRole("region",{name:"Latest missing releases"}).locator(".library-row").first()).toBeVisible();
     await page.screenshot({path:"docs/imgs/overview.png"});
   }
+  const categoryPages: Record<string,string> = {"Prepare library":"Correct tags", "Link catalogue":"Link artists", "Complete library":"Missing releases", "Update library":"MQA audit", "Settings":"General"};
   for (const name of [
     "Prepare library",
     "Correct tags",
@@ -295,7 +318,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
       .getByRole("button", { name, exact: true })
       .click();
     await expect(
-      page.getByRole("heading", { name, exact: true }).first(),
+      page.getByRole("heading", { name:categoryPages[name] || name, exact: true }).first(),
     ).toBeVisible();
     if (await page.locator(".table-scroll").count()) {
       await expect(page.locator(".table-scroll")).toHaveAttribute("aria-busy", "false");
@@ -315,6 +338,16 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     if (name === "MQA audit") await expect(page.getByRole("button",{name:"Scan selected tracks",exact:true})).toBeEnabled();
     await expect(page.getByRole("alert")).toHaveCount(0);
     if (process.env.TIBRARY_SCREENSHOTS && screenshots[name]) {
+      if (name === "Link releases") await columnAll(page,"Status");
+      if (["Link artists","Favourite artists","Link releases"].includes(name)) {
+        const artist=page.getByRole("button",{name:"Expand North Assembly",exact:true});
+        if (await artist.count()) await artist.click();
+      }
+      if (name === "Link releases") {
+        const remaining=page.locator("tbody").getByRole("button",{name:/^Expand /});
+        for(let count=0;count<20 && await remaining.count();count++) await remaining.first().click();
+        await expect(page.getByRole("checkbox",{name:"Select track Low Tide",exact:true})).toBeVisible();
+      }
       if (name === "Local duplicates") {
         await page.getByRole("button", {name:"Check local duplicates",exact:true}).click();
         await expect(page.locator(".header-workload")).toBeVisible();
@@ -363,17 +396,21 @@ test("window navigation remains available with the sidebar hidden and overview l
   await expect(page.locator("aside")).toBeHidden();
   expect((await page.locator("main").boundingBox())!.x).toBe(0);
   await page.getByRole("button", {name:"Back",exact:true}).click();
-  await expect(page.getByRole("heading", {name:"Prepare library",exact:true})).toBeVisible();
+  await expect(page.getByRole("heading", {name:"Correct tags",exact:true})).toBeVisible();
   await page.getByRole("button", {name:"Forward",exact:true}).click();
-  await expect(page.getByRole("heading", {name:"Link catalogue",exact:true})).toBeVisible();
+  await expect(page.getByRole("heading", {name:"Link artists",exact:true})).toBeVisible();
   await page.getByRole("button", {name:"Back",exact:true}).click();
   await page.getByRole("button", {name:"Show sidebar",exact:true}).click();
   await page.locator("aside").getByRole("button", {name:"Overview",exact:true}).click();
   await expect(page.getByRole("button", {name:"Forward",exact:true})).toBeDisabled();
   const list = page.getByRole("region", {name:"Latest missing releases"});
   await expect(list.locator(".library-row").first()).toBeVisible();
-  expect((await list.boundingBox())!.height).toBeLessThanOrEqual(320);
+  const listBox=(await list.boundingBox())!, mainBox=(await page.locator("main").boundingBox())!;
+  expect(listBox.height).toBeGreaterThan(320);
+  expect(listBox.y+listBox.height).toBeLessThanOrEqual(mainBox.y+mainBox.height);
   expect(await list.evaluate(element => getComputedStyle(element).overflowY)).toBe("auto");
+  expect(await page.locator("main").evaluate(element=>element.scrollHeight <= element.clientHeight+1)).toBe(true);
+  expect(await page.evaluate(()=>window.scrollY)).toBe(0);
 });
 test("local table sorting and filters are usable", async ({ page }) => {
   await page.goto("/");
@@ -470,6 +507,7 @@ test("multiple file context action affects only selected files", async ({
   await expect(page.locator("tbody tr")).toHaveCount(0);
   await columnOnly(page, "Status", ["Ignored"]);
   await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expandLocalArtist(page);
   await page.getByRole("button", {name:"Expand Blue Hours",exact:true}).click();
   await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
   await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).toBeVisible();
@@ -506,8 +544,11 @@ test("link releases group local files and keep selected track actions scoped", a
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
   await columnAll(page,"Status");
-  await expect(page.locator("tbody tr")).toHaveCount(2);
-  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–2 of 2");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("2 releases");
+  const artist=page.getByRole("checkbox",{name:"Select North Assembly",exact:true});
+  await expandLocalArtist(page);
+  await expect(page.locator("tbody tr")).toHaveCount(3);
   const parent=page.getByRole("checkbox",{name:"Select Blue Hours",exact:true});
   await parent.check();
   const firstTrack=await localTrackRow(page,"First Light");
@@ -523,15 +564,16 @@ test("link releases group local files and keep selected track actions scoped", a
   await expect(driftCheck).toBeChecked();
   await firstCheck.uncheck();
   await expect(parent).toHaveJSProperty("indeterminate",true);
+  await expect(artist).toHaveJSProperty("indeterminate",true);
   await expect(page.getByRole("checkbox",{name:"Select visible rows",exact:true})).toHaveJSProperty("indeterminate",true);
   await page.getByRole("button",{name:"Release",exact:true}).click();
   await page.getByRole("button",{name:"Release",exact:true}).click();
   await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await expect(page.getByRole("button",{name:"Collapse North Assembly",exact:true})).toBeVisible();
   await expect(driftCheck).toBeChecked();
   await expect(firstCheck).not.toBeChecked();
   if(process.env.TIBRARY_SCREENSHOTS) {
-    await page.screenshot({path:"/tmp/tibrary-expanded-linked-releases-0.9.18.png"});
-    await page.screenshot({path:"docs/imgs/link_releases.png"});
+    await page.screenshot({path:"/tmp/tibrary-expanded-linked-releases-0.9.19.png"});
   }
   const driftPath=join(root,"Drift.flac");
   await page.getByRole("button",{name:"Recheck 1 selected",exact:true}).click();
@@ -554,6 +596,127 @@ test("link releases group local files and keep selected track actions scoped", a
   const ignored=(await rpc("table",{...args,column_filters:{status:{include:["Ignored"]}}})).result;
   expect(ignored.rows[0].children.map((row:any)=>row.path)).toEqual([join(root,"First Light.flac")]);
   expect(requests.every(request=>!(request.args.ids || request.args.args.ids).some((id:string)=>id.startsWith("local-release:")))).toBe(true);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+test("artist hierarchy shows local release evidence without exposing online IDs or track controls", async ({page}) => {
+  const root=join(folder,"music"), errors:string[]=[], detailArtists:string[]=[];
+  page.on("pageerror",error=>errors.push(error.message));
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="detail" && request.args.artist) detailArtists.push(request.args.artist);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  const sidebar=page.locator("aside");
+  await sidebar.getByRole("button",{name:"Link artists",exact:true}).click();
+  await expect(page.getByRole("columnheader",{name:/Online ID/i})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Evidence",exact:true})).toBeVisible();
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody")).not.toContainText("Various Artists");
+  await page.getByRole("button",{name:"North Assembly",exact:true}).click();
+  const blue=page.locator("tbody tr").filter({has:page.getByRole("button",{name:"Blue Hours",exact:true})});
+  const night=page.locator("tbody tr").filter({has:page.getByRole("button",{name:"Night Maps",exact:true})});
+  await expect(blue).toBeVisible();
+  await expect(night).toBeVisible();
+  await expect(blue).toContainText("Linked");
+  await expect(blue.locator("input[type=checkbox], button[aria-label^=Actions]")).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Expand Blue Hours",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("checkbox",{name:/Select track/})).toHaveCount(0);
+  await blue.getByRole("button",{name:"Blue Hours",exact:true}).click();
+  const dialog=page.getByRole("dialog");
+  await expect(dialog).toContainText("Local release details");
+  await expect(dialog).toContainText("Blue Hours");
+  await expect(dialog).toContainText("2 local tracks");
+  const box=(await dialog.boundingBox())!;
+  expect(box.width).toBeGreaterThanOrEqual(1300);
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.y+box.height).toBeLessThanOrEqual(1000);
+  await dialog.getByRole("button",{name:"Done",exact:true}).click();
+  const catalogue=(await rpc("table",{route:"favourites",root,local_releases:true,limit:100})).result;
+  expect(catalogue.total).toBe(3);
+  const canonical=catalogue.rows.find((row:any)=>row.artist==="North Assembly Online");
+  expect(canonical.children).toHaveLength(2);
+  expect(canonical.tracks).toBe(4);
+  expect(canonical.lookup_artist).toBe("North Assembly");
+  expect(catalogue.rows.some((row:any)=>row.artist==="North Assembly")).toBe(false);
+  await sidebar.getByRole("button",{name:"Favourite artists",exact:true}).click();
+  await expect(page.getByRole("columnheader",{name:/Online ID/i})).toHaveCount(0);
+  await expect(page.locator("tbody tr")).toHaveCount(3);
+  const north=page.locator("tbody tr").filter({has:page.getByRole("button",{name:"North Assembly Online",exact:true})});
+  const local=page.locator("tbody tr").filter({has:page.getByRole("button",{name:"New Local",exact:true})});
+  await expect(north).toContainText("In library");
+  await expect(north).toContainText("Linked");
+  await expect(local).toContainText("Local only");
+  await expect(local).toContainText("Not linked");
+  await expandLocalArtist(page,"North Assembly Online");
+  await expect(page.getByRole("button",{name:"Blue Hours",exact:true})).toBeVisible();
+  await expect(page.getByRole("button",{name:"Night Maps",exact:true})).toBeVisible();
+  await expect(page.getByRole("button",{name:"Expand Blue Hours",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("checkbox",{name:/Select track/})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Expand Remote Favourite",exact:true})).toHaveCount(0);
+  await page.getByRole("button",{name:"Actions for North Assembly Online",exact:true}).click();
+  await page.getByRole("menuitem",{name:"View metadata / match details",exact:true}).click();
+  await expect(page.getByRole("dialog")).toContainText("Local recordings");
+  await expect(page.getByRole("dialog")).toContainText("North Assembly");
+  expect(detailArtists).toEqual(["North Assembly"]);
+  await page.getByRole("dialog").getByRole("button",{name:"Done",exact:true}).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+test("artist hierarchy keeps compilation releases together and resolves selected file paths at every level", async ({page}) => {
+  const root=join(folder,"music"), requests:any[]=[];
+  const args={route:"links",root,group_releases:true,group_artists:true,sort:"artist",direction:"asc",limit:1};
+  const all=(await rpc("table",{...args,limit:100})).result;
+  expect(all.total).toBe(3);
+  expect(all.release_total).toBe(4);
+  expect(all.track_total).toBe(7);
+  const compilation=all.rows.find((row:any)=>row.artist==="Various Artists");
+  expect(compilation.artist_group).toBe(true);
+  expect(compilation.children).toHaveLength(1);
+  expect(compilation.children[0].release).toBe("Night Sessions");
+  expect(compilation.children[0].children.map((row:any)=>row.title)).toEqual(["Opening","Closing"]);
+  const first=(await rpc("table",args)).result, second=(await rpc("table",{...args,offset:1})).result;
+  expect(first.total).toBe(3);
+  expect(first.rows).toHaveLength(1);
+  expect(first.rows[0].id).not.toBe(second.rows[0].id);
+  const north=all.rows.find((row:any)=>row.artist==="North Assembly");
+  expect(north.children).toHaveLength(2);
+  const paths=north.children.flatMap((release:any)=>release.children.map((track:any)=>track.path));
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start" && request.args.kind==="link") {
+      requests.push(request);
+      await route.fulfill({json:{result:{id:"artist-scope-check",kind:"link",status:"complete",message:"Selected files checked"}}});
+    } else await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await columnAll(page,"Status");
+  await expect(page.locator("tbody tr")).toHaveCount(3);
+  await page.getByRole("checkbox",{name:"Select North Assembly",exact:true}).check();
+  await page.getByRole("button",{name:"Recheck 4 selected",exact:true}).click();
+  await expect.poll(()=>requests.length).toBe(1);
+  expect(requests[0].args.args.ids.sort()).toEqual(paths.sort());
+  await expandLocalArtist(page);
+  await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeChecked();
+  await expect(page.getByRole("checkbox",{name:"Select Night Maps",exact:true})).toBeChecked();
+  await page.getByRole("checkbox",{name:"Select Blue Hours",exact:true}).uncheck();
+  await expect(page.getByRole("checkbox",{name:"Select North Assembly",exact:true})).toHaveJSProperty("indeterminate",true);
+  const track=await localTrackRow(page,"Signal","Night Maps");
+  await track.getByRole("checkbox",{name:"Select track Signal",exact:true}).uncheck();
+  await expect(page.getByRole("checkbox",{name:"Select Night Maps",exact:true})).toHaveJSProperty("indeterminate",true);
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Collapse North Assembly",exact:true})).toBeVisible();
+  await expect(page.getByRole("button",{name:"Collapse Night Maps",exact:true})).toBeVisible();
+  await page.getByRole("button",{name:"Recheck 1 selected",exact:true}).click();
+  await expect.poll(()=>requests.length).toBe(2);
+  expect(requests[1].args.args.ids).toEqual([join(root,"North Assembly/Night Maps (2022)/Disc 2/Afterimage.flac")]);
+  await expandLocalArtist(page,"Various Artists");
+  await expect(page.getByRole("button",{name:"Expand Night Sessions",exact:true})).toHaveCount(1);
+  await page.getByRole("button",{name:"Expand Night Sessions",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track Opening",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track Closing",exact:true})).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 test("dark settings fit a full window and retain defaults", async ({
@@ -1705,11 +1868,12 @@ test("favourite artist states have distinct theme-aware colours", async ({page})
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Favourite artists",exact:true}).click();
-  await expect(page.locator(".badge")).toHaveCount(3);
+  const statusBadges=page.locator("tbody tr td:nth-child(3) .badge");
+  await expect(statusBadges).toHaveCount(3);
   for (const theme of ["light","dark"]) {
     await page.evaluate(theme => {document.documentElement.dataset.theme=theme},theme);
-    const colours = await page.locator(".badge").evaluateAll(elements => elements.map(el => getComputedStyle(el).color));
-    const muted = await page.locator(".badge").first().evaluate(el => getComputedStyle(el).getPropertyValue("--muted"));
+    const colours = await statusBadges.evaluateAll(elements => elements.map(el => getComputedStyle(el).color));
+    const muted = await statusBadges.first().evaluate(el => getComputedStyle(el).getPropertyValue("--muted"));
     expect(new Set(colours).size).toBe(3);
     expect(colours.every(colour => colour !== muted)).toBe(true);
   }

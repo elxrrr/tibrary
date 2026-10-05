@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.18** · [Setup and screenshots](../../README.md)
+Version **0.9.19** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -32,9 +32,13 @@ Reviewed moves keep their links and ignore choices; equivalent number formatting
 
 ### Linking and recommendations
 
+Sidebar category headings open their first workflow directly. Overview remains the dashboard, with recent missing releases filling the available space and scrolling independently. Match, tag-review and download dialogs use more of the window.
+
+Link artists and Favourite artists expand to locally indexed releases without another scan. Favourite artists shows a separate Catalogue link status, including local-only artists with a saved online identity. Confirmed online identities combine differently named local aliases into one favourite row. Artist selections target artist mappings; release summaries have no artist mutation controls.
+
 Artist matching starts from local **Album Artist** tags. Compilation placeholders such as “Various artists” are excluded from the artist inbox. Confirmed artists are skipped during unresolved matching; select them explicitly to recheck or unlink.
 
-Link releases shows one expandable row per local release folder. Disc folders are combined; separate editions stay separate. Expand a release to inspect or select its tracks. Selecting a release selects its matching tracks; filters apply before grouping, and the page reports both release and track counts. Recheck, ignore and unlink use the selected file paths.
+Link releases groups album artists, then local release folders, then tracks. Disc folders are combined; separate editions stay separate. Compilation releases appear under one Various artists group without entering artist matching. Expand an artist and release to inspect linked and unresolved tracks. Selecting an artist or release selects its matching files; filters apply before grouping, and the page reports artist, release and track counts. Recheck, ignore and unlink use the selected file paths.
 
 Recording matches use ISRC, title, duration, release structure and track positions. Linking writes associations to the database, not file tags. Multiple compatible editions can supply metadata, but conflicting totals, mixes or recording evidence require review.
 

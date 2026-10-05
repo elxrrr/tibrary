@@ -13,7 +13,7 @@ import { Row, readable } from "./api";
 import { Selection, parentState, toggleChild, toggleParent } from "./selection";
 import { ColumnSelection, columnSelectionLabel, columnValueSelected, toggleColumnValue } from "./columnFilters";
 export type { ColumnSelection } from "./columnFilters";
-export type Column = { key: string; label: string };
+export type Column = { key: string; label: string; width?: number | string };
 export type ColumnFilterOption = { value: string; label: string; count?: number };
 export type ColumnFilterOptions = { options: ColumnFilterOption[]; total: number };
 export type HeaderFilter = {
@@ -70,6 +70,7 @@ export function DataTable({
   tree,
   grouped,
   fileGroups,
+  hierarchy,
   treeSelection,
   onTreeSelect,
   onExpand,
@@ -94,6 +95,8 @@ export function DataTable({
   grouped?: boolean;
   /** Local releases whose child selections are actual file IDs, not release IDs. */
   fileGroups?: boolean;
+  /** Cached local release summaries, optionally including their indexed files. */
+  hierarchy?: "artists" | "links";
   treeSelection?: Selection;
   onTreeSelect?: (s: Selection) => void;
   onExpand?: (r: Row) => void;
@@ -107,6 +110,7 @@ export function DataTable({
   headerFilters?: Record<string, HeaderFilter>;
   selectionLabel?: (row: Row) => string;
 }) {
+  const fileSelection = fileGroups || hierarchy === "links";
   const [anchor, setAnchor] = useState<number | null>(null);
   const fileAnchor = useRef<string | null>(null);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
@@ -291,14 +295,41 @@ export function DataTable({
     </>,
     document.body,
   );
+  function fileIds(row: Row): string[] {
+    if (row.artist_group || row.link_group)
+      return (row.children || []).flatMap((child: Row) => fileIds(child));
+    return [row.id];
+  }
+  function hierarchyRows(): { row: Row; depth: number }[] {
+    const result: { row: Row; depth: number }[] = [];
+    function visit(row: Row, depth: number) {
+      result.push({ row, depth });
+      if (expanded.has(row.id))
+        (row.children || []).forEach((child: Row) => visit(child, depth + 1));
+    }
+    rows.forEach(row => visit(row, 0));
+    return result;
+  }
+  function toggleExpanded(row: Row) {
+    const next = new Set(expanded);
+    if (next.has(row.id)) next.delete(row.id);
+    else {
+      next.add(row.id);
+      // Artist and local release children come from the indexed library.
+      if (!hierarchy && !row.expanded_available) onExpand?.(row);
+    }
+    setExpanded(next);
+  }
   function select(row: Row, index: number, event: React.MouseEvent) {
-    if (fileGroups) {
-      const visible = rows.flatMap(parent => [parent, ...(expanded.has(parent.id) ? parent.children || [] : [])]);
+    if (fileSelection) {
+      const visible: Row[] = hierarchy
+        ? hierarchyRows().map(entry => entry.row)
+        : rows.flatMap(parent => [parent, ...(expanded.has(parent.id) ? parent.children || [] : [])]);
       const target = visible.findIndex(item => item.id === row.id);
       const start = visible.findIndex(item => item.id === fileAnchor.current);
       const next = event.metaKey || event.ctrlKey || event.shiftKey ? new Set(selected) : new Set<string>();
       const range = event.shiftKey && start >= 0 ? visible.slice(Math.min(start,target), Math.max(start,target) + 1) : [row];
-      const ids = range.flatMap(item => item.link_group ? (item.children || []).map((child: Row) => child.id) : [item.id]);
+      const ids: string[] = range.flatMap(item => fileIds(item));
       const remove = !event.shiftKey && (event.metaKey || event.ctrlKey) && ids.every(id => selected.has(id));
       ids.forEach(id => remove ? next.delete(id) : next.add(id));
       fileAnchor.current = row.id;
@@ -318,6 +349,11 @@ export function DataTable({
     setAnchor(index);
   }
   function groupState(row: Row) {
+    if (fileSelection) {
+      const ids = fileIds(row);
+      const count = ids.filter(id => selected.has(id)).length;
+      return count ? count === ids.length ? "checked" : "mixed" : "empty";
+    }
     if (selected.has(row.id)) return "checked";
     const children = row.children || [];
     const count = children.filter((c: Row) => selected.has(c.id)).length;
@@ -325,12 +361,12 @@ export function DataTable({
   }
   function toggleFiles(row: Row, yes: boolean) {
     const next = new Set(selected);
-    (row.children || []).forEach((child: Row) => yes ? next.add(child.id) : next.delete(child.id));
+    fileIds(row).forEach(id => yes ? next.add(id) : next.delete(id));
     onSelect(next);
   }
   function selectForMenu(row: Row) {
-    if (fileGroups && row.link_group) {
-      if (groupState(row) === "empty") onSelect(new Set((row.children || []).map((child: Row) => child.id)));
+    if (fileSelection && (row.link_group || row.artist_group)) {
+      if (groupState(row) === "empty") onSelect(new Set(fileIds(row)));
     } else if (!selected.has(row.id)) onSelect(new Set([row.id]));
   }
   const visibleStates = rows.map((r) =>
@@ -339,10 +375,11 @@ export function DataTable({
           treeSelection?.[r.id],
           (r.children || []).map((c: Row) => c.id),
         )
-      : grouped || fileGroups ? groupState(r) : selected.has(r.id) ? "checked" : "empty",
+      : grouped || fileSelection ? groupState(r) : selected.has(r.id) ? "checked" : "empty",
   );
   const checked = visibleStates.filter(state => state === "checked").length;
   const anySelected = visibleStates.some(state => state !== "empty");
+  const localHierarchyRows = hierarchy ? hierarchyRows() : [];
   return (
     <div
       ref={scroller}
@@ -371,7 +408,7 @@ export function DataTable({
                   } else {
                     const next = new Set(selected);
                     rows.forEach((r) => {
-                      if (fileGroups) (r.children || []).forEach((child: Row) => yes ? next.add(child.id) : next.delete(child.id));
+                      if (fileSelection) fileIds(r).forEach(id => yes ? next.add(id) : next.delete(id));
                       else yes ? next.add(r.id) : next.delete(r.id);
                       if (grouped) (r.children || []).forEach((c: Row) => next.delete(c.id));
                     });
@@ -383,6 +420,7 @@ export function DataTable({
             {columns.map((c) => (
               <th
                 key={c.key}
+                style={{ width: c.width }}
                 title="Click to sort. Right-click for column options."
                 onContextMenu={(event) => {
                   event.preventDefault();
@@ -437,7 +475,89 @@ export function DataTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((r, i) => {
+          {hierarchy ? localHierarchyRows.map(({ row, depth }) => {
+            const artistRow = depth === 0;
+            const releaseRow = !artistRow && !!row.link_group;
+            const trackRow = hierarchy === "links" && !artistRow && !releaseRow;
+            const selectable = hierarchy === "links" || artistRow;
+            const expandable = (artistRow || releaseRow) && (row.children?.length || 0) > 0;
+            const name = artistRow ? row.artist : releaseRow ? row.release : trackRow ? row.title : row.release;
+            const state = fileSelection ? groupState(row) : selected.has(row.id) ? "checked" : "empty";
+            const selectLabel = trackRow ? `Select track ${name}` : selectionLabel?.(row) || `Select ${name}`;
+            function toggleSelection(yes: boolean) {
+              if (fileSelection) toggleFiles(row, yes);
+              else {
+                const next = new Set(selected);
+                yes ? next.add(row.id) : next.delete(row.id);
+                onSelect(next);
+              }
+            }
+            return <tr
+              key={row.id}
+              tabIndex={0}
+              className={`${depth ? "child " : ""}${state === "checked" && selectable ? "selected " : ""}${row.ignored ? "inactive" : ""}`}
+              onClick={event => { if (selectable) select(row, rows.findIndex(parent => parent.id === row.id), event); }}
+              onDoubleClick={event => { if (!(event.target as Element).closest("button,input")) onDetail(row); }}
+              onKeyDown={event => {
+                if (event.target !== event.currentTarget) return;
+                if (event.key === "Enter") onDetail(row);
+                if (event.key === " " && selectable) {
+                  event.preventDefault();
+                  toggleSelection(state !== "checked");
+                }
+                if (expandable && ((event.key === "ArrowRight" && !expanded.has(row.id)) || (event.key === "ArrowLeft" && expanded.has(row.id)))) {
+                  event.preventDefault();
+                  toggleExpanded(row);
+                }
+              }}
+              onContextMenu={event => {
+                event.preventDefault();
+                if (!selectable) return;
+                selectForMenu(row);
+                onMenu(row, event.clientX, event.clientY);
+              }}
+            >
+              <td className="check">{selectable && <Check label={selectLabel} state={state} onChange={toggleSelection} />}</td>
+              {columns.map(column => {
+                const nameCell = artistRow ? column.key === "artist" : column.key === "release";
+                const value = column.key === "artist" && !artistRow ? ""
+                  : column.key === "release" && artistRow ? row.releases ?? row.release
+                  : column.key === "release" && trackRow ? row.title
+                  : column.key === "tracks" && trackRow ? row.position
+                  : row[column.key];
+                const title = column.key === "tracks" && trackRow ? `Disc · track: ${readable(value)}` : readable(value);
+                return <td key={column.key} className={column.key === "tracks" && trackRow ? "track-position" : undefined}
+                  title={title} style={nameCell && depth ? { paddingLeft: depth === 1 ? 18 : 38 } : undefined}>
+                  {nameCell && expandable && <button
+                    className="disclosure"
+                    aria-label={`${expanded.has(row.id) ? "Collapse" : "Expand"} ${name}`}
+                    aria-expanded={expanded.has(row.id)}
+                    onDoubleClick={event => event.stopPropagation()}
+                    onClick={event => {
+                      event.stopPropagation();
+                      if (event.detail <= 1) toggleExpanded(row);
+                    }}
+                  >{expanded.has(row.id) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button>}
+                  {nameCell && !trackRow ? <button
+                    className="hierarchy-name"
+                    style={{ background: "none", border: 0, borderRadius: 0, padding: 0, color: "inherit", font: "inherit", display: "inline", maxWidth: "100%", verticalAlign: "middle" }}
+                    aria-expanded={expandable ? expanded.has(row.id) : undefined}
+                    title={expandable ? `Show ${artistRow ? "releases" : "tracks"} for ${name}` : `View ${name}`}
+                    onClick={event => {
+                      event.stopPropagation();
+                      if (event.detail <= 1) expandable ? toggleExpanded(row) : onDetail(row);
+                    }}
+                    onDoubleClick={event => { event.stopPropagation(); onDetail(row); }}
+                  >{readable(value)}</button> : ["status", "recommendation", "catalogue_status"].includes(column.key) && value ?
+                    <span className={"badge " + String(value).toLowerCase().replaceAll(" ", "-")}>{readable(value)}</span> : readable(value)}
+                </td>;
+              })}
+              <td className="more">{selectable && <button
+                aria-label={`Actions for ${trackRow ? "track " : ""}${name}`}
+                onClick={event => { event.stopPropagation(); selectForMenu(row); onMenu(row, event.clientX, event.clientY); }}
+              ><MoreHorizontal size={16} /></button>}</td>
+            </tr>;
+          }) : rows.map((r, i) => {
             const state = tree
               ? parentState(
                   treeSelection?.[r.id],

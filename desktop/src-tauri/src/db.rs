@@ -1090,6 +1090,35 @@ impl TursoDb {
         Ok((records, total))
     }
 
+    /// One indexed inventory read for artist release tables. This does not
+    /// inspect audio, and handles historical trailing-slash root keys equally.
+    pub async fn get_local_files_for_release_tables(
+        &self, root: Option<&str>,
+    ) -> Result<Vec<LocalFileRecord>, String> {
+        let conn = self.connect()?;
+        let clean = root.unwrap_or("").trim_end_matches('/');
+        let mut rows = conn.query(
+            "SELECT path, root, COALESCE(size, 0), COALESCE(mtime, 0), metadata, error FROM local_files
+             WHERE present = 1 AND metadata IS NOT NULL AND (? = '' OR root = ? OR root = ?)
+             ORDER BY path",
+            (clean, clean, format!("{clean}/").as_str()),
+        ).await.map_err(|e| e.to_string())?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+            let metadata: Option<String> = row.get(4).ok().flatten();
+            records.push(LocalFileRecord {
+                path: row.get(0).map_err(|e| e.to_string())?,
+                root: row.get(1).map_err(|e| e.to_string())?,
+                size: row.get(2).map_err(|e| e.to_string())?,
+                mtime: row.get(3).map_err(|e| e.to_string())?,
+                metadata: metadata.and_then(|text| serde_json::from_str(&text).ok()),
+                error: row.get(5).ok().flatten(),
+                present: true,
+            });
+        }
+        Ok(records)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn get_link_rows(
         &self,
@@ -3744,7 +3773,8 @@ impl TursoDb {
         limit: usize,
     ) -> Result<TablePage<Value>, String> {
         let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
-        let cache_key = root.unwrap_or("").to_string();
+        let clean_root = root.unwrap_or("").trim_end_matches('/');
+        let cache_key = clean_root.to_string();
         let cached = self
             .favourite_rows_cache
             .lock()
@@ -3759,8 +3789,8 @@ impl TursoDb {
             let mut local_counts: HashMap<String, (String, usize)> = HashMap::new();
             let mut files = conn
                 .query(
-                    "SELECT metadata FROM local_files WHERE present = 1 AND (? = '' OR root = ?)",
-                    (root.unwrap_or(""), root.unwrap_or("")),
+                    "SELECT metadata FROM local_files WHERE present = 1 AND (? = '' OR root = ? OR root = ?)",
+                    (clean_root, clean_root, format!("{clean_root}/").as_str()),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -5984,6 +6014,8 @@ with sqlite3.connect('{db}') as db:
         let meta =
             json!({"album_artist":"North Assembly","artist":"Guest Artist","album":"Blue Hours"});
         conn.execute("INSERT INTO local_files (path,root,metadata,present) VALUES ('/music/song.flac','/music',?,1)", (meta.to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO local_files (path,root,metadata,present) VALUES ('/music/second.flac','/music/',?,1)", (meta.to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO local_files (path,root,metadata,present) VALUES ('/other/song.flac','/other',?,1)", (meta.to_string(),)).await.unwrap();
         let cached =
             json!([{"id":"101","name":"North Assembly"},{"id":"102","name":"Away Artist"}]);
         conn.execute(
@@ -6005,7 +6037,10 @@ with sqlite3.connect('{db}') as db:
             .await
             .unwrap();
         assert_eq!(local.total, 1);
-        assert_eq!(local.rows[0]["tracks"], 1);
+        assert_eq!(local.rows[0]["tracks"], 2, "equivalent historical root spellings share one scope");
+        let slash = store.get_favourite_rows(Some("/music/"), "In library", "North", "tracks", "desc", 0, 10).await.unwrap();
+        assert_eq!(slash.rows, local.rows);
+        assert_eq!(store.get_local_files_for_release_tables(Some("/music/")).await.unwrap().len(), 2, "release inventory and favourite counts agree");
         let missing = store
             .get_favourite_rows(
                 Some("/music"),
