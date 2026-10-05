@@ -248,7 +248,11 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
             let root = args["root"].as_str().unwrap_or("");
             let current = duplicates::indexed_manifest_fingerprint(db, root).await?;
             let saved = db.get_preference(&format!("desktop-mqa-manifest:{root}")).await?;
-            if saved.as_ref().and_then(Value::as_str) != Some(current.as_str()) {
+            let legacy_rows = cached_rows.as_ref().is_some_and(|rows| rows.iter().any(|row|
+                !row["scanned"].is_boolean() || row["path"].as_str().is_some_and(|path|
+                    std::path::Path::new(path).extension().is_none_or(|extension| !extension.eq_ignore_ascii_case("flac")))
+            ));
+            if legacy_rows || saved.as_ref().and_then(Value::as_str) != Some(current.as_str()) {
                 let indexed = actions::files(db, root).await?;
                 let rows = actions::cached_mqa_rows(db, &indexed).await?;
                 db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows)).await?;

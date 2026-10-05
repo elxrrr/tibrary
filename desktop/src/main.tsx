@@ -52,6 +52,7 @@ import { ActivityView, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } 
 import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import { CoalescedQuery } from "./query";
+import { ScanButton, ScanScope } from "./ScanButton";
 import "./style.css";
 import { version as appVersion } from "../package.json";
 const groups = [
@@ -181,8 +182,17 @@ type ColumnSelections = Record<string, ColumnSelection>;
 function defaultColumnSelections(route: string): ColumnSelections {
   if (route === "missing") return {recommendation:{include:["Recommended", "Potential"]},status:{exclude:["Unavailable"]}};
   if (route === "links") return {status:{exclude:["Linked", "Ignored"]}};
+  if (route === "correct") return {changes:{exclude:["", "—"]}};
+  if (route === "organise") return {folder_operation:{exclude:["No change"]}};
   return {};
 }
+type MqaSelection = {
+  ids: string[];
+  detected_ids: string[];
+  unlinked_ids: string[];
+  ready_ids: string[];
+  counts: {selected: number; detected: number; unlinked: number; ready: number};
+};
 function Modal({
   title,
   children,
@@ -240,7 +250,6 @@ function App() {
     }),
     [loading, setLoading] = useState(false),
     [query, setQuery] = useState(""),
-    [affectedOnly, setAffectedOnly] = useState(false),
     [columnSelections, setColumnSelections] = useState<ColumnSelections>(() => defaultColumnSelections(initialRoute)),
     [viewOptionsOpen, setViewOptionsOpen] = useState(false),
     [sort, setSort] = useState(initialRoute === "missing" ? "date" : "artist"),
@@ -251,6 +260,10 @@ function App() {
   const [selected, setSelected] = useState(new Set<string>()),
     [expanded, setExpanded] = useState(new Set<string>()),
     [selection, setSelection] = useState<Selection>({});
+  const [mqaScope, setMqaScope] = useState<ScanScope | null>("unscanned");
+  const [mqaScopePending, setMqaScopePending] = useState(false);
+  const [mqaSummary, setMqaSummary] = useState<(MqaSelection & {key: string}) | null>(null);
+  const mqaScopeRequest = useRef(0);
   const [action, setAction] = useState("dates"),
     [preview, setPreview] = useState<string | undefined>(),
     [timeline, setTimeline] = useState("Newer than newest owned"),
@@ -370,7 +383,6 @@ function App() {
     setSelected(new Set());
     setOffset(0);
     setQuery("");
-    setAffectedOnly(["correct", "organise"].includes(route));
     setColumnSelections(defaultColumnSelections(route));
     setViewOptionsOpen(false);
     if (route === "missing") {
@@ -384,6 +396,39 @@ function App() {
     setPreview(undefined);
     lastRoute.current = route;
   }, [route]);
+  // Choosing a scope changes checkmarks, never starts audio work. Navigation
+  // does not own the audit job; a completed job still refreshes its shared cache.
+  useEffect(() => {
+    if (route !== "mqa" || !root) return;
+    chooseMqaScope("unscanned");
+    return () => { mqaScopeRequest.current++; };
+  }, [route, root]);
+  const mqaSummaryKey = route === "mqa" ? JSON.stringify([root, state?.revision, [...selected]]) : "";
+  const mqaSummaryCurrent = !!mqaSummary && mqaSummary.key === mqaSummaryKey;
+  useEffect(() => {
+    if (route !== "mqa" || !root) return;
+    let live = true;
+    const timer = window.setTimeout(() => {
+      call<MqaSelection>("mqa.selection", {root, scope:"selected", ids:[...selected]})
+        .then(summary => { if (live) setMqaSummary({...summary, key:mqaSummaryKey}); })
+        .catch(error => { if (live) notifyError(error); });
+    }, 120);
+    return () => { live = false; window.clearTimeout(timer); };
+  }, [mqaSummaryKey]);
+  async function chooseMqaScope(scope: ScanScope) {
+    const request = ++mqaScopeRequest.current;
+    setMqaScopePending(true);
+    try {
+      const summary = await call<MqaSelection>("mqa.selection", {root, scope});
+      if (request !== mqaScopeRequest.current) return;
+      setMqaScope(scope);
+      setSelected(new Set(summary.ids));
+      setColumnSelections({});
+      setQuery("");
+      setOffset(0);
+    } catch (error) { if (request === mqaScopeRequest.current) notifyError(error); }
+    finally { if (request === mqaScopeRequest.current) setMqaScopePending(false); }
+  }
   useEffect(() => {
     document.documentElement.dataset.theme = state?.settings.theme || "system";
     document.documentElement.dataset.highlight = settings?.general?.highlight_colour || "system";
@@ -409,7 +454,7 @@ function App() {
     offset,
     limit: pageSize,
     search: query,
-    filter: affectedOnly ? "affected" : "all",
+    filter: "all",
     column_filters: columnSelections,
     sort,
     direction,
@@ -440,7 +485,6 @@ function App() {
     root,
     offset,
     query,
-    affectedOnly,
     columnSelections,
     sort,
     direction,
@@ -554,11 +598,20 @@ function App() {
         call("preview", { id: j.result.preview_id })
           .then(setDeep)
           .catch(notifyError);
-      else if (root === j.result.root && route === target) setAffectedOnly(true);
+      else if (root === j.result.root && route === target)
+        setColumnSelections(target === "organise" ? defaultColumnSelections(target) : {changes:{exclude:["", "—"]}});
     }
     if (["apply", "deep_apply", "consolidate"].includes(j.kind)) {
       setPreview(undefined);
       setSelected(new Set());
+    }
+    if (j.kind === "queue_mqa" && j.status === "complete") {
+      setToast("Replacements queued; review them in Download queue");
+      if (j.result?.root === root && route === "mqa") {
+        const queued = new Set<string>(j.result?.queued_paths || []);
+        setSelected(previous => new Set([...previous].filter(path => !queued.has(path))));
+        setMqaScope(null);
+      }
     }
     if (j.kind === "manual_candidate" && selected.size)
       loadDetail({ id: [...selected][0] });
@@ -636,6 +689,22 @@ function App() {
   }
   function scope() {
     return selected.size ? { ids: [...selected] } : {};
+  }
+  async function prepareMqaReplacements(kind: "link" | "queue_mqa") {
+    if (mqaScopePending || !selected.size) return;
+    setSubmitting(true);
+    try {
+      // Read the whole selection again, including off-page tracks. Never pass
+      // an empty scope to linking, where omission means the entire library.
+      const summary = await call<MqaSelection>("mqa.selection", {root, scope:"selected", ids:[...selected]});
+      const ids = kind === "link" ? summary.unlinked_ids : summary.ready_ids;
+      if (!ids.length) {
+        setToast(kind === "link" ? "Selected MQA tracks already have matches" : "Find an online match for the selected MQA tracks first");
+        return;
+      }
+      await run(kind, {ids});
+    } catch (error) { notifyError(error); }
+    finally { setSubmitting(false); }
   }
   async function addLibrary() {
     try {
@@ -821,7 +890,6 @@ function App() {
   function openMissingReleases() {
     setTimeline(overviewMissingFilters.timeline);
     setArtistScope(overviewMissingFilters.artist_scope);
-    setAffectedOnly(false);
     setColumnSelections(defaultColumnSelections("missing"));
     setQuery("");
     setOffset(0);
@@ -1116,35 +1184,6 @@ function App() {
             </button>
           </>
         )}
-        {route === "mqa" && (
-          <>
-            <button
-              className="primary"
-              disabled={busy || !root}
-              onClick={() => run("mqa")}
-            >
-              Audit unscanned audio
-            </button>
-            <button
-              disabled={busy || !root}
-              onClick={() => run("mqa", { force: true })}
-            >
-              Recheck all audio
-            </button>
-            <button
-              disabled={busy || !selected.size}
-              onClick={() => run("link", scope())}
-            >
-              Link selected for replacement
-            </button>
-            <button
-              disabled={busy || !data.rows.some(r => selected.has(r.id) && r.affected === true)}
-              onClick={() => run("queue_mqa", {ids: data.rows.filter(r => selected.has(r.id) && r.affected === true).map(r => r.id)})}
-            >
-              Queue lossless replacements
-            </button>
-          </>
-        )}
         {["local", "online"].includes(route) && (
           <>
             <button
@@ -1303,8 +1342,7 @@ function App() {
                     setAction(id);
                     setPreview(undefined);
                     setSelected(new Set());
-                    setAffectedOnly(true);
-                    setColumnSelections({});
+                    setColumnSelections(defaultColumnSelections(route));
                   }}
                 >
                   <Tags size={18} />
@@ -1316,7 +1354,7 @@ function App() {
             )}
           </div>
         )}
-        {toolbar()}
+        {route !== "mqa" && toolbar()}
         <div className="filters">
           <label className="search">
             <Search size={16} />
@@ -1330,10 +1368,6 @@ function App() {
               }}
             />
           </label>
-          {["correct", "organise", "metadata", "artwork", "mqa"].includes(route) && <label className="affected-filter">
-            <input type="checkbox" checked={affectedOnly} onChange={event => {setAffectedOnly(event.target.checked);setOffset(0);}} />
-            Affected files only
-          </label>}
           {route === "missing" && <div className="table-view-control">
             <button ref={viewOptionsButton} aria-haspopup="dialog" aria-expanded={viewOptionsOpen} onClick={() => setViewOptionsOpen(open=>!open)} title={`${artistScope} · ${timeline}`}>
               <SlidersHorizontal size={15} /> View options
@@ -1360,6 +1394,14 @@ function App() {
               : `${data.total.toLocaleString()} ${tree ? "releases" : "items"}${route === "missing" ? ` matching filters · ${(data.missing_total ?? data.total).toLocaleString()} missing, incomplete or queued in total` : ""}`}
           </span>
         </div>
+        {route === "mqa" && <div className="mqa-selection-summary" role="status" aria-live="polite">
+          {mqaSummaryCurrent && !mqaScopePending ? <>
+            <span>{mqaSummary!.counts.detected} selected with MQA signals</span>
+            <span>{mqaSummary!.counts.unlinked} need an online match</span>
+            <span>{mqaSummary!.counts.ready} ready to queue</span>
+          </> : <span>Checking selection…</span>}
+          <small>Scanning only reads audio. Replacements are downloaded after approval in the queue.</small>
+        </div>}
         {route === "missing" && <div className="table-scope-summary">{artistScope} · {timeline}</div>}
         {route === "local" && data.rows.length > 0 && (
           <div className="cluster-callout">
@@ -1386,7 +1428,8 @@ function App() {
           columns={columns}
           headerFilters={headerFilters}
           selected={selected}
-          onSelect={setSelected}
+          onSelect={next => {setSelected(next); if (route === "mqa") setMqaScope(null);}}
+          selectionLabel={route === "mqa" ? row => `Select ${row.title || row.id}` : undefined}
           sort={sort}
           direction={direction}
           onSort={(key, requestedDirection) => {
@@ -1430,6 +1473,26 @@ function App() {
             </button>
           </div>
         </footer>
+        {route === "mqa" && <div className="mqa-actions">
+          <ScanButton count={mqaSummaryCurrent ? mqaSummary!.counts.selected : selected.size} scope={mqaScope}
+            disabled={localBusy || !root || mqaScopePending} selectionPending={!mqaSummaryCurrent}
+            scanning={active(state?.job) && state?.job?.kind === "mqa"}
+            onScope={chooseMqaScope}
+            onScan={() => { if (mqaSummaryCurrent && mqaSummary!.ids.length) run("mqa", {ids:mqaSummary!.ids, force:true}); }} />
+          <button disabled={!selected.size || mqaScopePending} onClick={() => {setSelected(new Set());setMqaScope(null);}}>Clear selection</button>
+          <div className="mqa-replacement-actions">
+            <button aria-label="Find online matches" disabled={localBusy || active(state?.online_job) || mqaScopePending || !mqaSummaryCurrent || !mqaSummary!.counts.unlinked}
+              title="Step 1: identify online recordings for selected MQA tracks without a verified match. Saves database links; no files are changed."
+              onClick={() => prepareMqaReplacements("link")}>
+              Find online matches ({mqaSummaryCurrent ? mqaSummary!.counts.unlinked : "…"})
+            </button>
+            <button aria-label="Queue replacements" disabled={localBusy || active(state?.online_job) || mqaScopePending || !mqaSummaryCurrent || !mqaSummary!.counts.ready}
+              title="Step 2: add selected MQA tracks with verified matches to the download queue as lossless replacements. Review and download them in Download queue."
+              onClick={() => prepareMqaReplacements("queue_mqa")}>
+              Queue replacements ({mqaSummaryCurrent ? mqaSummary!.counts.ready : "…"})
+            </button>
+          </div>
+        </div>}
       </>
     );
   }

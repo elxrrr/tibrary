@@ -64,32 +64,101 @@ pub async fn cached_mqa_rows(
     db: &TursoDb,
     indexed: &[LocalFileRecord],
 ) -> Result<Vec<Value>, String> {
-    let conn = db.connect()?;
-    let mut query = conn
-        .query(
-            "SELECT key,payload FROM app_preferences WHERE key LIKE 'mqa-audit:%'",
-            (),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut saved = std::collections::HashMap::new();
-    while let Some(row) = query.next().await.map_err(|e| e.to_string())? {
-        let key: String = row.get(0).map_err(|e| e.to_string())?;
-        let payload: String = row.get(1).map_err(|e| e.to_string())?;
-        if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-            saved.insert(key.trim_start_matches("mqa-audit:").to_owned(), value);
-        }
-    }
-    let rows = indexed.iter().filter(|file| file.present).map(|file| {
+    let saved = maintenance::load_inspections(db, "mqa-audit:").await?;
+    let rows = indexed.iter().filter(|file| mqa_eligible(file)).map(|file| {
         let tags = workflows::extract_tags_map(&file.metadata);
-        let prior = saved.get(&file.path).filter(|value| value["size"] == json!(file.size) && value["mtime"] == json!(file.mtime));
+        let prior = saved.get(&file.path).filter(|value| mqa_inspection_current(value, file));
         let result = prior.map(|value| &value["result"]);
         json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),
+            "scanned":result.is_some(),
             "status":result.and_then(|value| value["status"].as_str()).unwrap_or("Not audited"),
             "evidence":result.and_then(|value| value["evidence"].as_str()).unwrap_or("New or changed audio; run the MQA audit"),
             "affected":result.is_some_and(|value| value["detected"] == true),"target":if result.is_some_and(|v| v["detected"] == true) { "Queue lossless replacement" } else { "—" }})
     }).collect();
     Ok(rows)
+}
+
+fn mqa_eligible(file: &LocalFileRecord) -> bool {
+    file.present && std::path::Path::new(&file.path).extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
+}
+
+fn mqa_inspection_current(value: &Value, file: &LocalFileRecord) -> bool {
+    maintenance::valid_inspection(value, file.size, file.mtime) && value["result"].is_object()
+}
+
+/// Scope and replacement readiness come from the full indexed library, never
+/// the current table page. This is a cache-only read and cannot change files.
+pub async fn mqa_selection(db: &TursoDb, args: &Value) -> Result<Value, String> {
+    let root = args["root"].as_str().filter(|root| !root.is_empty())
+        .ok_or("Choose a registered library first")?;
+    let scope = args["scope"].as_str().unwrap_or("selected");
+    if !matches!(scope, "all" | "unscanned" | "selected") {
+        return Err("Choose all tracks, unscanned tracks or selected tracks".into());
+    }
+    let explicit: HashSet<String> = match args.get("ids") {
+        Some(value) => serde_json::from_value::<Vec<String>>(value.clone())
+            .map_err(|_| "Select tracks with valid file paths")?.into_iter().collect(),
+        None => HashSet::new(),
+    };
+    if scope == "selected" && explicit.is_empty() {
+        return Ok(json!({"ids":[],"detected_ids":[],"unlinked_ids":[],"ready_ids":[],
+            "counts":{"selected":0,"detected":0,"unlinked":0,"ready":0}}));
+    }
+    let conn = db.connect()?;
+    let mut rows = conn.query(
+        "SELECT f.path,f.size,f.mtime,p.payload FROM local_files f LEFT JOIN app_preferences p ON p.key='mqa-audit:' || f.path WHERE f.root=? AND f.present=1 AND (? != 'selected' OR f.path IN (SELECT value FROM json_each(?))) ORDER BY f.path",
+        (root,scope,json!(explicit).to_string()),
+    ).await.map_err(|error| error.to_string())?;
+    let mut indexed = vec![];
+    let mut saved = std::collections::HashMap::new();
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        let path: String = row.get(0).map_err(|error| error.to_string())?;
+        if let Some(value) = row.get::<Option<String>>(3).ok().flatten()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) {
+            saved.insert(path.clone(),value);
+        }
+        indexed.push(LocalFileRecord {path,root:root.into(),
+            size:row.get(1).map_err(|error| error.to_string())?,
+            mtime:row.get(2).map_err(|error| error.to_string())?,
+            metadata:None,error:None,present:true});
+    }
+    drop(rows);
+    drop(conn);
+    let eligible: Vec<_> = indexed.iter().filter(|file| mqa_eligible(file)).collect();
+    let current = |file: &&LocalFileRecord| saved.get(&file.path)
+        .filter(|value| mqa_inspection_current(value, file));
+    let unscanned = eligible.iter().filter(|file| current(file).is_none()).count();
+    let selected: Vec<_> = eligible.iter().copied().filter(|file| match scope {
+        "all" => true,
+        "unscanned" => current(file).is_none(),
+        _ => explicit.contains(&file.path),
+    }).collect();
+    let detected: Vec<_> = selected.iter().copied().filter(|file|
+        current(file).is_some_and(|value| value["result"]["detected"] == true)
+    ).collect();
+    let settings = db.get_settings().await?;
+    let market = args["market"].as_str()
+        .or_else(|| settings["general"]["market"].as_str()).unwrap_or("GB");
+    let detected_paths: Vec<_> = detected.iter().map(|file| file.path.as_str()).collect();
+    let links = metadata_link_ids(db, &detected_paths, market, &AtomicBool::new(false)).await?;
+    let verified = |file: &&LocalFileRecord| links.get(&file.path).is_some_and(|ids|
+        ids["album_id"].as_str().is_some_and(|id| !id.is_empty())
+            && ids["track_id"].as_str().is_some_and(|id| !id.is_empty())
+    );
+    let ready: Vec<_> = detected.iter().filter(|file| verified(file)).map(|file| &file.path).collect();
+    let unlinked: Vec<_> = detected.iter().filter(|file| !verified(file)).map(|file| &file.path).collect();
+    let mut result = json!({
+        "ids":selected.iter().map(|file| &file.path).collect::<Vec<_>>(),
+        "detected_ids":detected_paths,"unlinked_ids":unlinked,"ready_ids":ready,
+        "counts":{"selected":selected.len(),
+            "detected":detected.len(),"unlinked":unlinked.len(),"ready":ready.len()}
+    });
+    if scope != "selected" {
+        result["counts"]["all"] = json!(eligible.len());
+        result["counts"]["unscanned"] = json!(unscanned);
+    }
+    Ok(result)
 }
 // Serialize only identical releases; unrelated releases and local work stay independent.
 pub(crate) fn release_gate(key: String) -> Arc<tokio::sync::Mutex<()>> {
@@ -133,7 +202,7 @@ async fn metadata_link_ids(
     if paths.is_empty() || cancel.load(Ordering::Relaxed) { return Ok(Default::default()); }
     let conn = db.connect()?;
     let mut rows = conn.query(
-        "SELECT path, CASE WHEN json_valid(payload) THEN json_extract(payload,'$.ids') END FROM track_links WHERE market=? AND path IN (SELECT value FROM json_each(?))",
+        "SELECT path, CASE WHEN json_valid(payload) THEN CASE WHEN json_extract(payload,'$.status') IS NULL OR json_extract(payload,'$.status')='linked' THEN json_extract(payload,'$.ids') END END FROM track_links WHERE market=? AND path IN (SELECT value FROM json_each(?))",
         (market,json!(paths).to_string()),
     ).await.map_err(|error|error.to_string())?;
     let mut ids = std::collections::HashMap::new();
@@ -1074,6 +1143,7 @@ pub async fn execute(
         }
         let mut selection = std::collections::HashMap::<String, Option<Vec<String>>>::new();
         let mut replacements = std::collections::HashMap::<String, Value>::new();
+        let mut queued_paths = vec![];
         let selected_paths: Vec<_> = indexed.iter().filter(|file|ids.contains(&file.path)).map(|file|file.path.as_str()).collect();
         let links = metadata_link_ids(db,&selected_paths,market,cancel.as_ref()).await?;
         for file in indexed.iter().filter(|f| ids.contains(&f.path)) {
@@ -1090,9 +1160,10 @@ pub async fn execute(
             }
             let linked = links.get(&file.path).cloned().unwrap_or(Value::Null);
             if let (Some(album), Some(track)) = (
-                linked["album_id"].as_str(),
-                linked["track_id"].as_str(),
+                linked["album_id"].as_str().filter(|id|!id.is_empty()),
+                linked["track_id"].as_str().filter(|id|!id.is_empty()),
             ) {
+                queued_paths.push(file.path.clone());
                 let tracks=selection
                     .entry(album.into())
                     .or_insert_with(|| Some(vec![]))
@@ -1115,7 +1186,7 @@ pub async fn execute(
         }
         if cancel.load(Ordering::Relaxed) { return Err("Cancelled; replacements were not queued".into()); }
         db.queue_add_with_replacements(&selection,&replacements).await?;
-        return Ok(json!({"releases":selection.len()}));
+        return Ok(json!({"root":root,"releases":selection.len(),"queued_paths":queued_paths}));
     }
     if kind == "queue_replacements" {
         if ids.is_empty() {
@@ -1710,37 +1781,42 @@ pub async fn execute(
         return Ok(json!({"preview_id":id,"operation":action,"root":root}));
     }
     if kind == "mqa" {
-        let mut rows = vec![];
+        let chosen: Option<Vec<String>> = args.get("ids").map(|value|
+            serde_json::from_value(value.clone()).map_err(|_| "Select tracks with valid file paths".to_owned())
+        ).transpose()?;
+        if chosen.as_ref().is_some_and(Vec::is_empty) {
+            return Err("Select tracks to scan".into());
+        }
+        let selected: Vec<_> = indexed.iter().filter(|file|
+            mqa_eligible(file) && (chosen.is_none() || ids.contains(&file.path))
+        ).collect();
+        if selected.is_empty() {
+            return Err("Select indexed FLAC tracks to scan".into());
+        }
         let saved_inspections = maintenance::load_inspections(db, "mqa-audit:").await?;
         let mut reused = 0;
         let mut inspected = 0;
-        for (position,file) in indexed.iter().enumerate() {
-            state.progress_for(kind,&format!("MQA audit · {position}/{} files · {}",indexed.len(),file.path));
+        for (position,file) in selected.iter().enumerate() {
+            state.progress_for(kind,&format!("MQA audit · {position}/{} files · {}",selected.len(),file.path));
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let key = format!("mqa-audit:{}", file.path);
             let saved = saved_inspections.get(&file.path);
-            let result = if args["force"] != true
-                && saved.as_ref().is_some_and(|v| {
-                    v["size"] == json!(file.size) && v["mtime"] == json!(file.mtime)
-                }) {
+            if args["force"] != true
+                && saved.is_some_and(|value| mqa_inspection_current(value, file)) {
                 reused += 1;
-                saved.unwrap()["result"].clone()
             } else {
                 let path=file.path.clone();
                 let result = tokio::task::spawn_blocking(move ||serde_json::to_value(crate::mqa::audit_file(std::path::Path::new(&path))))
                     .await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
                 inspected += 1;
                 db.set_preference(&key, &json!({"size":file.size,"mtime":file.mtime,"result":result})).await?;
-                result
-            };
-            let tags = workflows::extract_tags_map(&file.metadata);
-            rows.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"status":result["status"],"evidence":result["evidence"],"affected":result["detected"],"target":if result["detected"] == true { "Queue lossless replacement" } else { "—" }}));
+            }
         }
-        if cancel.load(Ordering::Relaxed) {
-            rows = cached_mqa_rows(db, &indexed).await?;
-        }
+        // Refresh the whole view from per-file caches, including unchecked files
+        // and partial progress retained when an audit is cancelled.
+        let rows = cached_mqa_rows(db, &indexed).await?;
         db.set_preference(&format!("desktop-mqa:{root}"), &json!(rows))
             .await?;
         db.set_preference(
@@ -1748,8 +1824,8 @@ pub async fn execute(
             &json!(crate::duplicates::manifest_fingerprint(&indexed)),
         )
         .await?;
-        state.progress_for(kind, &format!("MQA audit ready · {}/{} files checked · {reused} saved inspections reused · {inspected} audio inspections", reused + inspected, rows.len()));
-        return Ok(json!({"files":rows.len(),"reused":reused,"inspected":inspected}));
+        state.progress_for(kind, &format!("MQA audit ready · {}/{} files checked · {reused} saved inspections reused · {inspected} audio inspections", reused + inspected, selected.len()));
+        return Ok(json!({"files":selected.len(),"cached_files":rows.len(),"reused":reused,"inspected":inspected}));
     }
     Err(format!(
         "{kind} is not yet available in this build; no changes were made"
@@ -1761,17 +1837,96 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn mqa_scope_uses_current_audits_and_only_chosen_market_links() {
+        let dir = std::env::temp_dir().join(format!("mqa-selection-{}", uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let conn = db.connect().unwrap();
+        let root = "/synthetic";
+        for (name,present) in [("ready.flac",1),("unlinked.FLAC",1),("clean.flac",1),
+            ("changed.flac",1),("new.flac",1),("other.mp3",1),("absent.flac",0)] {
+            conn.execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES(?,?,10,20,'{}',?)",
+                (format!("{root}/{name}"),root,present)).await.unwrap();
+        }
+        for (name,detected,mtime) in [("ready.flac",true,20),("unlinked.FLAC",true,20),
+            ("clean.flac",false,20),("changed.flac",true,19),("other.mp3",true,20),
+            ("absent.flac",true,20)] {
+            db.set_preference(&format!("mqa-audit:{root}/{name}"),
+                &json!({"size":10,"mtime":mtime,"result":{"detected":detected,
+                    "status":if detected {"MQA signal"} else {"No signal found"}}})).await.unwrap();
+        }
+        for (name,market) in [("ready.flac","GB"),("unlinked.FLAC","US"),("changed.flac","GB")] {
+            db.choose_track_link(&json!({"path":format!("{root}/{name}"),"album_id":"10","track_id":"101","market":market})).await.unwrap();
+        }
+        let all = mqa_selection(&db,&json!({"root":root,"scope":"all","market":"GB"})).await.unwrap();
+        assert_eq!(all["counts"],json!({"all":5,"unscanned":2,"selected":5,"detected":2,"ready":1,"unlinked":1}));
+        assert_eq!(all["ready_ids"],json!(["/synthetic/ready.flac"]));
+        assert_eq!(all["unlinked_ids"],json!(["/synthetic/unlinked.FLAC"]),"Another market's placement is not a verified replacement source");
+        let unscanned = mqa_selection(&db,&json!({"root":root,"scope":"unscanned"})).await.unwrap();
+        assert_eq!(unscanned["ids"],json!(["/synthetic/changed.flac","/synthetic/new.flac"]));
+        assert_eq!(unscanned["counts"]["selected"],2);
+        assert_eq!(unscanned["counts"]["detected"],0,"Changed file audits cannot queue replacements");
+        let selected = mqa_selection(&db,&json!({"root":root,"scope":"selected","market":"GB",
+            "ids":["/synthetic/ready.flac","/synthetic/unlinked.FLAC","/synthetic/other.mp3","/synthetic/absent.flac","/another/track.flac"]})).await.unwrap();
+        assert_eq!(selected["counts"],json!({"selected":2,"detected":2,"ready":1,"unlinked":1}));
+        assert_eq!(selected["ids"].as_array().unwrap().len(),2);
+        for args in [json!({"root":root,"scope":"selected"}),json!({"root":root,"scope":"selected","ids":[]})] {
+            let empty = mqa_selection(&db,&args).await.unwrap();
+            assert_eq!(empty["ids"],json!([]),"Empty selected scope must never mean the whole library");
+            assert_eq!(empty["counts"]["selected"],0);
+        }
+        let rows = cached_mqa_rows(&db,&files(&db,root).await.unwrap()).await.unwrap();
+        assert_eq!(rows.len(),5);
+        assert_eq!(rows.iter().find(|row|row["path"]=="/synthetic/changed.flac").unwrap()["scanned"],false);
+        assert_eq!(rows.iter().find(|row|row["path"]=="/synthetic/clean.flac").unwrap()["scanned"],true);
+        drop(conn); drop(db); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_mqa_scan_preserves_unchecked_files_and_rejects_empty_selection() {
+        let dir = std::env::temp_dir().join(format!("mqa-selected-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_> = (0..3).map(|index|dir.join(format!("track-{index}.flac"))).collect();
+        for path in &paths { std::fs::write(path,crate::stream_download::MINIMAL_FLAC).unwrap(); }
+        let before: Vec<_> = paths.iter().map(|path|std::fs::read(path).unwrap()).collect();
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        crate::scanner::scan_library(&db,&dir,cancel.clone(),|_|{}).await.unwrap();
+        let root = dir.to_string_lossy();
+        let indexed = files(&db,&root).await.unwrap();
+        let unchanged = indexed.iter().find(|file|file.path==paths[1].to_string_lossy()).unwrap();
+        let saved = json!({"size":unchanged.size,"mtime":unchanged.mtime,
+            "result":{"detected":true,"status":"MQA signal","evidence":"Cached inspection"}});
+        db.set_preference(&format!("mqa-audit:{}",unchanged.path),&saved).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        let result = execute(&db,&backend,"mqa",
+            &json!({"root":root,"ids":[paths[0]],"force":true}),cancel.clone()).await.unwrap();
+        assert_eq!(result["files"],1);
+        assert_eq!(result["inspected"],1);
+        assert_eq!(result["cached_files"],3);
+        assert_eq!(db.get_preference(&format!("mqa-audit:{}",unchanged.path)).await.unwrap(),Some(saved));
+        let visible = db.get_preference(&format!("desktop-mqa:{root}")).await.unwrap().unwrap();
+        assert_eq!(visible.as_array().unwrap().len(),3,"Selected scans must preserve the full audit view");
+        assert_eq!(visible.as_array().unwrap().iter().find(|row|row["id"]==json!(paths[1])).unwrap()["status"],"MQA signal");
+        assert_eq!(visible.as_array().unwrap().iter().find(|row|row["id"]==json!(paths[2])).unwrap()["scanned"],false);
+        for ids in [json!([]),json!(["/not-indexed.flac"]),json!({"path":"broken"})] {
+            assert!(execute(&db,&backend,"mqa",&json!({"root":root,"ids":ids}),cancel.clone()).await.is_err());
+        }
+        assert_eq!(before,paths.iter().map(|path|std::fs::read(path).unwrap()).collect::<Vec<_>>());
+        drop(db); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn metadata_preparation_reads_only_chosen_ids_in_the_requested_market() {
         let dir=std::env::temp_dir().join(format!("metadata-links-{}",uuid::Uuid::new_v4()));
         let db=TursoDb::open(dir.join("db")).await.unwrap();
         let conn=db.connect().unwrap();
         let selected=json!({"album_id":"12","track_id":"121"});
         let payload=json!({"ids":selected,"placements":[{"album_id":"13","track_id":"131"}],"catalogue_options":[{"id":"99","track_id":"991"}]});
-        for (path,market,raw) in [("/chosen.flac","GB",payload.to_string()),("/chosen.flac","US",json!({"ids":{"album_id":"14","track_id":"141"}}).to_string()),("/other.flac","GB",payload.to_string()),("/bad.flac","GB","broken legacy payload".into())] {
+        for (path,market,raw) in [("/chosen.flac","GB",payload.to_string()),("/chosen.flac","US",json!({"ids":{"album_id":"14","track_id":"141"}}).to_string()),("/other.flac","GB",payload.to_string()),("/ignored.flac","GB",json!({"status":"ignored","ids":selected}).to_string()),("/bad.flac","GB","broken legacy payload".into())] {
             conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES(?,?,'',?)",(path,market,raw)).await.unwrap();
         }
         let cancel=AtomicBool::new(false);
-        let result=metadata_link_ids(&db,&["/chosen.flac","/bad.flac","/missing.flac"],"GB",&cancel).await.unwrap();
+        let result=metadata_link_ids(&db,&["/chosen.flac","/bad.flac","/missing.flac","/ignored.flac"],"GB",&cancel).await.unwrap();
         assert_eq!(result.len(),1);
         assert_eq!(result["/chosen.flac"],selected,"Alternative editions must not silently replace the selected recording");
         cancel.store(true,Ordering::Relaxed);
@@ -1847,7 +2002,10 @@ mod tests {
         let before: Vec<_>=paths.iter().map(|path|std::fs::read(path).unwrap()).collect();
         let backend=Arc::new(Backend::new());
         let args=json!({"root":root,"ids":paths});
-        assert_eq!(execute(&db,&backend,"queue_mqa",&args,cancel).await.unwrap()["releases"],1);
+        let result = execute(&db,&backend,"queue_mqa",&args,cancel).await.unwrap();
+        assert_eq!(result["releases"],1);
+        assert_eq!(result["root"],json!(root));
+        assert_eq!(result["queued_paths"],json!(paths));
         let conn=db.connect().unwrap();
         let mut rows=conn.query("SELECT payload FROM queue WHERE id='10'",()).await.unwrap();
         let queued: Value=serde_json::from_str(&rows.next().await.unwrap().unwrap().get::<String>(0).unwrap()).unwrap();

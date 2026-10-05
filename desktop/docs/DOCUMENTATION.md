@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.10** · [Setup and screenshots](../../README.md)
+Version **0.9.11** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -22,7 +22,7 @@ Select one correction or organisation operation, then review the affected files 
 
 Track/disc matching treats `01` and `1` equally. Number corrections use padded tags and flag impossible totals such as `04/1`. Consistent local or cached online evidence can supply replacement totals; ambiguous cases require review.
 
-Duplicate removal uses the system Trash and preserves the chosen keeper. MQA signals are audit evidence; replacement is a separate action. Review proposed changes before applying them.
+Duplicate removal uses the system Trash and preserves the chosen keeper. MQA signals are audit evidence; replacement is a separate action. In MQA audit, use the arrow beside **Scan** to check **All releases** or **Unscanned releases only** (new or changed FLAC tracks). Scope choices change checkmarks; **Scan** inspects just the checked tracks and preserves other saved results. Individual checkmarks and selections across pages are respected. **Find online matches** saves links for selected MQA tracks that need a match. **Queue replacements** adds only selected, matched MQA tracks to the lossless download queue. Files change only when you approve and download those replacements. Review proposed changes before applying them.
 
 Files changed through the app update its index and dependent views. After editing or moving files in another application, use **Check local changes** from Overview. It reads tags only for added or changed files and records removals. Keep the database: it holds links, cached metadata and saved decisions.
 
@@ -40,7 +40,7 @@ The Overview count includes all missing, incomplete and queued releases within *
 
 Right-click any main table header, or click its filter icon, to sort or check the actual values in that column. Multiple checked values in one column are combined; filters on different columns apply together. Counts and searchable value lists cover the full matching dataset before pagination. **Select all** includes every value, including values beyond the loaded list; **Clear selection** lets you choose just the values you need. **Reset column filters** clears all column selections. Keyboard users can focus a header and press **Shift+F10**; **Escape** closes the menu.
 
-The duplicate filter dropdowns have been removed. Missing releases keeps album-artist scope and release range in **View options**, since these describe the whole view. Confidence, coverage, type, artist and other fields use their column menus. **Affected files only** in local tools limits the preview to files with proposed changes; column selections further narrow that preview. Unavailable releases remain inspectable by selecting all Recommendation values and checking **Unavailable** in Coverage; artist scope and release range still apply.
+The duplicate filter dropdowns have been removed. Missing releases keeps album-artist scope and release range in **View options**, since these describe the whole view. Confidence, coverage, type, artist and other fields use their column menus. Tag-correction previews initially exclude blank proposed changes; folder previews exclude **No change**. Use the corresponding column menu or **Reset column filters** to show everything. Unavailable releases remain inspectable by selecting all Recommendation values and checking **Unavailable** in Coverage; artist scope and release range still apply.
 
 A release is marked superseded only when cached evidence shows a newer available release contains all its recordings. Exclusive mixes remain protected; superseded items remain inspectable.
 

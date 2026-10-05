@@ -80,6 +80,7 @@ export function DataTable({
   loading,
   busy,
   headerFilters,
+  selectionLabel,
 }: {
   rows: Row[];
   columns: Column[];
@@ -101,6 +102,7 @@ export function DataTable({
   loading: boolean;
   busy: boolean;
   headerFilters?: Record<string, HeaderFilter>;
+  selectionLabel?: (row: Row) => string;
 }) {
   const [anchor, setAnchor] = useState<number | null>(null);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
@@ -445,7 +447,7 @@ export function DataTable({
                 >
                   <td className="check">
                     <Check
-                      label={`Select ${r.release || r.title || r.artist}`}
+                      label={selectionLabel?.(r) || `Select ${r.release || r.title || r.artist}`}
                       state={state}
                       disabled={busy && tree}
                       onChange={(yes) => {

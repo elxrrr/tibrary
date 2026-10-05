@@ -53,6 +53,8 @@ Use **Check local changes** after editing files outside the app, and **Update mi
 
 Filter any main table using checkmarked values in its column headers; multiple values and columns can be combined. Missing releases keeps album-artist scope and release range in **View options**.
 
+In **MQA audit**, the arrow beside **Scan** selects all releases or only unscanned tracks. Adjust individual checkmarks before scanning. **Find online matches** identifies selected MQA recordings; **Queue replacements** adds matched tracks to the download queue for approval.
+
 Browse cached releases and manage the queue while updates run. Expanding a release loads missing track details on demand; downloads and local scans run independently. File-changing operations wait for active downloads to finish.
 
 ## Screenshots

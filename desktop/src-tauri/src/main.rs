@@ -862,7 +862,7 @@ async fn handle_rpc_call(
         return Err("Finish the quit confirmation before starting another task".into());
     }
 
-    let cacheable = matches!(method.as_str(), "table" | "table.facets" | "state");
+    let cacheable = matches!(method.as_str(), "table" | "table.facets" | "state" | "mqa.selection");
     let key = format!("{method}:{}", args);
     let gate = cacheable.then(|| state.read_gate(&key));
     let _read = match gate.as_ref() { Some(gate) => Some(gate.lock().await), None => None };
@@ -918,7 +918,7 @@ async fn handle_rpc_uncached(
     if method == "appearance.accent" {
         return serde_json::to_value(appearance::system_accent(app_handle).await).map_err(|error| error.to_string());
     }
-    if matches!(method.as_str(), "table" | "table.facets" | "detail" | "job.start")
+    if matches!(method.as_str(), "table" | "table.facets" | "detail" | "job.start" | "mqa.selection")
         || method.starts_with("turso.") || method.starts_with("release.")
         || method.starts_with("artists.") || method.starts_with("links.") || method.starts_with("queue.") {
         let preferences = db.get_settings().await?;
@@ -1210,6 +1210,9 @@ async fn handle_rpc_uncached(
         let canonical = musical_keys::canonical_key(key);
         let camelot = musical_keys::camelot_key(key);
         return Ok(json!({ "canonical": canonical, "camelot": camelot }));
+    }
+    if method == "mqa.selection" {
+        return actions::mqa_selection(db, &args).await;
     }
     if method == "turso.mqa.audit" {
         let path_str = args

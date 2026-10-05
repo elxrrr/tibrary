@@ -268,6 +268,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
       await expect(page.getByRole("button",{name:/^Filter /})).toHaveCount(columns);
       await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
     }
+    if (name === "MQA audit") await expect(page.locator(".mqa-selection-summary")).not.toContainText("Checking selection");
     await expect(page.getByRole("alert")).toHaveCount(0);
     if (process.env.TIBRARY_SCREENSHOTS && screenshots[name]) {
       if (name === "Local duplicates") {
@@ -278,6 +279,8 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
         await expect(page.locator(".header-workload")).toHaveCount(0);
       }
       await page.mouse.move(1590, 10);
+      // Let the pointer leave the sidebar before capturing hover transitions.
+      await page.waitForTimeout(120);
       await page.screenshot({path:`docs/imgs/${screenshots[name]}.png`});
     }
   }
@@ -774,7 +777,8 @@ test("automatic correction previews can be applied and all-files view remains av
   await expect.poll(async()=> (await rpc("job.status")).result?.job?.status).toBe("complete");
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect(page.locator("tbody tr")).toHaveCount(0);
-  await page.getByRole("checkbox", {name:"Affected files only",exact:true}).uncheck();
+  await expect(page.getByRole("checkbox", {name:"Affected files only",exact:true})).toHaveCount(0);
+  await page.getByRole("button", {name:"Reset column filters",exact:true}).click();
   await expect(page.locator("tbody tr")).toHaveCount(2);
 });
 
@@ -803,17 +807,145 @@ test("organise files previews and applies only to the disposable library", async
   expect(indexed.result.rows.every((row:any) => row.path.includes("/North Assembly/Blue Hours"))).toBe(true);
 });
 
-test("MQA and local duplicate scan controls complete without blocking navigation", async ({page}) => {
+test("MQA scan scopes check the relevant files and selected scans preserve other cached rows", async ({page}) => {
+  const root=join(folder,"music"), first=join(root,"First Light.flac"), second=join(root,"Drift.flac");
+  const scans:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start" && request.args.kind==="mqa") scans.push(request.args.args);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"MQA audit",exact:true}).click();
   await expect(page.locator("tbody").getByText("Not audited").first()).toBeVisible();
-  await page.getByRole("button",{name:/Recheck|Audit/}).first().click();
+  await expect(page.getByRole("checkbox",{name:"Affected files only",exact:true})).toHaveCount(0);
+  const scan=page.getByRole("button",{name:"Scan selected tracks",exact:true});
+  const firstCheck=page.locator("tbody tr").filter({hasText:"First Light"}).getByRole("checkbox");
+  const secondCheck=page.locator("tbody tr").filter({hasText:"Drift"}).getByRole("checkbox");
+  await expect(firstCheck).toBeChecked();
+  await expect(secondCheck).toBeChecked();
+  await expect(scan).toContainText("2");
+  await secondCheck.uncheck();
+  await expect(scan).toContainText("1");
+  await scan.click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
+  expect(scans[0].ids).toEqual([first]);
+  expect(scans[0].force).toBe(true);
+  expect((await rpc("job.status")).result.job.result.inspected).toBe(1);
+  const inspected=(await rpc("table",{route:"mqa",root,limit:100})).result;
+  expect(inspected.total).toBe(2);
+  expect(inspected.rows.find((row:any)=>row.id===second).status).toBe("Not audited");
+  expect(inspected.rows.find((row:any)=>row.id===first).status).not.toBe("Not audited");
+  expect((await rpc("mqa.selection",{root,scope:"unscanned"})).result.ids).toEqual([second]);
+  // Both scopes read the same audit cache; selecting a scope never scans audio.
+  await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
+  await page.locator("aside").getByRole("button",{name:"MQA audit",exact:true}).click();
+  await expect(firstCheck).not.toBeChecked();
+  await expect(secondCheck).toBeChecked();
+  await page.getByRole("button",{name:"Choose scan scope",exact:true}).click();
+  await page.getByRole("menuitemradio",{name:"All releases",exact:true}).click();
+  await expect(firstCheck).toBeChecked();
+  await expect(secondCheck).toBeChecked();
+  await page.getByRole("button",{name:"Choose scan scope",exact:true}).click();
+  await page.getByRole("menuitemradio",{name:"Unscanned releases only",exact:true}).click();
+  await expect(firstCheck).not.toBeChecked();
+  await expect(secondCheck).toBeChecked();
+  expect(scans).toHaveLength(1);
+  await page.getByRole("button",{name:"Choose scan scope",exact:true}).click();
+  await page.getByRole("menuitemradio",{name:"All releases",exact:true}).press("Escape");
+  await expect(page.getByRole("menuitemradio",{name:"All releases",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Choose scan scope",exact:true})).toBeFocused();
+  await page.getByRole("button",{name:"Clear selection",exact:true}).click();
+  await expect(scan).toBeDisabled();
+  await expect(page.getByRole("button",{name:"Find online matches",exact:true})).toBeDisabled();
+  await expect(page.getByRole("button",{name:"Queue replacements",exact:true})).toBeDisabled();
+  expect(scans).toHaveLength(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
   await page.locator("aside").getByRole("button",{name:"Local duplicates",exact:true}).click();
   await page.getByRole("button",{name:"Check local duplicates",exact:true}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
   await expect(page.getByRole("button",{name:"Check local duplicates",exact:true})).toBeVisible();
   await expect(page.getByRole("heading",{name:"Local duplicates",exact:true})).toBeVisible();
+});
+
+test("MQA replacement actions use selected signal tracks across pages and remain separate from scans", async ({page}) => {
+  const rows=Array.from({length:55},(_,index)=>({
+    id:`/disposable/track-${index}.flac`,path:`/disposable/track-${index}.flac`,artist:"North Assembly",
+    release:`Release ${String(index).padStart(2,"0")}`,title:`Track ${index}`,
+    status:[0,54].includes(index)?"MQA signal":"No signal found",
+    evidence:[0,54].includes(index)?"Saved MQA encoder tag":"No MQA tags or audio signature",
+    affected:[0,54].includes(index),target:[0,54].includes(index)?"Queue lossless replacement":"—",
+  }));
+  const starts:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON(), args=request.args||{};
+    if(["table","table.facets"].includes(request.method) && args.route==="mqa") {
+      if(request.method==="table.facets") {
+        await route.fulfill({json:{result:mockFacets(rows,args)}});return;
+      }
+      const selected=filteredMockRows(rows,args).filter(row=>!args.search || `${row.artist} ${row.release} ${row.title}`.toLowerCase().includes(args.search.toLowerCase()));
+      selected.sort((a:any,b:any)=>String(a[args.sort]||"").localeCompare(String(b[args.sort]||""))*(args.direction==="desc"?-1:1));
+      await route.fulfill({json:{result:{rows:selected.slice(args.offset||0,(args.offset||0)+(args.limit||50)),total:selected.length}}});return;
+    }
+    if(request.method==="mqa.selection") {
+      const ids:string[]=args.scope==="all" ? rows.map(row=>row.id) : args.scope==="unscanned" ? [] : args.ids||[];
+      const detected=ids.filter(id=>rows.some(row=>row.id===id && row.affected));
+      const unlinked=detected.filter(id=>id===rows[0].id), ready=detected.filter(id=>id===rows[54].id);
+      await route.fulfill({json:{result:{ids,detected_ids:detected,unlinked_ids:unlinked,ready_ids:ready,counts:{selected:ids.length,detected:detected.length,unlinked:unlinked.length,ready:ready.length,queued:0}}}});return;
+    }
+    if(request.method==="job.start" && ["link","queue_mqa","mqa"].includes(args.kind)) {
+      starts.push(args);
+      const result=args.kind==="queue_mqa" ? {root:args.args.root,queued_paths:args.args.ids} : {};
+      await route.fulfill({json:{result:{id:`safe-mqa-${starts.length}`,kind:args.kind,status:"complete",message:"Test action complete",started:Date.now()/1000,result}}});return;
+    }
+    await route.fulfill({json:await rpc(request.method,args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"MQA audit",exact:true}).click();
+  const scan=page.getByRole("button",{name:"Scan selected tracks",exact:true});
+  const match=page.getByRole("button",{name:"Find online matches",exact:true});
+  const queue=page.getByRole("button",{name:"Queue replacements",exact:true});
+  await expect(scan).toBeDisabled();
+  await expect(match).toBeDisabled();
+  await expect(queue).toBeDisabled();
+  await page.getByRole("textbox",{name:"Filter table",exact:true}).fill("Track 0");
+  await columnOnly(page,"Status",["MQA signal"]);
+  await page.getByRole("button",{name:"Choose scan scope",exact:true}).click();
+  await page.getByRole("menuitemradio",{name:"All releases",exact:true}).click();
+  await expect(page.getByRole("textbox",{name:"Filter table",exact:true})).toHaveValue("");
+  await expect(page.getByRole("button",{name:"Filter Status",exact:true})).not.toHaveClass(/active/);
+  await expect(page.locator("tbody tr")).toHaveCount(50);
+  await expect(scan).toContainText("55");
+  await expect(match).toContainText("1");
+  await expect(queue).toContainText("1");
+  // Track 54 is outside the rendered page, but its approved replacement is queued.
+  await queue.click();
+  await expect.poll(()=>starts.length).toBe(1);
+  expect(starts[0].kind).toBe("queue_mqa");
+  expect(starts[0].args.ids).toEqual([rows[54].id]);
+  await expect(scan).toContainText("54");
+  await expect(queue).toContainText("0");
+  await expect(queue).toBeDisabled();
+  const unlinked=page.locator("tbody tr").filter({hasText:"Track 0"}).getByRole("checkbox");
+  await expect(unlinked).toBeChecked();
+  await unlinked.uncheck();
+  await expect(match).toBeDisabled();
+  await expect(queue).toBeDisabled();
+  await unlinked.check();
+  await expect(match).toBeEnabled();
+  await match.click();
+  await expect.poll(()=>starts.length).toBe(2);
+  expect(starts[1].kind).toBe("link");
+  expect(starts[1].args.ids).toEqual([rows[0].id]);
+  await expect(page.locator(".mqa-actions")).toContainText("Scan");
+  const tableBox=await page.locator(".table-scroll").boundingBox(), actionsBox=await page.locator(".mqa-actions").boundingBox();
+  expect(actionsBox!.y).toBeGreaterThanOrEqual(tableBox!.y+tableBox!.height-1);
+  await page.getByRole("button",{name:"Clear selection",exact:true}).click();
+  await expect(scan).toBeDisabled();
+  await expect(match).toBeDisabled();
+  await expect(queue).toBeDisabled();
+  expect(starts).toHaveLength(2);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("local change checks reuse indexed tags and keep dependent controls gated across navigation", async ({page}) => {
