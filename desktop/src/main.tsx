@@ -1,4 +1,5 @@
 import { MetadataView, DownloadReview, TagChanges, ReleaseMetadata } from "./MetadataView";
+import { availableColumnSelections, columnFilterAvailable } from "./columnFilters";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
@@ -430,6 +431,7 @@ function App() {
   }, [settings?.general?.highlight_colour,state?.settings.theme]);
   const pageSize = Number(settings?.general?.page_size || 50);
   useEffect(() => { setOffset(0); }, [pageSize]);
+  const activeColumnSelections = availableColumnSelections(route, columnSelections);
   const viewArgs = {
     route,
     root: root || undefined,
@@ -437,7 +439,7 @@ function App() {
     limit: pageSize,
     search: query,
     filter: "all",
-    column_filters: columnSelections,
+    column_filters: activeColumnSelections,
     sort,
     direction,
     action,
@@ -835,9 +837,10 @@ function App() {
         : route === "online"
           ? [
               { key: "artist", label: "Artist" },
-              { key: "release", label: "Local release" },
-              { key: "target", label: "Replacement" },
+              { key: "release", label: "Release" },
+              { key: "date", label: "Release date" },
               { key: "tracks", label: "Tracks" },
+              { key: "duplicates", label: "Duplicate files" },
               { key: "gained", label: "Tracks gained" },
               { key: "evidence", label: "Evidence" },
             ]
@@ -866,12 +869,13 @@ function App() {
           : fileColumns;
   const headerFilters: Record<string, HeaderFilter> = {};
   for (const column of columns) {
-    const otherSelections = {...columnSelections};
+    if (!columnFilterAvailable(route, column.key)) continue;
+    const otherSelections = {...activeColumnSelections};
     delete otherSelections[column.key];
     const facetArgs = {...viewArgs, offset:0, limit:100, column:column.key, column_filters:otherSelections};
     headerFilters[column.key] = {
       label:`${column.label} values`,
-      selection:columnSelections[column.key],
+      selection:activeColumnSelections[column.key],
       optionsKey:JSON.stringify({...facetArgs, revision:state?.revision, refresh:tableRefresh}),
       loadOptions:search => call<ColumnFilterOptions>("table.facets", {...facetArgs, facet_search:search}),
       onChange:selection => {
@@ -1199,7 +1203,7 @@ function App() {
               </div>
             </>}
           </div>}
-          {Object.keys(columnSelections).length > 0 && <button className="reset-column-filters" aria-label="Reset column filters" onClick={() => {setColumnSelections({});setOffset(0);}} title="Reset column filters: show all column values within the current view options"><FilterX size={16} /></button>}
+          {Object.keys(activeColumnSelections).length > 0 && <button className="reset-column-filters" aria-label="Reset column filters" onClick={() => {setColumnSelections({});setOffset(0);}} title="Reset column filters: show all column values within the current view options"><FilterX size={16} /></button>}
           {selected.size > 0 && <span>{selected.size} selected</span>}
           {pagination()}
         </div>
@@ -1218,7 +1222,7 @@ function App() {
             setOffset(0);
           }}
           tree={tree}
-          grouped={route === "local"}
+          grouped={["local", "online"].includes(route)}
           hierarchy={route === "links" ? "links" : ["artists", "favourites"].includes(route) ? "artists" : undefined}
           treeSelection={selection}
           onTreeSelect={selectTree}
@@ -1647,9 +1651,12 @@ function App() {
   function contextMenu() {
     if (!menu) return null;
     const r = menu.row;
+    const replacementGroup = ["local", "online"].includes(route) && !!r.children?.length;
+    const groupSelected = ["local", "online"].includes(route) && data.rows.some(parent =>
+      selected.has(parent.id) && (parent.children || []).some((child: Row) => child.id === r.id));
     const ids: string[] = route === "links" && (r.artist_group || r.link_group)
       ? (selected.size ? [...selected] : linkedFiles([r]).map(child => child.id))
-      : selected.has(r.id) ? [...selected] : [r.id];
+      : replacementGroup || selected.has(r.id) || groupSelected ? (selected.size ? [...selected] : [r.id]) : [r.id];
     return (
       <>
         <div className="menu-scrim" onClick={() => setMenu(null)} />
@@ -1683,6 +1690,11 @@ function App() {
             <button role="menuitem" disabled={busy} onClick={() => {setMenu(null); run("match_artists", {artists: ids});}}>Recheck selected artists</button>
             <button role="menuitem" disabled={busy} onClick={() => unlinkArtists(ids)}>Unlink selected artists</button>
           </>}
+          {["local", "online"].includes(route) && <button role="menuitem" disabled={busy} onClick={() => {
+            setMenu(null);
+            if (route === "local") run("review_consolidation", {ids, scope:"local"});
+            else run("queue_replacements", {ids});
+          }}>{route === "local" ? "Review duplicate removal" : "Queue selected replacement releases"}</button>}
           {r.path && (
             <>
               <button
@@ -2030,7 +2042,8 @@ function App() {
       {detail && (
         <Modal
           title={
-            detail.local_artist ? "Artist release links" : detail.local_release ? "Local release details" : detail.artist && !detail.tags
+            detail.operation ? route === "online" ? "Replacement release details" : "Local duplicate details"
+              : detail.local_artist ? "Artist release links" : detail.local_release ? "Local release details" : detail.artist && !detail.tags
               ? "Artist candidates"
               : detail.release
                 ? "Release details"
@@ -2203,7 +2216,23 @@ function App() {
                 </details>
               </>
             )}
-            {detail.operation && <section><h3>{detail.operation.release}</h3><p>{detail.operation.evidence}</p><dl><dt>Local folder</dt><dd>{detail.operation.path}</dd><dt>Retained / replacement destination</dt><dd>{detail.operation.target}</dd><dt>Duplicate tracks</dt><dd>{detail.operation.duplicates}</dd></dl></section>}
+            {detail.operation && <section>
+              <h3>{detail.operation.artist} — {detail.operation.release}</h3>
+              <p>{detail.operation.evidence}</p>
+              <dl>
+                {detail.operation.path && <><dt>Local folder</dt><dd>{detail.operation.path}</dd></>}
+                {detail.operation.target && <><dt>Retained / replacement destination</dt><dd>{detail.operation.target}</dd></>}
+                <dt>Local duplicate files</dt><dd>{detail.operation.duplicates}</dd>
+              </dl>
+              {detail.operation.online_id && <button onClick={() => external(`https://tidal.com/album/${detail.operation.online_id}`).catch(notifyError)}>Open on web</button>}
+              {!!detail.operation.children?.length && <div className="metadata-table"><table aria-label="Affected local releases">
+                <thead><tr><th>Local release</th><th>Tracks</th><th>Folder</th><th>Evidence</th><th /></tr></thead>
+                <tbody>{detail.operation.children.map((child: Row) => <tr key={child.id}>
+                  <td>{child.release}</td><td>{child.tracks}</td><td title={child.path}>{child.path}</td><td>{child.evidence}</td>
+                  <td><button onClick={() => loadDetail(child)}>View release</button></td>
+                </tr>)}</tbody>
+              </table></div>}
+            </section>}
             {detail.artist && !detail.tags && (
               <>
                 <p>

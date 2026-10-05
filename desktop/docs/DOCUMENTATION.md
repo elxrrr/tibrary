@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.19** · [Setup and screenshots](../../README.md)
+Version **0.9.20** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -46,11 +46,13 @@ Missing releases defaults to **My album artists** and **Recommended and potentia
 
 The Overview count includes all missing, incomplete and queued releases within **My album artists → Recommended and potential**, regardless of the filters currently used on the Missing releases page. Clicking that card opens the same scope.
 
-Right-click any main table header, or click its filter icon, to sort or check the actual values in that column. Multiple checked values in one column are combined; filters on different columns apply together. Counts and searchable value lists cover the full matching dataset before pagination. **Select all** includes every value, including values beyond the loaded list; **Clear selection** lets you choose just the values you need. **Reset column filters** clears all column selections. Keyboard users can focus a header and press **Shift+F10**; **Escape** closes the menu.
+All main table headers support sorting. Filter icons appear on descriptive columns such as artist, release title, date and status; counts, positions and evidence have no filter menus. Multiple checked values in one column are combined; filters on different columns apply together. Searchable value lists cover the full matching dataset before pagination. **Select all** includes every value, including values beyond the loaded list; **Clear selection** lets you choose just the values you need. **Reset column filters** clears all column selections. Keyboard users can focus a header and press **Shift+F10**; **Escape** closes the menu.
 
 The duplicate filter dropdowns have been removed. Missing releases keeps album-artist scope and release range in **View options**, since these describe the whole view. Confidence, coverage, type, artist and other fields use their column menus. Tag-correction previews initially exclude blank proposed changes; folder previews exclude **No change**. Use the corresponding column menu or **Reset column filters** to show everything. Unavailable releases remain inspectable by selecting all Recommendation values and checking **Unavailable** in Coverage; artist scope and release range still apply.
 
 A release is marked superseded only when cached evidence shows a newer available release contains all its recordings. Exclusive mixes remain protected; superseded items remain inspectable.
+
+Local duplicates and Online replacements group the release to keep or acquire above its redundant local releases. Expand a group to inspect evidence and select individual releases. Online replacement groups reuse saved results; selecting a group queues its replacement once, while selecting a child retains that child's original plan scope. Originals remain in place. View metadata / match details shows the affected local folders.
 
 ### Cache and refresh controls
 

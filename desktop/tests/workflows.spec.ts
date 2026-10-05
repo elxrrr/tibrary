@@ -1,6 +1,6 @@
 import { test, expect, Page, Locator } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -147,6 +147,24 @@ for artist,performer,album,title,track,total in [('Various Artists','First Perfo
 c.execute('CREATE TABLE IF NOT EXISTS favourite_artists(cache_id TEXT PRIMARY KEY,payload TEXT,fetched TEXT)')
 c.execute('INSERT INTO favourite_artists VALUES(?,?,?)',('test',json.dumps([{'id':'900001','name':'North Assembly Online'},{'id':'900099','name':'Remote Favourite'}]),'2026-10-05'))
 c.commit()`, join(folder,"db"), join(folder,"music")],{
+      env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
+    });
+  }
+  if(test.info().title.startsWith("online replacements group")) {
+    execFileSync("python3",["-c",`import json,sqlite3,sys
+from pathlib import Path
+from seed_desktop import write_flac
+library=Path(sys.argv[2]); c=sqlite3.connect(sys.argv[1])
+for album,title,ident in [('First Light','First Light','91000300'),('Signal','Signal','91000200')]:
+ path=library/'North Assembly'/f'{album} (2019)'/f'{title}.flac'
+ write_flac(path,'North Assembly',album,title,1,1)
+ metadata={'albumartist':['North Assembly'],'artist':['North Assembly'],'album':[album],'title':[title],'tracknumber':['1/1'],'discnumber':['1/1'],'date':['2019-01-01'],'duration':180.0,'tidal_track_id':ident}
+ c.execute('INSERT INTO local_files VALUES (?,?,?,?,?,NULL,1)',(str(path),str(library),path.stat().st_size,path.stat().st_mtime_ns,json.dumps(metadata)))
+plans=[]
+for album,path,target,ident,date,tracks,matched,target_tracks in [('Blue Hours',library,'Blue Hours (Deluxe)','910003','2023-04-03',2,['91000300','91000301'],4),('First Light',library/'North Assembly'/'First Light (2019)','Blue Hours (Deluxe)','910003','2023-04-03',1,['91000300'],4),('Signal',library/'North Assembly'/'Signal (2019)','Night Maps','910002','2022-09-16',1,['91000200'],3)]:
+ plans.append({'id':f'{ident}::{path}','artist':'North Assembly','release':album,'target':target,'online_id':ident,'path':str(path),'date':'2019-01-01','target_artist':'North Assembly','target_date':date,'target_tracks':target_tracks,'matched_track_ids':matched,'tracks':tracks,'duplicates':tracks,'gained':target_tracks-tracks,'evidence':f'All {tracks} local recordings are contained in {target}; matching recording identifiers, mix and duration','status':'Larger online release','affected':True})
+c.execute('INSERT OR REPLACE INTO app_preferences VALUES(?,?)',(f'desktop-online:{library}',json.dumps(plans)))
+c.commit()`,join(folder,"db"),join(folder,"music")],{
       env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
     });
   }
@@ -322,8 +340,17 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     ).toBeVisible();
     if (await page.locator(".table-scroll").count()) {
       await expect(page.locator(".table-scroll")).toHaveAttribute("aria-busy", "false");
-      const columns=await page.locator(".table-header-actions").count();
-      await expect(page.getByRole("button",{name:/^Filter /})).toHaveCount(columns);
+      const headers=page.locator(".table-header-actions");
+      let filterCount=0;
+      for(let index=0;index<await headers.count();index++) {
+        const header=headers.nth(index), label=(await header.getByRole("button").first().innerText()).trim();
+        const numerical=["Tracks","Local tracks","Tracks gained","Duplicates","Duplicate files","Disc · track","Online ID","Online IDs"].includes(label)
+          || (["Link artists","Favourite artists","Link catalogue"].includes(name) && label === "Releases");
+        const filterable=!numerical && label !== "Evidence";
+        await expect(header.getByRole("button",{name:`Filter ${label}`,exact:true})).toHaveCount(filterable ? 1 : 0);
+        if(filterable) filterCount++;
+      }
+      await expect(page.getByRole("button",{name:/^Filter /})).toHaveCount(filterCount);
       await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
       const pagination=page.getByRole("navigation",{name:"Table pagination",exact:true});
       const actions=page.getByRole("group",{name:"Table actions",exact:true});
@@ -422,6 +449,39 @@ test("local table sorting and filters are usable", async ({ page }) => {
   await expect(page.locator("tbody tr").first()).toBeVisible();
   await page.getByRole("button", { name: "Release", exact: true }).click();
   await page.getByRole("button", { name: "Release", exact: true }).click();
+});
+test("numeric and evidence headers keep sorting without value filters or facet requests", async ({page}) => {
+  const facets:string[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="table.facets") facets.push(`${request.args.route}:${request.args.column}`);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link artists",exact:true}).click();
+  for(const label of ["Tracks","Releases","Evidence"]) {
+    await expect(page.getByRole("button",{name:`Filter ${label}`,exact:true})).toHaveCount(0);
+    const header=page.getByRole("columnheader").filter({has:page.getByRole("button",{name:label,exact:true})});
+    await header.click({button:"right"});
+    const menu=page.getByRole("menu",{name:`${label} column options`,exact:true});
+    await expect(menu.getByRole("menuitemcheckbox")).toHaveCount(0);
+    await menu.getByRole("menuitemradio",{name:"Sort descending",exact:true}).click();
+    await expect(header).toHaveAttribute("aria-sort","descending");
+    await header.getByRole("button",{name:label,exact:true}).click();
+    await expect(header).toHaveAttribute("aria-sort","ascending");
+  }
+  await columnOnly(page,"Match status",["Confirmed"]);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await columnAll(page,"Status");
+  await expect(page.getByRole("button",{name:"Filter Tracks",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Filter Evidence",exact:true})).toHaveCount(0);
+  await columnOnly(page,"Release",["Blue Hours"]);
+  await expandLocalArtist(page);
+  await expect(page.getByRole("button",{name:"Expand Blue Hours",exact:true})).toBeVisible();
+  expect(facets.some(key=>/:(tracks|evidence|position|gained|duplicates|online_id)$/.test(key))).toBe(false);
+  expect(facets).not.toContain("artists:release");
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 test("queue approvals cascade, persist and survive sorting and expansion", async ({
   page,
@@ -718,6 +778,117 @@ test("artist hierarchy keeps compilation releases together and resolves selected
   await expect(page.getByRole("checkbox",{name:"Select track Opening",exact:true})).toBeVisible();
   await expect(page.getByRole("checkbox",{name:"Select track Closing",exact:true})).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+test("online replacements group targets and preserve scoped selection, readable evidence and cached results", async ({page}) => {
+  const root=join(folder,"music"), requests:any[]=[];
+  const originalFiles=[join(root,"First Light.flac"),join(root,"Drift.flac"),join(root,"North Assembly/First Light (2019)/First Light.flac")];
+  const originalBytes=originalFiles.map(path=>readFileSync(path));
+  const all=(await rpc("table",{route:"online",root,limit:100,sort:"release",direction:"asc"})).result;
+  expect(all.total).toBe(2);
+  const deluxe=all.rows.find((row:any)=>row.release==="Blue Hours (Deluxe)");
+  expect(deluxe.replacement_group).toBe(true);
+  expect(deluxe.id).toBe("online-replacement:910003");
+  expect(deluxe.children.map((row:any)=>row.release).sort()).toEqual(["Blue Hours","First Light"]);
+  expect(deluxe.tracks).toBe(4);
+  expect(deluxe.duplicates).toBe(3);
+  expect(deluxe.gained).toBe(2);
+  expect(deluxe.date).toBe("2023-04-03");
+  const bluePlan=deluxe.children.find((row:any)=>row.release==="Blue Hours").id;
+  const firstPlan=deluxe.children.find((row:any)=>row.release==="First Light").id;
+  expect(bluePlan).toBe(`910003::${root}`);
+  const filtered=(await rpc("table",{route:"online",root,column_filters:{release:{include:["Blue Hours (Deluxe)"]}},limit:100})).result;
+  expect(filtered.total).toBe(1);
+  expect(filtered.rows[0].children).toHaveLength(2);
+  const childSearch=(await rpc("table",{route:"online",root,search:"First Light",limit:100})).result;
+  expect(childSearch.total).toBe(1);
+  expect(childSearch.rows[0].children.map((row:any)=>row.id).sort()).toEqual([bluePlan,firstPlan].sort());
+  await rpc("queue.decision",{ids:["910001","910002","910003","910004","910005","910006"],decision:"removed"});
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start" && request.args.kind==="queue_replacements") requests.push(request);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  const sidebar=page.locator("aside");
+  await sidebar.getByRole("button",{name:"Online replacements",exact:true}).click();
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.getByRole("button",{name:"Filter Tracks",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Filter Duplicate files",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Filter Tracks gained",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Filter Evidence",exact:true})).toHaveCount(0);
+  const parent=page.getByRole("checkbox",{name:"Select Blue Hours (Deluxe)",exact:true});
+  await parent.check();
+  await page.getByRole("button",{name:"Expand Blue Hours (Deluxe)",exact:true}).click();
+  const blue=page.getByRole("checkbox",{name:"Select local release Blue Hours",exact:true});
+  const first=page.getByRole("checkbox",{name:"Select local release First Light",exact:true});
+  await expect(blue).toBeChecked();
+  await expect(first).toBeChecked();
+  await page.locator("tbody tr").filter({has:blue}).click({button:"right"});
+  await page.getByRole("menuitem",{name:"View metadata / match details",exact:true}).click();
+  await expect(page.getByRole("dialog")).toContainText("Blue Hours");
+  await page.getByRole("dialog").getByRole("button",{name:"Done",exact:true}).click();
+  await expect(parent).toBeChecked();
+  await expect(blue).toBeChecked();
+  await expect(first).toBeChecked();
+  await first.uncheck();
+  await expect(parent).toHaveJSProperty("indeterminate",true);
+  await expect(blue).toBeChecked();
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours (Deluxe)",exact:true})).toBeVisible();
+  await expect(first).not.toBeChecked();
+  await page.getByRole("button",{name:"Actions for Blue Hours (Deluxe)",exact:true}).click();
+  await page.getByRole("menuitem",{name:"View metadata / match details",exact:true}).click();
+  const dialog=page.getByRole("dialog");
+  const affected=dialog.getByRole("table",{name:"Affected local releases",exact:true});
+  await expect(affected).toContainText("Blue Hours");
+  await expect(affected).toContainText("First Light");
+  await expect(affected).toContainText("matching recording identifiers");
+  await expect(dialog.locator("pre")).toHaveCount(0);
+  await dialog.getByRole("button",{name:"Done",exact:true}).click();
+  await expect(parent).toHaveJSProperty("indeterminate",true);
+  await expect(first).not.toBeChecked();
+  await expect(page.getByRole("button",{name:"Queue replacement releases (1)",exact:true})).toBeEnabled();
+  await page.getByRole("button",{name:"Actions for Blue Hours (Deluxe)",exact:true}).click();
+  await page.getByRole("menuitem",{name:"Queue selected replacement releases",exact:true}).click();
+  await expect.poll(()=>requests.length).toBe(1);
+  expect(requests[0].args.args.ids).toEqual([bluePlan]);
+  await expect.poll(async()=>{
+    const jobs=(await rpc("job.status")).result;
+    return [jobs.job,jobs.online_job].find(job=>job?.kind==="queue_replacements")?.status;
+  }).toBe("complete");
+  const queue=(await rpc("table",{route:"queue",root,limit:100})).result;
+  expect(queue.rows.map((row:any)=>row.id)).toEqual(["910003"]);
+  for(let index=0;index<originalFiles.length;index++) expect(readFileSync(originalFiles[index])).toEqual(originalBytes[index]);
+  await sidebar.getByRole("button",{name:"Local duplicates",exact:true}).click();
+  await page.getByRole("button",{name:"Check local duplicates",exact:true}).click();
+  await expect.poll(async()=>{
+    const job=(await rpc("job.status")).result.job;
+    return job?.kind==="local_duplicates" ? job.status : "waiting";
+  }).toBe("complete");
+  const retained=page.getByRole("checkbox",{name:"Select Blue Hours",exact:true});
+  await retained.check();
+  await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
+  const duplicate=page.getByRole("checkbox",{name:"Select duplicate First Light",exact:true});
+  await expect(duplicate).toBeChecked();
+  await page.getByRole("button",{name:"Actions for First Light",exact:true}).click();
+  await page.getByRole("menuitem",{name:"View metadata / match details",exact:true}).click();
+  await expect(page.getByRole("dialog")).toContainText("First Light");
+  await page.getByRole("dialog").getByRole("button",{name:"Done",exact:true}).click();
+  await expect(retained).toBeChecked();
+  await duplicate.uncheck();
+  await expect(retained).not.toBeChecked();
+  await expect(page.getByRole("button",{name:/^Review duplicate removal/})).toBeDisabled();
+  await sidebar.getByRole("button",{name:"Overview",exact:true}).click();
+  await sidebar.getByRole("button",{name:"Online replacements",exact:true}).click();
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–2 of 2");
+  await expect(page.getByRole("checkbox",{name:"Select Blue Hours (Deluxe)",exact:true})).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  if(process.env.TIBRARY_SCREENSHOTS) {
+    const expander=page.getByRole("button",{name:/^(Expand|Collapse) Blue Hours \(Deluxe\)$/});
+    if(await expander.getAttribute("aria-expanded") !== "true") await expander.click();
+    await page.screenshot({path:"/tmp/tibrary-online-replacements-0.9.20.png"});
+  }
 });
 test("dark settings fit a full window and retain defaults", async ({
   page,

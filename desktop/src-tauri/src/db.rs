@@ -3916,6 +3916,14 @@ impl TursoDb {
         }
     }
 
+    /// Reuse the shared batched snapshots for replacement presentation. This
+    /// only reads saved catalogue, track and subscriber metadata.
+    pub async fn cached_replacement_releases(&self, market: &str, ids: &HashSet<String>) -> Result<HashMap<String, Value>, String> {
+        if ids.is_empty() { return Ok(HashMap::new()); }
+        self.ensure_catalogue_release_index().await?;
+        self.recommendation_anchor_releases(market, ids).await
+    }
+
     pub async fn get_detail(&self, args: &Value) -> Result<Value, String> {
         let conn = self.connect()?;
         if let Some(release_id) = args.get("release_id").and_then(|v| v.as_str()) {

@@ -669,6 +669,23 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
                 .await?;
             cached_rows = Some(rows);
         }
+        if route == "online" && cached_rows.as_ref().is_some_and(|rows|!rows.is_empty()) {
+            let rows = cached_rows.take().unwrap_or_default();
+            let missing_targets = rows.iter().filter(|row|!row["target_metadata"].is_object())
+                .filter_map(|row|row["online_id"].as_str().map(str::to_owned)).collect();
+            let market = args["market"].as_str().unwrap_or("GB");
+            let targets = db.cached_replacement_releases(market, &missing_targets).await?;
+            let mut dates = HashMap::<String, String>::new();
+            if rows.iter().any(|row|row["date"].as_str().is_none_or(str::is_empty)) {
+                for file in db.get_local_files_for_release_tables(args["root"].as_str()).await? {
+                    let tags = workflows::extract_tags_map(&file.metadata);
+                    if let Some(date) = tags.get("date").filter(|date|!date.is_empty()) {
+                        dates.entry(duplicates::extract_release_folder(&file.path)).or_insert_with(||date.clone());
+                    }
+                }
+            }
+            cached_rows = Some(duplicates::online_replacement_groups(&rows, &targets, &dates));
+        }
         if let Some(mut rows) = cached_rows {
             if filter == Some("affected") {
                 rows.retain(|r| r["affected"] == true);

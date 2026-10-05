@@ -523,6 +523,91 @@ pub fn clusters_to_group_rows(clusters: &[DuplicateCluster]) -> Vec<serde_json::
     }).collect()
 }
 
+pub fn online_replacement_group_id(release_id: &str) -> String {
+    format!("online-replacement:{release_id}")
+}
+
+/// A replacement release owns the local releases it can absorb. Cached plans
+/// keep their original IDs so selections never become filesystem operations.
+pub fn online_replacement_groups(
+    plans: &[serde_json::Value],
+    metadata: &HashMap<String, serde_json::Value>,
+    local_dates: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    use serde_json::{json, Value};
+    let mut groups = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    for plan in plans {
+        let target = plan["online_id"].as_str().filter(|id|!id.is_empty()).map(str::to_owned)
+            .unwrap_or_else(||format!("unverified:{:x}",Sha256::digest(plan["id"].to_string().as_bytes())));
+        groups.entry(target).or_default().push(plan.clone());
+    }
+    groups.into_iter().map(|(target_id, mut children)| {
+        children.sort_by(|left,right| crate::compare_table_cell(left,right,"release")
+            .then_with(||crate::compare_table_cell(left,right,"path"))
+            .then_with(||crate::compare_table_cell(left,right,"id")));
+        let first = children[0].clone();
+        let snapshot = metadata.get(&target_id)
+            .or_else(||children.iter().find_map(|plan|plan.get("target_metadata").filter(|snapshot|snapshot.is_object())))
+            .cloned().unwrap_or(Value::Null);
+        let text = |field: &str, fallback: &str, last: &str| snapshot[field].as_str().filter(|text|!text.is_empty())
+            .or_else(||first[fallback].as_str().filter(|text|!text.is_empty()))
+            .unwrap_or(last).to_string();
+        let title = text("title", "target", "Unknown replacement");
+        let artist = text("artist", "target_artist", first["artist"].as_str().unwrap_or("Unknown artist"));
+        let date = text("date", "target_date", "");
+        let tracks = snapshot["tracks"].as_array().filter(|tracks|!tracks.is_empty()).map(Vec::len)
+            .or_else(||children.iter().find_map(|plan|plan["target_tracks"].as_u64().filter(|count|*count > 0).map(|count|count as usize)))
+            .or_else(||snapshot["track_count"].as_u64().filter(|count|*count > 0).map(|count|count as usize))
+            .or_else(||children.iter().filter_map(|plan|Some(plan["tracks"].as_u64()? + plan["gained"].as_u64()?)).max().map(|count|count as usize));
+        let id = online_replacement_group_id(&target_id);
+        let mut matched = HashSet::<String>::new();
+        let exact_coverage = children.iter().all(|plan|plan["matched_track_ids"].as_array().is_some_and(|ids| {
+            let mut unique = HashSet::new();
+            !ids.is_empty() && Some(ids.len() as u64) == plan["tracks"].as_u64()
+                && ids.iter().all(|id|id.as_str().filter(|id|!id.is_empty()).is_some_and(|id| {
+                    matched.insert(id.to_string()); unique.insert(id.to_string())
+                }))
+        }));
+        let gained = if exact_coverage { tracks.map(|count|json!(count.saturating_sub(matched.len()))) }
+            else if children.len() == 1 { tracks.zip(first["tracks"].as_u64())
+                .map(|(total, covered)|json!(total.saturating_sub(covered as usize))) } else { None };
+        let duplicates = children.iter().map(|plan|plan["duplicates"].as_u64().or_else(||plan["tracks"].as_u64()).unwrap_or(0)).sum::<u64>();
+        for child in &mut children {
+            child["parent_id"] = json!(id);
+            child["target"] = json!(title);
+            child["replacement_group"] = json!(false);
+            if child["date"].as_str().is_none_or(|date|date.is_empty()) {
+                child["date"] = json!(child["path"].as_str().and_then(|folder|local_dates.get(folder)).cloned().unwrap_or_default());
+            }
+        }
+        let actionable = !target_id.is_empty() && target_id.bytes().all(|byte|byte.is_ascii_digit());
+        let sources = children.len();
+        let target_metadata = json!({"id":target_id,"artist":artist,"title":title,"date":date,
+            "track_count":tracks,"type":snapshot["type"],"quality":snapshot["quality"],
+            "label":snapshot["label"],"copyright":snapshot["copyright"],"upc":snapshot["upc"]});
+        json!({"id":id,"artist":artist,"release":title,"title":title,"date":date,"tracks":tracks,
+            "duplicates":duplicates,"gained":gained.unwrap_or(Value::Null),"target":title,"online_id":if actionable{Some(target_id)}else{None},
+            "status":if actionable{"Larger online release"}else{"Needs review"},
+            "evidence":if actionable {format!("{sources} local {} fully contained · {duplicates} duplicate files; originals retained until downloaded and reviewed",if sources==1{"release"}else{"releases"})}
+                else {"Replacement identity is unverified; inspect the saved plan before queuing. Local files are retained.".to_string()},
+            "changes":"Queue complete release; retain originals until downloaded and reviewed",
+            "optimization_group":true,"replacement_group":true,"expanded_available":true,
+            "plan_ids":children.iter().map(|plan|plan["id"].clone()).collect::<Vec<_>>(),
+            "local_releases":sources,"target_metadata":target_metadata,"children":children,"affected":true})
+    }).collect()
+}
+
+/// Expand selected aggregate IDs against the current saved plans. Unknown IDs
+/// cannot queue a release, and each remote release is queued at most once.
+pub fn selected_online_replacement_releases(plans: &[serde_json::Value], selected: &HashSet<String>) -> HashSet<String> {
+    plans.iter().filter_map(|plan| {
+        let release = plan["online_id"].as_str().filter(|id|!id.is_empty() && id.bytes().all(|byte|byte.is_ascii_digit()))?;
+        let chosen = plan["id"].as_str().is_some_and(|id|selected.contains(id))
+            || selected.contains(&online_replacement_group_id(release));
+        chosen.then(||release.to_string())
+    }).collect()
+}
+
 pub fn clusters_to_link_rows(clusters: &[DuplicateCluster]) -> Vec<LinkRow> {
     let mut rows = Vec::new();
 
@@ -693,6 +778,78 @@ pub async fn consolidate_redundant_releases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn online_replacements_group_sources_with_exact_unique_recording_gains() {
+        use serde_json::json;
+        let plans = vec![
+            json!({"id":"123::/Music/Single A","online_id":"123","artist":"Artist","release":"Single A",
+                "path":"/Music/Single A","tracks":2,"duplicates":2,"gained":2,"target":"Deluxe",
+                "matched_track_ids":["track-1","track-2"],"evidence":"Exact recordings"}),
+            json!({"id":"123::/Music/Single B","online_id":"123","artist":"Artist","release":"Single B",
+                "path":"/Music/Single B","tracks":1,"duplicates":1,"gained":3,"target":"Deluxe",
+                "matched_track_ids":["track-1"],"target_tracks":4,"evidence":"Exact recording"}),
+            json!({"id":"456::/Music/Other","online_id":"456","artist":"Artist","release":"Other",
+                "path":"/Music/Other","tracks":1,"gained":2,"target":"Other Album"}),
+        ];
+        let metadata = HashMap::from([("123".into(),json!({"id":"123","artist":"Canonical Artist","title":"Deluxe","date":"2024-03-01",
+            "track_count":5,"label":"Label","copyright":"Rights","quality":"LOSSLESS"}))]);
+        let dates = HashMap::from([("/Music/Single A".into(),"2020".into()),("/Music/Single B".into(),"2021".into())]);
+        let grouped = online_replacement_groups(&plans, &metadata, &dates);
+        assert_eq!(grouped.len(), 2);
+        let parent = &grouped[0];
+        assert_eq!(parent["id"], "online-replacement:123");
+        assert_eq!(parent["replacement_group"], true);
+        assert_eq!(parent["artist"], "Canonical Artist");
+        assert_eq!(parent["release"], "Deluxe");
+        assert_eq!(parent["date"], "2024-03-01");
+        assert_eq!(parent["tracks"], 4, "proven audio count takes precedence over a published count with video");
+        assert_eq!(parent["duplicates"], 3);
+        assert_eq!(parent["gained"], 2, "overlapping local recordings only count once toward the target");
+        assert_eq!(parent["target_metadata"]["copyright"], "Rights");
+        assert_eq!(parent["plan_ids"],json!([plans[0]["id"],plans[1]["id"]]));
+        assert!(parent.get("path").is_none(), "online aggregate must never masquerade as a local folder");
+        assert_eq!(parent["children"][0]["id"], plans[0]["id"]);
+        assert_eq!(parent["children"][0]["date"], "2020");
+        assert_eq!(parent["children"][0]["path"], plans[0]["path"]);
+        assert!(parent["children"][0].get("children").is_none());
+    }
+
+    #[test]
+    fn legacy_replacement_groups_keep_context_without_fabricating_overlapping_gains() {
+        use serde_json::json;
+        let plans = vec![
+            json!({"id":"123::/A","online_id":"123","artist":"Artist","release":"A","path":"/A","tracks":2,"gained":3,"target":"Album"}),
+            json!({"id":"123::/B","online_id":"123","artist":"Artist","release":"B","path":"/B","tracks":3,"gained":2,"target":"Album"}),
+        ];
+        let grouped = online_replacement_groups(&plans,&HashMap::new(),&HashMap::new());
+        assert_eq!(grouped[0]["tracks"],5);
+        assert_eq!(grouped[0]["duplicates"],5);
+        assert!(grouped[0]["gained"].is_null(), "the union of legacy recordings is not proven");
+        assert_eq!(grouped[0]["children"].as_array().unwrap().len(),2);
+        assert_eq!(grouped[0]["children"][1]["id"], plans[1]["id"]);
+        assert_eq!(grouped[0]["children"][1]["gained"],2);
+        let invalid = online_replacement_groups(&[json!({"id":"invalid","online_id":"bad","release":"A","path":"/A","tracks":1})],&HashMap::new(),&HashMap::new());
+        assert_eq!(invalid[0]["status"],"Needs review");
+        assert!(invalid[0]["evidence"].as_str().unwrap().contains("unverified"));
+    }
+
+    #[test]
+    fn replacement_selection_expands_only_current_group_or_original_plan_ids() {
+        use serde_json::json;
+        let plans = vec![
+            json!({"id":"123::/A","online_id":"123"}),json!({"id":"123::/B","online_id":"123"}),
+            json!({"id":"456::/C","online_id":"456"}),json!({"id":"invalid::/D","online_id":"bad"})
+        ];
+        let group = HashSet::from(["online-replacement:123".to_string()]);
+        assert_eq!(selected_online_replacement_releases(&plans,&group), HashSet::from(["123".to_string()]));
+        let child = HashSet::from(["123::/B".to_string()]);
+        assert_eq!(selected_online_replacement_releases(&plans,&child), HashSet::from(["123".to_string()]));
+        let mixed = HashSet::from(["online-replacement:123".to_string(),"456::/C".to_string(),"123::/A".to_string()]);
+        assert_eq!(selected_online_replacement_releases(&plans,&mixed), HashSet::from(["123".to_string(),"456".to_string()]));
+        let stale = HashSet::from(["online-replacement:999".to_string(),"invalid::/D".to_string()]);
+        assert!(selected_online_replacement_releases(&plans,&stale).is_empty());
+    }
 
     fn make_test_track(path: &str, title: &str, isrc: &str, dur: f64) -> LocalTrack {
         LocalTrack {

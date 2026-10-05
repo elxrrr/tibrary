@@ -1,5 +1,16 @@
 import { expect, it } from "vitest";
-import { columnSelectionLabel, columnValueSelected, toggleColumnValue } from "./columnFilters";
+import { availableColumnSelections, columnFilterAvailable, columnSelectionLabel, columnValueSelected, toggleColumnValue } from "./columnFilters";
+
+it("keeps title and status filters while excluding counts and stale hidden selections", () => {
+  for (const key of ["tracks", "gained", "duplicates", "position", "online_id", "evidence"])
+    expect(columnFilterAvailable("missing", key)).toBe(false);
+  expect(columnFilterAvailable("artists", "release")).toBe(false);
+  expect(columnFilterAvailable("favourites", "release")).toBe(false);
+  expect(columnFilterAvailable("missing", "release")).toBe(true);
+  const selected = {release:{include:["Blue Hours"]}, status:{include:["Linked"]}, tracks:{include:["4"]}, evidence:{include:["Exact match"]}};
+  expect(availableColumnSelections("missing", selected)).toEqual({release:selected.release, status:selected.status});
+  expect(availableColumnSelections("artists", selected)).toEqual({status:selected.status});
+});
 
 it("deselects from all without losing values outside the loaded facet page", () => {
   const selection = toggleColumnValue(undefined, "Album", false);

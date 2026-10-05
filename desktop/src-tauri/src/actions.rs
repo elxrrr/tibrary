@@ -1196,17 +1196,9 @@ pub async fn execute(
             .get_preference(&format!("desktop-online:{root}"))
             .await?
             .unwrap_or(json!([]));
-        let mut selection = std::collections::HashMap::new();
-        for row in plans
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|r| r["id"].as_str().is_some_and(|id| ids.contains(id)))
-        {
-            if let Some(id) = row["online_id"].as_str() {
-                selection.insert(id.to_string(), None);
-            }
-        }
+        let chosen = crate::duplicates::selected_online_replacement_releases(
+            plans.as_array().map(Vec::as_slice).unwrap_or_default(), &ids);
+        let selection: std::collections::HashMap<String, Option<Vec<String>>> = chosen.into_iter().map(|id|(id,None)).collect();
         if selection.is_empty() {
             return Err("No current replacement plans selected".into());
         }
@@ -1308,6 +1300,9 @@ pub async fn execute(
                 continue;
             }
             for local in relevant {
+                // A larger published count can include videos. Replacements
+                // must add audio, using the loaded audio-only track list.
+                if target.tracks.len() <= local.tracks.len() { continue; }
                 let mut claimed = HashSet::new();
                 let contained = local.tracks.iter().all(|track| {
                     target.tracks.iter().any(|online| {
@@ -1335,7 +1330,13 @@ pub async fn execute(
                 });
                 let id = format!("{}::{}", target.id, local.folder);
                 if contained && seen.insert(id.clone()) {
-                    rows.push(json!({"id":id,"artist":local.artist,"release":local.title,"title":format!("{} tracks",local.tracks.len()),"tracks":local.tracks.len(),"duplicates":local.tracks.len(),"gained":target.tracks.len()-local.tracks.len(),"path":local.folder,"status":"Larger online release","evidence":format!("Every local recording has matching ISRC, mix title and duration; {} additional audio tracks",target.tracks.len()-local.tracks.len()),"target":target.title,"online_id":target.id,"affected":true,"changes":"Queue complete release; retain originals until downloaded and reviewed"}));
+                    let mut matched_track_ids: Vec<_> = claimed.into_iter().collect();
+                    matched_track_ids.sort();
+                    let target_metadata = json!({"id":target.id,"artist":target.artist,"title":target.title,"date":target.date,
+                        "track_count":target.tracks.len(),"type":target.r#type,"quality":target.quality,"label":target.label,"copyright":target.copyright,"upc":target.upc});
+                    rows.push(json!({"id":id,"artist":local.artist,"release":local.title,"date":local.date,"title":format!("{} tracks",local.tracks.len()),"tracks":local.tracks.len(),"duplicates":local.tracks.len(),"gained":target.tracks.len()-local.tracks.len(),"path":local.folder,"status":"Larger online release","evidence":format!("Every local recording has matching ISRC, mix title and duration; {} additional audio tracks",target.tracks.len()-local.tracks.len()),"target":target.title,"online_id":target.id,
+                        "target_artist":target.artist,"target_date":target.date,"target_tracks":target.tracks.len(),"target_metadata":target_metadata,"matched_track_ids":matched_track_ids,
+                        "affected":true,"changes":"Queue complete release; retain originals until downloaded and reviewed"}));
                 }
             }
         }
@@ -1344,7 +1345,8 @@ pub async fn execute(
         }
         db.set_preference(&format!("desktop-online:{root}"), &json!(rows))
             .await?;
-        return Ok(json!({"opportunities":rows.len()}));
+        let opportunities = rows.iter().filter_map(|row|row["online_id"].as_str()).collect::<HashSet<_>>().len();
+        return Ok(json!({"opportunities":opportunities,"local_releases":rows.len()}));
     }
     if kind == "artwork" {
         let http = crate::network::client(25)?;

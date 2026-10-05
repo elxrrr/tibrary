@@ -336,6 +336,28 @@ export function DataTable({
       onSelect(next);
       return;
     }
+    if (grouped) {
+      const visible: Row[] = rows.flatMap(parent => [parent, ...(expanded.has(parent.id) ? parent.children || [] : [])]);
+      const start = visible.findIndex(item => item.id === fileAnchor.current);
+      const target = visible.findIndex(item => item.id === row.id);
+      if (event.shiftKey && start >= 0 && target >= 0) {
+        const next = new Set(selected);
+        // Convert compact group selection to its children before selecting a
+        // range, so later individual deselection retains every other child.
+        rows.forEach(parent => {
+          if (next.delete(parent.id)) (parent.children || []).forEach((child: Row) => next.add(child.id));
+        });
+        visible.slice(Math.min(start, target), Math.max(start, target) + 1).forEach(item => {
+          if (item.children?.length) item.children.forEach((child: Row) => next.add(child.id));
+          else next.add(item.id);
+        });
+        onSelect(next);
+      } else if (event.metaKey || event.ctrlKey) {
+        toggleGrouped(row, groupState(row) !== "checked");
+      } else onSelect(new Set([row.id]));
+      fileAnchor.current = row.id;
+      return;
+    }
     const next =
       event.metaKey || event.ctrlKey || event.shiftKey
         ? new Set(selected)
@@ -355,6 +377,7 @@ export function DataTable({
       return count ? count === ids.length ? "checked" : "mixed" : "empty";
     }
     if (selected.has(row.id)) return "checked";
+    if (grouped && rows.some(parent => selected.has(parent.id) && (parent.children || []).some((child: Row) => child.id === row.id))) return "checked";
     const children = row.children || [];
     const count = children.filter((c: Row) => selected.has(c.id)).length;
     return count ? count === children.length ? "checked" : "mixed" : "empty";
@@ -364,9 +387,23 @@ export function DataTable({
     fileIds(row).forEach(id => yes ? next.add(id) : next.delete(id));
     onSelect(next);
   }
+  function toggleGrouped(row: Row, yes: boolean) {
+    const next = new Set(selected);
+    if (row.children?.length) {
+      yes ? next.add(row.id) : next.delete(row.id);
+      row.children.forEach((child: Row) => next.delete(child.id));
+    } else {
+      const parent = rows.find(group => (group.children || []).some((child: Row) => child.id === row.id));
+      if (parent && next.delete(parent.id)) (parent.children || []).forEach((child: Row) => next.add(child.id));
+      yes ? next.add(row.id) : next.delete(row.id);
+    }
+    onSelect(next);
+  }
   function selectForMenu(row: Row) {
     if (fileSelection && (row.link_group || row.artist_group)) {
       if (groupState(row) === "empty") onSelect(new Set(fileIds(row)));
+    } else if (grouped) {
+      if (groupState(row) === "empty") onSelect(new Set([row.id]));
     } else if (!selected.has(row.id)) onSelect(new Set([row.id]));
   }
   const visibleStates = rows.map((r) =>
@@ -570,7 +607,7 @@ export function DataTable({
               <Fragment key={r.id}>
                 <tr
                   className={
-                    (selected.has(r.id) || (fileGroups && state === "checked") ? "selected " : "") +
+                    (selected.has(r.id) || ((fileGroups || grouped) && state === "checked") ? "selected " : "") +
                     (r.ignored || (tree && state === "empty") ? "inactive" : "")
                   }
                   tabIndex={0}
@@ -585,9 +622,14 @@ export function DataTable({
                     if (e.key === " ") {
                       e.preventDefault();
                       if (fileGroups) { toggleFiles(r,state !== "checked"); return; }
+                      if (grouped) { toggleGrouped(r,state !== "checked"); return; }
                       const s = new Set(selected);
                       s.has(r.id) ? s.delete(r.id) : s.add(r.id);
                       onSelect(s);
+                    }
+                    if (grouped && r.children?.length && ((e.key === "ArrowRight" && !expanded.has(r.id)) || (e.key === "ArrowLeft" && expanded.has(r.id)))) {
+                      e.preventDefault();
+                      toggleExpanded(r);
                     }
                   }}
                   onContextMenu={(e) => {
@@ -607,10 +649,10 @@ export function DataTable({
                             toggleParent(treeSelection || {}, r.id, yes),
                           );
                         else if (fileGroups) toggleFiles(r,yes);
+                        else if (grouped) toggleGrouped(r,yes);
                         else {
                           const next = new Set(selected);
                           yes ? next.add(r.id) : next.delete(r.id);
-                          if (grouped) (r.children || []).forEach((c: Row) => next.delete(c.id));
                           onSelect(next);
                         }
                       }}
@@ -618,7 +660,7 @@ export function DataTable({
                   </td>
                   {columns.map((c, j) => (
                     <td key={c.key} title={readable(r[c.key])}>
-                      {j === 0 && (tree || grouped || fileGroups) ? (
+                      {j === 0 && (tree || fileGroups || (grouped && r.children?.length)) ? (
                         <button
                           className="disclosure"
                           aria-label={`${expanded.has(r.id) ? "Collapse" : "Expand"} ${r.release}`}
@@ -692,14 +734,21 @@ export function DataTable({
                   </tr>
                 ))}
                 {grouped && expanded.has(r.id) && (r.children || []).map((child: Row) => (
-                  <tr key={child.id} className={"child " + (selected.has(child.id) ? "selected" : "")}
-                    onClick={e => {const next=e.metaKey||e.ctrlKey||e.shiftKey ? new Set(selected):new Set<string>();next.add(child.id);onSelect(next);}}
+                  <tr key={child.id} tabIndex={0} className={"child " + (groupState(child) === "checked" ? "selected " : "") + (child.ignored ? "inactive" : "")}
+                    onClick={event => select(child,i,event)}
                     onDoubleClick={(e) => {if (!(e.target as Element).closest("button,input")) onDetail(child);}}
-                    onContextMenu={e => {e.preventDefault();if (!selected.has(child.id)) onSelect(new Set([child.id]));onMenu(child,e.clientX,e.clientY);}}>
-                    <td><Check label={`Select duplicate ${child.release}`} state={selected.has(child.id)||selected.has(r.id)?"checked":"empty"} disabled={busy}
-                      onChange={yes => {const next=new Set(selected);if(next.delete(r.id)){for(const sibling of r.children)next.add(sibling.id);}yes?next.add(child.id):next.delete(child.id);onSelect(next);}} /></td>
-                    {columns.map(c => <td key={c.key} title={readable(child[c.key])}>{readable(child[c.key])}</td>)}
-                    <td className="more"><button aria-label={`Actions for ${child.release}`} onClick={e=>{e.stopPropagation();onMenu(child,e.clientX,e.clientY);}}><MoreHorizontal size={16}/></button></td>
+                    onKeyDown={event => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key === "Enter") onDetail(child);
+                      if (event.key === " ") { event.preventDefault(); toggleGrouped(child,groupState(child) !== "checked"); }
+                    }}
+                    onContextMenu={event => {event.preventDefault();selectForMenu(child);onMenu(child,event.clientX,event.clientY);}}>
+                    <td className="check"><Check label={`Select ${r.replacement_group ? "local release" : "duplicate"} ${child.release}`} state={groupState(child)} disabled={busy}
+                      onChange={yes => toggleGrouped(child,yes)} /></td>
+                    {columns.map(column => <td key={column.key} title={readable(child[column.key])} style={column.key === "release" ? {paddingLeft:28} : undefined}>
+                      {["status", "recommendation"].includes(column.key) ? <span className={"badge " + String(child[column.key]).toLowerCase().replaceAll(" ", "-")}>{readable(child[column.key])}</span> : readable(child[column.key])}
+                    </td>)}
+                    <td className="more"><button aria-label={`Actions for ${child.release}`} onClick={event=>{event.stopPropagation();selectForMenu(child);onMenu(child,event.clientX,event.clientY);}}><MoreHorizontal size={16}/></button></td>
                   </tr>
                 ))}
                 {tree &&
