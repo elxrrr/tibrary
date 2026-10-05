@@ -579,10 +579,10 @@ export function DataTable({
                             }
                           />
                         </td>
-                        <td colSpan={Math.max(1, columns.length - 2)}>
-                          <span className="track-position">{t.position}</span>
+                        <td className="track-title" colSpan={Math.max(1, columns.length - 3)}>
                           {t.title}
                         </td>
+                        <td className="track-position" title="Disc · track">{t.position}</td>
                         <td>
                           {t.duration
                             ? `${Math.floor(t.duration / 60)}:${String(Math.round(t.duration % 60)).padStart(2, "0")}`

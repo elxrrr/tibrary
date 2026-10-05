@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.16** · [Setup and screenshots](../../README.md)
+Version **0.9.17** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 

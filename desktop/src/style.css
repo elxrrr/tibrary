@@ -679,12 +679,8 @@ tr.child td {
 }
 tr.child:hover { background: var(--accent-hover); }
 tr.child.selected { background: var(--selected); }
-.track-position {
-  display: inline-block;
-  min-width: 62px;
-  margin-left: 20px;
-  font-variant-numeric: tabular-nums;
-}
+tr.child td.track-title { padding-left: 32px; }
+.track-position { font-variant-numeric: tabular-nums; }
 .check {
   width: 35px;
   text-align: center;

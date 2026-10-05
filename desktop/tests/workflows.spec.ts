@@ -51,6 +51,15 @@ async function actionOption(page: Page, trigger: string, option: string, role: "
   await page.getByRole("button", {name: trigger, exact: true}).click();
   await page.getByRole(role, {name: option, exact: true}).click();
 }
+async function expectTrackPositionInTracks(page: Page, title: string, position: string) {
+  const row = page.locator("tbody tr").filter({has: page.getByRole("checkbox", {name: `Select track ${title}`, exact: true})});
+  await expect(row.locator("td").nth(1)).toHaveText(title);
+  const positionCell = row.getByRole("cell", {name: position, exact: true});
+  await expect(positionCell).toBeVisible();
+  const header = page.locator("thead th").filter({has: page.getByRole("button", {name: "Tracks", exact: true})});
+  const [cellBox, headerBox] = await Promise.all([positionCell.boundingBox(), header.boundingBox()]);
+  expect(cellBox!.x).toBeCloseTo(headerBox!.x, 0);
+}
 function displayColumnValue(value: any): string {
   return value == null ? "—" : typeof value === "object" ? Array.isArray(value)
     ? value.map(displayColumnValue).join(" · ")
@@ -377,6 +386,8 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
     exact: true,
   });
   await expect(childBox).toBeChecked();
+  await expectTrackPositionInTracks(page, "First Light", "1 · 1");
+  if (process.env.TIBRARY_SCREENSHOTS) await page.screenshot({path: "/tmp/tibrary-expanded-queue-0.9.17.png"});
   await childBox.uncheck();
   await expect(parent).toHaveJSProperty("indeterminate", true);
   await expect.poll(async () => (await rpc("queue.export",{format:"text"})).result?.text)
@@ -411,6 +422,7 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
   const downloadedExpander = page.getByRole("button",{name:/^(Expand|Collapse) Blue Hours$/});
   await expect(downloadedExpander).toBeVisible();
   if (await downloadedExpander.getAttribute("aria-expanded") !== "true") await downloadedExpander.click();
+  await expectTrackPositionInTracks(page, "First Light", "1 · 1");
   await page.getByRole("checkbox",{name:"Select track First Light",exact:true}).check();
   await page.getByRole("button",{name:"Export",exact:true}).click();
   await expect(page.getByRole("textbox",{name:"Download links"})).toHaveValue("https://tidal.com/track/91000100\n");
@@ -485,6 +497,7 @@ test("missing releases queue only the selected audio tracks", async ({
   await page
     .getByRole("button", { name: "Expand Blue Hours", exact: true })
     .click();
+  await expectTrackPositionInTracks(page, "First Light", "1 · 1");
   await page
     .getByRole("checkbox", { name: "Select Blue Hours", exact: true })
     .check();
