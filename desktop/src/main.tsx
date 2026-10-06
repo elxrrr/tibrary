@@ -54,7 +54,7 @@ import { workload, jobTitle } from "./ActivityView";
 import { Selection, selectedReleases } from "./selection";
 import { CoalescedQuery } from "./query";
 import { ScanButton, ScanScope } from "./ScanButton";
-import { ActionButton, ActionButtonOption } from "./ActionButton";
+import { ActionButton } from "./ActionButton";
 import "./style.css";
 import { version as appVersion } from "../package.json";
 const groups = [
@@ -321,7 +321,7 @@ function App() {
   const busy = submitting || active(onlineRoute ? state?.online_job : state?.job) || (onlineRoute && indexChanging);
   const fileChangesRunning = active(state?.job) && ["apply", "deep_apply", "consolidate"].includes(state?.job?.kind || "");
   const queueBusy = submitting || (route === "queue" && active(state?.download_job));
-  const downloadBusy = submitting || active(state?.download_job) || fileChangesRunning;
+  const downloadBusy = submitting || active(state?.download_job) || fileChangesRunning || (active(state?.job) && state?.job?.startup === true);
   const tree = ["missing", "queue", "downloaded"].includes(route);
   const notifyError = (e: any) => setError(String(e?.message || e));
   async function refresh(targetRoot?: string) {
@@ -1030,13 +1030,6 @@ function App() {
                 >
                   Open
                 </button>
-                <button
-                  disabled={localBusy}
-                  onClick={() => run("scan", { root: r.root })}
-                  title="Find added, changed or removed files. Unchanged tags are reused; music files stay unchanged."
-                >
-                  Check local changes
-                </button>
               </div>
             ))
           ) : (
@@ -1106,10 +1099,6 @@ function App() {
     if (id) loadDetail((route === "links" || fileGroupRoutes.has(route) ? linkedFiles(data.rows) : data.rows).find(row => row.id === id) || {id, artist:id});
   }
   function tableActions() {
-    const localOptions: ActionButtonOption[] = [
-      {id:"local-changes",label:"Check local changes",note:"Update the shared index for added, changed or removed files. Unchanged tags are reused.",disabled:localBusy || !root,onClick:() => run("scan")},
-      {id:"reread-tags",label:"Reread all tags",note:"Read every file again after external edits. Music files stay unchanged.",disabled:localBusy || !root,onClick:() => run("scan", {force:true})},
-    ];
     const selectedReleaseCount = Object.keys(selectedReleases(selection)).length;
     const clear = !tree && selected.size > 0 && <button onClick={() => setSelected(new Set())}>Clear selection</button>;
     const apply = <button disabled={localBusy || active(state?.download_job) || !preview || !selected.size} onClick={prepareApply}>Review & apply ({selected.size})</button>;
@@ -1123,12 +1112,10 @@ function App() {
         busy={active(state?.job) && state?.job?.kind === "preview"} busyLabel="Preparing preview…"
         menuLabel={route === "correct" ? "Choose correction" : "Choose organisation action"}
         title="Preview one operation at a time. Files change only after you review and apply the selected proposals."
-        options={[...operations.map(([id,label,note]) => ({id,label,note,selected:action === id,onClick:() => chooseOperation(id)})),...localOptions]} />
+        options={operations.map(([id,label,note]) => ({id,label,note,selected:action === id,onClick:() => chooseOperation(id)}))} />
         {clear}<div className="table-result-actions">{apply}</div></>;
     } else if (route === "files") {
-      controls = <><ActionButton label="Check local changes" onClick={() => run("scan")} disabled={localBusy || !root}
-        busy={active(state?.job) && state?.job?.kind === "scan"} busyLabel="Checking local changes…"
-        menuLabel="Local scan options" title={localOptions[0].note} options={localOptions.slice(1)} />{clear}</>;
+      controls = clear;
     } else if (route === "links") {
       controls = <><ActionButton label={selected.size ? `Recheck ${selected.size} selected` : "Link unresolved tracks"}
         onClick={() => run("link",scope())} disabled={submitting || !root || (busy && localBusy)} actionDisabled={busy} menuLabel="Linking options"
@@ -1136,7 +1123,6 @@ function App() {
         options={[
           {id:"editions",label:"Recheck edition choices",note:"Recheck only unresolved tracks that need an edition choice across this library.",disabled:busy,onClick:() => run("link",{editions_only:true})},
           {id:"extended",label:"Extended review",note:"Review the selected tracks with extended matching evidence.",disabled:busy || !selected.size,onClick:() => run("deep_review",scope())},
-          ...localOptions,
         ]} />{clear}<div className="table-result-actions"><button disabled={!selected.size} onClick={selectedDetail}>Choose match</button></div></>;
     } else if (route === "artists") {
       controls = <><ActionButton label={selected.size ? "Match selected artists" : "Match artist"}
@@ -1145,7 +1131,6 @@ function App() {
         options={[
           {id:"unresolved",label:"Match unresolved artists",note:"Reuse confirmed artists and check only artists that still need a match.",disabled:busy,onClick:() => run("match_artists")},
           {id:"unlink",label:"Unlink selected artists",note:"Remove artist associations. File tags and recording links stay unchanged.",disabled:busy || !selected.size,onClick:() => unlinkArtists([...selected])},
-          ...localOptions,
         ]} />{clear}<div className="table-result-actions"><button disabled={!selected.size} onClick={selectedDetail}>Review match</button></div></>;
     } else if (["metadata", "artwork"].includes(route)) {
       controls = <><ActionButton label={route === "metadata" ? "Find missing tags (online)" : "Find artwork (online)"}
@@ -1154,7 +1139,6 @@ function App() {
         menuLabel={route === "metadata" ? "Metadata lookup options" : "Artwork lookup options"}
         options={[
           {id:"all",label:route === "metadata" ? "Find missing tags for all files" : "Find artwork for all files",note:"Use every indexed file in this library, reusing completed checks where possible.",disabled:busy,onClick:() => run(route)},
-          ...localOptions,
         ]} />{clear}<div className="table-result-actions">{apply}</div></>;
     } else if (["local", "online"].includes(route)) {
       const local = route === "local";
@@ -1164,17 +1148,15 @@ function App() {
         title={local ? "Find releases fully contained in another local release, using the shared tag index. Review before moving redundant audio to Trash." : "Find complete online replacements using saved catalogue data. Makes no network requests."}
         options={local ? [
           {id:"chained",label:"Select chained duplicates",note:"Select chained duplicate groups on this page for one removal review.",disabled:loading || !data.rows.some(row => row.status === "Chained duplicate"),onClick:() => setSelected(new Set(data.rows.filter(row => row.status === "Chained duplicate").map(row => row.id)))},
-          ...localOptions,
         ] : [
           {id:"online",label:"Search online replacements",note:"Fill missing catalogue evidence before checking for larger releases that preserve your recordings.",onClick:() => run("check_replacements",{scope:"remote"})},
-          ...localOptions,
         ]} />{clear}<div className="table-result-actions">{local
           ? <button disabled={busy || !selected.size} onClick={() => run("review_consolidation",{ids:[...selected],scope:"local"})}>Review duplicate removal {selected.size ? `(${selected.size})` : ""}</button>
           : <button disabled={busy || !selected.size} onClick={() => run("queue_replacements",{ids:[...selected]})}>Queue replacement releases {selected.size ? `(${selected.size})` : ""}</button>}</div></>;
     } else if (route === "favourites") {
       controls = <><ActionButton label="Refresh favourite artists" onClick={() => run("favourites")} disabled={submitting || (busy && localBusy)} actionDisabled={busy}
         menuLabel="Favourite artist options" title="Refresh online favourites and compare them with linked local album artists."
-        options={[{id:"match",label:"Match local artists",note:"Match unresolved local album artists to their online identities.",disabled:busy || !root,onClick:() => run("match_artists")},...localOptions]} />{clear}</>;
+        options={[{id:"match",label:"Match local artists",note:"Match unresolved local album artists to their online identities.",disabled:busy || !root,onClick:() => run("match_artists")}]} />{clear}</>;
     } else if (route === "missing") {
       const refresh = state?.catalogue_refresh;
       const resumable = refresh && refresh.status !== "complete" && refresh.completed.length < refresh.ids.length;
@@ -1203,7 +1185,7 @@ function App() {
     } else if (route === "downloaded") {
       controls = <button disabled={submitting} onClick={() => openExport("downloaded")}>Export</button>;
     }
-    return <div className="table-actions" role="group" aria-label="Table actions" key={route}>{controls}</div>;
+    return controls ? <div className="table-actions" role="group" aria-label="Table actions" key={route}>{controls}</div> : null;
   }
   function pagination() {
     return <nav className="table-pagination-top" aria-label="Table pagination">
@@ -1515,13 +1497,6 @@ function App() {
                     {r.linked} / {r.tracks} tracks linked
                   </small>
                 </div>
-                <button
-                  disabled={localBusy}
-                  onClick={() => run("scan", { root: r.root })}
-                >
-                  Check local changes
-                </button>
-                <button disabled={localBusy} onClick={() => run("scan", {root: r.root, force: true})} title="Read every file's tags again, even when size and modification time are unchanged. Use only when the normal change check misses an external edit.">Reread all tags</button>
                 <button
                   disabled={busy}
                   onClick={() =>

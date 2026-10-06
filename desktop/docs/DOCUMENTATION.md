@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.21** · [Setup and screenshots](../../README.md)
+Version **0.9.22** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -30,7 +30,7 @@ Track/disc matching treats `01` and `1` equally. Number corrections use padded t
 
 Duplicate removal uses the system Trash and preserves the chosen keeper. MQA signals are audit evidence; replacement is a separate action. In MQA audit, use the arrow beside **Scan** to check **All releases** or **Unscanned releases only** (new or changed FLAC tracks). Scope choices change checkmarks; **Scan** inspects just the checked tracks and preserves other saved results. Individual checkmarks and selections across pages are respected. **Find online matches** saves links for selected MQA tracks that need a match. **Queue replacements** adds only selected, matched MQA tracks to the lossless download queue. Files change only when you approve and download those replacements. Review proposed changes before applying them.
 
-Files changed through the app update its index and dependent views. After editing or moving files in another application, use **Check local changes** from Overview. It reads tags only for added or changed files and records removals. Keep the database: it holds links, cached metadata and saved decisions.
+At launch, Tibrary checks each registered library for added, changed or removed files. Unchanged tags are reused. Files changed through the app update the shared index and dependent views immediately; navigating between pages does not reread tags. Make external edits while Tibrary is closed. Keep the database: it holds links, cached metadata and saved decisions.
 
 Reviewed moves keep their links and ignore choices; equivalent number formatting does not invalidate a recording link. Scans exclude temporary working audio files. If a file/tag update cannot be indexed, the original path and tags are restored.
 
@@ -62,7 +62,6 @@ Local duplicates and Online replacements group the release to keep or acquire ab
 
 | Action | When to use it |
 | --- | --- |
-| Check local changes | Update the shared index after editing files outside Tibrary; reuse unchanged tags. |
 | Update missing releases | Fill missing evidence for your downloaded, linked releases first, then check artist release lists and complete new, changed or incomplete candidates. |
 | Release update options → Check release lists only | Check for new releases without collecting additional track details. |
 | Release update options → Fill missing release artists | Fill album artist evidence for older cached releases. |
@@ -70,7 +69,6 @@ Local duplicates and Online replacements group the release to keep or acquire ab
 | Release update options → Check saved release availability | Check all saved missing releases for your linked album artists using cached checks where possible. |
 | Release update options → Recheck saved availability online | Request fresh checks, including previously unavailable releases; bypass cached availability. |
 | Release update options → Recalculate saved results | Recalculate ownership and recommendations locally, without API requests. |
-| Reread all tags in General or a local scan menu | Force a complete tag read if an external editor preserved file size and modification time. |
 | Get missing metadata in a release’s metadata view | Complete that release’s missing metadata, reusing checked track details and credits. |
 | Refresh track details and credits | Request a fresh check for a particular release. |
 | Recheck availability | Request a fresh market-availability check. |

@@ -239,10 +239,12 @@ pub async fn scan_library_with_options(
         let size: i64 = row.get(1).map_err(|e| e.to_string())?;
         let mtime: i64 = row.get(2).map_err(|e| e.to_string())?;
         let error_opt: Option<String> = row.get::<Option<String>>(4).unwrap_or(None);
+        let saved_metadata: Option<String> = row.get::<Option<String>>(3).unwrap_or(None);
         let has_error = error_opt
             .as_deref()
             .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || saved_metadata.as_deref().is_none_or(|value| value.trim().is_empty());
         let present: i64 = row.get(5).unwrap_or(1);
         cached_files.insert(path, (size, mtime, has_error, present != 0));
     }
@@ -514,6 +516,11 @@ mod tests {
         assert_eq!(restored.restored,1);
         assert!(store.revision.load(Ordering::SeqCst)>absent_revision);
         assert_eq!(store.get_local_files_page(None,10,0).await.unwrap().1,1);
+        // A matching file stamp is insufficient when its tag cache is absent.
+        store.connect().unwrap().execute("UPDATE local_files SET metadata=NULL WHERE path=?",(song_path.to_str().unwrap(),)).await.unwrap();
+        let recovered=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+        assert_eq!(recovered.read,1);
+        assert!(store.get_local_files_page(None,10,0).await.unwrap().0[0].metadata.is_some());
         let _ = fs::remove_dir_all(temp_dir);
     }
 }

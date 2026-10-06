@@ -301,6 +301,8 @@ pub struct Backend {
     pub download_monitor: Mutex<HashMap<String, Value>>,
     quit_prompt: AtomicBool,
     quit_approved: AtomicBool,
+    startup_scan_scheduled: AtomicBool,
+    startup_scan_pending: AtomicBool,
     pub logs: ActivityBuffers,
     pub log_epochs: Arc<[AtomicU64; 3]>,
     pub log_persist_gate: Arc<tokio::sync::Mutex<()>>,
@@ -333,6 +335,8 @@ impl Default for Backend {
             download_monitor: Mutex::new(HashMap::new()),
             quit_prompt: AtomicBool::new(false),
             quit_approved: AtomicBool::new(false),
+            startup_scan_scheduled: AtomicBool::new(false),
+            startup_scan_pending: AtomicBool::new(false),
             logs: ActivityBuffers::default(),
             log_epochs: Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]),
             log_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -830,6 +834,128 @@ impl Backend {
     }
 }
 
+/// One worker owns the full freshness pass, independent of the visible page.
+/// App-originated edits already publish their tags to the index. This pass is
+/// only needed at launch to discover changes made while Tibrary was closed.
+async fn check_libraries_on_startup(app: Option<tauri::AppHandle>, backend: Arc<Backend>, db: TursoDb) {
+    if backend.startup_scan_scheduled.swap(true, Ordering::SeqCst) { return; }
+    backend.startup_scan_pending.store(true, Ordering::SeqCst);
+    let roots = async {
+        let conn = db.connect()?;
+        let mut rows = conn.query("SELECT root FROM roots ORDER BY root", ()).await.map_err(|error| error.to_string())?;
+        let mut roots = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let root: String = row.get(0).map_err(|error| error.to_string())?;
+            if !root.trim().is_empty() { roots.push(std::path::PathBuf::from(root)); }
+        }
+        Ok::<_, String>(roots)
+    }.await;
+    let roots = match roots {
+        Ok(roots) => roots,
+        Err(error) => {
+            backend.startup_scan_pending.store(false, Ordering::SeqCst);
+            backend.log_with_category(&format!("Could not check libraries at startup: {error}"), "error", Some("scan"));
+            return;
+        }
+    };
+    if roots.is_empty() {
+        backend.startup_scan_pending.store(false, Ordering::SeqCst);
+        return;
+    }
+    loop {
+        if backend.quit_prompt.load(Ordering::SeqCst) || backend.quit_approved.load(Ordering::SeqCst) {
+            backend.startup_scan_pending.store(false, Ordering::SeqCst);
+            return;
+        }
+        // Reserve the normal local worker atomically with other job starts.
+        // Online catalogue requests remain independent of this read-only pass.
+        let dispatch = backend.dispatch_gate.lock().await;
+        let occupied = backend.active_job_cancel.lock().unwrap().is_some()
+            || backend.download_cancel.lock().unwrap().is_some();
+        if !occupied {
+            start_local_scan(app.as_ref(), &backend, &db, roots, false, true);
+            backend.startup_scan_pending.store(false, Ordering::SeqCst);
+            return;
+        }
+        drop(dispatch);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+fn start_local_scan(app: Option<&tauri::AppHandle>, backend: &Arc<Backend>, db: &TursoDb,
+    roots: Vec<std::path::PathBuf>, force: bool, startup: bool) -> Value {
+    let id = uuid::Uuid::new_v4().to_string();
+    let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let initial = json!({"id":id,"kind":"scan","status":"running","startup":startup,
+        "message":if startup {"Checking libraries at startup · unchanged tags reused"} else {"Checking local changes · unchanged file tags will be reused"},
+        "started":started,"result":null});
+    let cancel = Arc::new(AtomicBool::new(false));
+    backend.start_job(initial.clone(), cancel.clone());
+    let db = db.clone();
+    let backend = backend.clone();
+    let app = app.cloned();
+    let initial_copy = initial.clone();
+    tauri::async_runtime::spawn(async move {
+        let before = db.local_revision.load(Ordering::SeqCst);
+        let mut total = scanner::ScanSummary::default();
+        let mut results = Vec::new();
+        let mut failed = 0;
+        let mut checked = 0;
+        let count = roots.len();
+        for (index, root) in roots.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) { break; }
+            let display = root.file_name().and_then(|name|name.to_str()).unwrap_or("Library").to_owned();
+            let label = if count > 1 {format!("Library {}/{count} · {display}", index + 1)} else {display};
+            let prog_backend = backend.clone();
+            let prog_app = app.clone();
+            let mut prog_template = initial_copy.clone();
+            prog_template["root"] = json!(root);
+            prog_template["progress_phase_override"] = json!(format!("library {} of {count}", index + 1));
+            let result = scanner::scan_library_with_options(&db, &root, cancel.clone(), force, move |message| {
+                let message = format!("{label} · {message}");
+                let job = prog_backend.update_job_progress(&message, prog_template.clone());
+                if let Some(app) = &prog_app {
+                    let _ = app.emit("backend-event", json!({"event":"progress","message":message,"job":job}));
+                }
+            }).await;
+            match result {
+                Ok(summary) => {
+                    total.read += summary.read; total.unchanged += summary.unchanged;
+                    total.errors += summary.errors; total.missing += summary.missing;
+                    total.removed += summary.removed; total.restored += summary.restored;
+                    if summary.status == "complete" {checked += 1;}
+                    results.push(json!({"root":root,"summary":summary}));
+                }
+                Err(error) => {
+                    failed += 1;
+                    backend.log_for("scan", &format!("Library check skipped · {} · {error}",root.display()), "warning");
+                    results.push(json!({"root":root,"error":error}));
+                }
+            }
+        }
+        let cancelled = cancel.load(Ordering::Relaxed);
+        let status = if cancelled {"cancelled"} else if failed > 0 && checked == 0 {"failed"} else {"complete"};
+        let message = if cancelled {"Local check cancelled · completed results retained".to_owned()}
+            else {format!("Local index checked · {checked}/{count} libraries · {} tags read · {} unchanged reused · {} newly missing · {} restored{}",
+                total.read,total.unchanged,total.removed,total.restored,
+                if failed > 0 {format!(" · {failed} unavailable or unreadable")} else {String::new()})};
+        let mutated = db.local_revision.load(Ordering::SeqCst) != before;
+        if mutated {backend.previews.lock().unwrap().clear();}
+        let final_job = json!({"id":id,"kind":"scan","status":status,"startup":startup,"message":message,"started":started,
+            "finished":chrono::Utc::now().timestamp_millis() as f64 / 1000.,
+            "result":{"files":total.read+total.unchanged,"read":total.read,"unchanged":total.unchanged,
+                "missing":total.missing,"removed":total.removed,"restored":total.restored,"errors":total.errors,
+                "libraries_checked":checked,"libraries_unavailable":failed,"libraries":results}});
+        backend.finish_job(final_job.clone());
+        let _ = db.set_preference("desktop-last-job", &final_job).await;
+        if let Some(app) = app {
+            let _ = app.emit("backend-event",json!({"event":"job","job":final_job}));
+            let _ = app.emit("backend-event",json!({"event":if mutated {"library-mutated"} else {"changed"}}));
+        }
+    });
+    initial
+}
+
 async fn preview_inputs(db: &TursoDb, operation: &str) -> Result<Value, String> {
     Ok(json!({
         "local_revision":db.local_revision.load(Ordering::SeqCst),
@@ -943,11 +1069,19 @@ async fn handle_rpc_uncached(
             else { obj.entry("market").or_insert(json!(market)); }
         }
     }
-    let _dispatch = if matches!(method.as_str(),"job.start"|"auth.reply"|"turso.tags.write"|"turso.scan"|"turso.discography") {
+    let _dispatch = if matches!(method.as_str(),"job.start"|"auth.reply"|"turso.tags.write"|"turso.scan"|"turso.discography"|"turso.maintenance.apply") {
         Some(state.dispatch_gate.lock().await)
     } else {
         None
     };
+    let startup_check_running = state.startup_scan_pending.load(Ordering::SeqCst)
+        || state.active_job.lock().unwrap().as_ref().is_some_and(|job| job["startup"] == true
+            && matches!(job["status"].as_str(),Some("running"|"cancelling")));
+    if startup_check_running && (matches!(method.as_str(),"turso.tags.write"|"turso.maintenance.apply"|"turso.scan")
+        || (method == "job.start" && (!is_online_job(args["kind"].as_str().unwrap_or(""))
+            || matches!(args["kind"].as_str(),Some("link"|"match_artists"|"metadata"|"artwork"|"deep_review"|"deep_preview"|"manual_candidate"))))) {
+        return Err("Checking changes made while the app was closed. This action will be available when the local check finishes.".into());
+    }
     if method == "job.start" {
         let kind = args["kind"].as_str().unwrap_or("");
         if kind == "download" && state.active_job.lock().unwrap().as_ref().is_some_and(|job|
@@ -1673,129 +1807,8 @@ async fn handle_rpc_uncached(
             return Err("Choose a registered library first".to_string());
         }
 
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let started = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-        let initial_job = json!({
-            "id": job_id,
-            "kind": "scan",
-            "status": "running",
-            "message": "Checking local changes · unchanged file tags will be reused",
-            "started": started,
-            "result": null
-        });
-
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        state.start_job(initial_job.clone(), cancel_flag.clone());
-
-        let db_clone = db.clone();
-        let app_clone = app_handle.cloned();
-        let backend_task = state.clone();
-        let j_id = job_id.clone();
-        let root_path = std::path::PathBuf::from(root_str);
         let force = inner_args["force"].as_bool().unwrap_or(false);
-
-        tauri::async_runtime::spawn(async move {
-            let j_id_prog = j_id.clone();
-            let app_prog = app_clone.clone();
-            let backend_prog = backend_task.clone();
-
-            let before_scan = db_clone.local_revision.load(Ordering::SeqCst);
-            let scan_res = scanner::scan_library_with_options(
-                &db_clone,
-                &root_path,
-                cancel_flag.clone(),
-                force,
-                move |msg| {
-                    let prog_job = json!({
-                        "id": j_id_prog,
-                        "kind": "scan",
-                        "status": "running",
-                        "message": msg,
-                        "started": started,
-                        "result": null
-                    });
-                    let prog_job = backend_prog.update_job_progress(msg, prog_job.clone());
-                    if let Some(ref app) = app_prog {
-                        let _ = app.emit(
-                            "backend-event",
-                            json!({
-                                "event": "progress",
-                                "message": msg,
-                                "job": prog_job
-                            }),
-                        );
-                    }
-                },
-            )
-            .await;
-
-            let is_cancelled = cancel_flag.load(Ordering::Relaxed);
-            let (status, message, result_val) = match scan_res {
-                Ok(summary) => {
-                    let st = if is_cancelled || summary.status == "cancelled" {
-                        "cancelled"
-                    } else {
-                        "complete"
-                    };
-                    let msg = if st == "cancelled" {
-                        "Refresh local files · cancelled; completed results retained".to_string()
-                    } else {
-                        format!(
-                            "Local index updated · {} tags read · {} unchanged reused · {} newly missing · {} restored",
-                            summary.read, summary.unchanged, summary.removed, summary.restored
-                        )
-                    };
-                    (
-                        st,
-                        msg,
-                        json!({
-                            "files": summary.read + summary.unchanged,
-                            "read": summary.read,
-                            "unchanged": summary.unchanged,
-                            "missing": summary.missing,
-                            "removed": summary.removed,
-                            "restored": summary.restored,
-                            "errors": summary.errors,
-                        }),
-                    )
-                }
-                Err(e) => ("failed", format!("Scan failed: {}", e), json!(null)),
-            };
-
-            let library_mutated = db_clone.local_revision.load(Ordering::SeqCst) != before_scan
-                || result_val["read"].as_u64().unwrap_or(0) > 0
-                || result_val["removed"].as_u64().unwrap_or(0) > 0
-                || result_val["restored"].as_u64().unwrap_or(0) > 0;
-            if library_mutated { backend_task.previews.lock().unwrap().retain(|_, p| p["root"].as_str() != root_path.to_str()); }
-            let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-            let final_job = json!({
-                "id": j_id,
-                "kind": "scan",
-                "status": status,
-                "message": message,
-                "started": started,
-                "finished": finished_at,
-                "result": result_val
-            });
-
-            backend_task.finish_job(final_job.clone());
-            let _ = db_clone
-                .set_preference("desktop-last-job", &final_job)
-                .await;
-
-            if let Some(ref app) = app_clone {
-                let _ = app.emit(
-                    "backend-event",
-                    json!({
-                        "event": "job",
-                        "job": final_job
-                    }),
-                );
-                let _ = app.emit("backend-event", json!({ "event": if library_mutated { "library-mutated" } else { "changed" } }));
-            }
-        });
-
-        return Ok(initial_job);
+        return Ok(start_local_scan(app_handle, state, db, vec![std::path::PathBuf::from(root_str)], force, false));
     }
     if method == "turso.discography"
         || (method == "job.start"
@@ -2732,6 +2745,8 @@ fn main() {
                 }
             }
 
+            check_libraries_on_startup(None, backend.clone(), turso_db.clone()).await;
+
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
             for line in stdin.lines() {
@@ -2803,6 +2818,14 @@ fn main() {
                     backend.logs.load(loaded);
                 }
             }
+            // Freshness is checked once per process, never on page navigation.
+            backend.startup_scan_pending.store(true, Ordering::SeqCst);
+            let startup_backend = backend.clone();
+            let startup_db = turso_db.clone();
+            let startup_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                check_libraries_on_startup(Some(startup_app), startup_backend, startup_db).await;
+            });
             // Only read-only catalogue refreshes resume automatically. Explicit cancellation stays cancelled.
             let resume_db = turso_db.clone();
             let resume_backend = backend.clone();
@@ -2871,6 +2894,94 @@ fn main() {
                     });
                 });
         });
+}
+
+#[cfg(test)]
+mod startup_freshness_tests {
+    use super::*;
+
+    async fn finished(backend: &Backend) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while backend.active_job_cancel.lock().unwrap().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        backend.active_job.lock().unwrap().clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn startup_checks_all_libraries_incrementally_once_and_keeps_offline_entries() {
+        let dir = std::env::temp_dir().join(format!("startup-tags-{}",uuid::Uuid::new_v4()));
+        let first = dir.join("first"); let second = dir.join("second");
+        let offline = dir.join("offline");
+        std::fs::create_dir_all(&first).unwrap(); std::fs::create_dir_all(&second).unwrap();
+        let changed = first.join("changed.flac"); let same = first.join("same.flac");
+        let removed = second.join("removed.flac"); let new = second.join("new.flac");
+        for path in [&changed,&same,&removed] {
+            std::fs::write(path,stream_download::MINIMAL_FLAC).unwrap();
+            tag_writer::write_tags(path,&HashMap::from([("title".to_owned(),"Before closing".to_owned())])).unwrap();
+        }
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        for root in [&first,&second] {scanner::scan_library(&db,root,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();}
+        let missing = offline.join("keep.flac").display().to_string();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO roots(root,status) VALUES(?,'complete')",(offline.display().to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO local_files(path,root,size,mtime,metadata,present) VALUES(?,?,1,1,'{}',1)",(missing.as_str(),offline.display().to_string())).await.unwrap();
+        tag_writer::write_tags(&changed,&HashMap::from([("title".to_owned(),"Changed between launches".to_owned())])).unwrap();
+        std::fs::remove_file(&removed).unwrap(); std::fs::write(&new,stream_download::MINIMAL_FLAC).unwrap();
+        let backend = Arc::new(Backend::new()); backend.set_db(Arc::new(db.clone()));
+        check_libraries_on_startup(None,backend.clone(),db.clone()).await;
+        let job = finished(&backend).await;
+        assert_eq!(job["status"],"complete"); assert_eq!(job["startup"],true);
+        assert_eq!(job["result"]["read"],2); assert_eq!(job["result"]["unchanged"],1);
+        assert_eq!(job["result"]["removed"],1);
+        assert_eq!(job["result"]["libraries_checked"],2);
+        assert_eq!(job["result"]["libraries_unavailable"],1);
+        let (files,_) = db.get_local_files_page(None,10,0).await.unwrap();
+        assert_eq!(files.iter().find(|file|file.path==changed.display().to_string()).unwrap().metadata.as_ref().unwrap()["title"],"Changed between launches");
+        assert!(files.iter().any(|file|file.path==missing),"An offline root must not lose cached presence");
+        assert!(!files.iter().any(|file|file.path==removed.display().to_string()));
+        let revision = db.local_revision.load(Ordering::SeqCst);
+        check_libraries_on_startup(None,backend.clone(),db.clone()).await;
+        assert_eq!(backend.active_job.lock().unwrap().as_ref().unwrap()["id"],job["id"]);
+        assert_eq!(db.local_revision.load(Ordering::SeqCst),revision);
+        let next_launch = Arc::new(Backend::new());
+        check_libraries_on_startup(None,next_launch.clone(),db.clone()).await;
+        let unchanged = finished(&next_launch).await;
+        assert_eq!(unchanged["result"]["read"],0); assert_eq!(unchanged["result"]["unchanged"],3);
+        assert_eq!(db.local_revision.load(Ordering::SeqCst),revision);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_publication_blocks_writes_and_cancels_without_absence_decisions() {
+        let dir=std::env::temp_dir().join(format!("startup-guards-{}",uuid::Uuid::new_v4()));
+        let music=dir.join("music"); std::fs::create_dir_all(&music).unwrap();
+        let path=music.join("song.flac"); std::fs::write(&path,stream_download::MINIMAL_FLAC).unwrap();
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        scanner::scan_library(&db,&music,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+        let backend=Arc::new(Backend::new());
+        backend.start_download_job(json!({"id":"publish","kind":"download","status":"running"}),Arc::new(AtomicBool::new(false)));
+        let worker=tokio::spawn(check_libraries_on_startup(None,backend.clone(),db.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(backend.startup_scan_pending.load(Ordering::SeqCst));
+        assert!(backend.active_job.lock().unwrap().is_none());
+        let write=handle_rpc_call(None,&backend,&db,"turso.tags.write".into(),json!({"path":path,"tags":{"title":"Must wait"}})).await.unwrap_err();
+        assert!(write.contains("while the app was closed"));
+        backend.finish_download_job(json!({"id":"publish","kind":"download","status":"complete"}));
+        worker.await.unwrap(); finished(&backend).await;
+        std::fs::remove_file(&path).unwrap();
+        let next_launch=Arc::new(Backend::new());
+        check_libraries_on_startup(None,next_launch.clone(),db.clone()).await;
+        next_launch.cancel_active_job("Cancel startup check");
+        let cancelled=finished(&next_launch).await;
+        assert_eq!(cancelled["status"],"cancelled");
+        assert_eq!(db.get_local_files_page(None,10,0).await.unwrap().1,1);
+        let final_launch=Arc::new(Backend::new());
+        check_libraries_on_startup(None,final_launch.clone(),db.clone()).await;
+        assert_eq!(finished(&final_launch).await["result"]["removed"],1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg(test)]

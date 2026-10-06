@@ -174,6 +174,16 @@ c.commit()`,join(folder,"db"),join(folder,"music")],{
       env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
     });
   }
+  if(test.info().title.startsWith("cached local menus omit")) {
+    // Simulate an external edit while the app is closed: keep the old indexed
+    // metadata and let the next process's normal startup check discover it.
+    execFileSync("python3",["-c",`import sys
+from pathlib import Path
+from seed_desktop import write_flac
+write_flac(Path(sys.argv[1])/'First Light.flac','North Assembly','Blue Hours','Changed between launches',1,3)`,join(folder,"music")],{
+      env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
+    });
+  }
   child = spawn(
     join(root, "desktop/src-tauri/target/debug/tibrary"),
     ["--rpc", "--db", join(folder, "db")],
@@ -1708,8 +1718,12 @@ test("local change checks reuse indexed tags and keep dependent controls gated a
     if(holdCompletion && running && ["job.status","state"].includes(request.method)) response.result.job=running;
     await route.fulfill({json:response});
   });
+  // A startup/internal change check uses the same worker; local table menus no
+  // longer expose manual rereads of the shared tag index.
+  const args={root:join(folder,"music")};
+  scans.push(args);
+  running=(await rpc("job.start",{kind:"scan",args})).result;
   await page.goto("/");
-  await page.getByRole("button",{name:"Check local changes",exact:true}).click();
   await expect.poll(()=>scans.length).toBe(1);
   expect(scans[0].force).not.toBe(true);
   await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
@@ -1724,6 +1738,52 @@ test("local change checks reuse indexed tags and keep dependent controls gated a
   expect(status.result.read).toBe(0);
   expect(status.result.unchanged).toBe(2);
   expect(scans).toHaveLength(1);
+});
+
+test("cached local menus omit manual tag rereads and navigation never starts a scan", async ({page}) => {
+  const startup=(await rpc("job.status")).result.job;
+  expect(startup.kind).toBe("scan");
+  expect(startup.startup).toBe(true);
+  expect(startup.status).toBe("complete");
+  expect(startup.result.read).toBe(1);
+  expect(startup.result.unchanged).toBe(1);
+  const cache=(await rpc("table",{route:"files",root:join(folder,"music")})).result;
+  expect(cache.rows.some((row:any)=>row.title==="Changed between launches")).toBe(true);
+  const starts:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start") starts.push(request.args);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await expect(page.getByRole("main",{name:"Overview",exact:true})).toBeVisible();
+  await expect(page.getByRole("button",{name:"Check local changes",exact:true})).toHaveCount(0);
+  for(const [name,menu] of [
+    ["Local duplicates","Duplicate check options"],
+    ["Correct tags","Choose correction"],
+    ["Organise files","Choose organisation action"],
+    ["Link releases","Linking options"],
+    ["Link artists","Artist matching options"],
+    ["Add missing tags","Metadata lookup options"],
+    ["Fix artwork","Artwork lookup options"],
+    ["Online replacements","Replacement search options"],
+  ]) {
+    await page.locator("aside").getByRole("button",{name,exact:true}).click();
+    await expect(page.getByRole("main",{name,exact:true})).toBeVisible();
+    await page.getByRole("button",{name:menu,exact:true}).click();
+    await expect(page.getByRole("menuitem",{name:"Reread all tags",exact:true})).toHaveCount(0);
+    await expect(page.getByRole("menuitem",{name:"Check local changes",exact:true})).toHaveCount(0);
+    await page.keyboard.press("Escape");
+  }
+  await page.locator("aside").getByRole("button",{name:"General",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Reread all tags",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Check local changes",exact:true})).toHaveCount(0);
+  // Reopening a populated local view reads the central cache, without a job.
+  await page.locator("aside").getByRole("button",{name:"Correct tags",exact:true}).click();
+  await actionOption(page,"Choose correction","Track & disc numbers","menuitemradio");
+  await expect(page.getByRole("button",{name:"Expand Blue Hours",exact:true})).toBeVisible();
+  expect(starts).toHaveLength(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("table reloads when saved page size arrives after the initial table", async ({page}) => {

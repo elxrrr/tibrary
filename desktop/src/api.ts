@@ -16,6 +16,7 @@ export type Job = {
   progress_updated_at?: number;
   progress_phase?: string;
   historical?: boolean;
+  startup?: boolean;
   result?: any;
 };
 export type AppState = {

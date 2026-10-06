@@ -893,7 +893,7 @@ impl DownloadManager {
                 };
                 if let Err(error) = update {
                     index_ok = false;
-                    progress_cb(format!("Audio saved; local index update needs retry · {} · {error}. Use Check local changes.", path.display()));
+                    progress_cb(format!("Audio saved; local index update needs retry · {} · {error}. Reopen the app to refresh the local index.", path.display()));
                 }
             }
             if index_ok {

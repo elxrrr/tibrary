@@ -102,7 +102,8 @@ impl Progress {
             Some("discography") => unit == "artists" || unit == "items" || (explicit.is_some() && unit == "reference releases"),
             Some("download") => unit == "tracks",
             _ => true,
-        });
+        }).map(|(done,total,phase)| (done,total,
+            job["progress_phase_override"].as_str().map(str::to_owned).unwrap_or(phase)));
         let estimate = self.jobs.entry(id).or_default();
         if let Some((done, total, phase)) = measured {
             estimate.observe(now, done, total, &phase);
@@ -138,6 +139,18 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parsed_scan_counts_reset_eta_for_each_library() {
+        let mut progress=Progress::default();
+        let mut first=json!({"id":"startup","kind":"scan","progress_phase_override":"library 1 of 2"});
+        progress.update(&mut first,"First library · Reading local tags · 50/100 files",1.);
+        assert_eq!(first["progress_phase"],"library 1 of 2");
+        let mut second=json!({"id":"startup","kind":"scan","progress_phase_override":"library 2 of 2"});
+        progress.update(&mut second,"Second library · Reading local tags · 10/20 files",2.);
+        assert_eq!(second["progress_phase"],"library 2 of 2");
+        assert_eq!(second["total"],20);
+        assert_eq!(second["eta_seconds"],Value::Null);
+    }
     #[test]
     fn downloaded_references_have_their_own_measured_phase() {
         let mut progress = Progress::default();
