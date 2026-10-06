@@ -4225,7 +4225,7 @@ fn extract_tag_str(val: &Value, keys: &[&str]) -> Option<String> {
 
 /// Bound key batches use primary-key seeks. A large IN(json_each(...)) can
 /// turn into repeated virtual-table expansion in the embedded database.
-async fn preference_snapshots_for_keys(conn: &Connection, mut keys: Vec<String>) -> Result<Vec<(String,Value)>,String> {
+pub(crate) async fn preference_snapshots_for_keys(conn: &Connection, mut keys: Vec<String>) -> Result<Vec<(String,Value)>,String> {
     keys.sort();
     keys.dedup();
     let mut snapshots = Vec::new();

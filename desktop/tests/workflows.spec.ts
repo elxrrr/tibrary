@@ -153,6 +153,32 @@ c.commit()`, join(folder,"db"), join(folder,"music")], {
       env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
     });
   }
+  if (test.info().title.startsWith("unresolved linking reuses verified peer placements")) {
+    // A saved, complete release has two independently verified peer links.
+    // The third file has an inconsistent ISRC, as in the Flight Facilities
+    // case, but its title, duration, position and whole-release totals agree.
+    execFileSync("python3", ["-c", `import json,sqlite3,sys,time
+from pathlib import Path
+from seed_desktop import write_flac
+library=Path(sys.argv[2]); c=sqlite3.connect(sys.argv[1])
+names=['First Light','Drift','Low Tide']
+release={'id':'910001','artist':'North Assembly','title':'Blue Hours','date':'2020-04-03','type':'ALBUM','available':True,'tracks_loaded':True,'track_count':3,'tracks':[{'id':str(91000100+i),'title':title,'duration':180.0+i*10,'track_number':i+1,'disc_number':1,'isrc':f'GBTEST20200{i+1}'} for i,title in enumerate(names)]}
+for index,title in enumerate(names,1):
+ path=library/f'{title}.flac'
+ write_flac(path,'North Assembly','Blue Hours',title,index,3)
+ metadata={'albumartist':['North Assembly'],'artist':['North Assembly'],'album':['Blue Hours'],'title':[title],'tracknumber':[f'{index:02}/03'],'discnumber':['01/01'],'date':['2020-04-03'],'duration':170.0+index*10,'isrc':[f'GBTEST20200{index}' if index<3 else 'USOTHER202003']}
+ c.execute('INSERT OR REPLACE INTO local_files VALUES(?,?,?,?,?,NULL,1)',(str(path),str(library),path.stat().st_size,path.stat().st_mtime_ns,json.dumps(metadata)))
+ payload={'status':'linked','manual':True,'scope':'track','ids':{'album_id':'910001','track_id':str(91000100+index-1)}} if index<3 else {'status':'review','catalogue_note':'Track position unverified on candidate release','catalogue_options':[{'id':'910001','title':'Blue Hours','tracks':3,'matched':2}]}
+ c.execute('INSERT OR REPLACE INTO track_links VALUES(?,?,?,?)',(str(path),'GB',json.dumps([0,0,path.stat().st_size,path.stat().st_mtime_ns]),json.dumps(payload)))
+c.execute('INSERT OR REPLACE INTO app_preferences VALUES(?,?)',('tag-review:GB:910001',json.dumps(release)))
+catalogue=json.loads(c.execute('SELECT payload FROM catalogue WHERE artist_id=? AND market=?',('900001','GB')).fetchone()[0])
+catalogue['releases']=[release]
+c.execute('UPDATE catalogue SET payload=? WHERE artist_id=? AND market=?',(json.dumps(catalogue),'900001','GB'))
+c.execute('INSERT OR REPLACE INTO app_preferences VALUES(?,?)',('release-live:GB:910001',json.dumps({'available':True,'checked_at':int(time.time()),'source':'album_lookup'})))
+c.commit()`, join(folder,"db"), join(folder,"music")], {
+      env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
+    });
+  }
   if (test.info().title.startsWith("link releases group local files") || test.info().title.startsWith("artist hierarchy") || test.info().title.startsWith("local actions group")) {
     // Create extra real files before the disposable backend opens its database.
     execFileSync("python3", ["-c", `import json,sqlite3,sys
@@ -844,6 +870,39 @@ test("manual placement keeps a selected track scoped and inspects release-only c
   for(const [path,original] of bytes) expect(readFileSync(path).equals(original)).toBe(true);
   await expect(page.getByRole("alert")).toHaveCount(0);
   expect(errors).toEqual([]);
+});
+test("unresolved linking reuses verified peer placements without changing existing links or files", async ({page}) => {
+  const root=join(folder,"music"), paths=["First Light","Drift","Low Tide"].map(title=>join(root,`${title}.flac`));
+  const originalBytes=paths.map(path=>readFileSync(path));
+  const peerDetails=await Promise.all(paths.slice(0,2).map(path=>rpc("detail",{path}).then(reply=>reply.result)));
+  const starts:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="job.start" && request.args.kind==="link") starts.push(request.args);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Link unresolved tracks",exact:true})).toBeEnabled();
+  await page.getByRole("button",{name:"Link unresolved tracks",exact:true}).click();
+  await expect.poll(()=>starts.length).toBe(1);
+  expect(starts[0].args.ids).toBeUndefined();
+  await expect.poll(async()=>{
+    const job=(await rpc("job.status")).result.online_job;
+    return job?.kind==="link" ? job.status : "waiting";
+  }).toBe("complete");
+  const job=(await rpc("job.status")).result.online_job;
+  expect(job.result).toMatchObject({total:1,linked:1,review:0,unmatched:0});
+  const resolved=(await rpc("detail",{path:paths[2]})).result;
+  expect(resolved.linked_ids).toEqual({album_id:"910001",track_id:"91000102"});
+  expect(resolved.catalogue_note).toContain("existing track links");
+  expect(resolved.catalogue_options[0].evidence).toContain("Local ISRC differs");
+  expect(resolved.catalogue_options[0].position_label).toBe("Disc 01/01 · Track 03/03");
+  for(let index=0;index<2;index++) expect((await rpc("detail",{path:paths[index]})).result).toEqual(peerDetails[index]);
+  for(let index=0;index<paths.length;index++) expect(readFileSync(paths[index]).equals(originalBytes[index])).toBe(true);
+  // The disposable process has no credentials. Success from this cached
+  // fixture proves that normal unresolved linking needs no remote requests.
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 test("artist hierarchy shows local release evidence without exposing online IDs or track controls", async ({page}) => {
   const root=join(folder,"music"), errors:string[]=[], detailArtists:string[]=[];

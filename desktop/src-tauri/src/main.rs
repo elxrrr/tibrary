@@ -2197,11 +2197,10 @@ async fn handle_rpc_uncached(
         }
 
         let inner_args = args.get("args").cloned().unwrap_or(args.clone());
-        let market = inner_args
-            .get("market")
-            .and_then(|v| v.as_str())
-            .unwrap_or("GB")
-            .to_string();
+        let market = match inner_args.get("market").and_then(|value| value.as_str()).filter(|value| !value.is_empty()) {
+            Some(market) => market.to_string(),
+            None => db.get_settings().await?["general"]["market"].as_str().unwrap_or("GB").to_string(),
+        };
 
         let root_opt = inner_args
             .get("root")
