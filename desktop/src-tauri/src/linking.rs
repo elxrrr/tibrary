@@ -27,27 +27,50 @@ fn exact_recording_release(tracks: &[LocalTrackInfo], release: &TidalRelease) ->
         })
 }
 
+// Physical release boundaries must be identical for scan scoping and matching.
+fn release_folder(path: &str, root: &str) -> String {
+    let mut folder = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new(root));
+    if folder
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase()
+        .starts_with("disc ")
+    {
+        folder = folder.parent().unwrap_or(folder);
+    }
+    folder.display().to_string()
+}
+
 fn candidate_option(
     release: &TidalRelease,
     matched: &crate::release_matching::StructureMatchResult,
-    path: &str,
+    local: &LocalTrackInfo,
     shared_credits: usize,
     context: Option<&crate::release_anchor::ScanAnchoredRelease>,
 ) -> Option<Value> {
-    let alignment = matched.alignments.get(path)?;
+    let path = local.path.as_str();
+    let review_placement = context.and_then(|context| context.review_reasons.get(path)).and_then(|_| {
+        release.tracks.iter().find(|track| track.disc_number == local.disc_number && track.track_number == local.track_number)
+    }).map(|track| crate::release_matching::TrackAlignment {local_path:local.path.clone(),remote_track_id:track.id.clone(),disc_number:track.disc_number,track_number:track.track_number});
+    let alignment = matched.alignments.get(path).or(review_placement.as_ref())?;
+    let safe = matched.compatible && matched.alignments.contains_key(path);
     let mut evidence = matched.conflicts.clone();
     if let Some(context) = context {
         evidence.push(context.evidence.clone());
         if context.conflicting_isrc_paths.contains(path) {
-            evidence.push("Local ISRC differs; existing recording links and the complete release's titles, mixes, durations and positions agree".into());
+            evidence.push("Local ISRC differs; verified sibling recordings and the complete release's titles, mixes, durations and positions agree".into());
         }
+        if let Some(reason) = context.contextual_paths.get(path).or(context.review_reasons.get(path)) { evidence.push(reason.clone()); }
     }
     if shared_credits > 0 { evidence.push(format!("{shared_credits} shared local contributor credits support this release")); }
     let disc_total = release.tracks.iter().map(|track| track.disc_number).max().unwrap_or(1);
     let track_total = release.tracks.iter().filter(|track| track.disc_number == alignment.disc_number).count();
     Some(json!({"id":release.id,"title":release.title,"track_id":alignment.remote_track_id,"tracks":release.track_count,"artist":release.artist,"album":release.title,
         "position_label":format!("Disc {:02}/{disc_total:02} · Track {:02}/{track_total:02}",alignment.disc_number,alignment.track_number),
-        "evidence":evidence.join("; "),"structure":{"compatible":matched.compatible,"reasons":matched.conflicts},"compatible":matched.compatible}))
+        "evidence":evidence.join("; "),"structure":{"compatible":safe,"reasons":evidence},"compatible":safe}))
 }
 
 pub async fn link_library(
@@ -113,112 +136,31 @@ pub async fn link_library_mode(
         }
     }
 
-    // 2. Load catalogue releases by artist_id
-    let mut catalogues_by_artist: HashMap<String, Vec<TidalRelease>> = HashMap::new();
-    let mut cat_stmt = conn
-        .query(
-            "SELECT artist_id, payload FROM catalogue WHERE market = ?",
-            (market,),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    // Read saved decisions first; a completed or empty scope needs no catalogue
+    // decoding, and linked peers remain evidence rather than rewrite targets.
+    let mut anchor_cache = crate::release_anchor::ScanAnchorCache::load_link_state(db, market, root).await?;
 
-    while let Some(row) = cat_stmt.next().await.map_err(|e| e.to_string())? {
-        let artist_id: String = row.get(0).unwrap_or_default();
-        let payload_str: Option<String> = row.get(1).ok().flatten();
-        if let Some(s) = payload_str {
-            if let Ok(cat) = serde_json::from_str::<TidalCatalogue>(&s) {
-                catalogues_by_artist.insert(artist_id, cat.releases);
-            }
-        }
-    }
-    drop(cat_stmt);
-
-    // One snapshot supplies both scan eligibility and existing release anchors.
-    // Sibling links are evidence, not permission to change their saved choices.
-    let mut anchor_cache = crate::release_anchor::ScanAnchorCache::load(db, market, root).await?;
-    anchor_cache.merge_catalogues(catalogues_by_artist.values().flatten());
-
-    // 3. Load local files
+    // Read the cheap manifest first. A small selected/review scope should not
+    // deserialize every library file merely to discover which tracks need work.
     let mut file_stmt = conn
         .query(
-            "SELECT path, metadata, mtime, size FROM local_files WHERE root = ? AND present = 1 AND metadata IS NOT NULL",
+            "SELECT path, mtime, size FROM local_files WHERE root = ? AND present = 1 AND metadata IS NOT NULL",
             (root,),
         )
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut local_tracks = Vec::new();
-    let mut file_stamps = HashMap::new();
-    let mut totals = HashMap::new();
-    let mut local_upcs = HashMap::new();
-    let mut local_genres: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut local_credits = HashMap::new();
+    let mut manifest = Vec::new();
     let mut eligible = HashSet::new();
 
     while let Some(row) = file_stmt.next().await.map_err(|e| e.to_string())? {
+        if cancel.load(Ordering::Relaxed) { return Ok(LinkSummary::default()); }
         let path: String = row.get(0).unwrap_or_default();
-        let meta_str: Option<String> = row.get(1).ok().flatten();
-        let mtime: i64 = row.get(2).unwrap_or(0);
-        let size: i64 = row.get(3).unwrap_or(0);
-
-        file_stamps.insert(path.clone(), format!("[0,0,{},{}]", size, mtime));
-
-        let meta: Value = meta_str
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or(Value::Null);
-
-        local_credits.insert(
-            path.clone(),
-            crate::recommendations::local_credit_names(&meta),
-        );
-        let tags = crate::workflows::extract_tags_map(&Some(meta.clone()));
-        let text = |key: &str| tags.get(key).cloned().unwrap_or_default();
-        let number = |key: &str| {
-            text(key)
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(0)
-        };
-        let title = text("title");
-        let artist = tags
-            .get("albumartist")
-            .cloned()
-            .unwrap_or_else(|| text("artist"));
-        let album = text("album");
-        let duration = meta["duration"].as_f64().unwrap_or(0.0);
-        let track_number = number("tracknumber");
-        let disc_number = number("discnumber").max(1);
-        let isrc = tags.get("isrc").cloned();
-        let total = |key: &str, num: &str| {
-            let n = number(key);
-            if n > 0 {
-                n
-            } else {
-                text(num)
-                    .split('/')
-                    .nth(1)
-                    .unwrap_or("")
-                    .parse()
-                    .unwrap_or(0)
-            }
-        };
-        if let Some(genres) = tags.get("genre") { local_genres.insert(path.clone(),genres.split(';').map(crate::matching::name_key).filter(|g| !g.is_empty()).collect()); }
-        if let Some(upc) = tags.get("upc").or(tags.get("barcode")) { local_upcs.insert(path.clone(),upc.clone()); }
-        totals.insert(
-            path.clone(),
-            (
-                total("tracktotal", "tracknumber"),
-                total("disctotal", "discnumber"),
-            ),
-        );
+        let mtime: i64 = row.get(1).unwrap_or(0);
+        let size: i64 = row.get(2).unwrap_or(0);
         let (old, stamp_current) = anchor_cache.saved_links.get(&path)
-            .map(|(payload, stamp)| (payload.clone(), crate::db::link_stamp_matches(stamp, size, mtime)))
-            .unwrap_or((Value::Null, false));
+            .map(|(payload, stamp)| (payload, crate::db::link_stamp_matches(stamp, size, mtime)))
+            .unwrap_or((&Value::Null, false));
         let is_ignored = anchor_cache.ignored_paths.contains(&path);
         let linked = stamp_current
             && (old["status"] == "linked"
@@ -235,17 +177,7 @@ pub async fn link_library_mode(
         {
             eligible.insert(path.clone());
         }
-
-        local_tracks.push(LocalTrackInfo {
-            path,
-            title,
-            artist,
-            album,
-            duration,
-            track_number,
-            disc_number,
-            isrc,
-        });
+        manifest.push(path);
     }
 
     drop(file_stmt);
@@ -257,25 +189,65 @@ pub async fn link_library_mode(
         return Ok(LinkSummary::default());
     }
 
+    let eligible_folders: HashSet<_> = eligible.iter().map(|path| release_folder(path, root)).collect();
+    let peer_paths: Vec<_> = manifest.into_iter()
+        .filter(|path| eligible_folders.contains(&release_folder(path, root))).collect();
+    let mut local_tracks = Vec::with_capacity(peer_paths.len());
+    let mut file_stamps = HashMap::new();
+    let mut totals = HashMap::new();
+    let mut local_upcs = HashMap::new();
+    let mut local_genres: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut local_credits = HashMap::new();
+    // Include linked and ignored peers as physical release evidence, while only
+    // the eligible paths may be written. Bounded primary-key reads avoid a full
+    // metadata scan and retain the current root/presence safeguards.
+    for paths in peer_paths.chunks(256) {
+        if cancel.load(Ordering::Relaxed) { return Ok(LinkSummary { total, ..Default::default() }); }
+        let placeholders = vec!["?"; paths.len()].join(",");
+        let mut parameters = paths.to_vec();
+        parameters.push(root.to_string());
+        let mut rows = conn.query(
+            format!("SELECT path,metadata,mtime,size FROM local_files WHERE path IN ({placeholders}) AND root=? AND present=1 AND metadata IS NOT NULL"),
+            parameters,
+        ).await.map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+            let path: String = row.get(0).unwrap_or_default();
+            let meta_str: Option<String> = row.get(1).ok().flatten();
+            let mtime: i64 = row.get(2).unwrap_or(0);
+            let size: i64 = row.get(3).unwrap_or(0);
+            file_stamps.insert(path.clone(), format!("[0,0,{},{}]", size, mtime));
+            let meta: Value = meta_str.as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok()).unwrap_or(Value::Null);
+            local_credits.insert(path.clone(), crate::recommendations::local_credit_names(&meta));
+            let tags = crate::workflows::extract_tags_map(&Some(meta.clone()));
+            let text = |key: &str| tags.get(key).cloned().unwrap_or_default();
+            let number = |key: &str| text(key).split('/').next().unwrap_or("").trim().parse::<u32>().unwrap_or(0);
+            let title = text("title");
+            let artist = tags.get("albumartist").cloned().unwrap_or_else(|| text("artist"));
+            let album = text("album");
+            let duration = meta["duration"].as_f64().unwrap_or(0.0);
+            let track_number = number("tracknumber");
+            let disc_number = number("discnumber").max(1);
+            let isrc = tags.get("isrc").cloned();
+            let total = |key: &str, position: &str| {
+                let declared = number(key);
+                if declared > 0 { declared } else { text(position).split('/').nth(1).unwrap_or("").parse().unwrap_or(0) }
+            };
+            if let Some(genres) = tags.get("genre") { local_genres.insert(path.clone(),genres.split(';').map(crate::matching::name_key).filter(|genre| !genre.is_empty()).collect()); }
+            if let Some(upc) = tags.get("upc").or(tags.get("barcode")) { local_upcs.insert(path.clone(),upc.clone()); }
+            totals.insert(path.clone(), (total("tracktotal", "tracknumber"), total("disctotal", "discnumber")));
+            local_tracks.push(LocalTrackInfo { path, title, artist, album, duration, track_number, disc_number, isrc });
+        }
+    }
+
     // 4. Group local tracks by (artist_key, album_key)
     let mut groups: HashMap<(String, String, String), Vec<LocalTrackInfo>> = HashMap::new();
     for track in local_tracks {
         let art_key = title_key(&track.artist);
         let alb_key = title_key(&track.album);
-        let mut folder = std::path::Path::new(&track.path)
-            .parent()
-            .unwrap_or(std::path::Path::new(root));
-        if folder
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase()
-            .starts_with("disc ")
-        {
-            folder = folder.parent().unwrap_or(folder);
-        }
+        let folder = release_folder(&track.path, root);
         groups
-            .entry((art_key, alb_key, folder.display().to_string()))
+            .entry((art_key, alb_key, folder))
             .or_default()
             .push(track);
     }
@@ -285,7 +257,38 @@ pub async fn link_library_mode(
         ..Default::default()
     };
 
-    let group_count = groups.values().filter(|tracks| tracks.iter().any(|t| eligible.contains(&t.path))).count();
+    groups.retain(|_, tracks| tracks.iter().any(|track| eligible.contains(&track.path)));
+    anchor_cache.hydrate_for_tracks(db, market, groups.values().flatten()).await?;
+    let relevant_artists: HashSet<_> = groups.keys().filter_map(|(artist, _, _)| mappings.get(artist))
+        .flatten().cloned().collect();
+    let mut catalogues_by_artist: HashMap<String, Vec<TidalRelease>> = HashMap::new();
+    let mut exact_fallbacks: HashMap<String, Vec<TidalRelease>> = HashMap::new();
+    // Stream global credit references into a compact identity index. Retain full
+    // release objects only for the current artists and exact wrong-artist fixes.
+    // This preserves globally ambiguous aliases without retaining every album.
+    progress(format!("Loading cached release evidence · {total} unresolved tracks · retaining relevant artist catalogues and shared contributor identities"));
+    anchor_cache.begin_catalogue_references();
+    let mut cat_stmt = conn.query("SELECT artist_id,payload FROM catalogue WHERE market=?", (market,)).await.map_err(|e|e.to_string())?;
+    while let Some(row) = cat_stmt.next().await.map_err(|e|e.to_string())? {
+        if cancel.load(Ordering::Relaxed) { return Ok(summary); }
+        let artist_id: String = row.get(0).unwrap_or_default();
+        let Some(raw) = row.get::<Option<String>>(1).ok().flatten() else { continue; };
+        let Ok(catalogue) = serde_json::from_str::<TidalCatalogue>(&raw) else { continue; };
+        anchor_cache.merge_catalogues(catalogue.releases.iter());
+        if relevant_artists.contains(&artist_id) {
+            catalogues_by_artist.insert(artist_id, catalogue.releases);
+        } else {
+            for release in catalogue.releases {
+                let album_key = title_key(&release.title);
+                if groups.iter().any(|((_, local_album, _), tracks)| *local_album == album_key && exact_recording_release(tracks, &release)) {
+                    exact_fallbacks.entry(album_key).or_default().push(release);
+                }
+            }
+        }
+    }
+    drop(cat_stmt);
+    anchor_cache.finish_catalogue_references();
+    let group_count = groups.len();
     let mut group_idx = 0;
 
     for ((art_key, alb_key, _folder), group_tracks) in groups {
@@ -329,7 +332,7 @@ pub async fn link_library_mode(
         // Fall back across cached artist catalogues only with exact ISRC and
         // title/duration evidence for every local recording, never artist-name similarity.
         if candidate_releases.is_empty() {
-            for release in catalogues_by_artist.values().flatten() {
+            for release in catalogues_by_artist.values().flatten().chain(exact_fallbacks.get(&alb_key).into_iter().flatten()) {
                 if title_key(&release.title) == alb_key && exact_recording_release(&group_tracks, release)
                     && !candidate_releases.iter().any(|r| r.id == release.id) {
                     candidate_releases.push(release.clone());
@@ -425,12 +428,13 @@ pub async fn link_library_mode(
                 *release = serde_json::from_value(details).map_err(|e| e.to_string())?;
             }
         }
-        // Newly fetched details enter the same rules as saved data. This lets
-        // a missing cache fill unlock sibling matches in this pass, not next time.
-        if !cached_anchored {
-            anchor_cache.merge_catalogues(candidate_releases.iter());
-            anchored_matches = anchor_cache.match_group(&group_tracks, &totals);
-        }
+        // Loaded details and credits enter one release-context matcher, including
+        // complete releases established by a majority of exact recordings.
+        anchor_cache.merge_catalogues(candidate_releases.iter());
+        let candidate_ids: Vec<_> = candidate_releases.iter().map(|release| release.id.clone()).collect();
+        anchor_cache.extend_live_cache(db, market, &candidate_ids).await?;
+        anchored_matches = candidate_releases.iter().filter_map(|release| anchor_cache.evaluate_release(&group_tracks, &totals, release)).collect();
+        let bound_release = anchored_matches.iter().max_by_key(|context| (context.primary_anchor_count, context.structure.matched_count)).map(|context| &context.release);
         // Match against candidates
         let mut scored_candidates = Vec::new();
         let mut credit_scores = HashMap::new();
@@ -477,22 +481,20 @@ pub async fn link_library_mode(
                     res.conflicts
                         .push("Track or disc positions differ from local tags".into());
                 }
-                let (total, discs) = totals[&track.path];
-                let remote_total = rel
-                    .tracks
-                    .iter()
-                    .filter(|t| t.disc_number == track.disc_number)
-                    .count() as u32;
-                let remote_discs = rel.tracks.iter().map(|t| t.disc_number).max().unwrap_or(1);
-                let minimum_tracks = group_tracks.iter().filter(|t| t.disc_number == track.disc_number).map(|t| t.track_number).max().unwrap_or(0);
-                let minimum_discs = group_tracks.iter().map(|t| t.disc_number).max().unwrap_or(1);
-                if (total >= minimum_tracks && total > 0 && remote_total != total)
-                    || (discs >= minimum_discs && discs > 0 && remote_discs != discs)
-                {
-                    res.compatible = false;
-                    res.conflicts
-                        .push("Release totals differ from local tags".into());
-                }
+            }
+            let cardinality = crate::release_cardinality::validate_totals_with_context(
+                &group_tracks, &totals, rel,
+                anchored_matches.iter().any(|context| context.release.id == rel.id),
+            );
+            if !cardinality.valid() {
+                res.compatible = false;
+                res.conflicts.extend(cardinality.conflicts);
+            }
+            if !anchor_cache.respects_existing_choices(&group_tracks, rel, &res)
+                || bound_release.is_some_and(|bound| bound.id != rel.id
+                    && !crate::release_context::equivalent_editions(bound, rel)) {
+                res.compatible = false;
+                res.conflicts.push("A sibling establishes another release edition; this placement cannot split the local release".into());
             }
             let shared: usize = group_tracks
                 .iter()
@@ -526,12 +528,12 @@ pub async fn link_library_mode(
         scored_candidates.sort_by(|a, b| {
             b.1.compatible
                 .cmp(&a.1.compatible)
-                .then_with(|| b.1.matched_count.cmp(&a.1.matched_count))
-                .then_with(|| a.1.conflicts.len().cmp(&b.1.conflicts.len()))
                 .then_with(|| {
                     let support = |id: &str| anchored_matches.iter().find(|matched| matched.release.id == id).map(|matched| matched.primary_anchor_count).unwrap_or(0);
                     support(&b.0.id).cmp(&support(&a.0.id))
                 })
+                .then_with(|| b.1.matched_count.cmp(&a.1.matched_count))
+                .then_with(|| a.1.conflicts.len().cmp(&b.1.conflicts.len()))
                 .then_with(|| barcode_scores[&b.0.id].cmp(&barcode_scores[&a.0.id]))
                 .then_with(|| credit_scores[&b.0.id].cmp(&credit_scores[&a.0.id]))
                 .then_with(|| a.0.replacement_id.is_some().cmp(&b.0.replacement_id.is_some()))
@@ -541,8 +543,9 @@ pub async fn link_library_mode(
         let (best_rel, best_struct) = &scored_candidates[0];
 
         if best_struct.matched_count > 0 {
-            let is_perfect =
-                best_struct.compatible && best_struct.matched_count == group_tracks.len();
+            let best_context = anchored_matches.iter().find(|context| context.release.id == best_rel.id);
+            let is_perfect = best_struct.compatible
+                && (best_struct.matched_count == group_tracks.len() || best_context.is_some());
             let status = if is_perfect { "linked" } else { "review" };
 
             let cand_options: Vec<Value> = scored_candidates
@@ -582,7 +585,8 @@ pub async fn link_library_mode(
                     if is_perfect {
                         if let Some(context) = anchored_matches.iter().find(|matched| matched.release.id == best_rel.id) {
                             payload["catalogue_note"] = json!("Verified cached release from existing track links");
-                            payload["release_context"] = json!({"evidence":context.evidence,"isrc_conflict":context.conflicting_isrc_paths.contains(&track.path)});
+                            payload["release_context"] = json!({"evidence":context.evidence,"isrc_conflict":context.conflicting_isrc_paths.contains(&track.path),"track_evidence":context.contextual_paths.get(&track.path)});
+                            if context.primary_anchor_count == 0 { payload["catalogue_note"] = json!("Verified release from matching sibling recordings"); }
                         }
                     }
                     if !is_perfect {
@@ -590,7 +594,7 @@ pub async fn link_library_mode(
                     } else {
                         payload["placements"] = json!(scored_candidates
                             .iter()
-                            .filter(|(_, s)| s.compatible && s.matched_count == group_tracks.len())
+                            .filter(|(release, s)| s.compatible && (s.matched_count == group_tracks.len() || anchored_matches.iter().any(|context| context.release.id == release.id)))
                             .filter_map(|(r, s)| s
                                 .alignments
                                 .get(&track.path)
@@ -598,7 +602,7 @@ pub async fn link_library_mode(
                             .collect::<Vec<_>>());
                     }
                     payload["catalogue_options"] = json!(scored_candidates.iter().filter_map(|(release, matched)| candidate_option(
-                        release, matched, &track.path, credit_scores[&release.id],
+                        release, matched, track, credit_scores[&release.id],
                         anchored_matches.iter().find(|context| context.release.id == release.id),
                     )).collect::<Vec<_>>());
                     let payload_str = payload.to_string();
@@ -607,8 +611,10 @@ pub async fn link_library_mode(
                     summary.review += 1;
                     let payload = json!({
                         "status": "review",
-                        "catalogue_note": "Track position unverified on candidate release",
-                        "catalogue_options": cand_options,
+                        "catalogue_note": best_context.and_then(|context| context.review_reasons.get(&track.path)).map(String::as_str).unwrap_or("Track position unverified on candidate release"),
+                        "catalogue_options": if best_context.is_some() {
+                            scored_candidates.iter().filter_map(|(release, matched)| candidate_option(release, matched, track, credit_scores[&release.id], anchored_matches.iter().find(|context| context.release.id == release.id))).collect::<Vec<_>>()
+                        } else { cand_options.clone() },
                         "checked_at": chrono::Utc::now().timestamp(),
                     });
                     let payload_str = payload.to_string();

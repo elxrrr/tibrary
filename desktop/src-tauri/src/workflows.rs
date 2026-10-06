@@ -495,7 +495,12 @@ mod tests {
         conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Artist','a','confirmed')", ()).await.unwrap();
         let local = vec![sample(1,1),sample(4,1)];
         for file in &local {
-            db.apply_file_update(&file.path, &file.path, &file.root, file.metadata.as_ref().unwrap(), 1, 1).await.unwrap();
+            // The post-apply linker sees the reviewed tags already published
+            // by maintenance, not the original impossible 04/1 metadata.
+            let mut corrected = file.metadata.clone().unwrap();
+            let plan = plans.iter().find(|plan| plan.path == file.path).unwrap();
+            for (key, value) in &plan.changes { corrected[key] = serde_json::json!(value); }
+            db.apply_file_update(&file.path, &file.path, &file.root, &corrected, 1, 1).await.unwrap();
         }
         let paths: std::collections::HashSet<_> = local.iter().map(|f| f.path.clone()).collect();
         crate::maintenance::refresh_number_links(&db, "/root", &paths).await;

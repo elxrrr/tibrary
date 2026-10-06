@@ -14,6 +14,7 @@ pub struct ScanAnchorCache {
     active_links: HashMap<String, HashMap<String, String>>,
     releases: HashMap<String, TidalRelease>,
     live: HashMap<String, Value>,
+    aliases: crate::release_matching::CreditAliases,
 }
 
 pub struct ScanAnchoredRelease {
@@ -22,6 +23,8 @@ pub struct ScanAnchoredRelease {
     pub evidence: String,
     pub conflicting_isrc_paths: HashSet<String>,
     pub primary_anchor_count: usize,
+    pub contextual_paths: HashMap<String, String>,
+    pub review_reasons: HashMap<String, String>,
 }
 
 fn positive_id(value: &Value) -> Option<String> {
@@ -34,7 +37,19 @@ fn positive_id(value: &Value) -> Option<String> {
 }
 
 impl ScanAnchorCache {
+    #[cfg(test)]
     pub async fn load(db: &TursoDb, market: &str, root: &str) -> Result<Self, String> {
+        let mut result = Self::load_link_state(db, market, root).await?;
+        let paths: Vec<_> = result.active_links.keys().cloned().collect();
+        result
+            .hydrate_for_paths(db, market, paths.iter().map(String::as_str))
+            .await?;
+        Ok(result)
+    }
+
+    /// Eligibility needs only link, file-stamp and ignore state. Defer large
+    /// release/credit payloads until the requested local release groups exist.
+    pub async fn load_link_state(db: &TursoDb, market: &str, root: &str) -> Result<Self, String> {
         let conn = db.connect()?;
         let mut rows = conn.query(
             "SELECT f.path,l.payload,l.stamp,f.size,f.mtime,i.path FROM local_files f LEFT JOIN track_links l ON l.path=f.path AND l.market=? LEFT JOIN ignored_local_files i ON i.path=f.path WHERE f.root=? AND f.present=1",
@@ -46,8 +61,8 @@ impl ScanAnchorCache {
             active_links: HashMap::new(),
             releases: HashMap::new(),
             live: HashMap::new(),
+            aliases: crate::release_matching::CreditAliases::new(),
         };
-        let mut release_ids = HashSet::new();
         while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
             let path: String = row.get(0).map_err(|e| e.to_string())?;
             if row.get::<Option<String>>(5).ok().flatten().is_some() {
@@ -85,7 +100,6 @@ impl ScanAnchorCache {
                         positive_id(&placement["track_id"]),
                     ) {
                         had_placement = true;
-                        release_ids.insert(album.clone());
                         if placements.get(&album).is_some_and(|prior| prior != &track) {
                             placements.remove(&album);
                             rejected.insert(album.clone());
@@ -102,7 +116,44 @@ impl ScanAnchorCache {
             result.saved_links.insert(path, (value, stamp));
         }
         drop(rows);
+        Ok(result)
+    }
+
+    /// Retain every linked sibling in the eligible groups, while unrelated
+    /// library releases need neither metadata hydration nor live-cache reads.
+    /// Global catalogue aliases are still supplied separately by the caller.
+    pub async fn hydrate_for_tracks<'a>(
+        &mut self,
+        db: &TursoDb,
+        market: &str,
+        tracks: impl IntoIterator<Item = &'a crate::release_matching::LocalTrackInfo>,
+    ) -> Result<(), String> {
+        self.hydrate_for_paths(
+            db,
+            market,
+            tracks.into_iter().map(|track| track.path.as_str()),
+        )
+        .await
+    }
+
+    async fn hydrate_for_paths<'a>(
+        &mut self,
+        db: &TursoDb,
+        market: &str,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), String> {
+        let paths: HashSet<_> = paths.into_iter().collect();
+        self.active_links
+            .retain(|path, _| paths.contains(path.as_str()));
+        let release_ids: HashSet<_> = self
+            .active_links
+            .values()
+            .flat_map(|links| links.keys().cloned())
+            .collect();
+        self.releases.retain(|id, _| release_ids.contains(id));
+        self.live.retain(|id, _| release_ids.contains(id));
         if !release_ids.is_empty() {
+            let conn = db.connect()?;
             let keys: Vec<_> = release_ids
                 .iter()
                 .flat_map(|id| {
@@ -115,19 +166,22 @@ impl ScanAnchorCache {
             for (key, value) in crate::db::preference_snapshots_for_keys(&conn, keys).await? {
                 let id = key.rsplit(':').next().unwrap_or_default().to_string();
                 if key.starts_with("release-live:") {
-                    result.live.insert(id, value);
+                    self.live.insert(id, value);
                 } else if let Ok(release) = serde_json::from_value::<TidalRelease>(value) {
                     if release.id == id {
-                        result.releases.insert(id, release);
+                        self.releases.insert(id, release);
                     }
                 }
             }
         }
-        Ok(result)
+        self.aliases.extend_releases(self.releases.values());
+        Ok(())
     }
 
     /// Reuse the caller's already-loaded market catalogue; no second scan or API.
     pub fn merge_catalogues<'a>(&mut self, releases: impl IntoIterator<Item = &'a TidalRelease>) {
+        let releases: Vec<_> = releases.into_iter().collect();
+        self.aliases.extend_releases(releases.iter().copied());
         let ids: HashSet<_> = self
             .active_links
             .values()
@@ -144,6 +198,14 @@ impl ScanAnchorCache {
                 self.releases.insert(release.id.clone(), release.clone());
             }
         }
+    }
+
+    pub fn begin_catalogue_references(&mut self) {
+        self.aliases.begin_batch();
+    }
+
+    pub fn finish_catalogue_references(&mut self) {
+        self.aliases.finish_batch();
     }
 
     pub fn observe_checked_availability(&mut self, id: &str, available: bool) {
@@ -186,6 +248,40 @@ impl ScanAnchorCache {
         ids
     }
 
+    /// Preserve current sibling choices throughout ordinary and contextual
+    /// matching. An additional edition can supply metadata only when its full
+    /// audio sequence is equivalent to the chosen edition.
+    pub fn respects_existing_choices(
+        &self,
+        tracks: &[crate::release_matching::LocalTrackInfo],
+        candidate: &TidalRelease,
+        structure: &crate::release_matching::StructureMatchResult,
+    ) -> bool {
+        tracks.iter().all(|local| {
+            let Some(placements) = self.active_links.get(&local.path) else {
+                return true;
+            };
+            let Some(alignment) = structure.alignments.get(&local.path) else {
+                return false;
+            };
+            if let Some(chosen) = placements.get(&candidate.id) {
+                return chosen == &alignment.remote_track_id;
+            }
+            placements.iter().any(|(id, chosen)| {
+                let Some(release) = self.releases.get(id) else {
+                    return false;
+                };
+                self.is_release_confirmed_live(release)
+                    && crate::release_context::equivalent_editions(release, candidate)
+                    && release.tracks.iter().any(|track| {
+                        track.id == *chosen
+                            && track.disc_number == alignment.disc_number
+                            && track.track_number == alignment.track_number
+                    })
+            })
+        })
+    }
+
     pub fn candidate_releases(
         &self,
         tracks: &[crate::release_matching::LocalTrackInfo],
@@ -211,18 +307,6 @@ impl ScanAnchorCache {
             .filter(|saved| !crate::availability::observation_wins(&from_release, saved))
             .cloned()
             .unwrap_or(from_release)
-    }
-
-    pub fn is_confirmed_live(&self, id: &str) -> bool {
-        let observation = self
-            .releases
-            .get(id)
-            .map(|r| self.latest_observation(r))
-            .or_else(|| self.live.get(id).cloned());
-        let Some(observation) = observation else {
-            return false;
-        };
-        Self::confirmed_observation(&observation)
     }
 
     pub fn is_release_confirmed_live(&self, release: &TidalRelease) -> bool {
@@ -255,152 +339,26 @@ impl ScanAnchorCache {
         totals: &HashMap<String, (u32, u32)>,
         release: TidalRelease,
     ) -> Option<ScanAnchoredRelease> {
-        use crate::release_matching::{
-            clean_isrc, recording_matches, StructureMatchResult, TrackAlignment,
-        };
-        if tracks.is_empty() || !release.tracks_loaded || !self.is_confirmed_live(&release.id) {
-            return None;
-        }
-        let mut remote = HashMap::new();
-        let mut ids = HashSet::new();
-        let mut counts = HashMap::<u32, u32>::new();
-        for track in &release.tracks {
-            if track.disc_number == 0
-                || track.track_number == 0
-                || positive_id(&Value::String(track.id.clone())).is_none()
-                || !ids.insert(track.id.clone())
-                || remote
-                    .insert((track.disc_number, track.track_number), track)
-                    .is_some()
-            {
-                return None;
-            }
-            *counts.entry(track.disc_number).or_default() += 1;
-        }
-        let max_disc = counts.keys().copied().max()?;
-        if !(1..=max_disc).all(|disc| {
-            counts
-                .get(&disc)
-                .is_some_and(|count| (1..=*count).all(|index| remote.contains_key(&(disc, index))))
-        }) {
-            return None;
-        }
-        let mut local_positions = HashSet::new();
-        let mut alignments = HashMap::new();
-        let mut conflicting_isrc_paths = HashSet::new();
-        let mut primary_anchor_count = 0;
-        let mut exact_anchor_isrcs = HashSet::new();
-        let complete = tracks.len() == release.tracks.len();
-        for local in tracks {
-            let pos = (local.disc_number, local.track_number);
-            if local.track_number == 0 || !local_positions.insert(pos) {
-                return None;
-            }
-            let target = remote.get(&pos)?;
-            // Exact title/mix and positive durations are always required. ISRC
-            // disagreement is evaluated separately against whole-release proof.
-            let matches = |r: &&crate::tidal::TidalTrack| {
-                recording_matches(
-                    &local.title,
-                    local.duration,
-                    None,
-                    &r.title,
-                    r.duration,
-                    None,
-                    true,
-                )
-            };
-            if !matches(target) || release.tracks.iter().filter(|r| matches(r)).count() != 1 {
-                return None;
-            }
-            let (declared_tracks, declared_discs) =
-                totals.get(&local.path).copied().unwrap_or_default();
-            let local_max = tracks
-                .iter()
-                .filter(|t| t.disc_number == local.disc_number)
-                .map(|t| t.track_number)
-                .max()
-                .unwrap_or(0);
-            let local_discs = tracks.iter().map(|t| t.disc_number).max().unwrap_or(0);
-            let valid_total = declared_tracks > 0 && declared_tracks >= local_max;
-            let valid_discs = declared_discs > 0 && declared_discs >= local_discs;
-            if (valid_total && counts[&local.disc_number] != declared_tracks)
-                || (valid_discs && max_disc != declared_discs)
-                || (!complete && (!valid_total || (!valid_discs && max_disc != 1)))
-            {
-                return None;
-            }
-            let local_isrc = clean_isrc(local.isrc.as_deref()).filter(|s| !s.is_empty());
-            let remote_isrc = clean_isrc(target.isrc.as_deref()).filter(|s| !s.is_empty());
-            if local_isrc
-                .as_ref()
-                .zip(remote_isrc.as_ref())
-                .is_some_and(|(l, r)| l != r)
-            {
-                conflicting_isrc_paths.insert(local.path.clone());
-            }
-            if let Some(linked) = self.active_links.get(&local.path) {
-                if linked.get(&release.id) != Some(&target.id) {
-                    return None;
-                }
-                if self.saved_links.get(&local.path).and_then(|(saved, _)| positive_id(&saved["ids"]["album_id"])) == Some(release.id.clone()) {
-                    primary_anchor_count += 1;
-                }
-                if local_isrc
-                    .as_ref()
-                    .zip(remote_isrc.as_ref())
-                    .is_some_and(|(l, r)| l == r)
-                {
-                    exact_anchor_isrcs.insert(local_isrc.clone().unwrap());
-                }
-            }
-            alignments.insert(
-                local.path.clone(),
-                TrackAlignment {
-                    local_path: local.path.clone(),
-                    remote_track_id: target.id.clone(),
-                    disc_number: pos.0,
-                    track_number: pos.1,
-                },
-            );
-        }
+        self.evaluate_release(tracks, totals, &release)
+    }
 
-        let exact_anchors = exact_anchor_isrcs.len();
-        if !conflicting_isrc_paths.is_empty()
-            && (!complete
-                || exact_anchors < 2
-                || tracks.iter().any(|t| {
-                    crate::matching::title_key(&t.artist)
-                        != crate::matching::title_key(&release.artist)
-                }))
-        {
+    pub(crate) fn evaluate_release(
+        &self,
+        tracks: &[crate::release_matching::LocalTrackInfo],
+        totals: &HashMap<String, (u32, u32)>,
+        release: &TidalRelease,
+    ) -> Option<ScanAnchoredRelease> {
+        if !self.is_release_confirmed_live(release) {
             return None;
         }
-        let missing: Vec<_> = release
-            .tracks
-            .iter()
-            .filter(|t| !local_positions.contains(&(t.disc_number, t.track_number)))
-            .map(|t| t.id.clone())
-            .collect();
-        Some(ScanAnchoredRelease {
-            evidence: if conflicting_isrc_paths.is_empty() {
-                "Saved linked recordings confirm the release; titles, durations, positions and totals match".into()
-            } else {
-                format!("Complete release verified against {exact_anchors} independently linked ISRC matches; {} differing local ISRC tag(s) retained", conflicting_isrc_paths.len())
-            },
-            structure: StructureMatchResult {
-                compatible: true,
-                incomplete: !missing.is_empty(),
-                matched_count: tracks.len(),
-                total_remote_tracks: release.tracks.len(),
-                conflicts: Vec::new(),
-                alignments,
-                missing_remote_track_ids: missing,
-            },
+        crate::release_context::resolve(
+            tracks,
+            totals,
             release,
-            conflicting_isrc_paths,
-            primary_anchor_count,
-        })
+            &self.aliases,
+            &self.active_links,
+            &self.saved_links,
+        )
     }
 }
 
@@ -428,50 +386,117 @@ pub async fn verified(
     let conn = db.connect()?;
     let mut query = conn
         .query(
-            "SELECT path,payload FROM track_links WHERE market=?",
+            "SELECT path,payload,stamp FROM track_links WHERE market=?",
             (market,),
         )
         .await
         .map_err(|e| e.to_string())?;
+    let files_by_path: HashMap<_, _> = files
+        .iter()
+        .filter(|file| file.present)
+        .map(|file| (file.path.as_str(), file))
+        .collect();
     let mut anchors = HashMap::new();
+    let mut current_links = HashMap::new();
     while let Some(row) = query.next().await.map_err(|e| e.to_string())? {
+        let path: String = row.get(0).map_err(|e| e.to_string())?;
+        let Some(file) = files_by_path.get(path.as_str()) else {
+            continue;
+        };
         let raw: String = row.get(1).map_err(|e| e.to_string())?;
         if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-            if value["manual"] == true && value["status"] == "linked" {
-                anchors.insert(row.get::<String>(0).map_err(|e| e.to_string())?, value);
+            let stamp: String = row.get(2).unwrap_or_default();
+            if !crate::db::link_stamp_matches(&stamp, file.size, file.mtime)
+                || !(value["status"] == "linked"
+                    || value["status"] == "resolved"
+                    || value["status"].is_null())
+                || positive_id(&value["ids"]["album_id"]).is_none()
+                || positive_id(&value["ids"]["track_id"]).is_none()
+            {
+                continue;
             }
+            if value["manual"] == true {
+                anchors.insert(path.clone(), value.clone());
+            }
+            current_links.insert(path, value);
         }
     }
     drop(query);
+    // Read the relevant release snapshots together, rather than repeating a
+    // database lookup for every album while preparing number corrections.
+    let keys: Vec<_> = groups
+        .values()
+        .filter(|peers| {
+            peers.iter().any(|file| anchors.contains_key(&file.path))
+                || peers
+                    .iter()
+                    .filter(|file| current_links.contains_key(&file.path))
+                    .count()
+                    >= 2
+        })
+        .flat_map(|peers| {
+            peers.iter().filter_map(|file| {
+                current_links
+                    .get(&file.path)
+                    .and_then(|saved| positive_id(&saved["ids"]["album_id"]))
+                    .map(|id| format!("tag-review:{market}:{id}"))
+            })
+        })
+        .collect();
+    let cached_releases: HashMap<String, TidalRelease> =
+        crate::db::preference_snapshots_for_keys(&conn, keys)
+            .await?
+            .into_iter()
+            .filter_map(|(_, value)| serde_json::from_value::<TidalRelease>(value).ok())
+            .map(|release| (release.id.clone(), release))
+            .collect();
+    let mut aliases = crate::release_matching::CreditAliases::new();
+    aliases.extend_releases(cached_releases.values());
     let mut result = Vec::new();
     for (_, mut peers) in groups {
-        let chosen: Vec<_> = peers
+        let manual_chosen: Vec<_> = peers
             .iter()
             .filter_map(|p| anchors.get(&p.path).map(|a| (&p.path, a)))
             .collect();
-        let allow_link_propagation = chosen
+        let allow_link_propagation = manual_chosen
             .iter()
             .any(|(_, anchor)| anchor["scope"] == "release");
+        let require_independent_anchors = manual_chosen.is_empty();
+        let chosen: Vec<_> = if require_independent_anchors {
+            peers
+                .iter()
+                .filter_map(|file| {
+                    current_links
+                        .get(&file.path)
+                        .map(|saved| (&file.path, saved))
+                })
+                .collect()
+        } else {
+            manual_chosen
+        };
+        if require_independent_anchors && chosen.len() < 2 {
+            continue;
+        }
         let ids: HashSet<_> = chosen
             .iter()
-            .filter_map(|(_, a)| a["ids"]["album_id"].as_str())
+            .filter_map(|(_, a)| positive_id(&a["ids"]["album_id"]))
             .collect();
         if ids.len() != 1 {
             continue;
         }
-        let id = *ids.iter().next().unwrap();
-        let raw = match db
-            .get_preference(&format!("tag-review:{market}:{id}"))
-            .await?
-        {
-            Some(v) => v,
+        let id = ids.iter().next().unwrap();
+        let mut release = match cached_releases.get(id) {
+            Some(release) => release.clone(),
             None => {
-                db.get_detail(&serde_json::json!({"release_id":id,"market":market}))
-                    .await?
+                let raw = db
+                    .get_detail(&serde_json::json!({"release_id":id,"market":market}))
+                    .await?;
+                let Ok(release) = serde_json::from_value::<TidalRelease>(raw) else {
+                    continue;
+                };
+                aliases.extend_releases(std::iter::once(&release));
+                release
             }
-        };
-        let Ok(mut release) = serde_json::from_value::<TidalRelease>(raw) else {
-            continue;
         };
         if !release.tracks_loaded || release.tracks.len() != peers.len() || peers.is_empty() {
             continue;
@@ -490,45 +515,37 @@ pub async fn verified(
             continue;
         }
         peers.sort_by_key(position);
-        let mut positions = HashSet::new();
-        let mut remote_ids = HashSet::new();
-        let mut remote_positions = HashSet::new();
-        let valid = peers.iter().zip(&release.tracks).all(|(file, track)| {
-            let pos = position(file);
-            let tags = crate::workflows::extract_tags_map(&file.metadata);
-            let matches = |t: &crate::tidal::TidalTrack| {
-                crate::release_matching::recording_matches(
-                    tags.get("title").map(String::as_str).unwrap_or(""),
-                    file.metadata
-                        .as_ref()
-                        .and_then(|m| m["duration"].as_f64())
-                        .unwrap_or(0.0),
-                    tags.get("isrc").map(String::as_str),
-                    &t.title,
-                    t.duration,
-                    t.isrc.as_deref(),
-                    true,
-                )
-            };
-            pos.1 > 0
-                && track.disc_number > 0
-                && track.track_number > 0
-                && remote_positions.insert((track.disc_number, track.track_number))
-                && track.track_number
-                    <= release
-                        .tracks
-                        .iter()
-                        .filter(|t| t.disc_number == track.disc_number)
-                        .count() as u32
-                && positions.insert(pos)
-                && !track.id.is_empty()
-                && remote_ids.insert(track.id.clone())
-                && matches(track)
-                && release.tracks.iter().filter(|t| matches(t)).count() == 1
-                && anchors
-                    .get(&file.path)
-                    .is_none_or(|a| a["ids"]["track_id"].as_str() == Some(track.id.as_str()))
-        });
+        let positions: HashSet<_> = peers.iter().map(position).collect();
+        let paths: HashSet<_> = peers.iter().map(|file| file.path.as_str()).collect();
+        let remote_positions: HashSet<_> = release
+            .tracks
+            .iter()
+            .map(|track| (track.disc_number, track.track_number))
+            .collect();
+        let remote_ids: HashSet<_> = release
+            .tracks
+            .iter()
+            .map(|track| track.id.as_str())
+            .collect();
+        let remote_discs = release
+            .tracks
+            .iter()
+            .map(|track| track.disc_number)
+            .max()
+            .unwrap_or(0);
+        let remote_valid = remote_positions.len() == release.tracks.len()
+            && remote_ids.len() == release.tracks.len()
+            && release.tracks.iter().all(|track| {
+                track.disc_number > 0 && track.track_number > 0 && !track.id.is_empty()
+            })
+            && (1..=remote_discs).all(|disc| {
+                let count = release
+                    .tracks
+                    .iter()
+                    .filter(|track| track.disc_number == disc)
+                    .count() as u32;
+                count > 0 && (1..=count).all(|index| remote_positions.contains(&(disc, index)))
+            });
         // Only complete, contiguous local discs establish reliable per-disc totals.
         let contiguous = peers.iter().all(|p| {
             let (disc, _) = position(p);
@@ -539,10 +556,134 @@ pub async fn verified(
                 .collect();
             (1..=indices.len() as u32).all(|n| indices.contains(&n))
         });
-        if valid && contiguous {
+        if !remote_valid
+            || !contiguous
+            || positions.len() != peers.len()
+            || paths.len() != peers.len()
+            || peers.iter().any(|file| position(file).1 == 0)
+        {
+            continue;
+        }
+        let linked_target_agrees = |file: &LocalFileRecord, track: &crate::tidal::TidalTrack| {
+            current_links.get(&file.path).is_none_or(|saved| {
+                positive_id(&saved["ids"]["album_id"]).as_ref() == Some(id)
+                    && positive_id(&saved["ids"]["track_id"]).as_deref() == Some(track.id.as_str())
+            })
+        };
+        let strict_recording_matches =
+            |file: &LocalFileRecord, track: &crate::tidal::TidalTrack| {
+                let tags = crate::workflows::extract_tags_map(&file.metadata);
+                let duration = file
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m["duration"].as_f64())
+                    .unwrap_or(0.0);
+                duration.is_finite()
+                    && track.duration.is_finite()
+                    && crate::release_matching::recording_matches(
+                        tags.get("title").map(String::as_str).unwrap_or(""),
+                        duration,
+                        tags.get("isrc").map(String::as_str),
+                        &track.title,
+                        track.duration,
+                        track.isrc.as_deref(),
+                        true,
+                    )
+            };
+        // Preserve existing exact sequence/disc-layout corrections when an ISRC
+        // is absent. Reordering recordings needs a stronger unique ISRC bijection.
+        let sequence_valid = peers.iter().zip(&release.tracks).all(|(file, track)| {
+            strict_recording_matches(file, track)
+                && linked_target_agrees(file, track)
+                && release
+                    .tracks
+                    .iter()
+                    .filter(|other| strict_recording_matches(file, other))
+                    .count()
+                    == 1
+        });
+        let mut ordered = Vec::new();
+        if sequence_valid {
+            ordered = peers;
+        } else {
+            let mut by_online_position = HashMap::new();
+            for file in peers {
+                let tags = crate::workflows::extract_tags_map(&file.metadata);
+                let local_isrc =
+                    crate::release_matching::clean_isrc(tags.get("isrc").map(String::as_str))
+                        .filter(|isrc| !isrc.is_empty());
+                let duration = file
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata["duration"].as_f64())
+                    .unwrap_or(0.0);
+                let matches: Vec<_> = release
+                    .tracks
+                    .iter()
+                    .filter(|track| {
+                        let online_isrc =
+                            crate::release_matching::clean_isrc(track.isrc.as_deref())
+                                .filter(|isrc| !isrc.is_empty());
+                        local_isrc
+                            .as_ref()
+                            .zip(online_isrc.as_ref())
+                            .is_some_and(|(a, b)| a == b)
+                            && duration.is_finite()
+                            && track.duration.is_finite()
+                            && duration > 0.0
+                            && track.duration > 0.0
+                            && (duration - track.duration).abs() <= 3.0
+                            && aliases.titles_match(
+                                tags.get("title").map(String::as_str).unwrap_or(""),
+                                track,
+                                false,
+                            )
+                    })
+                    .collect();
+                if matches.len() != 1
+                    || !linked_target_agrees(&file, matches[0])
+                    || by_online_position
+                        .insert((matches[0].disc_number, matches[0].track_number), file)
+                        .is_some()
+                {
+                    by_online_position.clear();
+                    break;
+                }
+            }
+            if by_online_position.len() == release.tracks.len() {
+                ordered = release
+                    .tracks
+                    .iter()
+                    .map(|track| {
+                        by_online_position
+                            .remove(&(track.disc_number, track.track_number))
+                            .unwrap()
+                    })
+                    .collect();
+            }
+        }
+        let independent_anchors: HashSet<_> = ordered
+            .iter()
+            .zip(&release.tracks)
+            .filter_map(|(file, track)| {
+                if !current_links.contains_key(&file.path) {
+                    return None;
+                }
+                let tags = crate::workflows::extract_tags_map(&file.metadata);
+                let local =
+                    crate::release_matching::clean_isrc(tags.get("isrc").map(String::as_str))
+                        .filter(|isrc| !isrc.is_empty())?;
+                let online = crate::release_matching::clean_isrc(track.isrc.as_deref())
+                    .filter(|isrc| !isrc.is_empty())?;
+                (local == online).then_some(local)
+            })
+            .collect();
+        if ordered.len() == release.tracks.len()
+            && (!require_independent_anchors || independent_anchors.len() >= 2)
+        {
             result.push(AnchoredRelease {
                 release,
-                files: peers,
+                files: ordered,
                 allow_link_propagation,
             });
         }
@@ -731,6 +872,31 @@ mod tests {
             .await
             .unwrap();
         let revision = db.revision.load(std::sync::atomic::Ordering::SeqCst);
+        let mut deferred = ScanAnchorCache::load_link_state(&db, "GB", "/music")
+            .await
+            .unwrap();
+        assert!(deferred.releases.is_empty() && deferred.live.is_empty());
+        deferred
+            .hydrate_for_tracks(&db, "GB", local.iter())
+            .await
+            .unwrap();
+        assert_eq!(deferred.releases.len(), 1);
+        assert_eq!(deferred.match_group(&local, &totals).len(), 1);
+        let saved_count = deferred.saved_links.len();
+        deferred
+            .hydrate_for_tracks(&db, "GB", [&local[1]])
+            .await
+            .unwrap();
+        assert!(
+            deferred.active_links.is_empty()
+                && deferred.releases.is_empty()
+                && deferred.live.is_empty()
+        );
+        assert_eq!(
+            deferred.saved_links.len(),
+            saved_count,
+            "Scoped hydration must preserve the original eligibility snapshot"
+        );
         let cache = ScanAnchorCache::load(&db, "GB", "/music").await.unwrap();
         let result = cache.match_group(&local, &totals);
         assert_eq!(result.len(), 1);
@@ -748,7 +914,7 @@ mod tests {
         );
         assert!(result[0]
             .evidence
-            .contains("2 independently linked ISRC matches"));
+            .contains("2 verified existing sibling link(s)"));
         assert!(!crate::release_matching::recording_matches(
             &local[1].title,
             local[1].duration,
@@ -780,10 +946,24 @@ mod tests {
         // An additional cached edition can carry a newer withdrawal than its
         // stored positive check, even though it is not itself an anchor.
         let now = chrono::Utc::now().timestamp();
-        db.set_preference("release-live:GB:910002",&json!({"available":true,"checked_at":now-60,"source":"album_lookup"})).await.unwrap();
-        let mut other_cache = ScanAnchorCache::load(&db,"GB","/music").await.unwrap();
-        other_cache.extend_live_cache(&db,"GB",&["910002".to_string()]).await.unwrap();
-        let other = TidalRelease {id:"910002".into(),available:Some(false),availability_checked_at:Some(now),availability_source:Some("artist_list".into()),..Default::default()};
+        db.set_preference(
+            "release-live:GB:910002",
+            &json!({"available":true,"checked_at":now-60,"source":"album_lookup"}),
+        )
+        .await
+        .unwrap();
+        let mut other_cache = ScanAnchorCache::load(&db, "GB", "/music").await.unwrap();
+        other_cache
+            .extend_live_cache(&db, "GB", &["910002".to_string()])
+            .await
+            .unwrap();
+        let other = TidalRelease {
+            id: "910002".into(),
+            available: Some(false),
+            availability_checked_at: Some(now),
+            availability_source: Some("artist_list".into()),
+            ..Default::default()
+        };
         assert!(!other_cache.is_release_confirmed_live(&other));
 
         // Incomplete inventory supports ordinary strict recording matches, but
@@ -793,7 +973,9 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert!(matched[0].structure.incomplete);
         assert_eq!(matched[0].structure.missing_remote_track_ids.len(), 12);
-        assert!(cache.match_group(&local[..6], &totals).is_empty());
+        let partial = cache.match_group(&local[..6], &totals);
+        assert_eq!(partial.len(), 1);
+        assert!(!partial[0].structure.alignments.contains_key(&local[1].path));
         let mut summary_only = ScanAnchorCache::load(&db, "GB", "/music").await.unwrap();
         summary_only
             .releases
@@ -812,10 +994,15 @@ mod tests {
 
         let mut changed = local.clone();
         changed[1].duration += 3.0;
-        assert!(cache.match_group(&changed, &totals).is_empty());
+        let partial = cache.match_group(&changed, &totals);
+        assert_eq!(partial.len(), 1);
+        assert!(!partial[0].structure.alignments.contains_key(&local[1].path));
+        assert!(partial[0].review_reasons[&local[1].path].contains("duration differs"));
         changed = local.clone();
         changed[1].title.push_str(" (Extended Mix)");
-        assert!(cache.match_group(&changed, &totals).is_empty());
+        let partial = cache.match_group(&changed, &totals);
+        assert_eq!(partial.len(), 1);
+        assert!(!partial[0].structure.alignments.contains_key(&local[1].path));
         changed = local.clone();
         changed[1].track_number = 3;
         assert!(cache.match_group(&changed, &totals).is_empty());
@@ -828,9 +1015,10 @@ mod tests {
         assert!(wrong_links.match_group(&local, &totals).is_empty());
         wrong_links = ScanAnchorCache::load(&db, "GB", "/music").await.unwrap();
         wrong_links.active_links.remove(&local[5].path);
-        assert!(
-            wrong_links.match_group(&local, &totals).is_empty(),
-            "One exact anchor cannot waive a conflicting ISRC"
+        assert_eq!(
+            wrong_links.match_group(&local, &totals).len(),
+            1,
+            "A strong complete-release majority can establish context without two prior choices"
         );
         wrong_links.observe_checked_availability(&release.id, false);
         assert!(wrong_links.match_group(&strict_subset, &totals).is_empty());
@@ -854,6 +1042,175 @@ mod tests {
         );
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_reordered_release_offers_reviewed_numbers_from_unique_recordings() {
+        let directory =
+            std::env::temp_dir().join(format!("reordered-numbers-{}", uuid::Uuid::new_v4()));
+        let db = TursoDb::open(directory.join("db")).await.unwrap();
+        let remote_titles = [
+            "Heaven (Lenno Remix)",
+            "Favorite Sound (BRKLYN Remix)",
+            "Favorite Sound (Win and Woo Remix)",
+            "Buzzing (Codeko Remix)",
+            "See You on the Other Side (Upmost Remix)",
+        ];
+        let release = TidalRelease {
+            id: "448619412".into(),
+            artist: "Artist".into(),
+            title: "Remixes".into(),
+            tracks_loaded: true,
+            tracks: remote_titles
+                .iter()
+                .enumerate()
+                .map(|(index, title)| crate::tidal::TidalTrack {
+                    id: format!("44861941{}", index + 3),
+                    title: (*title).into(),
+                    duration: 180.0 + index as f64,
+                    isrc: Some(format!("GBTEST26000{index}")),
+                    disc_number: 1,
+                    track_number: index as u32 + 1,
+                    artists: vec![
+                        json!({"name":"Maty Noyes","id":6699993}),
+                        json!({"name":"Echosmith","id":4624156}),
+                        json!({"name":"Nevve","id":8014921}),
+                    ],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let local_to_remote = [0usize, 3, 4, 1, 2];
+        let local_titles = [
+            "Heaven (feat. Maty Noyes) [Lenno Remix]",
+            "Buzzing (with Nevve) [Codeko Remix]",
+            "See You on the Other Side [Upmost Remix]",
+            "Favorite Sound (with Echosmith) [BRKLYN Remix]",
+            "Favorite Sound (with Echosmith) [Win and Woo Remix]",
+        ];
+        let mut files = Vec::new();
+        for (index, remote_index) in local_to_remote.iter().enumerate() {
+            let remote = &release.tracks[*remote_index];
+            let path = format!("/fixture/Artist/Remixes/{:02}.flac", index + 1);
+            let metadata = json!({"albumartist":"Artist","album":"Remixes","title":local_titles[index],"duration":remote.duration+0.2,"isrc":remote.isrc,"tracknumber":format!("{:02}",index+1),"tracktotal":"01","discnumber":"01","disctotal":"01"});
+            db.apply_file_update(&path, &path, "/fixture", &metadata, 10, 20)
+                .await
+                .unwrap();
+            files.push(LocalFileRecord {
+                path,
+                root: "/fixture".into(),
+                size: 10,
+                mtime: 20,
+                metadata: Some(metadata),
+                error: None,
+                present: true,
+            });
+        }
+        db.set_preference("tag-review:GB:448619412", &json!(release))
+            .await
+            .unwrap();
+        let manual = json!({"status":"linked","manual":true,"scope":"track","ids":{"album_id":448619412,"track_id":448619417}});
+        db.save_track_link(&files[2].path, "GB", "[0,0,10,20]", &manual.to_string())
+            .await
+            .unwrap();
+        let groups = verified(&db, &files, "GB").await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(!groups[0].allow_link_propagation);
+        assert_eq!(
+            groups[0]
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                files[0].path.as_str(),
+                files[3].path.as_str(),
+                files[4].path.as_str(),
+                files[1].path.as_str(),
+                files[2].path.as_str()
+            ]
+        );
+        let plans = crate::workflows::plan_cached(&db, &files, "numbers", None)
+            .await
+            .unwrap();
+        for (index, file) in files.iter().enumerate() {
+            let plan = plans.iter().find(|plan| plan.path == file.path).unwrap();
+            assert_eq!(plan.changes["tracktotal"], "05");
+            if local_to_remote[index] + 1 != index + 1 {
+                assert_eq!(
+                    plan.changes["tracknumber"],
+                    format!("{:02}", local_to_remote[index] + 1)
+                );
+            }
+            assert!(
+                plan.target.is_none(),
+                "Numbering review leaves all files in place"
+            );
+        }
+        assert_eq!(
+            propagate_files(&db, &files, "GB").await.unwrap(),
+            0,
+            "A one-track choice never authorizes sibling propagation"
+        );
+        let connection = db.connect().unwrap();
+        let mut row = connection
+            .query(
+                "SELECT payload FROM track_links WHERE path=?",
+                (files[2].path.as_str(),),
+            )
+            .await
+            .unwrap();
+        let saved: Value =
+            serde_json::from_str(&row.next().await.unwrap().unwrap().get::<String>(0).unwrap())
+                .unwrap();
+        assert_eq!(saved, manual, "Reviewing numbering is read-only");
+        drop(row);
+        let automatic =
+            json!({"status":"linked","ids":{"album_id":"448619412","track_id":"448619417"}});
+        db.save_track_link(&files[2].path, "GB", "[0,0,10,20]", &automatic.to_string())
+            .await
+            .unwrap();
+        assert!(
+            verified(&db, &files, "GB").await.unwrap().is_empty(),
+            "One automatic recording cannot establish a numbering correction"
+        );
+        db.save_track_link(
+            &files[1].path,
+            "GB",
+            "[0,0,10,20]",
+            &json!({"status":"linked","ids":{"album_id":"448619412","track_id":"448619416"}})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let automatic_groups = verified(&db, &files, "GB").await.unwrap();
+        assert_eq!(
+            automatic_groups.len(),
+            1,
+            "Two independent automatic recording links support a reviewed full-release correction"
+        );
+        assert!(!automatic_groups[0].allow_link_propagation);
+        files[1].metadata.as_mut().unwrap()["isrc"] = json!("WRONG");
+        assert!(
+            verified(&db, &files, "GB").await.unwrap().is_empty(),
+            "Reordering requires every recording to match uniquely by ISRC"
+        );
+        files[1].metadata.as_mut().unwrap()["isrc"] = json!(release.tracks[3].isrc);
+        connection
+            .execute(
+                "UPDATE track_links SET stamp='[0,0,10,19]' WHERE path=?",
+                (files[2].path.as_str(),),
+            )
+            .await
+            .unwrap();
+        assert!(
+            verified(&db, &files, "GB").await.unwrap().is_empty(),
+            "Stale manual links cannot establish numbering corrections"
+        );
+        drop(connection);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod release_artists;
 mod release_anchor;
+mod release_cardinality;
+mod release_context;
+#[cfg(test)]
+mod release_context_tests;
 mod availability;
 mod network;
 mod progress;
