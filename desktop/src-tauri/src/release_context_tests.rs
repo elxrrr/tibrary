@@ -150,6 +150,124 @@ async fn link(db: &TursoDb) -> crate::linking::LinkSummary {
 }
 
 #[tokio::test]
+async fn omitted_recording_explains_audio_counts_without_creating_a_wrong_placement() {
+    let (db, directory) = database().await;
+    let complete_local = release(&[11]);
+    let mut shortened = complete_local.clone();
+    shortened.tracks.remove(8);
+    for (index, track) in shortened.tracks.iter_mut().enumerate() {
+        track.track_number = index as u32 + 1;
+    }
+    shortened.track_count = 10;
+    shortened.quality = "LOSSLESS".into();
+    let mut alternate = shortened.clone();
+    alternate.id = "810004".into();
+    alternate.quality = "DOLBY_ATMOS".into();
+    for (index, track) in alternate.tracks.iter_mut().enumerate() {
+        track.id = format!("810004{:02}", index + 1);
+    }
+    cache(&db, vec![shortened.clone(), alternate]).await;
+    // Impossible saved totals must not conceal the eleven physical local files.
+    let paths = local_files(&db, &complete_local, 1, None, None).await;
+    let mut existing = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        if index == 8 {
+            continue;
+        }
+        let remote_index = if index < 8 { index } else { index - 1 };
+        let saved = json!({"status":"linked","manual":index == 0,"scope":"track","ids":{"album_id":ALBUM_ID,"track_id":shortened.tracks[remote_index].id}});
+        db.save_track_link(path, "GB", "[0,0,10,20]", &saved.to_string())
+            .await
+            .unwrap();
+        existing.push((path.clone(), saved));
+    }
+    let summary = link(&db).await;
+    assert_eq!(
+        (
+            summary.total,
+            summary.linked,
+            summary.review,
+            summary.unmatched
+        ),
+        (1, 0, 1, 0)
+    );
+    let review = payload(&db, &paths[8]).await;
+    assert_eq!(review["status"], "review");
+    assert!(review["ids"].is_null());
+    let note = review["catalogue_note"].as_str().unwrap();
+    assert!(note.contains("Local release: 11 tracks · online candidate: 10 audio tracks"));
+    assert!(note.contains("recording absent"));
+    let options = review["catalogue_options"].as_array().unwrap();
+    assert_eq!(
+        options.len(),
+        2,
+        "Both shortened editions remain inspectable release candidates"
+    );
+    for option in options {
+        assert!(option["track_id"].is_null(), "The song occupying the omitted recording's old position must not be offered as its placement");
+        assert_eq!(option["audio_tracks"], 10);
+        assert_eq!(option["local_tracks"], 11);
+        assert_eq!(option["compatible"], false);
+        assert_eq!(option["recording_absent"], true);
+        assert!(option["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("recording absent"));
+    }
+    let repeated = link_library_mode(
+        &db,
+        "GB",
+        ROOT,
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+        None,
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated.total, 0,
+        "Inspectable editions without the recording are not available placement choices"
+    );
+    assert_eq!(payload(&db, &paths[8]).await, review);
+    for (path, saved) in existing {
+        assert_eq!(
+            payload(&db, &path).await,
+            saved,
+            "Existing sibling choices remain unchanged"
+        );
+    }
+    drop(db);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn wholly_unmatched_recording_keeps_diagnostics_without_creating_choices() {
+    let (db, directory) = database().await;
+    let remote = release(&[1]);
+    cache(&db, vec![remote.clone()]).await;
+    let mut local = remote;
+    local.tracks[0].title = "Absent Recording".into();
+    local.tracks[0].isrc = Some("GBOTHER260001".into());
+    let paths = local_files(&db, &local, 1, None, None).await;
+    let summary = link(&db).await;
+    assert_eq!(
+        (summary.linked, summary.review, summary.unmatched),
+        (0, 0, 1)
+    );
+    let saved = payload(&db, &paths[0]).await;
+    assert_eq!(saved["status"], "unmatched");
+    assert!(saved["catalogue_options"].is_null());
+    assert!(saved["catalogue_note"]
+        .as_str()
+        .unwrap()
+        .contains("recording absent"));
+    drop(db);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn majority_records_resolve_conflicting_isrc_only_inside_the_same_release() {
     let (db, directory) = database().await;
     let mut album = release(&[4]);

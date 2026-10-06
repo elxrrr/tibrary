@@ -133,6 +133,20 @@ fn artist_key(artist: &str) -> String {
     }
 }
 
+fn scope_link_release_page(mut page: Value, args: &Value) -> Value {
+    if args["route"] == "links" {
+        // Hide the compilation placeholder in this view only. Scope the full
+        // cached snapshot before grouping, facets and pagination; saved tracks
+        // and their links remain available to the other library workflows.
+        if let Some(rows) = page["rows"].as_array_mut() {
+            rows.retain(|row| artist_key(row["artist"].as_str().unwrap_or("")) != "various artists");
+            let total = rows.len();
+            page["total"] = json!(total);
+        }
+    }
+    page
+}
+
 #[derive(Default)]
 struct LinkCounts { linked: usize, choices: usize, unlinked: usize, ignored: usize }
 
@@ -1122,6 +1136,7 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         }
         page
     };
+    let page = scope_link_release_page(page, args);
     Ok(if grouped_links {
         if let Some(column) = column {
             grouped_link_facets(&page,&filters,args,column,args["facet_search"].as_str().unwrap_or(""),offset,limit.min(500))
@@ -1347,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn compilation_releases_remain_under_one_artist_without_performer_leakage() {
+    fn shared_compilation_grouping_preserves_original_tracks_without_performer_leakage() {
         let mut first = link_row("/Music/Compilations/A/01.flac", "Disc 1/1 · Track 1/2", "Linked");
         first["artist"] = json!("Various Artists");
         first["performer"] = json!("Singer A");
@@ -1364,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn compilation_artist_filters_and_facets_share_the_canonical_group_label() {
+    fn shared_compilation_filters_and_facets_use_the_canonical_group_label() {
         let mut first = link_row("/Music/Compilations/A/01.flac", "Disc 1/1 · Track 1/2", "Linked");
         first["artist"] = json!("Various Artists");
         let mut second = link_row("/Music/Compilations/A/02.flac", "Disc 1/1 · Track 2/2", "Unlinked");
@@ -1381,6 +1396,53 @@ mod tests {
         assert_eq!(grouped_link_page(page.clone(), &old_alias_filter, &args, 0, 100)["track_total"], 2);
         let excluded = parse(Some(&json!({"artist":{"exclude":["Various Artists"]}}))).unwrap();
         assert_eq!(grouped_link_page(page, &excluded, &args, 0, 100)["track_total"], 1);
+    }
+
+    #[test]
+    fn link_releases_route_hides_compilation_aliases_before_paging_counts_and_facets() {
+        let mut rows = vec![link_row("/Music/Artist/A/01.flac", "Disc 1/1 · Track 1/1", "Linked")];
+        let mut similar_name = link_row("/Music/Ensemble/A/01.flac", "Disc 1/1 · Track 1/1", "Unlinked");
+        similar_name["artist"] = json!("Various Artists Ensemble");
+        rows.push(similar_name);
+        for (index, alias) in ["Various Artists", "Various Artist", "V.A.", "V A"].into_iter().enumerate() {
+            let mut track = link_row(&format!("/Music/Compilation/A/{index}.flac"),
+                &format!("Disc 1/1 · Track {}/4",index+1), "Needs choice");
+            track["artist"] = json!(alias);
+            track["online_id"] = json!(format!("saved-track-{index}"));
+            rows.push(track);
+        }
+        let source = json!({"rows":rows,"total":6,"root":"/Music","revision":19});
+        let args = json!({"route":"links","group_releases":true,"group_artists":true});
+        let scoped = scope_link_release_page(source.clone(), &args);
+        assert_eq!(scoped["total"], 2);
+        assert_eq!(source["rows"].as_array().unwrap().len(), 6, "the cached source and saved links remain intact");
+        assert_eq!(source["rows"][2]["online_id"], "saved-track-0");
+        assert_eq!(scope_link_release_page(source.clone(), &json!({"route":"files"})), source,
+            "local maintenance keeps compilation tracks and their saved links");
+        assert_eq!(scope_link_release_page(source.clone(), &json!({"route":"artists"})), source);
+
+        let first = grouped_link_page(scoped.clone(), &ColumnFilters::new(), &args, 0, 1);
+        let second = grouped_link_page(scoped.clone(), &ColumnFilters::new(), &args, 1, 1);
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["artist_total"], 2);
+        assert_eq!(first["release_total"], 2);
+        assert_eq!(first["track_total"], 2);
+        assert_eq!(first["rows"][0]["artist"], "Artist");
+        assert_eq!(second["rows"][0]["artist"], "Various Artists Ensemble", "similar names are not compilation aliases");
+        assert_eq!(second["offset"], 1);
+        assert_eq!(second["revision"], 19);
+        assert_eq!(filter_page(scoped.clone(), &ColumnFilters::new(), 1, 1)["total"], 2,
+            "flat Link releases pages use the same scope");
+        let artist_facet = grouped_link_facets(&scoped, &ColumnFilters::new(), &args, "artist", "", 0, 100);
+        assert_eq!(artist_facet["options"], json!([
+            {"value":"Artist","label":"Artist","count":1},
+            {"value":"Various Artists Ensemble","label":"Various Artists Ensemble","count":1}
+        ]));
+        let status_facet = grouped_link_facets(&scoped, &ColumnFilters::new(), &args, "status", "", 0, 100);
+        assert!(status_facet["options"].as_array().unwrap().iter().all(|option| option["value"] != "Needs choice"));
+        let compilation_filter = parse(Some(&json!({"artist":{"include":["Various Artists"]}}))).unwrap();
+        assert_eq!(grouped_link_page(scoped, &compilation_filter, &args, 0, 100)["total"], 0,
+            "a saved column filter cannot restore the hidden group");
     }
 
     #[test]

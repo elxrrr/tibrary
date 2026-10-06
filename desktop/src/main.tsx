@@ -2132,7 +2132,7 @@ function App() {
                 {detail.proposed && Object.keys(detail.proposed).length > 0 && <section><h3>Proposed changes</h3>
                   {detail.source_release_id && <p>Online source · Release {detail.source_release_id} · Track {detail.source_track_id}</p>}
                   <TagChanges changes={detail.proposed} current={detail.tags}/></section>}
-                {!detail.folder_target && <><h3>Available placements</h3>
+                {!detail.folder_target && <><h3>{detail.catalogue_options?.some((option: any) => option.recording_absent) ? "Inspected releases and placements" : "Available placements"}</h3>
                 {detail.availability_note && <><p>{detail.availability_note}</p><button disabled={detail.availability_checking} onClick={async () => {
                   const path = detail.path;
                   setDetail({...detail, availability_checking:true});
@@ -2161,7 +2161,7 @@ function App() {
                         <p>
                           {o.position_label || "Position not yet verified"} · Release ID {albumId || "Unavailable"}
                         </p>
-                        {!trackId && <p>Release candidate; inspect it to find this track’s placement.</p>}
+                        {!trackId && <p>{o.recording_absent ? "This edition’s saved audio track list omits this recording." : "Release candidate; inspect it to find this track’s placement."}</p>}
                         <p>{o.evidence}</p>
                         {(o.structure?.compatible || (o.structure?.reason || o.structure?.reasons) && readable(o.structure?.reason || o.structure?.reasons) !== readable(o.evidence)) && <p
                           className={

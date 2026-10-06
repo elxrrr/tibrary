@@ -44,18 +44,95 @@ fn release_folder(path: &str, root: &str) -> String {
     folder.display().to_string()
 }
 
+/// Explain a missing alignment without treating the song at the same index as
+/// its recording, or claiming an omission merely because a mix/title differs.
+fn unplaced_recording_evidence(
+    local: &LocalTrackInfo,
+    release: &TidalRelease,
+    local_audio_count: usize,
+) -> String {
+    unplaced_recording_diagnostic(local, release, local_audio_count).0
+}
+
+fn unplaced_recording_diagnostic(
+    local: &LocalTrackInfo,
+    release: &TidalRelease,
+    local_audio_count: usize,
+) -> (String, bool) {
+    if !release.tracks_loaded {
+        return ("Online audio track details are not loaded; recording placement cannot be verified".into(), false);
+    }
+    let counts = format!("Local release: {local_audio_count} track{} · online candidate: {} audio track{}", if local_audio_count == 1 {""} else {"s"}, release.tracks.len(), if release.tracks.len() == 1 {""} else {"s"});
+    let local_isrc = crate::release_matching::clean_isrc(local.isrc.as_deref()).filter(|isrc| !isrc.is_empty());
+    let equal_isrc = |track: &crate::tidal::TidalTrack| {
+        local_isrc.as_ref().zip(crate::release_matching::clean_isrc(track.isrc.as_deref()).filter(|isrc| !isrc.is_empty()).as_ref()).is_some_and(|(a,b)| a == b)
+    };
+    let mut aliases = crate::release_matching::CreditAliases::new();
+    aliases.extend_releases(std::iter::once(release));
+    let identity_hits: Vec<_> = release.tracks.iter().filter(|track| equal_isrc(track)).collect();
+    let title_hits: Vec<_> = release.tracks.iter().filter(|track| aliases.titles_match(&local.title, track, equal_isrc(track))).collect();
+    let hits = if !identity_hits.is_empty() { &identity_hits } else { &title_hits };
+    if let [track] = hits.as_slice() {
+        let mut reasons = Vec::new();
+        if (track.disc_number, track.track_number) != (local.disc_number, local.track_number) {
+            reasons.push(format!("Recording found at online Disc {:02} · Track {:02}; local Disc {:02} · Track {:02}; track/disc positions differ",track.disc_number,track.track_number,local.disc_number,local.track_number));
+        } else {
+            reasons.push("Recording identifier or title is present at the local position; a verified placement could not be established".into());
+        }
+        if local.duration.is_finite() && track.duration.is_finite() && local.duration > 0.0 && track.duration > 0.0 && (local.duration-track.duration).abs() > 3.0 {
+            reasons.push(format!("Duration differs by {:.2} seconds (local {:.2}s · online {:.2}s; tolerance 3 seconds)",(local.duration-track.duration).abs(),local.duration,track.duration));
+        }
+        if !aliases.titles_match(&local.title, track, equal_isrc(track)) {
+            reasons.push("Recording identifier is present, but the title or mix differs".into());
+        }
+        if local_isrc.is_some() && !equal_isrc(track) {
+            reasons.push("The title is present, but the recording identifier differs or is missing".into());
+        }
+        return (format!("{counts}; {}", reasons.join("; ")), false);
+    }
+    if !hits.is_empty() {
+        return (format!("{counts}; multiple online tracks share this recording identifier or title; no unique placement is verified"), false);
+    }
+    let base_title = |title: &str| {
+        let key = title_key(title.split(['(', '[']).next().unwrap_or(title));
+        let end = [" feat ", " featuring ", " ft ", " with "].iter().filter_map(|separator| key.find(separator)).min().unwrap_or(key.len());
+        key[..end].to_string()
+    };
+    let local_base = base_title(&local.title);
+    if crate::release_matching::has_mix_keyword(&local.title)
+        || release.tracks.iter().any(|track| !local_base.is_empty() && base_title(&track.title) == local_base) {
+        return (format!("{counts}; no verified recording placement; related mix/version or credited-title differences require review"), false);
+    }
+    if local_isrc.is_some() && !release.tracks.is_empty() && release.tracks.iter().all(|track| crate::release_matching::clean_isrc(track.isrc.as_deref()).is_some_and(|isrc| !isrc.is_empty())) {
+        (format!("{counts}; recording absent from this candidate's loaded audio track list: no matching ISRC or title"), true)
+    } else {
+        (format!("{counts}; no matching recording identifier or title found; incomplete recording identifiers prevent confirming whether the recording is included"), false)
+    }
+}
+
 fn candidate_option(
     release: &TidalRelease,
     matched: &crate::release_matching::StructureMatchResult,
     local: &LocalTrackInfo,
     shared_credits: usize,
     context: Option<&crate::release_anchor::ScanAnchoredRelease>,
+    local_audio_count: usize,
 ) -> Option<Value> {
     let path = local.path.as_str();
     let review_placement = context.and_then(|context| context.review_reasons.get(path)).and_then(|_| {
         release.tracks.iter().find(|track| track.disc_number == local.disc_number && track.track_number == local.track_number)
     }).map(|track| crate::release_matching::TrackAlignment {local_path:local.path.clone(),remote_track_id:track.id.clone(),disc_number:track.disc_number,track_number:track.track_number});
-    let alignment = matched.alignments.get(path).or(review_placement.as_ref())?;
+    let alignment = matched.alignments.get(path).or(review_placement.as_ref());
+    let Some(alignment) = alignment else {
+        let (evidence, recording_absent) = unplaced_recording_diagnostic(local, release, local_audio_count);
+        let mut reasons = vec![evidence.clone()];
+        reasons.extend(matched.conflicts.iter().cloned());
+        let mut option = json!({"id":release.id,"title":release.title,"artist":release.artist,"album":release.title,"date":release.date,
+            "tracks":release.track_count,"audio_tracks":release.tracks.len(),"local_tracks":local_audio_count,"matched":matched.matched_count,
+            "position_label":"No verified track placement","evidence":evidence,"structure":{"compatible":false,"reasons":reasons},"compatible":false});
+        if recording_absent { option["recording_absent"] = json!(true); }
+        return Some(option);
+    };
     let safe = matched.compatible && matched.alignments.contains_key(path);
     let mut evidence = matched.conflicts.clone();
     if let Some(context) = context {
@@ -173,7 +250,7 @@ pub async fn link_library_mode(
                 || (!linked
                     && old["catalogue_options"]
                         .as_array()
-                        .is_some_and(|a| !a.is_empty())))
+                        .is_some_and(|options| options.iter().any(|option| option["recording_absent"] != true))))
         {
             eligible.insert(path.clone());
         }
@@ -591,6 +668,9 @@ pub async fn link_library_mode(
                     }
                     if !is_perfect {
                         payload.as_object_mut().unwrap().remove("ids");
+                        if (align.disc_number, align.track_number) != (track.disc_number, track.track_number) {
+                            payload["catalogue_note"] = json!(unplaced_recording_evidence(track, best_rel, group_tracks.len()));
+                        }
                     } else {
                         payload["placements"] = json!(scored_candidates
                             .iter()
@@ -604,6 +684,7 @@ pub async fn link_library_mode(
                     payload["catalogue_options"] = json!(scored_candidates.iter().filter_map(|(release, matched)| candidate_option(
                         release, matched, track, credit_scores[&release.id],
                         anchored_matches.iter().find(|context| context.release.id == release.id),
+                        group_tracks.len(),
                     )).collect::<Vec<_>>());
                     let payload_str = payload.to_string();
                     db.save_track_link(&track.path, market, &stamp, &payload_str).await?;
@@ -611,10 +692,8 @@ pub async fn link_library_mode(
                     summary.review += 1;
                     let payload = json!({
                         "status": "review",
-                        "catalogue_note": best_context.and_then(|context| context.review_reasons.get(&track.path)).map(String::as_str).unwrap_or("Track position unverified on candidate release"),
-                        "catalogue_options": if best_context.is_some() {
-                            scored_candidates.iter().filter_map(|(release, matched)| candidate_option(release, matched, track, credit_scores[&release.id], anchored_matches.iter().find(|context| context.release.id == release.id))).collect::<Vec<_>>()
-                        } else { cand_options.clone() },
+                        "catalogue_note": best_context.and_then(|context| context.review_reasons.get(&track.path)).cloned().unwrap_or_else(||unplaced_recording_evidence(track, best_rel, group_tracks.len())),
+                        "catalogue_options": scored_candidates.iter().filter_map(|(release, matched)| candidate_option(release, matched, track, credit_scores[&release.id], anchored_matches.iter().find(|context| context.release.id == release.id), group_tracks.len())).collect::<Vec<_>>(),
                         "checked_at": chrono::Utc::now().timestamp(),
                     });
                     let payload_str = payload.to_string();
@@ -626,7 +705,8 @@ pub async fn link_library_mode(
                 summary.unmatched += 1;
                 let payload = json!({
                     "status": "unmatched",
-                    "note": "Tracks did not align with candidate releases",
+                    "note": unplaced_recording_evidence(track, best_rel, group_tracks.len()),
+                    "catalogue_note": unplaced_recording_evidence(track, best_rel, group_tracks.len()),
                     "checked_at": chrono::Utc::now().timestamp(),
                 });
                 let stamp = file_stamps
@@ -657,6 +737,43 @@ mod tests {
     use super::*;
     use crate::tidal::TidalTrack;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn unplaced_evidence_distinguishes_omission_from_position_duration_and_mix_conflicts() {
+        let mut remote = TidalTrack {id:"710001".into(),title:"Existing Song".into(),duration:180.0,isrc:Some("GBTEST260001".into()),disc_number:1,track_number:1,..Default::default()};
+        let mut release = TidalRelease {id:"710000".into(),tracks_loaded:true,track_count:2,tracks:vec![remote.clone()],..Default::default()};
+        let mut local = LocalTrackInfo {path:"/fixture/02.flac".into(),title:"Missing Song".into(),artist:"Artist".into(),album:"Release".into(),duration:180.0,track_number:2,disc_number:1,isrc:Some("GBTEST260002".into())};
+        let absent = unplaced_recording_evidence(&local,&release,2);
+        assert!(absent.contains("Local release: 2 tracks · online candidate: 1 audio track"));
+        assert!(absent.contains("recording absent"));
+        assert!(unplaced_recording_diagnostic(&local,&release,2).1);
+        local.title="Existing Song".into();
+        local.isrc=remote.isrc.clone();
+        local.duration=190.0;
+        let conflict=unplaced_recording_evidence(&local,&release,2);
+        assert!(conflict.contains("positions differ") && conflict.contains("Duration differs by 10.00 seconds"));
+        assert!(!conflict.contains("absent"));
+        assert!(!unplaced_recording_diagnostic(&local,&release,2).1);
+        local.title="Existing Song (Other Person Remix)".into();
+        local.isrc=Some("DIFFERENT".into());
+        assert!(!unplaced_recording_evidence(&local,&release,2).contains("absent"),"A mix mismatch cannot prove that a recording was omitted");
+        assert!(!unplaced_recording_diagnostic(&local,&release,2).1);
+        local.title="Existing Song feat. Guest".into();
+        assert!(!unplaced_recording_evidence(&local,&release,2).contains("absent"),"Incomplete feature credits cannot prove that a recording was omitted");
+        assert!(!unplaced_recording_diagnostic(&local,&release,2).1);
+        remote.artists=vec![json!({"id":720001,"name":"Guest"})];
+        release.tracks=vec![remote];
+        local.isrc=Some("GBTEST260001".into());
+        let credited=unplaced_recording_evidence(&local,&release,2);
+        assert!(credited.contains("positions differ") && !credited.contains("absent"));
+        assert!(!unplaced_recording_diagnostic(&local,&release,2).1);
+        local.title="Missing Song".into();
+        local.isrc=Some("GBTEST260002".into());
+        release.tracks[0].isrc=None;
+        assert!(!unplaced_recording_diagnostic(&local,&release,2).1,"Incomplete online identifiers cannot confirm absence");
+        release.tracks.clear();
+        assert!(!unplaced_recording_diagnostic(&local,&release,2).1,"An empty loaded list cannot prove the recording was omitted");
+    }
 
     #[tokio::test]
     async fn cached_sibling_evidence_links_only_requested_tracks_and_retains_existing_choices() {

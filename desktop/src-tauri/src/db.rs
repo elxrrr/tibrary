@@ -1258,7 +1258,9 @@ impl TursoDb {
                         }
                     }
                     if let Some(opts) = p.get("catalogue_options").and_then(|v| v.as_array()) {
-                        candidates = opts.len();
+                        // An edition omitting the recording is inspectable, but
+                        // offers no placement. Preserve legacy unflagged choices.
+                        candidates = opts.iter().filter(|option| option["recording_absent"] != true).count();
                         if status != "Linked" && candidates > 0 {
                             status = "Needs choice".to_string();
                         }
@@ -4501,6 +4503,50 @@ fn is_compilation_artist(artist: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn omitted_recordings_remain_unlinked_without_hiding_inspectable_editions() {
+        let folder = std::env::temp_dir().join(format!("tibrary-omitted-choices-{}", uuid::Uuid::new_v4()));
+        let store = super::TursoDb::open(folder.join("db")).await.unwrap();
+        let root = "/synthetic-omission";
+        let missing = "/synthetic-omission/Artist/Release/Missing.flac";
+        let possible = "/synthetic-omission/Artist/Release/Possible.flac";
+        let note = "Recording omitted from the current online edition; 11 local audio files, 10 online audio tracks";
+        for (path, title, options) in [
+            (missing, "Missing", serde_json::json!([
+                {"id":"100","recording_absent":true},
+                {"id":"200","recording_absent":true}
+            ])),
+            (possible, "Possible", serde_json::json!([
+                {"id":"100","recording_absent":true},
+                {"id":"200"}
+            ])),
+        ] {
+            let metadata = serde_json::json!({"albumartist":"Artist","album":"Release","title":title});
+            store.apply_file_update(path, path, root, &metadata, 10, 20).await.unwrap();
+            let review = serde_json::json!({"status":"review","catalogue_note":note,"catalogue_options":options});
+            store.save_track_link(path, "GB", "[0,0,10,20]", &review.to_string()).await.unwrap();
+        }
+        let all = store.get_link_rows("GB", root, Some("all"), None, None, None, 0, 10).await.unwrap();
+        let omitted = all.rows.iter().find(|row| row.path == missing).unwrap();
+        assert_eq!(omitted.status, "Unlinked");
+        assert_eq!(omitted.candidates, 0);
+        assert_eq!(omitted.evidence, note);
+        let placement = all.rows.iter().find(|row| row.path == possible).unwrap();
+        assert_eq!(placement.status, "Needs choice");
+        assert_eq!(placement.candidates, 1, "Legacy choices must remain selectable");
+        let choices = store.get_link_rows("GB", root, Some("choice"), None, None, None, 0, 10).await.unwrap();
+        assert_eq!(choices.rows.len(), 1);
+        assert_eq!(choices.rows[0].path, possible);
+        let unlinked = store.get_link_rows("GB", root, Some("unlinked"), None, None, None, 0, 10).await.unwrap();
+        assert_eq!(unlinked.rows.len(), 2);
+        let detail = store.get_detail(&serde_json::json!({"path":missing,"market":"GB"})).await.unwrap();
+        assert_eq!(detail["catalogue_options"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["catalogue_options"][0]["recording_absent"], true);
+        assert!(detail["catalogue_options"][0]["track_id"].is_null());
+        drop(store);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
     #[tokio::test]
     async fn release_only_candidates_offer_unique_cached_recordings_for_manual_review_only() {
         let folder = std::env::temp_dir().join(format!("tibrary-manual-placement-{}", uuid::Uuid::new_v4()));
