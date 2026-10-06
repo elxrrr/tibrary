@@ -2933,13 +2933,19 @@ impl TursoDb {
 
     pub async fn choose_track_link(&self, args: &Value) -> Result<(), String> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let album_id = args.get("album_id").and_then(|v| v.as_str()).unwrap_or("");
-        let track_id = args.get("track_id").and_then(|v| v.as_str()).unwrap_or("");
+        let album_id = placement_id(&args["album_id"]);
+        let track_id = placement_id(&args["track_id"]);
         let market = args.get("market").and_then(|v| v.as_str()).unwrap_or("GB");
-        let conn = self.connect()?;
-        if path.is_empty() || album_id.is_empty() || track_id.is_empty() {
+        if path.is_empty() || album_id.is_none() || track_id.is_none() {
             return Err("Choose a valid release and track placement".into());
         }
+        let album_id = album_id.unwrap();
+        let track_id = track_id.unwrap();
+        let scope = args.get("scope").and_then(Value::as_str).unwrap_or("track");
+        if !matches!(scope, "track" | "release") {
+            return Err("Choose whether to link this track or its complete release".into());
+        }
+        let conn = self.connect()?;
         let mut file = conn
             .query(
                 "SELECT size,mtime FROM local_files WHERE path=? AND present=1",
@@ -2957,7 +2963,7 @@ impl TursoDb {
         drop(file);
         let now_iso = json!([0, 0, size, mtime]).to_string();
         let payload = json!({
-            "status":"linked", "manual":true,
+            "status":"linked", "manual":true, "scope":scope,
             "ids": {
                 "album_id": album_id,
                 "track_id": track_id
@@ -4027,6 +4033,7 @@ impl TursoDb {
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(Value::Null);
+                drop(file_stmt);
                 let settings = self.get_settings().await?;
                 let market = args["market"]
                     .as_str()
@@ -4044,10 +4051,11 @@ impl TursoDb {
                 } else {
                     json!({})
                 };
+                drop(links);
                 let tags = crate::workflows::extract_tags_map(&Some(meta.clone()));
                 let arrays: serde_json::Map<String, Value> =
                     tags.iter().map(|(k, v)| (k.clone(), json!([v]))).collect();
-                let options:Vec<Value>=link["catalogue_options"].as_array().into_iter().flatten().map(|option|{
+                let mut options:Vec<Value>=link["catalogue_options"].as_array().into_iter().flatten().map(|option|{
                     let mut value=option.clone();
                     if value["album"].is_null(){value["album"]=value["title"].clone();}
                     if value["artist"].is_null(){value["artist"]=json!(tags.get("albumartist").or(tags.get("artist")));}
@@ -4057,6 +4065,36 @@ impl TursoDb {
                     value
                 }).collect();
 
+                for option in &mut options {
+                    let Some(album_id) = placement_id(&option["album_id"]).or_else(|| placement_id(&option["id"])) else { continue; };
+                    option["id"] = json!(album_id);
+                    if let Some(track_id) = placement_id(&option["track_id"]) {
+                        option["track_id"] = json!(track_id);
+                        continue;
+                    }
+                    // Thin release candidates lack a recording ID. Fill only a
+                    // unique recording from saved complete data, never its index
+                    // alone and never turn manual review into an automatic link.
+                    let Some(cached) = self.cached_release(&album_id, market).await? else { continue; };
+                    let candidates = manual_recording_placements(&tags, meta["duration"].as_f64().unwrap_or(0.), &cached);
+                    if candidates.len() == 1 {
+                        let candidate = &candidates[0];
+                        for key in ["artist", "album"] {
+                            if candidate[key].as_str().is_some_and(|value| !value.is_empty()) { option[key] = candidate[key].clone(); }
+                        }
+                        for key in ["album_id", "track_id", "track", "position_label", "track_number", "disc_number", "track_total", "disc_total", "local_isrc", "isrc", "duration", "manual_review_required", "isrc_conflict", "recording_verified"] {
+                            option[key] = candidate[key].clone();
+                        }
+                        let prior = option["evidence"].as_str().unwrap_or("");
+                        let evidence = candidate["evidence"].as_str().unwrap_or("");
+                        option["evidence"] = json!(if prior.is_empty() { evidence.to_owned() } else { format!("{prior}; {evidence}") });
+                        if candidate["isrc_conflict"] == true {
+                            option["compatible"] = json!(false);
+                            option["structure"] = json!({"compatible":false,"reasons":option["evidence"]});
+                        }
+                    }
+                }
+
                 let mut sources = Vec::new();
                 let mut seen_sources = std::collections::HashSet::new();
                 let placements = link["placements"].as_array().cloned().unwrap_or_default();
@@ -4064,12 +4102,12 @@ impl TursoDb {
                     .chain(placements.iter())
                     .chain(options.iter())
                 {
-                    let album = source["album_id"].as_str().or(source["id"].as_str());
-                    let track = source["track_id"].as_str();
+                    let album = placement_id(&source["album_id"]).or_else(|| placement_id(&source["id"]));
+                    let track = placement_id(&source["track_id"]);
                     let (Some(album), Some(track)) = (album, track) else {
                         continue;
                     };
-                    if !seen_sources.insert((album.to_string(), track.to_string())) {
+                    if !seen_sources.insert((album.clone(), track.clone())) {
                         continue;
                     }
                     let dj = self
@@ -4081,7 +4119,7 @@ impl TursoDb {
                         .unwrap_or(Value::Null);
                     let recording = cached["tracks"]
                         .as_array()
-                        .and_then(|tracks| tracks.iter().find(|t| t["id"].as_str() == Some(track)))
+                        .and_then(|tracks| tracks.iter().find(|t| placement_id(&t["id"]).as_deref() == Some(track.as_str())))
                         .cloned()
                         .unwrap_or(Value::Null);
                     sources.push(json!({"album_id":album,"track_id":track,
@@ -4110,6 +4148,39 @@ impl TursoDb {
 
         Ok(json!({}))
     }
+}
+
+/// Subscriber responses use numeric IDs; normalized catalogue caches use strings.
+/// A release-only candidate is not a recording placement until it also has a track ID.
+pub(crate) fn placement_id(value: &Value) -> Option<String> {
+    let id = crate::tidal::resource_id(value);
+    id.trim().parse::<u64>().ok().filter(|id| *id > 0).map(|id| id.to_string())
+}
+
+/// Manual review can compare a uniquely titled recording even when an old
+/// local ISRC differs. This never changes the strict automatic matching rules.
+pub(crate) fn manual_recording_placements(tags: &HashMap<String, String>, duration: f64, release: &Value) -> Vec<Value> {
+    if release["tracks_loaded"] != true { return Vec::new(); }
+    let Some(album_id) = placement_id(&release["id"]) else { return Vec::new(); };
+    let Some(tracks) = release["tracks"].as_array() else { return Vec::new(); };
+    let disc_total = tracks.iter().filter_map(|track|track["disc_number"].as_u64()).max().unwrap_or(1);
+    tracks.iter().filter_map(|track| {
+        let track_id = placement_id(&track["id"])?;
+        let title = track["title"].as_str().unwrap_or("");
+        let remote_duration = track["duration"].as_f64().unwrap_or(0.);
+        if !crate::release_matching::recording_matches(tags.get("title").map(String::as_str).unwrap_or(""), duration, None, title, remote_duration, None, true) { return None; }
+        let disc = track["disc_number"].as_u64().filter(|n| *n > 0)?;
+        let index = track["track_number"].as_u64().filter(|n| *n > 0)?;
+        let track_total = tracks.iter().filter(|track|track["disc_number"].as_u64() == Some(disc)).count();
+        let local_isrc = crate::release_matching::clean_isrc(tags.get("isrc").map(String::as_str)).filter(|s|!s.is_empty());
+        let remote_isrc = crate::release_matching::clean_isrc(track["isrc"].as_str()).filter(|s|!s.is_empty());
+        let conflict = matches!((&local_isrc, &remote_isrc),(Some(local),Some(remote)) if local != remote);
+        let evidence = if conflict {
+            format!("Title and mix match; local duration {duration:.3}s / online {remote_duration:.3}s; local ISRC {} differs from online ISRC {}; review manually", local_isrc.as_deref().unwrap_or(""), remote_isrc.as_deref().unwrap_or(""))
+        } else { format!("Title and mix match; local duration {duration:.3}s / online {remote_duration:.3}s; choose this recording after reviewing its release and position") };
+        Some(json!({"id":album_id,"album_id":album_id,"title":release["title"],"album":release["title"],"artist":release["artist"],"track_id":track_id,"track":title,"tracks":tracks.len(),"track_number":index,"disc_number":disc,"track_total":track_total,"disc_total":disc_total,
+            "position_label":format!("Disc {disc:02}/{disc_total:02} · Track {index:02}/{track_total:02}"),"evidence":evidence,"structure":{"compatible":false,"reasons":evidence},"compatible":false,"manual_review_required":true,"isrc_conflict":conflict,"recording_verified":!conflict,"local_isrc":local_isrc,"isrc":remote_isrc,"duration":remote_duration}))
+    }).collect()
 }
 
 fn extract_tag_str(val: &Value, keys: &[&str]) -> Option<String> {
@@ -4430,6 +4501,54 @@ fn is_compilation_artist(artist: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn release_only_candidates_offer_unique_cached_recordings_for_manual_review_only() {
+        let folder = std::env::temp_dir().join(format!("tibrary-manual-placement-{}", uuid::Uuid::new_v4()));
+        let store = super::TursoDb::open(folder.join("db")).await.unwrap();
+        let path = "/music/Flight Facilities/Down to Earth/02 - Two Bodies.flac";
+        let metadata = serde_json::json!({"albumartist":"Flight Facilities","album":"Down to Earth","title":"Two Bodies","duration":368.346,"isrc":"QZFZ62138178","discnumber":"01","disctotal":"01","tracknumber":"02","tracktotal":"14"});
+        store.apply_file_update(path, path, "/music", &metadata, 10, 20).await.unwrap();
+        let prior = serde_json::json!({"status":"review","catalogue_options":[{"id":555276547,"title":"Down to Earth","tracks":14,"matched":13}]}).to_string();
+        store.save_track_link(path, "GB", "[0,0,10,20]", &prior).await.unwrap();
+        let mut release = serde_json::json!({"id":"555276547","artist":"Flight Facilities","title":"Down to Earth","track_count":14,"tracks_loaded":true,"tracks":(1..=14).map(|n|serde_json::json!({"id":555276550+n,"title":if n==2 { "Two Bodies".to_owned() } else { format!("Song {n}") },"duration":368.,"isrc":if n==2 {"AUFF01400582"} else {"OTHER"},"disc_number":1,"track_number":n})).collect::<Vec<_>>()});
+        store.set_preference("tag-review:GB:555276547", &release).await.unwrap();
+        let detail = store.get_detail(&serde_json::json!({"path":path,"market":"GB"})).await.unwrap();
+        let option = &detail["catalogue_options"][0];
+        assert_eq!(option["id"], "555276547");
+        assert_eq!(option["track_id"], "555276552");
+        assert_eq!(option["position_label"], "Disc 01/01 · Track 02/14");
+        assert_eq!(option["isrc_conflict"], true);
+        assert_eq!(option["recording_verified"], false);
+        assert_eq!(option["compatible"], false);
+        assert!(option["evidence"].as_str().unwrap().contains("QZFZ62138178 differs from online ISRC AUFF01400582"));
+        assert_eq!(detail["dj_checks"][0]["title"], "Two Bodies");
+        assert!(detail["linked_ids"].is_null());
+        let conn = store.connect().unwrap();
+        let mut row = conn.query("SELECT payload FROM track_links WHERE path=? AND market='GB'",(path,)).await.unwrap();
+        assert_eq!(row.next().await.unwrap().unwrap().get::<String>(0).unwrap(), prior, "Reading candidates must not persist an automatic link or change the saved review");
+        drop(row);
+        assert!(!crate::release_matching::recording_matches("Two Bodies",368.346,Some("QZFZ62138178"),"Two Bodies",368.,Some("AUFF01400582"),true));
+
+        let tags = crate::workflows::extract_tags_map(&Some(metadata));
+        assert!(super::manual_recording_placements(&tags,0.,&release).is_empty());
+        assert!(super::manual_recording_placements(&tags,380.,&release).is_empty());
+        release["tracks"][1]["title"] = serde_json::json!("Two Bodies (Extended Mix)");
+        assert!(super::manual_recording_placements(&tags,368.346,&release).is_empty());
+        release["tracks"][1]["title"] = serde_json::json!("Two Bodies");
+        let duplicate = release["tracks"][1].clone();
+        release["tracks"].as_array_mut().unwrap().push(duplicate);
+        store.set_preference("tag-review:GB:555276547", &release).await.unwrap();
+        let ambiguous = store.get_detail(&serde_json::json!({"path":path,"market":"GB"})).await.unwrap();
+        assert!(ambiguous["catalogue_options"][0]["track_id"].is_null(), "An ambiguous recording must remain release-only");
+        release["tracks_loaded"] = serde_json::json!(false);
+        assert!(super::manual_recording_placements(&tags,368.346,&release).is_empty());
+        for invalid in [serde_json::json!(null),serde_json::json!({"id":1}),serde_json::json!(true),serde_json::json!(0),serde_json::json!(-1),serde_json::json!(1.2),serde_json::json!("")] {
+            let error = store.choose_track_link(&serde_json::json!({"path":path,"album_id":555276547,"track_id":invalid})).await.unwrap_err();
+            assert_eq!(error, "Choose a valid release and track placement");
+        }
+        drop(conn); drop(store); std::fs::remove_dir_all(folder).unwrap();
+    }
+
     #[tokio::test]
     async fn downloaded_reference_profiles_use_canonical_cache_before_scoring_and_keep_scope_independent() {
         let folder = std::env::temp_dir().join(format!("tibrary-reference-profiles-{}", uuid::Uuid::new_v4()));

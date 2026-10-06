@@ -124,6 +124,35 @@ for artist, in c.execute("SELECT artist FROM mappings").fetchall():
  c.execute("INSERT OR REPLACE INTO match_reviews(artist,payload) VALUES(?,?)",(artist,json.dumps({"candidates":[{"artist":{"id":"900001","name":"North Assembly"},"evidence":"Saved candidate"}]})))
 c.commit()`, join(folder,"db")]);
   }
+  if (test.info().title.startsWith("manual placement keeps")) {
+    // Cached release summaries are not recording placements. Preserve both
+    // formats that existing databases can contain: a valid numeric recording
+    // ID and a release-only option whose tracks have not been inspected yet.
+    execFileSync("python3", ["-c", `import json,sqlite3,sys,time
+from pathlib import Path
+from seed_desktop import write_flac
+library=Path(sys.argv[2]); c=sqlite3.connect(sys.argv[1])
+release={'id':'910001','artist':'North Assembly','title':'Blue Hours','date':'2020-04-03','type':'ALBUM','available':True,'tracks_loaded':True,'track_count':2,'tracks':[{'id':'91000100','title':'First Light','duration':180.0,'track_number':1,'disc_number':1},{'id':'91000101','title':'Drift','duration':190.0,'track_number':2,'disc_number':1}]}
+for index,title in enumerate(['First Light','Drift'],1):
+ path=library/f'{title}.flac'
+ write_flac(path,'North Assembly','Blue Hours',title,index,2)
+ metadata={'albumartist':['North Assembly'],'artist':['North Assembly'],'album':['Blue Hours'],'title':[title],'tracknumber':[f'{index}/2'],'discnumber':['1/1'],'date':['2020-04-03'],'duration':170.0+index*10}
+ c.execute('UPDATE local_files SET size=?,mtime=?,metadata=? WHERE path=?',(path.stat().st_size,path.stat().st_mtime_ns,json.dumps(metadata),str(path)))
+ options=[{'id':910001,'track_id':91000100+index-1,'artist':'North Assembly','album':'Blue Hours','position_label':f'Disc 01/01 · Track {index:02}/02','evidence':'Cached recording placement','compatible':True}]
+ options.append({'id':'910003','title':'Blue Hours (Deluxe)','date':'2023-04-03','tracks':4,'matched':1})
+ payload={'status':'review','catalogue_note':'Multiple release candidates','catalogue_options':options}
+ c.execute('INSERT OR REPLACE INTO track_links VALUES(?,?,?,?)',(str(path),'GB',json.dumps([0,0,path.stat().st_size,path.stat().st_mtime_ns]),json.dumps(payload)))
+c.execute('INSERT OR REPLACE INTO app_preferences VALUES(?,?)',('tag-review:GB:910001',json.dumps(release)))
+catalogue=json.loads(c.execute('SELECT payload FROM catalogue WHERE artist_id=? AND market=?',('900001','GB')).fetchone()[0])
+for candidate in catalogue['releases']:
+ if candidate['id']=='910003': candidate.update(tracks=[],tracks_loaded=False)
+c.execute('UPDATE catalogue SET payload=? WHERE artist_id=? AND market=?',(json.dumps(catalogue),'900001','GB'))
+for ident in ['910001','910003']:
+ c.execute('INSERT OR REPLACE INTO app_preferences VALUES(?,?)',(f'release-live:GB:{ident}',json.dumps({'available':True,'checked_at':int(time.time()),'source':'album_lookup'})))
+c.commit()`, join(folder,"db"), join(folder,"music")], {
+      env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
+    });
+  }
   if (test.info().title.startsWith("link releases group local files") || test.info().title.startsWith("artist hierarchy") || test.info().title.startsWith("local actions group")) {
     // Create extra real files before the disposable backend opens its database.
     execFileSync("python3", ["-c", `import json,sqlite3,sys
@@ -751,6 +780,70 @@ test("link releases group local files and keep selected track actions scoped", a
   expect(ignored.rows[0].children.map((row:any)=>row.path)).toEqual([join(root,"First Light.flac")]);
   expect(requests.every(request=>!(request.args.ids || request.args.args.ids).some((id:string)=>id.startsWith("local-release:")))).toBe(true);
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+test("manual placement keeps a selected track scoped and inspects release-only candidates", async ({page}) => {
+  const root=join(folder,"music"), first=join(root,"First Light.flac"), sibling=join(root,"Drift.flac");
+  const bytes=new Map([first,sibling].map(path=>[path,readFileSync(path)]));
+  const siblingLink=async()=>(await rpc("detail",{path:sibling})).result;
+  const originalSibling=await siblingLink(), choices:any[]=[], inspections:any[]=[], details:string[]=[];
+  const errors:string[]=[];
+  page.on("pageerror",error=>errors.push(error.message));
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="tracks.choose") choices.push(request.args);
+    if(request.method==="job.start" && request.args.kind==="manual_candidate") {
+      inspections.push(request.args.args);
+      await route.fulfill({json:{result:{id:"inspect-one-release",kind:"manual_candidate",status:"complete",message:"Selected release inspected",started:Date.now()/1000,result:{root,inspected_paths:request.args.args.ids}}}});
+      return;
+    }
+    const response=await rpc(request.method,request.args);
+    if(request.method==="detail") details.push(request.args.path);
+    await route.fulfill({json:response});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
+  await columnAll(page,"Status");
+  const selected=await localTrackRow(page,"First Light");
+  await selected.getByRole("checkbox",{name:"Select track First Light",exact:true}).check();
+  await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).not.toBeChecked();
+  // A release's detail buttons can inspect another track without altering the
+  // existing checkbox selection. Completion must refresh that inspected track.
+  await page.getByRole("button",{name:"Actions for Blue Hours",exact:true}).click();
+  await page.getByRole("menuitem",{name:"View metadata / match details",exact:true}).click();
+  const dialog=page.getByRole("dialog");
+  const siblingRow=dialog.getByRole("table",{name:"Tracks in Blue Hours",exact:true}).getByRole("row").filter({has:page.getByRole("cell",{name:"Drift",exact:true})});
+  await siblingRow.getByRole("button",{name:"Choose match",exact:true}).click();
+  await expect(dialog).toContainText(sibling);
+  const summary=dialog.locator("article.candidate").filter({has:page.getByText("North Assembly — Blue Hours (Deluxe)",{exact:true})});
+  await expect(summary).toBeVisible();
+  const summaryChoice=summary.getByRole("button",{name:"Use this placement",exact:true});
+  if(await summaryChoice.count()) await expect(summaryChoice).toBeDisabled();
+  await summary.getByRole("button",{name:/Inspect.*release/i}).click();
+  await expect.poll(()=>inspections.length).toBe(1);
+  expect(inspections[0]).toMatchObject({ids:[sibling],album_id:"910003"});
+  expect(choices).toHaveLength(0);
+  await expect.poll(()=>details.filter(path=>path===sibling).length).toBeGreaterThanOrEqual(2);
+  await expect(dialog).toContainText(sibling);
+  await expect(dialog).not.toContainText(first);
+  await dialog.getByRole("button",{name:"Done",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeChecked();
+  await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).not.toBeChecked();
+  await page.getByRole("button",{name:"Choose match",exact:true}).click();
+  await expect(dialog).toContainText(first);
+  const placement=dialog.locator("article.candidate").filter({has:page.getByText("North Assembly — Blue Hours",{exact:true})});
+  await expect(placement).toContainText("Track 01/02");
+  await placement.getByRole("button",{name:"Use this placement",exact:true}).click();
+  await expect.poll(()=>choices.length).toBe(1);
+  expect(choices[0]).toMatchObject({path:first,album_id:"910001",track_id:"91000100",scope:"track",require_live:true});
+  await expect(dialog).toHaveCount(0);
+  const saved=(await rpc("detail",{path:first})).result;
+  expect(saved.linked_ids).toEqual({album_id:"910001",track_id:"91000100"});
+  expect(await siblingLink()).toEqual(originalSibling);
+  const siblingDetail=(await rpc("detail",{path:sibling})).result;
+  expect(siblingDetail.linked_ids).toBeNull();
+  for(const [path,original] of bytes) expect(readFileSync(path).equals(original)).toBe(true);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(errors).toEqual([]);
 });
 test("artist hierarchy shows local release evidence without exposing online IDs or track controls", async ({page}) => {
   const root=join(folder,"music"), errors:string[]=[], detailArtists:string[]=[];

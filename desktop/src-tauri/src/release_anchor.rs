@@ -9,6 +9,9 @@ use std::collections::{HashMap, HashSet};
 pub struct AnchoredRelease {
     pub release: TidalRelease,
     pub files: Vec<LocalFileRecord>,
+    // A manual track placement can support reviewed numbering proposals, but
+    // must not silently authorize linking the other files in its release.
+    allow_link_propagation: bool,
 }
 
 pub async fn verified(
@@ -48,6 +51,7 @@ pub async fn verified(
             .iter()
             .filter_map(|p| anchors.get(&p.path).map(|a| (&p.path, a)))
             .collect();
+        let allow_link_propagation = chosen.iter().any(|(_, anchor)| anchor["scope"] == "release");
         let ids: HashSet<_> = chosen
             .iter()
             .filter_map(|(_, a)| a["ids"]["album_id"].as_str())
@@ -139,6 +143,7 @@ pub async fn verified(
             result.push(AnchoredRelease {
                 release,
                 files: peers,
+                allow_link_propagation,
             });
         }
     }
@@ -194,6 +199,9 @@ pub async fn propagate_files(
     let conn = db.connect()?;
     let mut count = 0;
     for group in verified(db, peers, market).await? {
+        if !group.allow_link_propagation {
+            continue;
+        }
         for (file, track) in group.files.iter().zip(&group.release.tracks) {
             let mut q = conn
                 .query(
@@ -271,12 +279,18 @@ mod tests {
         db.set_preference("tag-review:GB:123", &release)
             .await
             .unwrap();
-        db.choose_track_link(
-            &json!({"path":files[0].path,"album_id":"123","track_id":"1","market":"GB"}),
-        )
+        db.choose_track_link(&json!({"path":files[0].path,"album_id":123,"track_id":1,"market":"GB"}))
         .await
         .unwrap();
         assert_eq!(verified(&db, &files, "GB").await.unwrap().len(), 1);
+        // Selecting one track retains safe numbering proposals, but neither
+        // immediate nor later maintenance propagation may link its siblings.
+        assert_eq!(propagate(&db, &files[0].path, "GB").await.unwrap(), 0);
+        assert_eq!(propagate_files(&db, &files, "GB").await.unwrap(), 0);
+        let detail = db.get_detail(&json!({"path":files[0].path,"market":"GB"})).await.unwrap();
+        assert_eq!(detail["linked_ids"]["album_id"], "123");
+        assert_eq!(detail["linked_ids"]["track_id"], "1");
+        assert!(db.get_detail(&json!({"path":files[1].path,"market":"GB"})).await.unwrap()["linked_ids"].is_null());
         let plans = crate::workflows::plan_cached(&db, &files, "numbers", None)
             .await
             .unwrap();
@@ -286,6 +300,7 @@ mod tests {
             assert_eq!(plan.changes["disctotal"], "01");
             assert!(plan.target.is_none());
         }
+        db.choose_track_link(&json!({"path":files[0].path,"album_id":"123","track_id":"1","market":"GB","scope":"release"})).await.unwrap();
         db.set_local_files_ignored(&[files[3].path.clone()], true)
             .await
             .unwrap();

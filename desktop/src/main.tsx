@@ -119,6 +119,12 @@ const titles: Record<string, string> = {
     ]),
   ),
 };
+function placementId(value: unknown): string {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value > 0 ? String(value) : "";
+  if (typeof value !== "string") return "";
+  const id = value.trim();
+  return /^\d+$/.test(id) && /[1-9]/.test(id) ? id : "";
+}
 const actions = [
   ["dates", "Dates", "Standardise date formatting"],
   ["numbers", "Track & disc numbers", "Pad numbers and repair proven totals"],
@@ -625,8 +631,13 @@ function App() {
         setMqaScope(null);
       }
     }
-    if (j.kind === "manual_candidate" && selected.size)
-      loadDetail({ id: [...selected][0] });
+    if (j.kind === "manual_candidate" && j.status === "complete" && j.result?.root === root && detail?.path &&
+        j.result?.inspected_paths?.includes(detail.path)) {
+      const path = detail.path;
+      call("detail", {root, path, check_availability:route === "links"})
+        .then(value => setDetail((current: any) => current?.path === path ? {...current, ...value} : current))
+        .catch(notifyError);
+    }
     if (j.kind === "release_details" && detail?.release?.id && j.status === "complete") {
       const id = detail.release.id;
       call("detail", {release_id:id}).then(value => setDetail((current: any) => current?.release?.id === id ? {
@@ -2129,24 +2140,28 @@ function App() {
                   catch (error) { notifyError(error); setDetail((current:any) => current?.path === path ? {...current,availability_checking:false} : current); }
                 }}>{detail.availability_checking ? "Checking availability…" : "Recheck availability"}</button></>}
                 {detail.catalogue_options?.length ? (
-                  detail.catalogue_options.map((o: any, i: number) => (
+                  detail.catalogue_options.map((o: any, i: number) => {
+                    const albumId = placementId(o.id) || placementId(o.album_id);
+                    const trackId = placementId(o.track_id);
+                    return (
                     <article
                       className="candidate"
                       key={i}
                       onContextMenu={(e) => {
                         e.preventDefault();
-                        external(`https://tidal.com/album/${o.id}`).catch(
+                        if (albumId) external(`https://tidal.com/album/${albumId}`).catch(
                           notifyError,
                         );
                       }}
                     >
                       <div>
                         <strong>
-                          {o.artist} — {o.album}
+                          {o.artist} — {o.album || o.title || "Release candidate"}
                         </strong>
                         <p>
-                          {o.position_label || "Position not yet verified"} · Release ID {o.id}
+                          {o.position_label || "Position not yet verified"} · Release ID {albumId || "Unavailable"}
                         </p>
+                        {!trackId && <p>Release candidate; inspect it to find this track’s placement.</p>}
                         <p>{o.evidence}</p>
                         {(o.structure?.compatible || (o.structure?.reason || o.structure?.reasons) && readable(o.structure?.reason || o.structure?.reasons) !== readable(o.evidence)) && <p
                           className={
@@ -2164,8 +2179,9 @@ function App() {
                       </div>
                       <div className="toolbar">
                         <button
+                          disabled={!albumId}
                           onClick={() =>
-                            external(`https://tidal.com/album/${o.id}`).catch(
+                            external(`https://tidal.com/album/${albumId}`).catch(
                               notifyError,
                             )
                           }
@@ -2173,26 +2189,32 @@ function App() {
                           Open on web <ArrowUpRight size={14} />
                         </button>
                         <button
-                          disabled={busy}
+                          disabled={busy || !albumId || !detail.path}
+                          title={trackId ? "Link only this track. Other tracks and file tags stay unchanged." : "Inspect the selected release for this track; no link is saved."}
                           onClick={async () => {
+                            if (!trackId) {
+                              await run("manual_candidate", {ids:[detail.path], album_id:albumId});
+                              return;
+                            }
                             if (
                               await mutate("tracks.choose", {
                                 root,
                                 path: detail.path,
-                                album_id: o.id,
+                                album_id: albumId,
                                 require_live: true,
-                                track_id: o.track_id,
+                                track_id: trackId,
                                 choice_key: o.choice_key,
+                                scope: "track",
                               })
                             )
                               setDetail(null);
                           }}
                         >
-                          Use this placement
+                          {trackId ? "Use this placement" : "Inspect release"}
                         </button>
                       </div>
                     </article>
-                  ))
+                  );})
                 ) : (
                   <p>
                     No inspected candidates. Recheck this recording or search a

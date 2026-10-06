@@ -1722,14 +1722,26 @@ async fn handle_rpc_uncached(
         return Ok(json!(true));
     }
     if method == "tracks.choose" {
-        if args["require_live"] == true {
-            let market = db.get_settings().await?["general"]["market"].as_str().unwrap_or("GB").to_string();
-            let id=args["album_id"].as_str().unwrap_or("").to_string();
-            if availability::check(db,&[id.clone()],&market).await?.get(&id).copied().flatten()!=Some(true) {return Err("This release is unavailable or its availability cannot be confirmed".into());}
+        let album_id = db::placement_id(&args["album_id"]).ok_or("Choose a valid release and track placement")?;
+        let track_id = db::placement_id(&args["track_id"]).ok_or("Choose a valid release and track placement")?;
+        let market = match args["market"].as_str().filter(|market| !market.trim().is_empty()) {
+            Some(market) => market.to_string(),
+            None => db.get_settings().await?["general"]["market"].as_str().unwrap_or("GB").to_string(),
+        };
+        let mut placement = args;
+        placement["album_id"] = json!(album_id);
+        placement["track_id"] = json!(track_id);
+        placement["market"] = json!(market);
+        if placement["require_live"] == true {
+            if availability::check(db,&[album_id.clone()],&market).await?.get(&album_id).copied().flatten()!=Some(true) {return Err("This release is unavailable or its availability cannot be confirmed".into());}
         }
-        db.choose_track_link(&args).await?;
-        let linked = release_anchor::propagate(db, args["path"].as_str().unwrap_or(""), args["market"].as_str().unwrap_or("GB")).await?;
-        state.log_with_category(&format!("Manual placement saved · {linked} additional tracks linked from the complete cached release · file tags unchanged"), "info", Some("linking"));
+        db.choose_track_link(&placement).await?;
+        if placement["scope"] == "release" {
+            let linked = release_anchor::propagate(db, placement["path"].as_str().unwrap_or(""), &market).await?;
+            state.log_with_category(&format!("Release placement saved · {linked} additional tracks linked from the complete cached release · file tags unchanged"), "info", Some("linking"));
+        } else {
+            state.log_with_category("Track placement saved · only the selected track was linked · file tags unchanged", "info", Some("linking"));
+        }
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
         }

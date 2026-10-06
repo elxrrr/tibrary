@@ -1565,6 +1565,7 @@ pub async fn execute(
     }
     if kind == "metadata" || kind == "manual_candidate" {
         let mut output = vec![];
+        let mut inspected_paths = vec![];
         let http = crate::network::client(20)?;
         let mut prepared = Vec::new();
         let mut albums = Vec::new();
@@ -1606,7 +1607,7 @@ pub async fn execute(
                 .as_str()
                 .or_else(|| tags.get("tidal_track_id").map(String::as_str));
             if kind == "manual_candidate" {
-                let options:Vec<Value>=rel.tracks.iter().filter(|t|crate::release_matching::recording_matches(tags.get("title").map(String::as_str).unwrap_or(""),file.metadata.as_ref().and_then(|v|v["duration"].as_f64()).unwrap_or(0.),tags.get("isrc").map(String::as_str),&t.title,t.duration,t.isrc.as_deref(),true)).map(|t|json!({"id":rel.id,"title":rel.title,"track_id":t.id,"artist":rel.artist,"album":rel.title,"tracks":rel.track_count,"position":format!("Disc {} · Track {}",t.disc_number,t.track_number),"evidence":"Recording candidate; choose a placement to link"})).collect();
+                let options = crate::db::manual_recording_placements(&tags, file.metadata.as_ref().and_then(|v|v["duration"].as_f64()).unwrap_or(0.), &json!(rel));
                 let conn = db.connect()?;
                 let mut q = conn
                     .query(
@@ -1634,6 +1635,7 @@ pub async fn execute(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+                inspected_paths.push(file.path.clone());
                 continue;
             }
             let Some(index) = rel
@@ -1670,7 +1672,7 @@ pub async fn execute(
             output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":changes,"affected":!changes.is_empty(),"size":file.size,"mtime":file.mtime,"status":if changes.is_empty(){"No supplied missing tags"}else{"Missing tags found"},"item":{"path":file.path,"tags":changes},"source_release_id":rel.id,"source_track_id":track.id,"evidence":format!("API BPM: {} · Key: {}{}",track.bpm.map(|n|n.to_string()).unwrap_or("not supplied".into()),track.key.unwrap_or("not supplied".into()),dj_note.map(|note|format!(" · DJ check deferred: {note}")).unwrap_or_default())}));
         }
         if kind == "manual_candidate" {
-            return Ok(json!({"checked":ids.len()}));
+            return Ok(json!({"checked":inspected_paths.len(),"root":root,"inspected_paths":inspected_paths}));
         }
         let id = uuid::Uuid::new_v4().to_string();
         state.previews.lock().unwrap().insert(id.clone(),json!({"id":id,"created":chrono::Utc::now().timestamp_millis(),"operation":"metadata","root":root,"rows":output,"count":output.len()}));

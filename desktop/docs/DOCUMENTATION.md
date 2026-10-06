@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.22** · [Setup and screenshots](../../README.md)
+Version **0.9.23** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -45,6 +45,8 @@ Artist matching starts from local **Album Artist** tags. Compilation placeholder
 Link releases groups album artists, then local release folders, then tracks. Disc folders are combined; separate editions stay separate. Compilation releases appear under one Various artists group without entering artist matching. Expand an artist and release to inspect linked and unresolved tracks. Selecting an artist or release selects its matching files; filters apply before grouping, and the page reports artist, release and track counts. Recheck, ignore and unlink use the selected file paths.
 
 Recording matches use ISRC, title, duration, release structure and track positions. Linking writes associations to the database, not file tags. Multiple compatible editions can supply metadata, but conflicting totals, mixes or recording evidence require review.
+
+**Use this placement** links only the track displayed in the match dialog. Release-only candidates offer **Inspect release** until a track placement is available. Cached title, mix and duration matches can be reviewed when ISRCs differ; the conflict is shown and is never accepted automatically.
 
 Missing releases defaults to **My album artists** and **Recommended and potential**, using album-level artist IDs and the same confidence filter as Overview. Artist scope and recommendation confidence have separate filters, so you can combine **My album artists** with **Recommended**, or inspect other appearances and low-confidence results. Recommendation references come from present local files and their verified online links. Contributor IDs and roles, independent recordings, labels and copyright holders strengthen a match; common distributors, technical credits and genres provide context. Conflicting artists, compilations and unofficial releases cannot become Recommended. A fully checked release with populated creative credits and rights/label metadata, but no shared recording, creative contributor in the same role, specific label or copyright holder, is **Suspect / Low match** when there are at least two independent downloaded creative-credit references. An artist-page ID alone cannot override this check. Incomplete, stale or empty credit checks remain neutral; a label change alone does not disqualify a release. Low-match results remain inspectable by checking **Suspect** in the Recommendation column menu, or choosing **Select all** there.
 
