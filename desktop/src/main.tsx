@@ -136,14 +136,14 @@ const organisationActions = [
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
 const groupRoutes = Object.fromEntries(groups.map(group => [group.id, group.items[0][0]]));
+const fileGroupRoutes = new Set(["files", "correct", "organise", "metadata", "artwork", "mqa"]);
 function linkedFiles(rows: Row[]): Row[] {
-  return rows.flatMap(row => row.artist_group || row.link_group ? linkedFiles(row.children || []) : [row]);
+  return rows.flatMap(row => row.artist_group || row.link_group || row.file_group ? linkedFiles(row.children || []) : [row]);
 }
 const fileColumns: Column[] = [
   { key: "artist", label: "Album artist" },
   { key: "release", label: "Release" },
-  { key: "title", label: "Track" },
-  { key: "position", label: "Disc · track" },
+  { key: "tracks", label: "Tracks" },
   { key: "status", label: "Status" },
   { key: "evidence", label: "Evidence" },
 ];
@@ -188,13 +188,14 @@ function Modal({
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const titleId = React.useId();
   useEffect(() => {
     ref.current?.showModal();
   }, []);
   return (
-    <dialog ref={ref} className={wide ? "wide" : ""} onCancel={onClose}>
+    <dialog ref={ref} aria-labelledby={titleId} className={wide ? "wide" : ""} onCancel={onClose}>
       <header>
-        <h2>{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         <button aria-label="Close dialog" onClick={onClose}>
           <X size={18} />
         </button>
@@ -258,7 +259,6 @@ function App() {
     return () => { if (viewOptionsButton.current?.isConnected) viewOptionsButton.current.focus({preventScroll:true}); };
   }, [viewOptionsOpen]);
   const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
-  const [systemAccent, setSystemAccent] = useState({name:"Multicolour",hex:"#007aff"});
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
   const [downloadMonitor, setDownloadMonitor] = useState<Record<string, Row>>({});
   const [tableReader] = useState(() => new CoalescedQuery<any>(setLoading, e => setError(String(e))));
@@ -302,6 +302,8 @@ function App() {
     [deepQuery, setDeepQuery] = useState(""),
     [deep, setDeep] = useState<any>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const settingWrites = useRef({next:0, versions:new Map<string,number>(), queue:Promise.resolve()});
   useEffect(() => {
     if (menu)
       document
@@ -313,6 +315,7 @@ function App() {
     stateRef = useRef(state);
   stateRef.current = state;
   const onlineRoute = ["catalogue", "artists", "links", "favourites", "missing", "metadata", "artwork", "online", "connections", "fix"].includes(route);
+  const displayTheme = settings?.general?.theme || state?.settings.theme || "system";
   const localBusy = submitting || active(state?.job);
   const indexChanging = active(state?.job) && ["scan", "apply", "deep_apply", "consolidate"].includes(state?.job?.kind || "");
   const busy = submitting || active(onlineRoute ? state?.online_job : state?.job) || (onlineRoute && indexChanging);
@@ -413,22 +416,44 @@ function App() {
     finally { if (request === mqaScopeRequest.current) setMqaScopePending(false); }
   }
   useEffect(() => {
-    document.documentElement.dataset.theme = state?.settings.theme || "system";
-    document.documentElement.dataset.highlight = settings?.general?.highlight_colour || "system";
-  }, [state?.settings.theme, settings?.general?.highlight_colour]);
+    document.documentElement.dataset.theme = displayTheme;
+  }, [displayTheme]);
   useEffect(() => {
-    if ((settings?.general?.highlight_colour || "system") !== "system") return;
     let live = true;
-    const refresh = () => call<{name:string;hex:string}>("appearance.accent").then(accent => {
-      if (!live || !/^#[0-9a-f]{6}$/i.test(accent.hex)) return;
-      document.documentElement.style.setProperty("--system-accent",accent.hex);
-      setSystemAccent(previous => previous.name === accent.name && previous.hex === accent.hex ? previous : accent);
-    }).catch(() => {});
+    let refreshing = false;
+    const dark = window.matchMedia("(prefers-color-scheme: dark)");
+    const contrast = window.matchMedia("(prefers-contrast: more)");
+    const refresh = () => {
+      if (refreshing) return;
+      refreshing = true;
+      call<{name:string;hex:string;palettes?:Record<string,Record<string,string>>}>("appearance.accent").then(accent => {
+        if (!live) return;
+        const theme = displayTheme;
+        const mode = (theme === "dark" || (theme === "system" && dark.matches) ? "dark" : "light")
+          + (contrast.matches ? "_high_contrast" : "");
+        const palette = accent.palettes?.[mode];
+        const style = document.documentElement.style;
+        const validColour = (value: string | undefined) => value && /^#[0-9a-f]{6}$/i.test(value);
+        for (const key of ["accent", "blue", "purple", "pink", "red", "orange", "yellow", "green", "graphite", "selection", "selection_text"]) {
+          const value = palette?.[key] || (key === "accent" ? accent.hex : undefined);
+          if (validColour(value)) style.setProperty(`--system-${key.replaceAll("_", "-")}`, value!);
+        }
+        if (validColour(palette?.table_header)) style.setProperty("--table-header", palette!.table_header);
+      }).catch(() => {}).finally(() => { refreshing = false; });
+    };
     refresh();
     const timer = window.setInterval(refresh,10000);
     window.addEventListener("focus",refresh);
-    return () => {live=false;window.clearInterval(timer);window.removeEventListener("focus",refresh);};
-  }, [settings?.general?.highlight_colour,state?.settings.theme]);
+    dark.addEventListener("change",refresh);
+    contrast.addEventListener("change",refresh);
+    return () => {
+      live=false;
+      window.clearInterval(timer);
+      window.removeEventListener("focus",refresh);
+      dark.removeEventListener("change",refresh);
+      contrast.removeEventListener("change",refresh);
+    };
+  }, [displayTheme]);
   const pageSize = Number(settings?.general?.page_size || 50);
   useEffect(() => { setOffset(0); }, [pageSize]);
   const activeColumnSelections = availableColumnSelections(route, columnSelections);
@@ -449,7 +474,7 @@ function App() {
     artist_scope: artistScope,
     type: "All types",
     include_unavailable: route === "missing",
-    group_releases: route === "links",
+    group_releases: route === "links" || fileGroupRoutes.has(route),
     group_artists: route === "links",
     local_releases: ["artists", "favourites"].includes(route),
   };
@@ -655,6 +680,8 @@ function App() {
     try {
       if (row.artist_group && route === "links") {
         setDetail({local_artist: row});
+      } else if (row.file_group) {
+        setDetail({local_file_release: row});
       } else if (row.link_group || row.local_release) {
         setDetail({local_release:row});
       } else if (tree) {
@@ -757,16 +784,13 @@ function App() {
       notifyError(e);
     }
   }
-  async function saveSettings(section: string, values: any) {
-    const result = await mutate("settings.save", { section, values });
-    if (result) setSettings(result);
-    return result;
-  }
-  async function updateSetting(section: string, key: string, value: any) {
-    const currentSection = settings?.[section] || {};
-    const nextSection = { ...currentSection, [key]: value };
-    setSettings((prev: any) => (prev ? { ...prev, [section]: nextSection } : prev));
-
+  function updateSetting(section: string, key: string, value: any) {
+    const version = ++settingWrites.current.next;
+    const fieldId = `${section}.${key}`;
+    settingWrites.current.versions.set(fieldId, version);
+    setSettings((prev: any) => prev ? { ...prev, [section]: { ...prev[section], [key]: value } } : prev);
+    setSettingsSaving(true);
+    setError("");
     const backendSection =
       section === "general"
         ? "desktop"
@@ -774,7 +798,30 @@ function App() {
         ? "release_links"
         : section;
 
-    await saveSettings(backendSection, nextSection);
+    // Apply key patches in input order. An older response must not replace a
+    // newer choice, another field or a draft the user is still editing.
+    const save = async () => {
+      try {
+        const result = await call<any>("settings.update", {section:backendSection, values:{[key]:value}});
+        if (settingWrites.current.versions.get(fieldId) === version) {
+          setSettings((prev: any) => prev ? {...prev, [section]:{...prev[section], [key]:result[section]?.[key] ?? value}} : result);
+        }
+      } catch (error) {
+        notifyError(error);
+        const saved = await call<any>("settings").catch(() => null);
+        if (saved && settingWrites.current.versions.get(fieldId) === version) {
+          setSettings((prev: any) => prev ? {...prev, [section]:{...prev[section], [key]:saved[section]?.[key]}} : saved);
+        }
+      } finally {
+        if (settingWrites.current.next === version) {
+          setSettingsSaving(false);
+          void refresh();
+        }
+      }
+    };
+    const queued = settingWrites.current.queue.then(save, save);
+    settingWrites.current.queue = queued;
+    return queued;
   }
   async function openExport(targetRoute: "queue" | "downloaded" = "queue") {
     try {
@@ -848,7 +895,7 @@ function App() {
           ? [
               { key: "artist", label: "Artist" },
               { key: "release", label: "Release" },
-              { key: "title", label: "File" },
+              { key: "tracks", label: "Tracks" },
               { key: "status", label: "Status" },
               { key: "evidence", label: "Evidence" },
               { key: "target", label: "Action" },
@@ -1007,6 +1054,7 @@ function App() {
                 View missing releases
               </button>
             </div>
+            <div className="latest-missing-scroll">
             <div className="overview-list" role="region" aria-label="Latest missing releases" tabIndex={0}>
             {latestMissing?.length ? (
               latestMissing.map((r) => (
@@ -1039,6 +1087,9 @@ function App() {
               <p>{latestMissing === null ? "Loading cached missing releases…" : "No missing releases with verified album artists. Check release artists or view all recommendations in Missing releases."}</p>
             )}
             </div>
+            <div className="edge-gradient-top" aria-hidden="true" />
+            <div className="edge-gradient-bottom" aria-hidden="true" />
+            </div>
         </section>
       </div>
     );
@@ -1052,7 +1103,7 @@ function App() {
   }
   function selectedDetail() {
     const id = [...selected][0];
-    if (id) loadDetail((route === "links" ? linkedFiles(data.rows) : data.rows).find(row => row.id === id) || {id, artist:id});
+    if (id) loadDetail((route === "links" || fileGroupRoutes.has(route) ? linkedFiles(data.rows) : data.rows).find(row => row.id === id) || {id, artist:id});
   }
   function tableActions() {
     const localOptions: ActionButtonOption[] = [
@@ -1161,6 +1212,7 @@ function App() {
           ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
           : "No items"}
         {route === "links" && data.total > 0 && ` artists · ${(data.release_total || 0).toLocaleString()} releases · ${(data.track_total || 0).toLocaleString()} tracks`}
+        {fileGroupRoutes.has(route) && data.total > 0 && " releases"}
       </span>
       <div>
         <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button>
@@ -1213,7 +1265,6 @@ function App() {
           headerFilters={headerFilters}
           selected={selected}
           onSelect={next => {setSelected(next); if (route === "mqa") setMqaScope(null);}}
-          selectionLabel={route === "mqa" ? row => `Select ${row.title || row.id}` : undefined}
           sort={sort}
           direction={direction}
           onSort={(key, requestedDirection) => {
@@ -1223,6 +1274,7 @@ function App() {
           }}
           tree={tree}
           grouped={["local", "online"].includes(route)}
+          fileGroups={fileGroupRoutes.has(route)}
           hierarchy={route === "links" ? "links" : ["artists", "favourites"].includes(route) ? "artists" : undefined}
           treeSelection={selection}
           onTreeSelect={selectTree}
@@ -1301,9 +1353,6 @@ function App() {
             value={String(curVal)}
             onChange={(e) => {
               const val = number ? Number(e.target.value) : e.target.value;
-              if (key === "theme") {
-                document.documentElement.dataset.theme = String(val);
-              }
               updateSetting(section, key, val);
             }}
           >
@@ -1329,17 +1378,17 @@ function App() {
             type={number ? "number" : "text"}
             value={settings[section]?.[key] ?? ""}
             onChange={(e) =>
-              setSettings({
-                ...settings,
+              setSettings((previous: any) => ({
+                ...previous,
                 [section]: {
-                  ...settings[section],
+                  ...previous[section],
                   [key]: number
                     ? e.target.value === ""
                       ? 0
                       : Number(e.target.value)
                     : e.target.value,
                 },
-              })
+              }))
             }
             onBlur={(e) => {
               const val = number
@@ -1385,14 +1434,6 @@ function App() {
         <>
           <section className="card">
             <h2>Application & display</h2>
-            {field("Highlight colour", "general", "highlight_colour", [
-              {value:"system",label:`System (${systemAccent.name})`},
-              {value:"multicolour",label:"Multicolour"},
-              {value:"blue",label:"Blue"},{value:"purple",label:"Purple"},
-              {value:"pink",label:"Pink"},{value:"red",label:"Red"},
-              {value:"orange",label:"Orange"},{value:"yellow",label:"Yellow"},
-              {value:"green",label:"Green"},{value:"graphite",label:"Graphite"},
-            ])}
             {field("Colour theme", "general", "theme", [
               "system",
               "light",
@@ -1544,10 +1585,10 @@ function App() {
             <input
               value={settings.downloads?.output || ""}
               onChange={(e) =>
-                setSettings({
-                  ...settings,
-                  downloads: { ...settings.downloads, output: e.target.value },
-                })
+                setSettings((previous: any) => ({
+                  ...previous,
+                  downloads: { ...previous.downloads, output: e.target.value },
+                }))
               }
               onBlur={(e) => updateSetting("downloads", "output", e.target.value)}
               onKeyDown={(e) => {
@@ -1628,7 +1669,7 @@ function App() {
           )}
           <div className="toolbar">
             <button
-              disabled={busy}
+              disabled={busy || settingsSaving}
               onClick={async () => {
                 const v = await mutate("settings.reset", {
                   group: "downloads",
@@ -1654,7 +1695,7 @@ function App() {
     const replacementGroup = ["local", "online"].includes(route) && !!r.children?.length;
     const groupSelected = ["local", "online"].includes(route) && data.rows.some(parent =>
       selected.has(parent.id) && (parent.children || []).some((child: Row) => child.id === r.id));
-    const ids: string[] = route === "links" && (r.artist_group || r.link_group)
+    const ids: string[] = (route === "links" && (r.artist_group || r.link_group)) || r.file_group
       ? (selected.size ? [...selected] : linkedFiles([r]).map(child => child.id))
       : replacementGroup || selected.has(r.id) || groupSelected ? (selected.size ? [...selected] : [r.id]) : [r.id];
     return (
@@ -1891,6 +1932,7 @@ function App() {
         </nav>
       </div>
       <aside id="app-sidebar" hidden={!sidebarVisible}>
+        <nav className="sidebar-navigation" aria-label="Library navigation">
         <button
           className={"nav-item " + (route === "overview" ? "current" : "")}
           onClick={() => setRoute("overview")}
@@ -1942,17 +1984,25 @@ function App() {
               ))}
           </div>
         ))}
+        </nav>
         <div className="sidebar-bottom">
+          <select
+            aria-label="Active library"
+            title={root || "Choose the library used across the app"}
+            value={root}
+            onChange={(e) => setRoot(e.target.value)}
+          >
+            <option value="">{!state ? "Loading libraries…" : state.roots.length ? "Choose library" : "Add a library to begin"}</option>
+            {state?.roots.map((r) => (
+              <option key={r.root} value={r.root}>{r.root.split("/").pop()}</option>
+            ))}
+          </select>
           <span className="sidebar-version">v{appVersion}</span>
         </div>
       </aside>
-      <main>
-        <header className="page-header">
-          <div>
-            <h1>{titles[route] || "Overview"}</h1>
-          </div>
-          <div className="header-actions">
-            {[state?.job, state?.online_job, state?.download_job].some(job => active(job)) && (
+      <main aria-label={titles[route] || "Overview"}>
+        {[state?.job, state?.online_job, state?.download_job].some(job => active(job)) && (
+          <header className="page-header">
               <div className="header-workloads" role="status" aria-live="off">
                 {[state?.job, state?.online_job, state?.download_job].filter(job => active(job)).map((job) => {
                   const progress = workload(job, downloadMonitor, clock);
@@ -1963,22 +2013,8 @@ function App() {
                   </button>;
                 })}
               </div>
-            )}
-            <select
-              aria-label="Active library"
-              value={root}
-              onChange={(e) => setRoot(e.target.value)}
-            >
-              <option value="">{!state ? "Loading libraries…" : state.roots.length ? "Choose library" : "Add a library to begin"}</option>
-              {state?.roots.map((r) => (
-                <option key={r.root} value={r.root}>
-                  {r.root.split("/").pop()}
-                </option>
-              ))}
-            </select>
-
-          </div>
-        </header>
+          </header>
+        )}
         {error && (
           <div className="notice error" role="alert">
             <span>{error}</span>
@@ -2043,7 +2079,7 @@ function App() {
         <Modal
           title={
             detail.operation ? route === "online" ? "Replacement release details" : "Local duplicate details"
-              : detail.local_artist ? "Artist release links" : detail.local_release ? "Local release details" : detail.artist && !detail.tags
+              : detail.local_file_release ? "Release review" : detail.local_artist ? "Artist release links" : detail.local_release ? "Local release details" : detail.artist && !detail.tags
               ? "Artist candidates"
               : detail.release
                 ? "Release details"
@@ -2053,6 +2089,20 @@ function App() {
           onClose={() => setDetail(null)}
         >
           <div className="modal-body">
+            {detail.local_file_release && <section className="metadata-source">
+              <h3>{detail.local_file_release.artist} — {detail.local_file_release.release}</h3>
+              <p>{detail.local_file_release.path}</p><p>{detail.local_file_release.evidence}</p>
+              <button onClick={() => reveal(detail.local_file_release.path).catch(notifyError)}>Show in Finder</button>
+              <div className="metadata-table"><table aria-label={`Files in ${detail.local_file_release.release}`}>
+                <thead><tr><th>Track</th><th>Disc · track</th><th>Status</th><th>Evidence</th><th>Proposed action</th><th /></tr></thead>
+                <tbody>{(detail.local_file_release.children || []).map((track: Row) => <tr key={track.id}>
+                  <td title={track.path}>{track.title}</td><td>{track.position}</td>
+                  <td><span className={"badge " + String(track.status).toLowerCase().replaceAll(" ", "-")}>{track.status}</span></td>
+                  <td>{track.evidence}</td><td title={track.target || undefined}>{readable(track.changes && Object.keys(track.changes).length ? track.changes : track.target)}</td>
+                  <td><button onClick={() => loadDetail(track)}>View file</button></td>
+                </tr>)}</tbody>
+              </table></div>
+            </section>}
             {detail.local_artist && <section className="metadata-source">
               <h3>{detail.local_artist.artist}</h3>
               <p>{detail.local_artist.evidence}</p>

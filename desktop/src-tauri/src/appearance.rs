@@ -2,12 +2,16 @@
 //! thread; callers and the web UI only receive ordinary serializable values.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SystemAccent {
     pub name: String,
     pub hex: String,
     pub rgb: [u8; 3],
+    /// Native dynamic colours resolved in each drawing appearance. Existing
+    /// consumers keep using name/hex/rgb; web themes can select a full variant.
+    pub palettes: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for SystemAccent {
@@ -22,6 +26,7 @@ impl SystemAccent {
             name: name.to_owned(),
             hex: format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]),
             rgb,
+            palettes: BTreeMap::new(),
         }
     }
 }
@@ -41,13 +46,26 @@ pub async fn system_accent(app: Option<&tauri::AppHandle>) -> SystemAccent {
     }
 }
 
+/// Read-only main-thread diagnostic, independent of databases or a running app.
+/// Unlike the worker fallback, this confirms that AppKit resolved every variant.
+pub fn native_probe() -> Result<SystemAccent, String> {
+    #[cfg(target_os = "macos")]
+    { macos::native_probe() }
+    #[cfg(not(target_os = "macos"))]
+    { Err("Native appearance inspection requires macOS".into()) }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::SystemAccent;
+    use block2::RcBlock;
     use objc2::{rc::autoreleasepool, MainThreadMarker};
-    use objc2_app_kit::{NSColor, NSColorSpace};
+    use objc2_app_kit::{NSAppearance, NSColor, NSColorSpace, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+        NSAppearanceNameAccessibilityHighContrastAqua, NSAppearanceNameAccessibilityHighContrastDarkAqua};
     use objc2_foundation::{NSString, NSUserDefaults};
     use std::{
+        cell::RefCell,
+        collections::BTreeMap,
         sync::{Mutex, OnceLock},
         time::{Duration, Instant},
     };
@@ -110,14 +128,9 @@ mod macos {
             // controlAccentColor is dynamic and may be grayscale/P3. Resolve
             // it in sRGB before accessing RGB components or serializing CSS.
             let colour = NSColor::controlAccentColor();
-            let Some(colour) = colour.colorUsingColorSpace(&NSColorSpace::sRGBColorSpace()) else {
+            let Some(rgb) = resolve_rgb(&colour) else {
                 return SystemAccent::default();
             };
-            let rgb = [
-                channel(colour.redComponent()),
-                channel(colour.greenComponent()),
-                channel(colour.blueComponent()),
-            ];
             let defaults = NSUserDefaults::standardUserDefaults();
             let key = NSString::from_str("AppleAccentColor");
             // This optional preference hint is only for the human-readable
@@ -126,7 +139,71 @@ mod macos {
             let selection = defaults
                 .stringForKey(&key)
                 .and_then(|value| value.to_string().parse::<i64>().ok());
-            SystemAccent::new(selection_name(selection), rgb)
+            let mut accent = SystemAccent::new(selection_name(selection), rgb);
+            // These immutable framework constants are valid for the lifetime
+            // of AppKit; using them avoids assumptions about enum string values.
+            for (key, appearance) in unsafe { [
+                ("light", NSAppearanceNameAqua),
+                ("dark", NSAppearanceNameDarkAqua),
+                ("light_high_contrast", NSAppearanceNameAccessibilityHighContrastAqua),
+                ("dark_high_contrast", NSAppearanceNameAccessibilityHighContrastDarkAqua),
+            ] } {
+                if let Some(palette) = read_palette(appearance) {
+                    accent.palettes.insert(key.into(), palette);
+                }
+            }
+            accent
+        })
+    }
+
+    fn resolve_rgb(colour: &NSColor) -> Option<[u8; 3]> {
+        let colour = colour.colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())?;
+        Some([channel(colour.redComponent()), channel(colour.greenComponent()), channel(colour.blueComponent())])
+    }
+
+    fn read_palette(name: &NSString) -> Option<BTreeMap<String, String>> {
+        let appearance = NSAppearance::appearanceNamed(name)?;
+        let resolved = RefCell::new(None);
+        let block = RcBlock::new(|| {
+            // Both creation and conversion happen inside this appearance. The
+            // dynamic AppKit colour object must not resolve in a stale theme.
+            let palette = [
+                ("accent", NSColor::controlAccentColor()),
+                ("blue", NSColor::systemBlueColor()),
+                ("purple", NSColor::systemPurpleColor()),
+                ("pink", NSColor::systemPinkColor()),
+                ("red", NSColor::systemRedColor()),
+                ("orange", NSColor::systemOrangeColor()),
+                ("yellow", NSColor::systemYellowColor()),
+                ("green", NSColor::systemGreenColor()),
+                ("graphite", NSColor::systemGrayColor()),
+                ("table_header", NSColor::controlBackgroundColor()),
+                ("selection", NSColor::selectedContentBackgroundColor()),
+                ("selection_text", NSColor::alternateSelectedControlTextColor()),
+            ].into_iter().filter_map(|(name, colour)|resolve_rgb(&colour)
+                .map(|rgb|(name.to_owned(),SystemAccent::new("",rgb).hex))).collect();
+            *resolved.borrow_mut() = Some(palette);
+        });
+        // AppKit restores the previous drawing appearance when the block exits.
+        // No global appearance or System Settings preference is written.
+        appearance.performAsCurrentDrawingAppearance(&block);
+        drop(block);
+        resolved.into_inner()
+    }
+
+    pub fn native_probe() -> Result<SystemAccent, String> {
+        let marker = MainThreadMarker::new().ok_or("Inspect native appearance on the main thread")?;
+        autoreleasepool(|_| {
+            let previous = NSAppearance::currentDrawingAppearance().name().to_string();
+            let accent = read_native(marker);
+            if NSAppearance::currentDrawingAppearance().name().to_string() != previous {
+                return Err("Native palette inspection changed the drawing appearance".into());
+            }
+            if accent.palettes.len() != 4 || accent.palettes.values().any(|palette|palette.len() != 12) {
+                return Err("AppKit did not resolve the complete appearance palette".into());
+            }
+            remember(&accent);
+            Ok(accent)
         })
     }
 
@@ -179,6 +256,17 @@ mod macos {
             let rgb = [channel(-0.01), channel(0.5), channel(1.2)];
             assert_eq!(rgb, [0, 128, 255]);
             assert_eq!(SystemAccent::new("Blue", rgb).hex, "#0080ff");
+        }
+
+        #[test]
+        fn native_palette_contract_preserves_legacy_accent_fields() {
+            let mut accent = SystemAccent::new("Graphite", [128, 128, 128]);
+            accent.palettes.insert("dark".into(),BTreeMap::from([("graphite".into(),"#808080".into())]));
+            let serialized = serde_json::to_value(accent).unwrap();
+            assert_eq!(serialized["name"],"Graphite");
+            assert_eq!(serialized["hex"],"#808080");
+            assert_eq!(serialized["rgb"],serde_json::json!([128,128,128]));
+            assert_eq!(serialized["palettes"]["dark"]["graphite"],"#808080");
         }
     }
 }

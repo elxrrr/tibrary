@@ -292,6 +292,170 @@ fn grouped_link_facets(page: &Value, filters: &ColumnFilters, args: &Value, colu
     facets(&json!({"rows":rows,"revision":page["revision"]}), &ColumnFilters::new(), column, search, offset, limit)
 }
 
+fn local_file_route(route: &str) -> bool {
+    matches!(route, "files" | "correct" | "organise" | "metadata" | "artwork" | "mqa")
+}
+
+fn current_file_position(tags: &HashMap<String, String>) -> Option<String> {
+    let number = |key: &str, part: usize| tags.get(key)?.split('/').nth(part)?.trim().parse::<u32>().ok();
+    let track = number("tracknumber", 0);
+    let disc = number("discnumber", 0);
+    if track.is_none() && disc.is_none() { return None; }
+    let total = |key: &str, number_key: &str| number(key, 0).or_else(||number(number_key, 1))
+        .map(|number|format!("{number:02}")).unwrap_or_else(||"?".into());
+    let track = track.map(|number|format!("{number:02}")).unwrap_or_else(||"?".into());
+    Some(format!("Disc {:02}/{} · Track {}/{}", disc.unwrap_or(1), total("disctotal", "discnumber"),
+        track, total("tracktotal", "tracknumber")))
+}
+
+fn local_file_position(row: &Value) -> (u32, u32) {
+    let position = row["position"].as_str().unwrap_or("");
+    if position.contains("Disc ") || position.contains("Track ") { return link_position(row); }
+    let parts: Vec<_> = position.split('·').collect();
+    if parts.len() == 2 {
+        let index = |part: &str| part.split('/').next().and_then(|number|number.trim().parse::<u32>().ok()).unwrap_or(0);
+        return (index(parts[0]), index(parts[1]));
+    }
+    let tags = workflows::extract_tags_map(&Some(row["tags"].clone()));
+    let index = |key: &str| tags.get(key).and_then(|value|value.split('/').next())
+        .and_then(|number|number.trim().parse::<u32>().ok()).unwrap_or(0);
+    (index("discnumber").max(1), index("tracknumber"))
+}
+
+/// Some audit snapshots omit tags. Fill their display positions from the
+/// shared local index once, without reading audio or modifying saved plans.
+async fn decorate_file_positions(db: &TursoDb, mut page: Value, root: Option<&str>) -> Result<Value, String> {
+    let mut missing = HashSet::new();
+    if let Some(rows) = page["rows"].as_array_mut() {
+        for row in rows {
+            if row["position"].as_str().is_some_and(|position|!position.is_empty()) { continue; }
+            let tags = workflows::extract_tags_map(&Some(row["tags"].clone()));
+            if let Some(position) = current_file_position(&tags) { row["position"] = json!(position); }
+            else if let Some(path) = row["path"].as_str() { missing.insert(path.to_owned()); }
+        }
+    }
+    if missing.is_empty() { return Ok(page); }
+    let positions: HashMap<_, _> = db.get_local_files_for_release_tables(root).await?.into_iter()
+        .filter(|file|missing.contains(&file.path))
+        .filter_map(|file|current_file_position(&workflows::extract_tags_map(&file.metadata)).map(|position|(file.path,position)))
+        .collect();
+    if let Some(rows) = page["rows"].as_array_mut() {
+        for row in rows {
+            if row["position"].as_str().is_some_and(|position|!position.is_empty()) { continue; }
+            if let Some(position) = row["path"].as_str().and_then(|path|positions.get(path)) {
+                row["position"] = json!(position);
+            }
+        }
+    }
+    Ok(page)
+}
+
+fn local_file_status(counts: &BTreeMap<String, usize>) -> &str {
+    if counts.len() == 1 { return counts.keys().next().unwrap(); }
+    for status in ["MQA signal", "Needs update", "Missing tags found", "Artwork available", "Needs choice",
+        "Unlinked", "Needs review", "Not audited", "No supplied missing tags", "Linked", "No signal found", "No change", "Ignored"] {
+        if let Some((status, _)) = counts.get_key_value(status) { return status; }
+    }
+    "Needs review"
+}
+
+/// Presentation-only parents own the matching indexed files, while the source
+/// preview remains flat. Tag maps and mutation items belong exclusively to leaves.
+fn local_file_release_groups(page: &Value, filters: &ColumnFilters, except: Option<&str>) -> Vec<Value> {
+    let mut groups = BTreeMap::<(String, String, String), Vec<Value>>::new();
+    for row in page["rows"].as_array().into_iter().flatten()
+        .filter(|row|matches_link_child(row, filters, except))
+    {
+        let folder = duplicates::extract_release_folder(row["path"].as_str().or_else(||row["id"].as_str()).unwrap_or(""))
+            .nfc().collect::<String>();
+        let release = row["release"].as_str().unwrap_or("").trim().nfc().collect::<String>().to_lowercase();
+        groups.entry((folder, artist_key(row["artist"].as_str().unwrap_or("")), release))
+            .or_default().push(row.clone());
+    }
+    groups.into_iter().map(|(key, mut children)| {
+        children.sort_by(|left, right|local_file_position(left).cmp(&local_file_position(right))
+            .then_with(||compare_table_cell(left, right, "id")));
+        let count = children.len();
+        let affected = children.iter().filter(|child|child["affected"] == true).count();
+        let mut statuses = BTreeMap::<String, usize>::new();
+        let mut changes = 0usize;
+        let mut movements = 0usize;
+        let mut targets = BTreeMap::<String, usize>::new();
+        let mut operations = BTreeMap::<String, usize>::new();
+        for child in &children {
+            let status = if child["ignored"] == true { "Ignored" } else { child["status"].as_str().filter(|status|!status.is_empty()).unwrap_or("Needs review") };
+            *statuses.entry(status.into()).or_default() += 1;
+            let changed = match &child["changes"] {
+                Value::Object(values) => !values.is_empty(),
+                Value::String(value) => !value.is_empty() && value != "—",
+                _ => false,
+            };
+            if changed { changes += 1; }
+            if let Some(target) = child["target"].as_str().filter(|target|!target.is_empty() && *target != "—") {
+                *targets.entry(target.into()).or_default() += 1;
+            }
+            if let Some(operation) = child["folder_operation"].as_str().filter(|operation|!operation.is_empty() && *operation != "No change") {
+                *operations.entry(operation.into()).or_default() += 1;
+                movements += 1;
+            }
+        }
+        let evidence = std::iter::once(format!("{count} {}",if count == 1 {"file"} else {"files"}))
+            .chain(statuses.iter().map(|(status, count)|format!("{count} {status}"))).collect::<Vec<_>>().join(" · ");
+        let target = if targets.len() == 1 && !targets.keys().next().unwrap().contains('/') {
+            targets.keys().next().unwrap().clone()
+        } else if targets.is_empty() { "—".into() }
+        else { format!("{} file destinations", targets.values().sum::<usize>()) };
+        let folder_operation = if operations.len() == 1 { operations.keys().next().unwrap().clone() }
+            else if movements > 0 { format!("{movements} files to move or rename") } else { "No change".into() };
+        let id = format!("local-file-release:{:x}",Sha256::digest(serde_json::to_vec(&key).expect("file release key serializes")));
+        let artist = if key.1 == "various artists" { json!("Various Artists") } else { children[0]["artist"].clone() };
+        json!({"id":id,"artist":artist,"release":children[0]["release"],"path":key.0,
+            "title":format!("{count} {}",if count == 1 {"file"} else {"files"}),"tracks":count,"files":count,
+            "status":local_file_status(&statuses),"status_counts":statuses,"evidence":evidence,
+            "affected":affected > 0,"affected_count":affected,"change_count":changes,
+            "changes":if changes > 0 {format!("{changes} {} with proposed changes",if changes == 1 {"file"} else {"files"})} else {String::new()},
+            "target":target,"folder_operation":folder_operation,"file_group":true,"expanded_available":true,
+            "track_ids":children.iter().map(|child|child["id"].clone()).collect::<Vec<_>>(),
+            "ignored":children.iter().all(|child|child["ignored"] == true),"children":children})
+    }).collect()
+}
+
+fn grouped_file_page(mut page: Value, filters: &ColumnFilters, args: &Value, offset: usize, limit: usize) -> Value {
+    let mut rows = local_file_release_groups(&page, filters, None);
+    rows.retain(|row|matches_link_count(row, filters));
+    let key = args["sort"].as_str().unwrap_or("artist");
+    let descending = args["direction"] == "desc";
+    rows.sort_by(|left, right| {
+        let order = compare_table_cell(left, right, key);
+        (if descending {order.reverse()} else {order})
+            .then_with(||compare_table_cell(left, right, "artist"))
+            .then_with(||compare_table_cell(left, right, "release"))
+            .then_with(||compare_table_cell(left, right, "path"))
+            .then_with(||compare_table_cell(left, right, "id"))
+    });
+    page["total"] = json!(rows.len());
+    page["release_total"] = json!(rows.len());
+    page["track_total"] = json!(rows.iter().map(|row|row["tracks"].as_u64().unwrap_or(0)).sum::<u64>());
+    page["affected_total"] = json!(rows.iter().map(|row|row["affected_count"].as_u64().unwrap_or(0)).sum::<u64>());
+    page["offset"] = json!(offset);
+    page["rows"] = json!(rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>());
+    page
+}
+
+fn grouped_file_facets(page: &Value, filters: &ColumnFilters, column: &str, search: &str, offset: usize, limit: usize) -> Value {
+    let mut groups = local_file_release_groups(page, filters, Some(column));
+    if column != "tracks" { groups.retain(|row|matches_link_count(row, filters)); }
+    let mut rows = if column == "tracks" { groups } else {
+        groups.into_iter().flat_map(|mut group|group["children"].as_array_mut().map(std::mem::take).unwrap_or_default()).collect()
+    };
+    if column == "artist" {
+        for row in &mut rows {
+            if artist_key(row["artist"].as_str().unwrap_or("")) == "various artists" { row["artist"] = json!("Various Artists"); }
+        }
+    }
+    facets(&json!({"rows":rows,"revision":page["revision"]}),&ColumnFilters::new(),column,search,offset,limit)
+}
+
 fn decorate_local_releases(mut page: Value, releases: Vec<Value>, mappings: &[Value], dates: &HashMap<String, String>, favourites: bool) -> Value {
     let mut by_artist = HashMap::<String, Vec<Value>>::new();
     for mut release in releases {
@@ -904,6 +1068,7 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
 pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_facet: bool) -> Result<Value, String> {
     let filters = parse(args.get("column_filters"))?;
     let grouped_links = args["route"] == "links" && args["group_releases"] == true;
+    let grouped_files = local_file_route(args["route"].as_str().unwrap_or("")) && args["group_releases"] == true;
     let normalize = |mut page: Value| {
         if let Some(rows) = page["rows"].as_array_mut() {
             // Before a metadata/artwork preview exists, its fallback rows are
@@ -932,11 +1097,15 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         for key in ["column_filters", "column", "facet_search", "group_releases", "group_artists"] { source.remove(key); }
         source.insert("offset".into(), json!(0));
         source.insert("limit".into(), json!(usize::MAX));
+        if grouped_files {
+            // Sorting presentation parents must reuse the same flat snapshot.
+            source.remove("sort"); source.remove("direction");
+        }
     }
     // Filtering/paging one column must not repeatedly reload a large catalogue.
     // This uses the existing per-view cache and invalidation, independently of
     // workers and the visible table request. No online requests are made here.
-    let key = format!("table.source:{source_args}");
+    let key = format!("table.source:{source_args}:file_positions={grouped_files}");
     let gate = state.read_gate(&key);
     let _source_read = gate.lock().await;
     let revision = db.revision.load(Ordering::SeqCst);
@@ -944,7 +1113,8 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         .filter(|(saved, at, _)| *saved == revision && at.elapsed().as_secs() < 30)
         .map(|(_, _, page)| page.clone());
     let page = if let Some(page) = cached { page } else {
-        let page = normalize(get_table_page(state, db, &source_args).await?);
+        let mut page = normalize(get_table_page(state, db, &source_args).await?);
+        if grouped_files { page = decorate_file_positions(db,page,args["root"].as_str()).await?; }
         if db.revision.load(Ordering::SeqCst) == revision {
             let mut cache = state.view_cache.lock().unwrap();
             if cache.len() >= 64 { cache.clear(); }
@@ -958,6 +1128,10 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         } else {
             grouped_link_page(page,&filters,args,offset,limit)
         }
+    } else if grouped_files {
+        if let Some(column) = column {
+            grouped_file_facets(&page,&filters,column,args["facet_search"].as_str().unwrap_or(""),offset,limit.min(500))
+        } else { grouped_file_page(page,&filters,args,offset,limit) }
     } else if let Some(column) = column {
         facets(&page,&filters,column,args["facet_search"].as_str().unwrap_or(""),offset,limit.min(500))
     } else {
@@ -968,6 +1142,96 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_row(path: &str, track: &str, status: &str, changes: Value) -> Value {
+        json!({"id":path,"path":path,"artist":"Artist","release":"Release","title":format!("Track {track}"),
+            "tags":{"tracknumber":track,"discnumber":"01/02","tracktotal":"12"},"changes":changes,
+            "status":status,"evidence":"Current local tags compared with the proposed tags",
+            "affected":status == "Needs update","item":{"path":path,"tags":changes}})
+    }
+
+    #[test]
+    fn local_file_groups_keep_flat_mutation_items_and_filter_stable_release_ids() {
+        let tenth = file_row("/Music/Artist/Release/Disc 1/10.flac", "10/12", "Needs update",json!({"tracknumber":"10"}));
+        let second = file_row("/Music/Artist/Release/Disc 1/02.flac", "02/12", "Needs update",json!({"tracknumber":"02"}));
+        let mut clean = file_row("/Music/Artist/Release/Disc 2/01.flac", "01/12", "No change",json!({}));
+        clean["tags"]["discnumber"] = json!("02/02");
+        let edition = file_row("/Music/Artist/Release deluxe/01.flac", "01/12", "No change",json!({}));
+        let page = json!({"rows":[tenth.clone(),clean.clone(),second.clone(),edition.clone()],"revision":12,"preview_id":"flat-preview"});
+        let original = page.clone();
+        let grouped = grouped_file_page(page.clone(),&ColumnFilters::new(),&json!({"sort":"tracks","direction":"desc"}),0,10);
+        assert_eq!(grouped["total"],2, "separate physical editions remain separate");
+        assert_eq!(grouped["track_total"],4);
+        assert_eq!(grouped["affected_total"],2);
+        let release = &grouped["rows"][0];
+        assert_eq!(release["file_group"],true);
+        assert_eq!(release["path"],"/Music/Artist/Release");
+        assert_eq!(release["tracks"],3);
+        assert_eq!(release["affected_count"],2);
+        assert_eq!(release["status_counts"]["Needs update"],2);
+        assert!(release.get("item").is_none(), "synthetic parents never become mutation plans");
+        assert_eq!(release["children"],json!([second.clone(),tenth.clone(),clean.clone()]));
+        assert_eq!(release["track_ids"],json!([second["id"],tenth["id"],clean["id"]]));
+        let filters = parse(Some(&json!({"changes":{"exclude":["","—"]}}))).unwrap();
+        let affected = grouped_file_page(page.clone(),&filters,&json!({}),0,10);
+        assert_eq!(affected["rows"][0]["id"],release["id"], "changing scope preserves expansion identity");
+        assert_eq!(affected["rows"][0]["children"],json!([second,tenth]));
+        assert_eq!(affected["rows"][0]["tracks"],2);
+        assert_eq!(affected["preview_id"],"flat-preview");
+        assert_eq!(page,original, "presenting or filtering groups cannot modify saved flat plans");
+        assert_eq!(grouped["rows"][1]["expanded_available"],true, "one-file releases still expand");
+    }
+
+    #[test]
+    fn local_file_groups_page_releases_and_keep_leaf_filter_facets() {
+        let page = json!({"rows":[
+            file_row("/Music/Artist/A/01.flac","1","Needs update",json!({"tracknumber":"01"})),
+            file_row("/Music/Artist/A/02.flac","2","Needs update",json!({"tracknumber":"02"})),
+            file_row("/Music/Artist/A/03.flac","3","No change",json!({})),
+            file_row("/Music/Artist/B/01.flac","1","Needs update",json!({"discnumber":"01"})),
+            file_row("/Music/Artist/C/01.flac","1","No change",json!({}))],"revision":14});
+        let filters = parse(Some(&json!({"changes":{"exclude":["","—"]}}))).unwrap();
+        let args = json!({"sort":"tracks","direction":"desc"});
+        let first = grouped_file_page(page.clone(),&filters,&args,0,1);
+        assert_eq!(first["total"],2);
+        assert_eq!(first["release_total"],2);
+        assert_eq!(first["track_total"],3);
+        assert_eq!(first["rows"][0]["children"].as_array().unwrap().len(),2, "pagination never splits a release");
+        let second = grouped_file_page(page.clone(),&filters,&args,1,1);
+        assert_eq!(second["offset"],1);
+        assert_eq!(second["rows"][0]["tracks"],1);
+        assert_eq!(second["revision"],14);
+        let counts = grouped_file_facets(&page,&filters,"tracks","",0,100);
+        assert_eq!(counts["options"],json!([{"value":"1","label":"1","count":1},{"value":"2","label":"2","count":1}]));
+        let changes = grouped_file_facets(&page,&filters,"changes","",0,100);
+        assert_eq!(changes["options"].as_array().unwrap().len(),4);
+        assert!(changes["options"].as_array().unwrap().iter().any(|option|option["value"]=="" && option["count"]==2));
+        assert!(changes["options"].as_array().unwrap().iter().all(|option|!option["value"].as_str().unwrap().contains("files with")),
+            "change facets expose original tag values, never synthetic summaries");
+        let only_two = parse(Some(&json!({"tracks":{"include":["2"]},"changes":{"exclude":["","—"]}}))).unwrap();
+        let statuses = grouped_file_facets(&page,&only_two,"status","",0,100);
+        assert_eq!(statuses["options"],json!([{"value":"Needs update","label":"Needs update","count":2}]));
+        let sorted = grouped_file_page(page,&filters,&json!({"sort":"tracks","direction":"asc"}),0,10);
+        assert_eq!(sorted["rows"][0]["tracks"],1);
+        assert_eq!(sorted["rows"][1]["tracks"],2);
+    }
+
+    #[test]
+    fn local_file_positions_use_current_tags_and_preserve_invalid_totals_for_review() {
+        let tags = HashMap::from([("discnumber".into(),"02/10".into()),("tracknumber".into(),"04/1".into())]);
+        assert_eq!(current_file_position(&tags).as_deref(),Some("Disc 02/10 · Track 04/01"),
+            "displaying positions must not repair invalid totals before approval");
+        let mut second = file_row("/Music/Artist/Release/CD 2/01.flac","01","MQA signal",json!({}));
+        second["position"] = json!("Disc 02/10 · Track 01/01");
+        let mut tenth = file_row("/Music/Artist/Release/CD 10/01.flac","01","No signal found",json!({}));
+        tenth["position"] = json!("Disc 10/10 · Track 01/01");
+        let groups = local_file_release_groups(&json!({"rows":[tenth,second.clone()]}),&ColumnFilters::new(),None);
+        assert_eq!(groups.len(),1);
+        assert_eq!(groups[0]["children"][0],second, "disc 2 precedes disc 10 without tag rewrites");
+        assert_eq!(groups[0]["status"],"MQA signal");
+        assert_eq!(groups[0]["status_counts"]["No signal found"],1);
+        assert!(groups[0]["evidence"].as_str().unwrap().contains("MQA signal"));
+    }
 
     fn link_row(path: &str, position: &str, status: &str) -> Value {
         json!({"id":path,"path":path,"artist":"Artist","release":"Release","title":"Track",

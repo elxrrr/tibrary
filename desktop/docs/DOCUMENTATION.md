@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.20** · [Setup and screenshots](../../README.md)
+Version **0.9.21** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -16,7 +16,11 @@ Libraries and their indexed/linked track counts load first. Local dashboard stat
 | Settings → General | Manage the subscriber connection, libraries, appearance, downloads and matching preferences. |
 | Settings → Activity | Search one saved activity log; inspect detailed checks and cancel individual workers. |
 
-Table pages keep search, column filters and pagination above the table, with workflow actions below. Use the arrow beside an action to choose a correction, scan scope or related check; choosing a correction does not apply it. Secondary actions explain whether they use selected rows, the visible page or the whole library.
+Choose the active library at the bottom of the sidebar, above the version. Its selection applies across pages. Table pages start with search, column filters and pagination, with workflow actions below. Use the arrow beside an action to choose a correction, scan scope or related check; choosing a correction does not apply it. Secondary actions explain whether they use selected rows, the visible page or the whole library.
+
+Latest missing releases scrolls within its Overview card, with the same edge fades as Settings. The dashboard stays in place while you browse the list.
+
+Local file tables group tracks beneath their release, including every Correct tags operation, Organise files, MQA audit, Add missing tags and Fix artwork. Expand a release to inspect each file's evidence, position and proposed action. Filters apply to files before grouping; selecting a release selects its displayed files. Review and apply still use individual file paths. Expansion reads the saved index and preview without another scan.
 
 ### Local changes
 
@@ -89,7 +93,7 @@ BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. M
 
 ### Downloads and activity
 
-Highlight colour defaults to **System**, following the macOS accent colour, including Multicolour. You can also choose Multicolour, Blue, Purple, Pink, Red, Orange, Yellow, Green or Graphite. Existing explicit choices are retained.
+Highlights follow the colour selected in macOS **Appearance**, including Multicolour and Graphite. Native colours adapt to Light, Dark and increased contrast; controls, selections and menus share the same palette. The app has no separate highlight colour setting.
 
 Choose the destination, template and audio options in General. Approve releases or individual tracks in the queue before starting a download. Videos are excluded. Download progress is separate from local work. Stalled transfers can be cancelled; failed transfers remove their partial files. Downloads publish only after the release has been staged and destination collisions checked. File moves and tag updates keep an original until the database update succeeds. Replacements retain valid existing BPM/key tags when the matching recording has no new values.
 

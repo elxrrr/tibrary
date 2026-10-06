@@ -125,6 +125,8 @@ export function DataTable({
   const headerMenuRef = useRef<HTMLDivElement>(null);
   const headerMenuLabelId = useId();
   const scroller = useRef<HTMLDivElement>(null);
+  const scrollOffset = useRef(0);
+  const renderedFileGroups = useRef<string[]>([]);
   const menuFilter = headerMenu ? headerFilters?.[headerMenu.column.key] : undefined;
   const latestMenuFilter = useRef(menuFilter);
   latestMenuFilter.current = menuFilter;
@@ -132,6 +134,16 @@ export function DataTable({
   const menuHasFilter = !!menuFilter;
   const menuOptionsKey = menuFilter?.optionsKey;
   useEffect(() => setAnchor(null), [rows]);
+  useLayoutEffect(() => {
+    const previous = renderedFileGroups.current;
+    const current = rows.map(row => row.id);
+    const ids = new Set(current);
+    // Reordering the same release groups should preserve the user's viewport.
+    // A changed filter/page retains normal browser clamping instead.
+    if (fileGroups && previous.length && previous.length === current.length && previous.every(id => ids.has(id)) && scroller.current)
+      scroller.current.scrollTop = scrollOffset.current;
+    renderedFileGroups.current = fileGroups ? current : [];
+  }, [rows, fileGroups]);
   function closeHeaderMenu() {
     const trigger = headerMenu?.trigger;
     setHeaderMenu(null);
@@ -296,7 +308,7 @@ export function DataTable({
     document.body,
   );
   function fileIds(row: Row): string[] {
-    if (row.artist_group || row.link_group)
+    if (row.artist_group || row.link_group || row.file_group)
       return (row.children || []).flatMap((child: Row) => fileIds(child));
     return [row.id];
   }
@@ -316,7 +328,7 @@ export function DataTable({
     else {
       next.add(row.id);
       // Artist and local release children come from the indexed library.
-      if (!hierarchy && !row.expanded_available) onExpand?.(row);
+      if (!hierarchy && !fileGroups && !row.expanded_available) onExpand?.(row);
     }
     setExpanded(next);
   }
@@ -328,7 +340,7 @@ export function DataTable({
       const target = visible.findIndex(item => item.id === row.id);
       const start = visible.findIndex(item => item.id === fileAnchor.current);
       const next = event.metaKey || event.ctrlKey || event.shiftKey ? new Set(selected) : new Set<string>();
-      const range = event.shiftKey && start >= 0 ? visible.slice(Math.min(start,target), Math.max(start,target) + 1) : [row];
+      const range = event.shiftKey && start >= 0 && target >= 0 ? visible.slice(Math.min(start,target), Math.max(start,target) + 1) : [row];
       const ids: string[] = range.flatMap(item => fileIds(item));
       const remove = !event.shiftKey && (event.metaKey || event.ctrlKey) && ids.every(id => selected.has(id));
       ids.forEach(id => remove ? next.delete(id) : next.add(id));
@@ -400,7 +412,7 @@ export function DataTable({
     onSelect(next);
   }
   function selectForMenu(row: Row) {
-    if (fileSelection && (row.link_group || row.artist_group)) {
+    if (fileSelection && (row.link_group || row.artist_group || row.file_group)) {
       if (groupState(row) === "empty") onSelect(new Set(fileIds(row)));
     } else if (grouped) {
       if (groupState(row) === "empty") onSelect(new Set([row.id]));
@@ -420,6 +432,7 @@ export function DataTable({
   return (
     <div
       ref={scroller}
+      onScroll={event => {scrollOffset.current = event.currentTarget.scrollTop;}}
       className={"table-scroll " + (loading ? "loading" : "")}
       aria-busy={loading}
     >
@@ -627,7 +640,7 @@ export function DataTable({
                       s.has(r.id) ? s.delete(r.id) : s.add(r.id);
                       onSelect(s);
                     }
-                    if (grouped && r.children?.length && ((e.key === "ArrowRight" && !expanded.has(r.id)) || (e.key === "ArrowLeft" && expanded.has(r.id)))) {
+                    if ((grouped || fileGroups) && r.children?.length && ((e.key === "ArrowRight" && !expanded.has(r.id)) || (e.key === "ArrowLeft" && expanded.has(r.id)))) {
                       e.preventDefault();
                       toggleExpanded(r);
                     }
@@ -640,7 +653,7 @@ export function DataTable({
                 >
                   <td className="check">
                     <Check
-                      label={selectionLabel?.(r) || `Select ${r.release || r.title || r.artist}`}
+                      label={(fileGroups ? `Select ${r.release || r.artist}` : selectionLabel?.(r)) || `Select ${r.release || r.title || r.artist}`}
                       state={state}
                       disabled={busy && tree}
                       onChange={(yes) => {
@@ -660,7 +673,7 @@ export function DataTable({
                   </td>
                   {columns.map((c, j) => (
                     <td key={c.key} title={readable(r[c.key])}>
-                      {j === 0 && (tree || fileGroups || (grouped && r.children?.length)) ? (
+                      {(fileGroups ? c.key === "release" && r.children?.length : j === 0 && (tree || (grouped && r.children?.length))) ? (
                         <button
                           className="disclosure"
                           aria-label={`${expanded.has(r.id) ? "Collapse" : "Expand"} ${r.release}`}
@@ -669,13 +682,7 @@ export function DataTable({
                           onClick={(e) => {
                             e.stopPropagation();
                             if (e.detail > 1) return;
-                            const s = new Set(expanded);
-                            if (s.has(r.id)) s.delete(r.id);
-                            else {
-                              s.add(r.id);
-                              if (!r.expanded_available) onExpand?.(r);
-                            }
-                            setExpanded(s);
+                            toggleExpanded(r);
                           }}
                         >
                           {expanded.has(r.id) ? (
@@ -685,7 +692,14 @@ export function DataTable({
                           )}
                         </button>
                       ) : null}
-                      {["status", "recommendation"].includes(c.key) ? (
+                      {fileGroups && c.key === "release" ? <button
+                        className="hierarchy-name"
+                        style={{ background: "none", border: 0, borderRadius: 0, padding: 0, color: "inherit", font: "inherit", display: "inline", maxWidth: "100%", verticalAlign: "middle" }}
+                        aria-expanded={expanded.has(r.id)}
+                        title={`Show files for ${r.release}`}
+                        onClick={event => {event.stopPropagation(); if (event.detail <= 1) toggleExpanded(r);}}
+                        onDoubleClick={event => {event.stopPropagation(); onDetail(r);}}
+                      >{readable(r[c.key])}</button> : ["status", "recommendation"].includes(c.key) ? (
                         <span
                           className={
                             "badge " +
@@ -726,7 +740,9 @@ export function DataTable({
                       onChange={yes => {const next=new Set(selected);yes?next.add(child.id):next.delete(child.id);onSelect(next);}} /></td>
                     {columns.map(column => {
                       const value=column.key === "artist" ? "" : column.key === "release" ? child.title : column.key === "tracks" ? child.position : child[column.key];
-                      return <td key={column.key} className={column.key === "tracks" ? "track-position" : undefined} title={column.key === "tracks" ? `Disc · track: ${child.position}` : readable(value)}>
+                      return <td key={column.key} className={column.key === "tracks" ? "track-position" : undefined}
+                        style={column.key === "release" ? {paddingLeft:28} : undefined}
+                        title={column.key === "tracks" ? `Disc · track: ${readable(child.position)}` : column.key === "release" ? `${readable(value)}\n${child.path || child.id}` : readable(value)}>
                         {column.key === "status" ? <span className={"badge " + String(value).toLowerCase().replaceAll(" ","-")}>{readable(value)}</span> : readable(value)}
                       </td>;
                     })}

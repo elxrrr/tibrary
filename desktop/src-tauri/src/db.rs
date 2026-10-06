@@ -2773,6 +2773,35 @@ impl TursoDb {
         self.get_settings().await
     }
 
+    /// Merge only the changed keys inside the database's write statement. Two
+    /// controls saving concurrently cannot overwrite each other's stale section.
+    pub async fn patch_settings(&self, section: &str, values: &Value) -> Result<Value, String> {
+        if !values.is_object() { return Err("Setting changes must be an object".into()); }
+        let section = match section {
+            "general" | "ui" => "desktop",
+            "links" => "release_links",
+            section => section,
+        };
+        let conn = self.connect()?;
+        // The canonical section and its legacy UI mirror share one statement.
+        // Legacy-only installations seed desktop from UI; subsequent patches
+        // start from the latest canonical payload under the same write lock.
+        conn.execute(
+            "INSERT INTO app_preferences(key,payload)
+             SELECT destination.key,json_patch(COALESCE(
+                 (SELECT payload FROM app_preferences WHERE key=?1),
+                 CASE WHEN ?1='desktop' THEN (SELECT payload FROM app_preferences WHERE key='ui') END,
+                 '{}'),?2)
+             FROM (SELECT ?1 AS key UNION ALL SELECT 'ui' WHERE ?1='desktop') AS destination
+             WHERE 1
+             ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+            (section,values.to_string()),
+        ).await.map_err(|error|format!("Could not update settings: {error}"))?;
+        drop(conn);
+        self.bump_revision();
+        self.get_settings().await
+    }
+
     pub async fn reset_settings(&self, group: &str) -> Result<Value, String> {
         let home_dir = std::env::var("HOME")
             .map(PathBuf::from)
@@ -5558,6 +5587,42 @@ with sqlite3.connect('{db}') as db:
         assert!(store.queue_add(&HashMap::from([("1".into(),None),("2".into(),Some(vec!["unknown".into()]))])).await.is_err());
         assert_eq!(store.get_queue_rows("queue",None,None,None,None,0,10).await.unwrap().total,0);
         drop(conn); drop(store); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn settings_key_patches_preserve_concurrent_controls_and_other_sections() {
+        let temp = std::env::temp_dir().join(format!("tibrary_settings_patch_{}",uuid::Uuid::new_v4()));
+        let store = TursoDb::open(temp.join("settings.sqlite3")).await.unwrap();
+        store.set_preference("ui",&json!({"theme":"dark","page_size":75,"persist_logs":true})).await.unwrap();
+        store.set_preference("provider",&json!({"download_concurrency":4,"request_interval_ms":900})).await.unwrap();
+        store.set_preference("downloads",&json!({"output":"/test/downloads","quality":"HI_RES_LOSSLESS"})).await.unwrap();
+        store.set_preference("release_links",&json!({"max_age_days":12,"enabled":true})).await.unwrap();
+        let theme = json!({"theme":"light"});
+        let highlight = json!({"highlight_colour":"purple"});
+        let (theme_saved,highlight_saved) = tokio::join!(
+            store.patch_settings("general",&theme),
+            store.patch_settings("ui",&highlight));
+        theme_saved.unwrap(); highlight_saved.unwrap();
+        let settings = store.get_settings().await.unwrap();
+        assert_eq!(settings["general"]["theme"],"light");
+        assert_eq!(settings["general"]["highlight_colour"],"purple");
+        assert_eq!(settings["general"]["page_size"],75, "legacy keys survive the first canonical patch");
+        assert_eq!(settings["provider"]["download_concurrency"],4);
+        assert_eq!(settings["provider"]["request_interval_ms"],900);
+        assert_eq!(settings["downloads"]["output"],"/test/downloads");
+        assert_eq!(settings["downloads"]["quality"],"HI_RES_LOSSLESS");
+        assert_eq!(store.get_preference("desktop").await.unwrap(),store.get_preference("ui").await.unwrap(),
+            "the legacy mirror is updated in the same atomic statement");
+        let links = store.patch_settings("links",&json!({"max_age_days":7})).await.unwrap();
+        assert_eq!(links["links"],json!({"max_age_days":7,"enabled":true}));
+        let revision = store.revision.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(store.patch_settings("general",&json!(["invalid"])).await.is_err());
+        assert_eq!(store.revision.load(std::sync::atomic::Ordering::SeqCst),revision);
+        assert_eq!(store.get_settings().await.unwrap()["general"]["theme"],"light");
+        store.save_settings("general",&json!({"theme":"dark"})).await.unwrap();
+        assert_eq!(store.get_preference("desktop").await.unwrap(),Some(json!({"theme":"dark"})),
+            "full settings saves retain their existing replacement semantics");
+        drop(store); std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]

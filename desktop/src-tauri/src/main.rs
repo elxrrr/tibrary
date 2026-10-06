@@ -1339,12 +1339,14 @@ async fn handle_rpc_uncached(
     if method == "settings.save" || method == "settings.update" {
         let section = args.get("section").and_then(|v| v.as_str()).unwrap_or("ui");
         let values = args.get("values").unwrap_or(&args);
-        if section == "desktop" || section == "general" {
-            if let Some(p) = values.get("persist_logs").and_then(|v| v.as_bool()) {
+        let res = if method == "settings.update" {
+            db.patch_settings(section, values).await?
+        } else { db.save_settings(section, values).await? };
+        if matches!(section, "desktop" | "general" | "ui") {
+            if let Some(p) = res["general"]["persist_logs"].as_bool() {
                 state.persist_logs.store(p, Ordering::SeqCst);
             }
         }
-        let res = db.save_settings(section, values).await?;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
         }
@@ -2703,7 +2705,16 @@ fn save_export(path: String, content: String) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--appearance-probe") {
+        match appearance::native_probe().and_then(|accent|serde_json::to_string(&accent).map_err(|error|error.to_string())) {
+            Ok(palette) => println!("{palette}"),
+            Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--rpc") {
+        #[cfg(target_os = "macos")]
+        let _ = appearance::native_probe();
         let db_path = args
             .windows(2)
             .find(|w| w[0] == "--db")

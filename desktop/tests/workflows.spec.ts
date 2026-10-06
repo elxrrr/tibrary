@@ -58,9 +58,15 @@ async function expandLocalArtist(page: Page, artist = "North Assembly") {
 }
 async function localTrackRow(page: Page, title: string, release = "Blue Hours", artist = "North Assembly"): Promise<Locator> {
   await expandLocalArtist(page, artist);
+  return localFileRow(page, title, release);
+}
+async function expandLocalRelease(page: Page, release = "Blue Hours") {
   const expander = page.getByRole("button", {name: new RegExp(`^(Expand|Collapse) ${release.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`)});
   await expect(expander).toBeVisible();
   if (await expander.getAttribute("aria-expanded") !== "true") await expander.click();
+}
+async function localFileRow(page: Page, title: string, release = "Blue Hours"): Promise<Locator> {
+  await expandLocalRelease(page, release);
   return page.locator("tbody tr").filter({has: page.getByRole("checkbox", {name: `Select track ${title}`, exact: true})});
 }
 async function expectTrackPositionInTracks(page: Page, title: string, position: string) {
@@ -118,7 +124,7 @@ for artist, in c.execute("SELECT artist FROM mappings").fetchall():
  c.execute("INSERT OR REPLACE INTO match_reviews(artist,payload) VALUES(?,?)",(artist,json.dumps({"candidates":[{"artist":{"id":"900001","name":"North Assembly"},"evidence":"Saved candidate"}]})))
 c.commit()`, join(folder,"db")]);
   }
-  if (test.info().title.startsWith("link releases group local files") || test.info().title.startsWith("artist hierarchy")) {
+  if (test.info().title.startsWith("link releases group local files") || test.info().title.startsWith("artist hierarchy") || test.info().title.startsWith("local actions group")) {
     // Create extra real files before the disposable backend opens its database.
     execFileSync("python3", ["-c", `import json,sqlite3,sys
 from pathlib import Path
@@ -232,7 +238,7 @@ test("tables publish usable results while catalogue revisions keep advancing", a
     await route.fulfill({json:response});
   });
   await page.goto("/");
-  await expect(page.getByRole("heading",{name:"Overview",exact:true})).toBeVisible();
+  await expect(page.getByRole("main",{name:"Overview",exact:true})).toBeVisible();
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
   await viewOption(page, "Release timeline", "All missing releases");
   await page.evaluate(()=>{(window as any).refreshTestTimer=setInterval(()=>(window as any).emitBackendEvent({event:"changed"}),80);});
@@ -298,7 +304,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { name: "Overview", exact: true }),
+    page.getByRole("main", { name: "Overview", exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Working", exact: true }),
@@ -336,8 +342,10 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
       .getByRole("button", { name, exact: true })
       .click();
     await expect(
-      page.getByRole("heading", { name:categoryPages[name] || name, exact: true }).first(),
+      page.getByRole("main", { name:categoryPages[name] || name, exact: true }),
     ).toBeVisible();
+    await expect(page.locator("main h1")).toHaveCount(0);
+    await expect(page.locator("aside .sidebar-bottom").getByRole("combobox", {name:"Active library",exact:true})).toBeVisible();
     if (await page.locator(".table-scroll").count()) {
       await expect(page.locator(".table-scroll")).toHaveAttribute("aria-busy", "false");
       const headers=page.locator(".table-header-actions");
@@ -365,6 +373,11 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
     if (name === "MQA audit") await expect(page.getByRole("button",{name:"Scan selected tracks",exact:true})).toBeEnabled();
     await expect(page.getByRole("alert")).toHaveCount(0);
     if (process.env.TIBRARY_SCREENSHOTS && screenshots[name]) {
+      if (name === "Prepare library") {
+        await actionOption(page,"Choose correction","Track & disc numbers","menuitemradio");
+        await expandLocalRelease(page);
+        await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
+      }
       if (name === "Link releases") await columnAll(page,"Status");
       if (["Link artists","Favourite artists","Link releases"].includes(name)) {
         const artist=page.getByRole("button",{name:"Expand North Assembly",exact:true});
@@ -387,6 +400,23 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
       await page.waitForTimeout(120);
       await page.screenshot({path:`docs/imgs/${screenshots[name]}.png`});
     }
+  }
+  if (process.env.TIBRARY_SCREENSHOTS) {
+    await page.locator("aside").getByRole("button", {name:"General",exact:true}).click();
+    await page.getByLabel("Colour theme").selectOption("light");
+    const native=(await rpc("appearance.accent")).result;
+    await expect(page.locator("html")).toHaveAttribute("data-theme","light");
+    await expect.poll(()=>page.locator("html").evaluate(element=>getComputedStyle(element).getPropertyValue("--system-blue").trim())).toBe(native.palettes.light.blue);
+    await page.mouse.move(1590,10);
+    await page.waitForTimeout(120);
+    await page.screenshot({path:"/tmp/tibrary-general-light-0.9.21.png"});
+    await page.locator("aside").getByRole("button", {name:"MQA audit",exact:true}).click();
+    await expandLocalRelease(page);
+    await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
+    await expect(page.getByRole("button",{name:"Scan selected tracks",exact:true})).toBeEnabled();
+    await page.mouse.move(1590,10);
+    await page.waitForTimeout(120);
+    await page.screenshot({path:"/tmp/tibrary-mqa-light-0.9.21.png"});
   }
   await page.setViewportSize({width:980,height:680});
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
@@ -416,18 +446,40 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
 test("window navigation remains available with the sidebar hidden and overview lists stay bounded", async ({page}) => {
   await rpc("queue.decision", {ids:["910002","910003","910004","910005","910006"],decision:"removed"});
   await page.goto("/");
+  for(const width of [1600,1000]) {
+    await page.setViewportSize({width,height:1000});
+    const boundary=await page.locator(".drag-region").evaluate(element=>{
+      const before=getComputedStyle(element,"::before"), sidebar=document.querySelector("aside")!.getBoundingClientRect();
+      return {sizing:before.boxSizing,sidebar:sidebar.width,
+        width:parseFloat(before.width)+(before.boxSizing === "border-box" ? 0 : parseFloat(before.borderRightWidth))};
+    });
+    expect(boundary.sizing).toBe("border-box");
+    expect(boundary.width).toBeCloseTo(boundary.sidebar,4);
+  }
+  await page.setViewportSize({width:1600,height:1000});
   await expect(page.getByRole("button", {name:"Back",exact:true})).toBeDisabled();
   await page.locator("aside").getByRole("button", {name:"Prepare library",exact:true}).click();
   await page.locator("aside").getByRole("button", {name:"Link catalogue",exact:true}).click();
   await page.getByRole("button", {name:"Hide sidebar",exact:true}).click();
   await expect(page.locator("aside")).toBeHidden();
+  await expect(page.getByRole("combobox",{name:"Active library",exact:true})).toBeHidden();
+  expect(await page.locator(".drag-region").evaluate(element=>getComputedStyle(element,"::before").borderRightWidth)).toBe("0px");
   expect((await page.locator("main").boundingBox())!.x).toBe(0);
   await page.getByRole("button", {name:"Back",exact:true}).click();
-  await expect(page.getByRole("heading", {name:"Correct tags",exact:true})).toBeVisible();
+  await expect(page.getByRole("main", {name:"Correct tags",exact:true})).toBeVisible();
   await page.getByRole("button", {name:"Forward",exact:true}).click();
-  await expect(page.getByRole("heading", {name:"Link artists",exact:true})).toBeVisible();
+  await expect(page.getByRole("main", {name:"Link artists",exact:true})).toBeVisible();
   await page.getByRole("button", {name:"Back",exact:true}).click();
   await page.getByRole("button", {name:"Show sidebar",exact:true}).click();
+  const librarySelect=page.locator("aside .sidebar-bottom").getByRole("combobox",{name:"Active library",exact:true});
+  await expect(librarySelect).toHaveValue(join(folder,"music"));
+  await expect(page.locator(".sidebar-version")).toBeVisible();
+  const [selectBox,versionBox,footerBox]=await Promise.all([librarySelect.boundingBox(),page.locator(".sidebar-version").boundingBox(),page.locator(".sidebar-bottom").boundingBox()]);
+  expect(selectBox!.y).toBeGreaterThanOrEqual(footerBox!.y);
+  expect(versionBox!.y+versionBox!.height).toBeLessThanOrEqual(footerBox!.y+footerBox!.height);
+  expect(footerBox!.y+footerBox!.height).toBeGreaterThan(970);
+  const toolbar=(await page.locator("main .filters").boundingBox())!;
+  expect(toolbar.y).toBeLessThan(95);
   await page.locator("aside").getByRole("button", {name:"Overview",exact:true}).click();
   await expect(page.getByRole("button", {name:"Forward",exact:true})).toBeDisabled();
   const list = page.getByRole("region", {name:"Latest missing releases"});
@@ -438,6 +490,38 @@ test("window navigation remains available with the sidebar hidden and overview l
   expect(await list.evaluate(element => getComputedStyle(element).overflowY)).toBe("auto");
   expect(await page.locator("main").evaluate(element=>element.scrollHeight <= element.clientHeight+1)).toBe(true);
   expect(await page.evaluate(()=>window.scrollY)).toBe(0);
+  const fades=page.locator(".latest-missing-scroll > .edge-gradient-top, .latest-missing-scroll > .edge-gradient-bottom");
+  await expect(fades).toHaveCount(2);
+  for(const theme of ["light","dark"]) {
+    await page.evaluate(theme=>{document.documentElement.dataset.theme=theme;},theme);
+    const styles=await fades.evaluateAll(elements=>elements.map(element=>{
+      const style=getComputedStyle(element),card=getComputedStyle(element.closest(".card")!);
+      return {hidden:element.getAttribute("aria-hidden"),position:style.position,pointerEvents:style.pointerEvents,background:style.backgroundImage,card:card.backgroundColor};
+    }));
+    for(const style of styles) {
+      expect(style.hidden).toBe("true");
+      expect(style.position).toBe("absolute");
+      expect(style.pointerEvents).toBe("none");
+      expect(style.background).toContain("linear-gradient");
+      expect(style.background).toContain(style.card);
+    }
+  }
+  // A shorter window makes the real cached catalogue overflow this region.
+  await page.setViewportSize({width:1600,height:680});
+  expect(await list.evaluate(element=>element.scrollHeight>element.clientHeight)).toBe(true);
+  await list.evaluate(element=>{element.scrollTop=element.scrollHeight;});
+  await expect.poll(()=>list.evaluate(element=>element.scrollTop)).toBeGreaterThan(0);
+  expect(await page.locator("main").evaluate(element=>element.scrollTop)).toBe(0);
+  expect(await page.evaluate(()=>window.scrollY)).toBe(0);
+  const last=list.locator(".library-row").last(),web=last.getByRole("button",{name:"Open on web",exact:true});
+  await expect(web).toBeInViewport();
+  const [buttonBox,fadeBox]=await Promise.all([web.boundingBox(),page.locator(".latest-missing-scroll > .edge-gradient-bottom").boundingBox()]);
+  expect(buttonBox!.y+buttonBox!.height).toBeLessThanOrEqual(fadeBox!.y+1);
+  await page.evaluate(()=>{(window as any).openedURLs=[];(window as any).__TAURI_INTERNALS__={invoke:async(command:string,args:any)=>{if(command==="open_external") (window as any).openedURLs.push(args.url);}};});
+  await web.click();
+  await expect.poll(()=>page.evaluate(()=>(window as any).openedURLs)).toHaveLength(1);
+  expect((await page.evaluate(()=>(window as any).openedURLs))[0]).toMatch(/^https:\/\/tidal\.com\/album\/\d+$/);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 test("local table sorting and filters are usable", async ({ page }) => {
   await page.goto("/");
@@ -904,7 +988,7 @@ test("dark settings fit a full window and retain defaults", async ({
     .getByRole("button", { name: "General", exact: true })
     .click();
   await expect(
-    page.getByRole("heading", { name: "General", exact: true }),
+    page.getByRole("main", { name: "General", exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Reset to default" }).click();
   await expect(page.getByRole("alert")).toHaveCount(0);
@@ -1060,7 +1144,9 @@ test("audit results survive navigation and unknown actions fail explicitly", asy
   expect(restored.result.rows).toEqual(first.result.rows);
   const status=first.result.rows[0].status;
   await columnOnly(page,"Status",[status]);
-  await expect(page.locator("tbody tr")).toHaveCount(first.result.rows.filter((row:any)=>row.status===status).length);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expandLocalRelease(page);
+  await expect(page.locator("tbody tr.child")).toHaveCount(first.result.rows.filter((row:any)=>row.status===status).length);
   expect((await rpc("job.start", {kind: "unknown_action"})).error).toBeTruthy();
 });
 
@@ -1154,23 +1240,71 @@ test("activity action filters search saved history beyond the recent page and ke
   await expect(page.getByRole("region",{name:"Downloads worker",exact:true})).toBeVisible();
 });
 
-test("display highlight preference changes focus palette", async ({page}) => {
+test("native macOS appearance follows theme contrast and focus while rapid settings preserve preferences", async ({page}) => {
+  // Deliberately distinct values prove the native palette is used instead of
+  // assuming fixed macOS colours or reusing the current appearance's colour.
+  const palette={
+    light:{accent:"#c94979",blue:"#236ecc",purple:"#ad49bc",pink:"#c94979",red:"#c84c44",orange:"#ed832b",yellow:"#d3ad1c",green:"#428d57",graphite:"#77818b",selection:"#f1bdd2",selection_text:"#24202a",table_header:"#f5f7f9"},
+    dark:{accent:"#ec77ac",blue:"#4791ec",purple:"#c779d8",pink:"#ec77ac",red:"#ec746c",orange:"#f1a347",yellow:"#eed557",green:"#7bc18a",graphite:"#a4aeba",selection:"#684256",selection_text:"#f5f8ff",table_header:"#23272b"},
+    light_high_contrast:{accent:"#a12b58",blue:"#164b9d",purple:"#7c2b88",pink:"#a12b58",red:"#98352e",orange:"#ad530d",yellow:"#86700e",green:"#285e37",graphite:"#46515f",selection:"#d7a0b8",selection_text:"#12101a",table_header:"#f7f9ff"},
+    dark_high_contrast:{accent:"#ffb7d8",blue:"#9bc6ff",purple:"#ecb6fb",pink:"#ffb7d8",red:"#ffaaa4",orange:"#ffd095",yellow:"#ffed9c",green:"#b2efbd",graphite:"#d7e0ed",selection:"#6f315a",selection_text:"#ffffff",table_header:"#13171b"},
+  };
+  let name="Pink",hex="#ec77ac",reads=0;
+  await rpc("settings.save",{section:"desktop",values:{highlight_colour:"orange",theme:"dark"}});
   await page.route("**/__test_rpc",async route => {
     const request = route.request().postDataJSON();
-    await route.fulfill({json:request.method === "appearance.accent" ? {result:{name:"Pink",hex:"#ff2d55"}} : await rpc(request.method,request.args)});
+    if(request.method === "appearance.accent") {
+      reads++;
+      await route.fulfill({json:{result:{name,hex,palettes:palette}}});
+    } else await route.fulfill({json:await rpc(request.method,request.args)});
   });
+  await page.emulateMedia({colorScheme:"dark",contrast:"no-preference"});
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"General",exact:true}).click();
-  const highlight = page.getByLabel("Highlight colour");
-  await expect(highlight).toHaveValue("system");
-  await expect(highlight).toContainText("System (Pink)");
-  await expect(highlight.locator("option")).toHaveText(["System (Pink)","Multicolour","Blue","Purple","Pink","Red","Orange","Yellow","Green","Graphite"]);
-  await expect.poll(() => page.locator("html").evaluate(element => getComputedStyle(element).getPropertyValue("--accent").trim())).toBe("#ff2d55");
+  const theme=page.getByLabel("Colour theme");
+  const pageSize=page.getByLabel("Items per page");
+  const property=(key:string)=>page.locator("html").evaluate((element,key)=>getComputedStyle(element).getPropertyValue(key).trim(),key);
+  const accent=()=>property("--accent");
+  await expect(page.getByLabel("Highlight colour")).toHaveCount(0);
+  expect(await page.locator("html").getAttribute("data-highlight")).toBeNull();
+  // An old app-specific colour preference must not override macOS.
+  await expect.poll(accent).toBe(palette.dark.accent);
   await expect(page.getByLabel("Catalogue market")).toHaveCount(0);
-  await page.getByLabel("Highlight colour").selectOption("graphite");
-  await expect(page.locator("html")).toHaveAttribute("data-highlight", "graphite");
-  await page.getByLabel("Highlight colour").selectOption("orange");
-  await expect.poll(() => page.locator("html").evaluate(element => getComputedStyle(element).getPropertyValue("--accent").trim())).toBe("#ff9500");
+  for(const mode of ["light","dark"] as const) {
+    await theme.selectOption(mode);
+    const size=mode === "light" ? "100" : "250";
+    // Back-to-back saves used to overwrite the theme with an older snapshot.
+    await pageSize.selectOption(size);
+    await expect(theme).toHaveValue(mode);
+    await expect(pageSize).toHaveValue(size);
+    await expect(page.locator("html")).toHaveAttribute("data-theme",mode);
+    await expect.poll(async()=> (await rpc("settings")).result.general.theme).toBe(mode);
+    await expect.poll(async()=> String((await rpc("settings")).result.general.page_size)).toBe(size);
+    await expect.poll(accent).toBe(palette[mode].accent);
+    await expect.poll(()=>property("--table-header")).toBe(palette[mode].table_header);
+    await expect.poll(()=>property("--system-selection")).toBe(palette[mode].selection);
+    await page.emulateMedia({contrast:"more"});
+    await expect.poll(accent).toBe(palette[`${mode}_high_contrast`].accent);
+    await expect.poll(()=>property("--table-header")).toBe(palette[`${mode}_high_contrast`].table_header);
+    await page.emulateMedia({contrast:"no-preference"});
+    await expect.poll(accent).toBe(palette[mode].accent);
+  }
+  // System appearance follows OS Light/Dark without replacing the saved choice.
+  await theme.selectOption("system");
+  for(const mode of ["light","dark"] as const) {
+    await page.emulateMedia({colorScheme:mode});
+    await expect.poll(accent).toBe(palette[mode].accent);
+  }
+  // Returning focus refreshes the native accent without an app preference.
+  await theme.selectOption("dark");
+  await expect.poll(accent).toBe(palette.dark.accent);
+  palette.dark.accent="#62a4ee";
+  name="Blue";hex=palette.dark.accent;
+  const previousReads=reads;
+  await page.evaluate(()=>window.dispatchEvent(new Event("focus")));
+  await expect.poll(()=>reads).toBeGreaterThan(previousReads);
+  await expect.poll(accent).toBe(palette.dark.accent);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("startup always shows overview and does not replay a historical failure", async ({ page }) => {
@@ -1182,7 +1316,7 @@ test("startup always shows overview and does not replay a historical failure", a
     await route.fulfill({json:response});
   });
   await page.goto("/");
-  await expect(page.getByRole("heading", {name:"Overview",exact:true})).toBeVisible();
+  await expect(page.getByRole("main", {name:"Overview",exact:true})).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
   const missing = await rpc("table", {route:"missing",timeline:"All missing releases",status:"all",limit:20,artist_scope:"My album artists",recommendation:"Recommended and potential"});
   await expect(page.locator(".metric").filter({hasText:"Missing releases"})).toContainText(String(missing.result.total));
@@ -1205,6 +1339,7 @@ test("libraries and local tables load while dashboard statistics are still pendi
     await expect(page.locator(".metric").filter({hasText:"Local tracks"})).toContainText("2 / 2");
     await expect(page.locator(".metric").filter({hasText:"Linked releases"}).locator("strong")).toHaveText("—");
     await page.locator(".metric").filter({hasText:"Local tracks"}).click();
+    await expandLocalRelease(page);
     await expect(page.locator("tbody")).toContainText("First Light");
     expect(reads).toBe(1);
   } finally { releaseStats(); }
@@ -1264,7 +1399,7 @@ test("automatic correction previews can be applied and all-files view remains av
   await expect(correctionMenu.getByRole("menuitemradio",{name:"Track & disc numbers",exact:true})).toHaveAttribute("aria-checked","true");
   await correctionMenu.press("Escape");
   await expect(page.getByRole("button",{name:/Review & apply/})).toHaveCount(1);
-  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
   await page.getByRole("checkbox",{name:"Select visible rows"}).check();
   await page.getByRole("button",{name:/Review & apply/}).click();
   await expect(page.getByRole("dialog").getByRole("table",{name:"Tag comparison"}).first()).toBeVisible();
@@ -1274,7 +1409,119 @@ test("automatic correction previews can be applied and all-files view remains av
   await expect(page.locator("tbody tr")).toHaveCount(0);
   await expect(page.getByRole("checkbox", {name:"Affected files only",exact:true})).toHaveCount(0);
   await page.getByRole("button", {name:"Reset column filters",exact:true}).click();
-  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+});
+
+test("local actions group releases, retain scoped selection and apply only the reviewed real file", async ({page}) => {
+  const root=join(folder,"music"), first=join(root,"First Light.flac"), second=join(root,"Drift.flac");
+  const indexed=(await rpc("table",{route:"files",root,limit:100})).result.rows;
+  expect(indexed).toHaveLength(4);
+  const originalBytes=new Map<string,Buffer>(indexed.map((row:any)=>[row.id,readFileSync(row.id)]));
+  const requests:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    requests.push(request);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  // A small page proves that releases, rather than individual files, are paged.
+  await rpc("settings.save",{section:"desktop",values:{page_size:1}});
+  await page.goto("/");
+  const sidebar=page.locator("aside");
+  await sidebar.getByRole("button",{name:"Correct tags",exact:true}).click();
+  await actionOption(page,"Choose correction","Track & disc numbers","menuitemradio");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–1 of 2 releases");
+  const grouped=(await rpc("table",{route:"correct",root,action:"numbers",group_releases:true,limit:1,sort:"release",direction:"asc"})).result;
+  expect(grouped.total).toBe(2);
+  expect(grouped.release_total).toBe(2);
+  expect(grouped.track_total).toBe(4);
+  expect(grouped.rows[0].track_ids.slice().sort()).toEqual([first,second].sort());
+  expect(grouped.rows[0].item).toBeUndefined();
+  const flatPreview=(await rpc("preview",{id:grouped.preview_id})).result;
+  expect(flatPreview.rows).toHaveLength(4);
+  expect(flatPreview.rows.every((row:any)=>!row.file_group && row.id.endsWith(".flac"))).toBe(true);
+
+  const parent=page.getByRole("checkbox",{name:"Select Blue Hours",exact:true});
+  await parent.check();
+  const firstRow=await localFileRow(page,"First Light");
+  const secondCheck=page.getByRole("checkbox",{name:"Select track Drift",exact:true});
+  await expect(firstRow.getByRole("checkbox")).toBeChecked();
+  await expect(secondCheck).toBeChecked();
+  await parent.uncheck();
+  await expect(firstRow.getByRole("checkbox")).not.toBeChecked();
+  await expect(secondCheck).not.toBeChecked();
+  await parent.check();
+  await expect(firstRow.getByRole("checkbox")).toBeChecked();
+  await expect(secondCheck).toBeChecked();
+  const trackColumn=page.getByRole("columnheader").filter({has:page.getByRole("button",{name:"Tracks",exact:true})});
+  const [positionBox,tracksBox]=await Promise.all([firstRow.locator("td.track-position").boundingBox(),trackColumn.boundingBox()]);
+  expect(positionBox!.x).toBeCloseTo(tracksBox!.x,0);
+  await secondCheck.uncheck();
+  await expect(parent).toHaveJSProperty("indeterminate",true);
+  await expect(page.getByRole("button",{name:/Review & apply/})).toHaveText("Review & apply (1)");
+  await page.getByRole("button",{name:"Next",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select Night Maps",exact:true})).toBeVisible();
+  await page.getByRole("button",{name:"Previous",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await expect(secondCheck).not.toBeChecked();
+  await columnOnly(page,"Release",["Blue Hours"]);
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("of 1 releases");
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await expect(parent).toHaveJSProperty("indeterminate",true);
+  await page.getByRole("button",{name:"Release",exact:true}).click();
+  if(process.env.TIBRARY_SCREENSHOTS) await page.screenshot({path:"/tmp/tibrary-correct-numbers-0.9.21.png"});
+
+  await page.getByRole("button",{name:"Actions for Blue Hours",exact:true}).click();
+  await page.getByRole("menuitem",{name:"View metadata / match details",exact:true}).click();
+  const releaseReview=page.getByRole("dialog").filter({has:page.getByRole("heading",{name:"Release review",exact:true})});
+  await expect(releaseReview.getByRole("table",{name:"Files in Blue Hours",exact:true}).locator("tbody tr")).toHaveCount(2);
+  await expect(releaseReview).toContainText("First Light");
+  await expect(releaseReview).toContainText("Drift");
+  await releaseReview.getByRole("button",{name:"Done",exact:true}).click();
+  await expect(parent).toHaveJSProperty("indeterminate",true);
+  await page.getByRole("button",{name:/Review & apply/}).click();
+  const review=page.getByRole("dialog").filter({has:page.getByRole("heading",{name:"Review changes",exact:true})});
+  await expect(review.getByRole("table",{name:"Tag comparison",exact:true})).toHaveCount(1);
+  await expect(review).toContainText("First Light.flac");
+  await expect(review).not.toContainText("Drift.flac");
+  await review.getByRole("button",{name:"Confirm & continue",exact:true}).click();
+  await expect.poll(async()=>(await rpc("job.status")).result?.job?.status).toBe("complete");
+  const applied=requests.find(request=>request.method==="job.start" && request.args.kind==="apply");
+  expect(applied.args.args.ids).toEqual([first]);
+  const refreshed=(await rpc("detail",{path:first})).result;
+  expect(refreshed.tags.tracknumber).toEqual(["01"]);
+  // Detail reads the indexed database metadata, independently of media reads.
+  expect(refreshed.metadata.tags.tracknumber).toEqual(["01"]);
+  expect(readFileSync(first).equals(originalBytes.get(first)!)).toBe(false);
+  for(const [path,bytes] of originalBytes) if(path!==first) expect(readFileSync(path).equals(bytes)).toBe(true);
+
+  await actionOption(page,"Choose correction","Dates","menuitemradio");
+  await expect(page.getByRole("button",{name:/Review & apply/})).toBeDisabled();
+  await page.getByRole("button",{name:"Reset column filters",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).not.toBeChecked();
+  await actionOption(page,"Choose correction","Track & disc numbers","menuitemradio");
+  await expect(page.locator("tbody tr.child")).toHaveCount(1);
+  await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).toBeVisible();
+
+  // Other local tables use the same cached hierarchy; navigation cannot start
+  // a metadata download or mutate any of the disposable source files.
+  const beforeNavigation=requests.filter(request=>request.method==="job.start").length;
+  for(const [route,name] of [["organise","Organise files"],["metadata","Add missing tags"],["artwork","Fix artwork"],["mqa","MQA audit"]]) {
+    await sidebar.getByRole("button",{name,exact:true}).click();
+    await expandLocalRelease(page);
+    const result=(await rpc("table",{route,root,group_releases:true,limit:100})).result;
+    expect(result.total).toBe(2);
+    expect(result.track_total).toBe(4);
+    expect(result.rows.every((row:any)=>row.file_group && row.children.every((track:any)=>track.id.endsWith(".flac")))).toBe(true);
+    await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
+    await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).toBeVisible();
+  }
+  expect(requests.filter(request=>request.method==="job.start")).toHaveLength(beforeNavigation);
+  expect(requests.filter(request=>request.method==="table" && ["correct","organise","metadata","artwork","mqa"].includes(request.args.route)).every(request=>request.args.group_releases===true)).toBe(true);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("organise files previews and applies only to the disposable library", async ({page}) => {
@@ -1283,7 +1530,7 @@ test("organise files previews and applies only to the disposable library", async
   await page.getByRole("button",{name:"Preview moves"}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
   await expect(page.locator("tbody tr").first()).toBeVisible();
-  await page.locator("tbody tr").first().dblclick();
+  await (await localFileRow(page,"First Light")).dblclick();
   await expect(page.getByRole("dialog")).toContainText("Proposed folder layout");
   await expect(page.getByRole("dialog")).toContainText("Proposed path");
   if (process.env.TIBRARY_FOLDER_SCREENSHOT) await page.screenshot({path:"/tmp/tibrary-folder-preview.png"});
@@ -1315,8 +1562,9 @@ test("MQA scan scopes check the relevant files and selected scans preserve other
   await expect(page.locator("tbody").getByText("Not audited").first()).toBeVisible();
   await expect(page.getByRole("checkbox",{name:"Affected files only",exact:true})).toHaveCount(0);
   const scan=page.getByRole("button",{name:"Scan selected tracks",exact:true});
-  const firstCheck=page.locator("tbody tr").filter({hasText:"First Light"}).getByRole("checkbox");
-  const secondCheck=page.locator("tbody tr").filter({hasText:"Drift"}).getByRole("checkbox");
+  await expandLocalRelease(page);
+  const firstCheck=page.getByRole("checkbox",{name:"Select track First Light",exact:true});
+  const secondCheck=page.getByRole("checkbox",{name:"Select track Drift",exact:true});
   await expect(firstCheck).toBeChecked();
   await expect(secondCheck).toBeChecked();
   await expect(scan).toContainText("2");
@@ -1335,6 +1583,7 @@ test("MQA scan scopes check the relevant files and selected scans preserve other
   // Both scopes read the same audit cache; selecting a scope never scans audio.
   await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
   await page.locator("aside").getByRole("button",{name:"MQA audit",exact:true}).click();
+  await expandLocalRelease(page);
   await expect(firstCheck).not.toBeChecked();
   await expect(secondCheck).toBeChecked();
   await page.getByRole("button",{name:"Choose scan scope",exact:true}).click();
@@ -1360,7 +1609,7 @@ test("MQA scan scopes check the relevant files and selected scans preserve other
   await page.getByRole("button",{name:"Check local duplicates",exact:true}).click();
   await expect.poll(async () => (await rpc("job.status")).result?.job?.status).toBe("complete");
   await expect(page.getByRole("button",{name:"Check local duplicates",exact:true})).toBeVisible();
-  await expect(page.getByRole("heading",{name:"Local duplicates",exact:true})).toBeVisible();
+  await expect(page.getByRole("main",{name:"Local duplicates",exact:true})).toBeVisible();
 });
 
 test("MQA replacement actions use selected signal tracks across pages and remain separate from scans", async ({page}) => {
@@ -1380,7 +1629,8 @@ test("MQA replacement actions use selected signal tracks across pages and remain
       }
       const selected=filteredMockRows(rows,args).filter(row=>!args.search || `${row.artist} ${row.release} ${row.title}`.toLowerCase().includes(args.search.toLowerCase()));
       selected.sort((a:any,b:any)=>String(a[args.sort]||"").localeCompare(String(b[args.sort]||""))*(args.direction==="desc"?-1:1));
-      await route.fulfill({json:{result:{rows:selected.slice(args.offset||0,(args.offset||0)+(args.limit||50)),total:selected.length}}});return;
+      const pageRows=selected.slice(args.offset||0,(args.offset||0)+(args.limit||50));
+      await route.fulfill({json:{result:{rows:args.group_releases ? pageRows.map(row=>({...row,id:`local-file-release:${row.release}`,file_group:true,title:"1 file",tracks:1,track_ids:[row.id],children:[row]})) : pageRows,total:selected.length,track_total:selected.length}}});return;
     }
     if(request.method==="mqa.selection") {
       const ids:string[]=args.scope==="all" ? rows.map(row=>row.id) : args.scope==="unscanned" ? [] : args.ids||[];
@@ -1421,7 +1671,8 @@ test("MQA replacement actions use selected signal tracks across pages and remain
   await expect(scan).toContainText("54");
   await expect(queue).toContainText("0");
   await expect(queue).toBeDisabled();
-  const unlinked=page.locator("tbody tr").filter({hasText:"Track 0"}).getByRole("checkbox");
+  await expandLocalRelease(page,"Release 00");
+  const unlinked=page.getByRole("checkbox",{name:"Select track Track 0",exact:true});
   await expect(unlinked).toBeChecked();
   await unlinked.uncheck();
   await expect(match).toBeDisabled();
@@ -1755,7 +2006,7 @@ test("real table facets filter before paging and share checkbox rules across wor
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await sidebar.getByRole("button",{name:"Correct tags",exact:true}).click();
   await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
-  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
   const tagMenu=await columnMenu(page,"Proposed tag changes");
   await expect(tagMenu.getByRole("menuitemcheckbox").first()).toBeVisible();
   expect(await tagMenu.getByRole("menuitemcheckbox").count()).toBeGreaterThan(0);
@@ -1767,7 +2018,7 @@ test("real table facets filter before paging and share checkbox rules across wor
   await expect(columnValue(artistMenu,"North Assembly")).toHaveAttribute("aria-checked","false");
   await columnValue(artistMenu,"North Assembly").click();
   await artistMenu.press("Escape");
-  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody tr")).toHaveCount(1);
   await expect(page.getByRole("combobox",{name:"Table filter",exact:true})).toHaveCount(0);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
