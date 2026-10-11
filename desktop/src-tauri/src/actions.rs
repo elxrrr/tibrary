@@ -58,6 +58,63 @@ pub async fn files(db: &TursoDb, root: &str) -> Result<Vec<LocalFileRecord>, Str
     Ok(out)
 }
 
+fn require_duplicate_quality(root: &str, indexed: &[LocalFileRecord]) -> Result<(), String> {
+    let missing_quality = indexed.iter().filter(|file| file.present).any(|file| {
+        std::path::Path::new(&file.path).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
+            && file.metadata.as_ref().is_none_or(|metadata|
+                metadata["sample_rate"].as_u64().unwrap_or(0) == 0 || metadata["bit_depth"].as_u64().unwrap_or(0) < 8)
+    });
+    if missing_quality && crate::library_access::require_library(root).is_err() {
+        return Err("Reconnect the library once to cache audio quality before comparing local duplicates. Saved duplicate results remain available.".into());
+    }
+    Ok(())
+}
+
+async fn duplicate_review_clusters(db: &TursoDb, root: &str, indexed: &[LocalFileRecord]) -> Result<Vec<crate::duplicates::DuplicateCluster>, String> {
+    let unavailable = match require_duplicate_quality(root, indexed) {
+        Ok(()) => return Ok(crate::duplicates::find_duplicate_clusters(indexed)),
+        Err(error) => error,
+    };
+    let manifest = crate::duplicates::manifest_fingerprint(indexed);
+    let current = db.get_preference(&format!("desktop-local-manifest:{root}")).await?
+        .as_ref().and_then(Value::as_str) == Some(manifest.as_str());
+    if current {
+        if let Some(saved) = db.get_preference(&format!("desktop-local:{root}")).await?.and_then(|value| value.as_array().cloned()) {
+            let releases = crate::duplicates::parse_local_releases(indexed);
+            let mut clusters = Vec::new();
+            for row in saved {
+                let master = releases.iter().find(|release| Some(release.folder.as_str()) == row["path"].as_str())
+                    .ok_or("Saved duplicate review is incomplete; reconnect the library to check again")?.clone();
+                let mut redundant = Vec::new();
+                for child in row["children"].as_array().ok_or("Saved duplicate review is incomplete; reconnect the library to check again")? {
+                    redundant.push(releases.iter().find(|release| Some(release.folder.as_str()) == child["path"].as_str())
+                        .ok_or("Saved duplicate review is incomplete; reconnect the library to check again")?.clone());
+                }
+                clusters.push(crate::duplicates::DuplicateCluster {
+                    cluster_id: row["id"].as_str().ok_or("Saved duplicate group has no ID")?.to_owned(),
+                    master, is_chained: row["status"] == "Chained duplicate", chain_summary: String::new(),
+                    total_redundant_tracks: redundant.iter().map(|release| release.tracks.len()).sum(),
+                    total_recoverable_bytes: redundant.iter().flat_map(|release| &release.tracks).map(|track| track.size).sum(),
+                    redundant,
+                });
+            }
+            return Ok(clusters);
+        }
+    }
+    Err(unavailable)
+}
+
+async fn remove_reviewed_duplicate(db: &TursoDb, root: &str, path: &str) -> Result<(), String> {
+    crate::library_access::require_library(root)?;
+    if !std::fs::symlink_metadata(path).map_err(|error| format!("Reviewed duplicate is unavailable; cached file retained: {error}"))?.is_file() {
+        return Err("Reviewed duplicate is no longer a regular file; cached file retained".into());
+    }
+    crate::duplicates::trash_file_or_directory(path).await?;
+    // Finder may report success or time out while the drive is disconnecting.
+    crate::library_access::require_library(root)?;
+    db.remove_local_file(path).await
+}
+
 /// Rebuild the visible audit list from indexed files and prior per-file results.
 /// Changed files become "Not audited" until the user runs the audio inspection.
 pub async fn cached_mqa_rows(
@@ -825,6 +882,7 @@ pub async fn execute(
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("Choose a registered library first")?;
+    if crate::library_access::requires_local_files(kind) { crate::library_access::require_library(root)?; }
     let indexed = files(db, root).await?;
     let ids: HashSet<String> = args["ids"]
         .as_array()
@@ -842,7 +900,7 @@ pub async fn execute(
         if args["scope"] == "remote" {
             return Err("Download replacements first, then review local duplicates".into());
         }
-        let clusters = crate::duplicates::find_duplicate_clusters(&indexed);
+        let clusters = duplicate_review_clusters(db, root, &indexed).await?;
         let mut rows = vec![];
         let mut count = 0;
         for cluster in clusters {
@@ -937,8 +995,7 @@ pub async fn execute(
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            crate::duplicates::trash_file_or_directory(&path).await?;
-            db.remove_local_file(&path).await?;
+            remove_reviewed_duplicate(db, root, &path).await?;
             completed += 1;
             state.progress_for(
                 kind,
@@ -1216,6 +1273,7 @@ pub async fn execute(
                     return Ok(json!({"opportunities":rows.len(),"reused":true}));
                 }
             }
+            require_duplicate_quality(root, &indexed)?;
             state.progress_for(
                 kind,
                 &format!(
@@ -1230,6 +1288,7 @@ pub async fn execute(
             let clusters=tokio::task::spawn_blocking(move ||crate::duplicates::find_duplicate_clusters_with_progress(&files,&cancelled,|done,total|backend.progress_for(&task,&format!("Comparing local releases · {done}/{total} artists"))))
                 .await.map_err(|e|e.to_string())?;
             if cancel.load(Ordering::Relaxed) {return Ok(json!({"cancelled":true}));}
+            require_duplicate_quality(root, &indexed)?;
             let rows = crate::duplicates::clusters_to_group_rows(&clusters);
             db.set_preference(&format!("desktop-local:{root}"), &json!(rows))
                 .await?;
@@ -1814,6 +1873,8 @@ pub async fn execute(
                 let path=file.path.clone();
                 let result = tokio::task::spawn_blocking(move ||serde_json::to_value(crate::mqa::audit_file(std::path::Path::new(&path))))
                     .await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+                // Losing a drive during the read must not replace a saved audit with an I/O error.
+                crate::library_access::require_library(root)?;
                 inspected += 1;
                 db.set_preference(&key, &json!({"size":file.size,"mtime":file.mtime,"result":result})).await?;
             }
@@ -1839,6 +1900,80 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn offline_duplicate_checks_keep_saved_results_and_reviews_without_live_quality() {
+        let temp = std::env::temp_dir().join(format!("offline-duplicates-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("drive");
+        let root_str = root.to_str().unwrap();
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        for album in ["Original", "Copy"] {
+            let path = root.join(album).join("song.flac");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+            // Model a library indexed before audio quality was persisted.
+            db.apply_file_update(path.to_str().unwrap(), path.to_str().unwrap(), root_str,
+                &json!({"title":"Song","artist":"Artist","album":album,"duration":1.0,"isrc":"TEST1"}), 123, 456).await.unwrap();
+        }
+        let input = json!({"root":root});
+        let initial = execute(&db, &backend, "local_duplicates", &input, Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert_eq!(initial["opportunities"], 1);
+        let saved = db.get_preference(&format!("desktop-local:{root_str}")).await.unwrap().unwrap();
+        std::fs::rename(&root, temp.join("unplugged")).unwrap();
+        let reused = execute(&db, &backend, "local_duplicates", &input, Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["opportunities"], 1);
+        let review = execute(&db, &backend, "review_consolidation", &json!({"root":root,"ids":[saved[0]["id"]]}),
+            Arc::new(AtomicBool::new(false))).await.unwrap();
+        let preview = backend.previews.lock().unwrap()[review["preview_id"].as_str().unwrap()].clone();
+        assert_eq!(preview["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(preview["rows"][0]["source_tracks"].as_array().unwrap().len(), 1);
+        assert_eq!(preview["rows"][0]["keeper_tracks"].as_array().unwrap().len(), 1);
+        let forced = execute(&db, &backend, "local_duplicates", &json!({"root":root,"force":true}),
+            Arc::new(AtomicBool::new(false))).await.unwrap_err();
+        assert!(forced.contains("Reconnect"));
+        assert_eq!(db.get_preference(&format!("desktop-local:{root_str}")).await.unwrap(), Some(saved.clone()));
+
+        // Newer cached quality supports a fresh comparison with the drive absent.
+        for file in files(&db, root_str).await.unwrap() {
+            let mut metadata = file.metadata.unwrap();
+            metadata["sample_rate"] = json!(44_100);
+            metadata["bit_depth"] = json!(16);
+            db.apply_file_update(&file.path, &file.path, root_str, &metadata, file.size, file.mtime).await.unwrap();
+        }
+        let fresh = execute(&db, &backend, "local_duplicates", &json!({"root":root,"force":true}),
+            Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert_eq!(fresh["opportunities"], 1);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_removed_after_review_or_disconnected_before_trash_keeps_cache() {
+        let temp = std::env::temp_dir().join(format!("reviewed-trash-disconnect-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("song.flac");
+        let root_str = root.to_str().unwrap();
+        let path_str = path.to_str().unwrap();
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        std::fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+        db.apply_file_update(path_str, path_str, root_str, &json!({"title":"Song"}), 1, 2).await.unwrap();
+        db.save_track_link(path_str, "GB", "[0,0,1,2]", r#"{"status":"linked"}"#).await.unwrap();
+        // The reviewed file existed at preflight; the drive vanishes before its turn.
+        assert!(std::fs::metadata(&path).unwrap().is_file());
+        std::fs::rename(&root, temp.join("unplugged")).unwrap();
+        assert!(remove_reviewed_duplicate(&db, root_str, path_str).await.is_err());
+        std::fs::rename(temp.join("unplugged"), &root).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(remove_reviewed_duplicate(&db, root_str, path_str).await.is_err());
+        assert!(crate::duplicates::trash_file_or_directory(path_str).await.is_err());
+        assert_eq!(files(&db, root_str).await.unwrap().len(), 1);
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT COUNT(*) FROM track_links WHERE path=?", (path_str,)).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 1);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
 
     #[tokio::test]
     async fn mqa_scope_uses_current_audits_and_only_chosen_market_links() {

@@ -31,6 +31,7 @@ pub fn write_tags(path: &Path, updates: &HashMap<String, String>) -> Result<(), 
         for (key, value) in updates {
             let lower = key.to_ascii_lowercase();
             let key = match lower.as_str() {
+                "track" => "TITLE",
                 "album_artist" => "ALBUMARTIST",
                 "track_number" => "TRACKNUMBER",
                 "track_total" => "TRACKTOTAL",
@@ -38,6 +39,7 @@ pub fn write_tags(path: &Path, updates: &HashMap<String, String>) -> Result<(), 
                 "disc_total" => "DISCTOTAL",
                 "year" => "DATE",
                 "initial_key" | "key" => "INITIALKEY",
+                "recordlabel" => "LABEL",
                 _ => key,
             }
             .to_ascii_uppercase();
@@ -77,7 +79,7 @@ pub fn write_tags(path: &Path, updates: &HashMap<String, String>) -> Result<(), 
             "tracktotal" | "track_total" => Some(ItemKey::TrackTotal),
             "discnumber" | "disc_number" => Some(ItemKey::DiscNumber),
             "disctotal" | "disc_total" => Some(ItemKey::DiscTotal),
-            "year" | "date" => Some(ItemKey::Year),
+            "year" | "date" => Some(ItemKey::RecordingDate),
             "genre" => Some(ItemKey::Genre),
             "bpm" => Some(ItemKey::Bpm),
             "initialkey" | "initial_key" | "key" => Some(ItemKey::InitialKey),
@@ -110,6 +112,121 @@ mod tests {
     use lofty::file::TaggedFileExt;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn flac_alias_updates_and_deletions_preserve_other_tags_and_audio() {
+        use lofty::file::AudioFile;
+        let path = std::env::temp_dir().join(format!("tag-aliases-{}.FLAC", uuid::Uuid::new_v4()));
+        fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+        let samples = |path: &Path| claxon::FlacReader::open(path).unwrap()
+            .samples().collect::<Result<Vec<_>, _>>().unwrap();
+        let original_audio = samples(&path);
+        write_tags(&path, &HashMap::from([
+            ("title".into(), "Old title".into()),
+            ("label".into(), "Old label".into()),
+            ("genre".into(), "Electronic".into()),
+            ("PROVIDER_CUSTOM_ID".into(), "001234".into()),
+        ])).unwrap();
+        write_tags(&path, &HashMap::from([
+            ("track".into(), "New title".into()),
+            ("recordlabel".into(), "New label".into()),
+            ("album_artist".into(), "Album artist".into()),
+            ("track_number".into(), "04".into()),
+            ("disc_number".into(), "02".into()),
+            ("track_total".into(), "12".into()),
+            ("disc_total".into(), "03".into()),
+            ("year".into(), "2025-03-04".into()),
+            ("key".into(), "8A".into()),
+            ("GENRE".into(), " \t ".into()),
+        ])).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let audio = lofty::flac::FlacFile::read_from(&mut file,
+            lofty::config::ParseOptions::default().implicit_conversions(false)).unwrap();
+        let comments = audio.vorbis_comments().unwrap();
+        for (key, expected) in [
+            ("TITLE", "New title"), ("LABEL", "New label"), ("ALBUMARTIST", "Album artist"),
+            ("TRACKNUMBER", "04"), ("DISCNUMBER", "02"), ("TRACKTOTAL", "12"),
+            ("DISCTOTAL", "03"), ("DATE", "2025-03-04"), ("INITIALKEY", "8A"),
+            ("PROVIDER_CUSTOM_ID", "001234"),
+        ] {
+            assert_eq!(comments.get(key), Some(expected), "Tag {key}");
+        }
+        assert_eq!(comments.get("GENRE"), None);
+        assert_eq!(comments.get("TRACK"), None);
+        assert_eq!(comments.get("RECORDLABEL"), None);
+        assert_eq!(samples(&path), original_audio);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn empty_updates_leave_bytes_unchanged_and_bad_audio_returns_an_error() {
+        let path = std::env::temp_dir().join(format!("tag-errors-{}.flac", uuid::Uuid::new_v4()));
+        let invalid = b"This is not an audio file";
+        fs::write(&path, invalid).unwrap();
+        write_tags(&path, &HashMap::new()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        assert!(write_tags(&path, &HashMap::from([("title".into(), "Title".into())])).is_err());
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mp4_tag_updates_dates_and_deletions_preserve_encoded_audio() {
+        let path = std::env::temp_dir().join(format!("mp4-tag-edits-{}.m4a", uuid::Uuid::new_v4()));
+        let fixture = include_bytes!("../tests/fixtures/silence.m4a");
+        fs::write(&path, fixture).unwrap();
+        let audio_payload = |bytes: &[u8]| {
+            let mut offset = 0;
+            let mut payload = Vec::new();
+            while offset + 8 <= bytes.len() {
+                let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                let (size, header) = match size {
+                    0 => (bytes.len() - offset, 8),
+                    1 => (u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()) as usize, 16),
+                    _ => (size, 8),
+                };
+                assert!(size >= header && offset + size <= bytes.len());
+                if &bytes[offset + 4..offset + 8] == b"mdat" {
+                    payload.extend_from_slice(&bytes[offset + header..offset + size]);
+                }
+                offset += size;
+            }
+            assert!(!payload.is_empty(), "Fixture must contain encoded audio");
+            payload
+        };
+        let before = audio_payload(fixture);
+        write_tags(&path, &HashMap::from([
+            ("track".into(), "New title".into()), ("artist".into(), "Track artist".into()),
+            ("album_artist".into(), "Album artist".into()), ("album".into(), "Release".into()),
+            ("track_number".into(), "04".into()), ("track_total".into(), "12".into()),
+            ("disc_number".into(), "2".into()), ("disc_total".into(), "3".into()),
+            ("year".into(), "2025-03-04".into()), ("bpm".into(), "123.5".into()),
+            ("initial_key".into(), "8A".into()), ("genre".into(), "Electronic".into()),
+            ("isrc".into(), "GBABC2500001".into()), ("recordlabel".into(), "Record label".into()),
+            ("copyright".into(), "Copyright holder".into()),
+        ])).unwrap();
+        let tagged = Probe::open(&path).unwrap().read().unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        for (key, expected) in [
+            (ItemKey::TrackTitle, "New title"), (ItemKey::TrackArtist, "Track artist"),
+            (ItemKey::AlbumArtist, "Album artist"), (ItemKey::AlbumTitle, "Release"),
+            (ItemKey::TrackNumber, "4"), (ItemKey::TrackTotal, "12"),
+            (ItemKey::DiscNumber, "2"), (ItemKey::DiscTotal, "3"),
+            (ItemKey::RecordingDate, "2025-03-04"), (ItemKey::Bpm, "123.5"),
+            (ItemKey::InitialKey, "8A"), (ItemKey::Isrc, "GBABC2500001"),
+            (ItemKey::Label, "Record label"), (ItemKey::CopyrightMessage, "Copyright holder"),
+        ] {
+            assert_eq!(tag.get_string(key.clone()), Some(expected), "{key:?}");
+        }
+        write_tags(&path, &HashMap::from([("genre".into(), " ".into()), ("key".into(), "".into())])).unwrap();
+        let tagged = Probe::open(&path).unwrap().read().unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(tag.get_string(ItemKey::Genre), None);
+        assert_eq!(tag.get_string(ItemKey::InitialKey), None);
+        assert_eq!(tag.get_string(ItemKey::TrackTitle), Some("New title"));
+        assert_eq!(audio_payload(&fs::read(&path).unwrap()), before);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn test_write_and_read_tags() {

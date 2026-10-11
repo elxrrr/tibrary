@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.26** · [Setup and screenshots](../../README.md)
+Version **0.9.27** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -31,6 +31,8 @@ Track/disc matching treats `01` and `1` equally. Number corrections use padded t
 Duplicate removal uses the system Trash and preserves the chosen keeper. MQA signals are audit evidence; replacement is a separate action. In MQA audit, use the arrow beside **Scan** to check **All releases** or **Unscanned releases only** (new or changed FLAC tracks). Scope choices change checkmarks; **Scan** inspects just the checked tracks and preserves other saved results. Individual checkmarks and selections across pages are respected. **Find online matches** saves links for selected MQA tracks that need a match. **Queue replacements** adds only selected, matched MQA tracks to the lossless download queue. Files change only when you approve and download those replacements. Review proposed changes before applying them.
 
 At launch, Tibrary checks each registered library for added, changed or removed files. Unchanged tags are reused. Files changed through the app update the shared index and dependent views immediately; navigating between pages does not reread tags. Make external edits while Tibrary is closed. Keep the database: it holds links, cached metadata and saved decisions.
+
+A disconnected removable library stays available from its saved index. Browse releases, inspect cached tags and matches, update online metadata, and queue or download music to a connected folder. File scans, tag writes, moves, duplicate removal and replacements into the missing drive are disabled. Open reviews update when the drive disconnects or reconnects; startup checks skip disconnected libraries without removing their cached tracks or links. Download checks use the actual approved queue destinations, including replacement paths. Older indices fill missing sample-rate and bit-depth information once from connected files without rereading tags; saved quality then supports duplicate comparisons while disconnected.
 
 Reviewed moves keep their links and ignore choices; equivalent number formatting does not invalidate a recording link. Scans exclude temporary working audio files. If a file/tag update cannot be indexed, the original path and tags are restored.
 
@@ -134,19 +136,23 @@ The macOS database is `~/Library/Application Support/Tibrary/library.sqlite3`. S
 
 ### Checks
 
-From the repository root:
+Install the development dependencies and WebKit once, then run the repeatable suite:
 
 ```sh
 npm --prefix desktop ci
-npm --prefix desktop run build
-npm --prefix desktop test
-cargo test --manifest-path desktop/src-tauri/Cargo.toml --bin tibrary
-cargo build --manifest-path desktop/src-tauri/Cargo.toml --bin tibrary
 (cd desktop && npx playwright install webkit)
-npm --prefix desktop run test:e2e
+sh desktop/tools/check.sh
 ```
 
-WebKit tests use the debug Rust executable with temporary databases and files. Authenticated live download tests are ignored by default and must be run deliberately with disposable destinations. Passing automated tests does not verify every live catalogue item or native macOS interaction.
+The suite builds the app and checks Rust services, frontend state, and WebKit workflows against temporary files and databases. It covers cache reuse, linking, recommendation filters, queue selection, HTTP retry/cancellation, parallel transfers, FLAC/M4A tag preservation, folder moves, duplicate removal, rollback, and unplug/reconnect behavior. FFmpeg is required for the lossless remux checks. Mock HTTP servers require localhost access. No personal library is used.
+
+The separate live check uses the signed-in subscriber account, downloads one track into a temporary folder, verifies audio and tags, and checks repeat-download behavior while its test library is disconnected:
+
+```sh
+sh desktop/tools/check.sh --live
+```
+
+It refuses expired/near-expiry credentials and never refreshes the saved account. Sign in again in Tibrary if needed. Other authenticated tests and benchmarks remain opt-in; do not run every ignored test indiscriminately. Automated checks do not guarantee every live catalogue item, native Finder interaction, or removable filesystem behaves identically.
 
 Optional focused benchmarks: `metadata_preparation_benchmark -- --ignored --nocapture` uses synthetic database records; `live_metadata_concurrency -- --ignored --nocapture` makes seven read-only credited-release requests through the saved subscriber connection. Add either filter after the Rust test command above. Stop live benchmarking if the service starts throttling.
 

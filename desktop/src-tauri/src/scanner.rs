@@ -50,6 +50,12 @@ pub struct AudioMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub releasetype: Option<String>,
     pub duration: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    #[serde(default)]
+    pub audio_properties_version: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copyright: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,6 +74,7 @@ pub struct ScanSummary {
     pub missing: usize,
     pub removed: usize,
     pub restored: usize,
+    pub properties_refreshed: usize,
     pub status: String,
 }
 
@@ -90,6 +97,7 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
 
     let mut tags_map: HashMap<String, Vec<String>> = HashMap::new();
     let duration: f64;
+    let (sample_rate, bit_depth);
 
     if ext == "flac" {
         let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
@@ -99,6 +107,8 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
             .read_cover_art(false);
         let audio = FlacFile::read_from(&mut file, options).map_err(|e| e.to_string())?;
         duration = (audio.properties().duration().as_secs_f64() * 1000.0).round() / 1000.0;
+        sample_rate = Some(audio.properties().sample_rate());
+        bit_depth = Some(audio.properties().bit_depth());
         if let Some(comments) = audio.vorbis_comments() {
             for (k, v) in comments.items() {
                 tags_map
@@ -118,6 +128,8 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
             .read()
             .map_err(|e| e.to_string())?;
         duration = (audio.properties().duration().as_secs_f64() * 1000.0).round() / 1000.0;
+        sample_rate = audio.properties().sample_rate();
+        bit_depth = audio.properties().bit_depth();
         if let Some(tag) = audio.primary_tag().or_else(|| audio.first_tag()) {
             for item in tag.items() {
                 let mapped = if item.key() == ItemKey::IntegerBpm {
@@ -130,6 +142,25 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
                 if let Some(key) = mapped {
                     if let Some(value) = item.value().text().or_else(|| item.value().locator()) {
                         tags_map.entry(key).or_default().push(value.to_string());
+                    }
+                }
+            }
+        }
+        // The generic tag model has no provider-ID keys. Read these MP4
+        // freeform atoms explicitly so AAC downloads retain release links.
+        if matches!(ext.as_str(), "m4a" | "mp4" | "alac") {
+            use lofty::mp4::{AtomData, AtomIdent, Mp4File};
+            let mut file = fs::File::open(path).map_err(|error|error.to_string())?;
+            let native = Mp4File::read_from(&mut file, options).map_err(|error|error.to_string())?;
+            if let Some(tag) = native.ilst() {
+                for name in ["TIDAL_TRACK_ID", "TIDAL_ALBUM_ID"] {
+                    let key = AtomIdent::Freeform { mean:"com.apple.iTunes".into(), name:name.into() };
+                    if let Some(atom) = tag.get(&key) {
+                        for value in atom.data() {
+                            if let AtomData::UTF8(value) | AtomData::UTF16(value) = value {
+                                tags_map.entry(name.to_ascii_lowercase()).or_default().push(value.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -179,6 +210,9 @@ pub fn read_audio_metadata(path: &Path) -> Result<AudioMetadata, String> {
         label: get_first(&["label", "organization", "publisher", "tpub"]),
         releasetype: get_first(&["releasetype", "musicbrainz album type"]),
         duration,
+        sample_rate,
+        bit_depth,
+        audio_properties_version: 1,
         copyright: get_first(&["copyright", "tcop"]),
         tidal_track_id: get_first(&["tidal_track_id", "tidaltrackid"]),
         tidal_album_id: get_first(&["tidal_album_id", "tidalalbumid"]),
@@ -213,6 +247,7 @@ pub async fn scan_library_with_options(
         return Err("Library folder does not exist or is offline".to_string());
     }
 
+    let original_library = crate::library_access::library_identity(&root_path)?;
     progress(&format!("Opening library · {}", root_str));
     let conn = db.connect()?;
     let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
@@ -234,6 +269,7 @@ pub async fn scan_library_with_options(
         .map_err(|e| e.to_string())?;
 
     let mut cached_files: HashMap<String, (i64, i64, bool, bool)> = HashMap::new();
+    let mut legacy_properties = HashMap::new();
     while let Some(row) = cached_rows.next().await.map_err(|e| e.to_string())? {
         let path: String = row.get(0).map_err(|e| e.to_string())?;
         let size: i64 = row.get(1).map_err(|e| e.to_string())?;
@@ -246,6 +282,11 @@ pub async fn scan_library_with_options(
             .unwrap_or(false)
             || saved_metadata.as_deref().is_none_or(|value| value.trim().is_empty());
         let present: i64 = row.get(5).unwrap_or(1);
+        if let Some(metadata) = saved_metadata.as_deref().and_then(|raw|serde_json::from_str::<serde_json::Value>(raw).ok()) {
+            if metadata.is_object() && metadata["audio_properties_version"] != 1 {
+                legacy_properties.insert(path.clone(), metadata);
+            }
+        }
         cached_files.insert(path, (size, mtime, has_error, present != 0));
     }
 
@@ -306,6 +347,28 @@ pub async fn scan_library_with_options(
             {
                 if !force && cached_size == size && cached_mtime == mtime && !has_error {
                     summary.unchanged += 1;
+                    // Older indices omitted audio quality. Fill this once from
+                    // properties only, preserving every saved tag and link.
+                    if let Some(mut saved) = legacy_properties.remove(&path_str) {
+                        let source = path.clone();
+                        let properties = tokio::task::spawn_blocking(move || {
+                            let audio = Probe::open(&source).map_err(|error|error.to_string())?
+                                .options(ParseOptions::new().read_tags(false).read_cover_art(false))
+                                .read().map_err(|error|error.to_string())?;
+                            Ok::<_,String>((audio.properties().sample_rate(), audio.properties().bit_depth()))
+                        }).await.map_err(|error|error.to_string())?;
+                        if let Ok((rate, depth)) = properties {
+                            saved["sample_rate"] = serde_json::json!(rate);
+                            saved["bit_depth"] = serde_json::json!(depth);
+                            saved["audio_properties_version"] = serde_json::json!(1);
+                            pending_writes.push((path_str.clone(), root_str.clone(), size, mtime, Some(saved.to_string()), None));
+                            summary.properties_refreshed += 1;
+                            if pending_writes.len() >= 64 {
+                                crate::library_access::require_same_library(&root_path, &original_library)?;
+                                flush_writes(db, &conn, &mut pending_writes).await?;
+                            }
+                        }
+                    }
                     if !is_present {
                         restored_paths.push(path_str);
                     }
@@ -330,12 +393,15 @@ pub async fn scan_library_with_options(
             pending_writes.push((path_str, root_str.clone(), size, mtime, meta_json, err_str));
 
             if pending_writes.len() >= 64 {
+                crate::library_access::require_same_library(&root_path, &original_library)?;
                 flush_writes(db, &conn, &mut pending_writes).await?;
             }
 
     }
     if summary.status != "cancelled" {progress(&format!("Reading local tags · {total}/{total} files · saving index"));}
 
+    // Do not publish I/O errors caused by a drive disappearing mid-read.
+    crate::library_access::require_same_library(&root_path, &original_library)?;
     // Flush any remaining writes
     if !pending_writes.is_empty() {
         flush_writes(db, &conn, &mut pending_writes).await?;
@@ -353,38 +419,54 @@ pub async fn scan_library_with_options(
         db.note_local_change();
     }
 
+    if cancelled.load(Ordering::Relaxed) { summary.status = "cancelled".into(); }
     if summary.status != "cancelled" {
-        summary.status = "complete".to_string();
-        // Mark missing files that exist in DB for this root but were not seen
-        let mut missing_count = 0;
-        for (path_str, (_, _, _, was_present)) in &cached_files {
-            if !seen_paths.contains(path_str) {
-                missing_count += 1;
-                if !was_present { continue; }
-                conn.execute(
-                    "UPDATE local_files SET present = 0 WHERE path = ?",
-                    (path_str.as_str(),),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                summary.removed += 1;
-                db.note_local_change();
+        // Publish missing-file decisions together, only while the same drive is present.
+        crate::library_access::require_same_library(&root_path, &original_library)?;
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|error| error.to_string())?;
+        let reconcile: Result<bool, String> = async {
+            for (path_str, (_, _, _, was_present)) in &cached_files {
+                if cancelled.load(Ordering::Relaxed) { return Ok(false); }
+                if !seen_paths.contains(path_str) {
+                    summary.missing += 1;
+                    if !was_present { continue; }
+                    conn.execute("UPDATE local_files SET present = 0 WHERE path = ?", (path_str.as_str(),))
+                        .await.map_err(|error|error.to_string())?;
+                    summary.removed += 1;
+                }
+            }
+            crate::library_access::require_same_library(&root_path, &original_library)?;
+            if cancelled.load(Ordering::Relaxed) { return Ok(false); }
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute("UPDATE roots SET status = 'complete', scanned_at = ? WHERE root = ?", (now.as_str(), root_str.as_str()))
+                .await.map_err(|error|error.to_string())?;
+            Ok(true)
+        }.await;
+        match reconcile {
+            Ok(true) => {
+                if let Err(error) = conn.execute("COMMIT", ()).await {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error.to_string());
+                }
+                summary.status = "complete".into();
+                if summary.removed > 0 { db.note_local_change(); }
+            }
+            Ok(false) => {
+                conn.execute("ROLLBACK", ()).await.map_err(|error|error.to_string())?;
+                summary.status = "cancelled".into();
+                summary.missing = 0;
+                summary.removed = 0;
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
             }
         }
-        summary.missing = missing_count;
-
-        let now_str = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE roots SET status = 'complete', scanned_at = ? WHERE root = ?",
-            (now_str.as_str(), root_str.as_str()),
-        )
-        .await
-        .ok();
     }
 
     progress(&format!(
-        "Scan {} · {} tags read · {} unchanged · {} errors · {} missing",
-        summary.status, summary.read, summary.unchanged, summary.errors, summary.missing
+        "Scan {} · {} tags read · {} unchanged · {} audio properties cached · {} errors · {} missing",
+        summary.status, summary.read, summary.unchanged, summary.properties_refreshed, summary.errors, summary.missing
     ));
 
     Ok(summary)
@@ -437,6 +519,73 @@ async fn flush_writes(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn legacy_audio_properties_are_cached_once_without_changing_tags_or_links() {
+        let temp = std::env::temp_dir().join(format!("tibrary-audio-properties-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("Music");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("track.flac");
+        fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+        let original = fs::read(&path).unwrap();
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let scan = || scan_library(&db,&root,Arc::new(AtomicBool::new(false)),|_|{});
+        scan().await.unwrap();
+        let mut metadata = db.get_local_files_page(None,10,0).await.unwrap().0[0].metadata.clone().unwrap();
+        for key in ["sample_rate","bit_depth","audio_properties_version"] { metadata.as_object_mut().unwrap().remove(key); }
+        // Cached tags are deliberately different: property repair must not reread them.
+        metadata["title"] = serde_json::json!("Cached title");
+        let conn = db.connect().unwrap();
+        conn.execute("UPDATE local_files SET metadata=? WHERE path=?",(metadata.to_string(),path.to_string_lossy().to_string())).await.unwrap();
+        db.save_track_link(path.to_str().unwrap(),"GB","fixture",r#"{"status":"linked","ids":{"album_id":"12","track_id":"13"}}"#).await.unwrap();
+        let result = scan().await.unwrap();
+        assert_eq!(result.read,0);
+        assert_eq!(result.properties_refreshed,1);
+        let metadata = db.get_local_files_page(None,10,0).await.unwrap().0[0].metadata.clone().unwrap();
+        assert_eq!(metadata["title"],"Cached title");
+        assert_eq!(metadata["sample_rate"],44_100);
+        assert_eq!(metadata["bit_depth"],16);
+        let mut links = conn.query("SELECT payload FROM track_links WHERE path=? AND market='GB'", (path.to_string_lossy().to_string(),)).await.unwrap();
+        let linked: String = links.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&linked).unwrap()["ids"]["track_id"],"13");
+        drop(links);
+        assert_eq!(scan().await.unwrap().properties_refreshed,0);
+        assert_eq!(fs::read(&path).unwrap(),original);
+        drop(conn);drop(db);fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_disconnection_or_replacement_during_scan_preserves_cached_inventory() {
+        let temp = std::env::temp_dir().join(format!("tibrary-scan-disconnect-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("drive");
+        let unplugged = temp.join("unplugged");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("track.flac");
+        fs::write(&file, crate::stream_download::MINIMAL_FLAC).unwrap();
+        let db = TursoDb::open(temp.join("index.sqlite3")).await.unwrap();
+        scan_library(&db, &root, Arc::new(AtomicBool::new(false)), |_|{}).await.unwrap();
+        let revision = db.local_revision.load(Ordering::SeqCst);
+        for replace_mount in [false, true] {
+            let result = scan_library(&db, &root, Arc::new(AtomicBool::new(false)), |message| {
+                if message.starts_with("Reading local tags · 0/") {
+                    fs::rename(&root, &unplugged).unwrap();
+                    if replace_mount { fs::create_dir(&root).unwrap(); }
+                }
+            }).await;
+            assert!(result.is_err());
+            let (saved, count) = db.get_local_files_page(None, 10, 0).await.unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(saved[0].path, file.to_string_lossy());
+            assert_eq!(db.local_revision.load(Ordering::SeqCst), revision);
+            if replace_mount { fs::remove_dir(&root).unwrap(); }
+            fs::rename(&unplugged, &root).unwrap();
+        }
+        let resumed = scan_library(&db, &root, Arc::new(AtomicBool::new(false)), |_|{}).await.unwrap();
+        assert_eq!(resumed.unchanged, 1);
+        assert_eq!(resumed.read, 0);
+        drop(db);
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[tokio::test]
     async fn test_native_scanner_pipeline() {

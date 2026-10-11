@@ -543,6 +543,7 @@ pub async fn get_playback_info(
     token: &str,
     quality: &str,
     market: &str,
+    cancel: &AtomicBool,
 ) -> Result<PlaybackStreamInfo, String> {
     let norm_quality = normalize_quality(quality);
     let url = format!(
@@ -554,22 +555,20 @@ pub async fn get_playback_info(
         .get(&url)
         .query(&[("countryCode", market)])
         .header(AUTHORIZATION, format!("Bearer {}", token))
-        , Duration::from_millis(350), 3, None)
+        , Duration::from_millis(350), 3, Some(cancel))
         .await
         .map_err(|e| format!("Playback info request failed: {}", e))?;
 
     if !res.status().is_success() {
         let status = res.status();
-        let body = res.text().await.unwrap_or_default();
+        let body = cancellable_audio_read(res.text(), cancel).await?;
         return Err(format!(
             "Playback info rejected (HTTP {}): {}",
             status, body
         ));
     }
 
-    let val: Value = res
-        .json()
-        .await
+    let val: Value = cancellable_audio_read(res.json(), cancel).await
         .map_err(|e| format!("Invalid playback info JSON: {}", e))?;
 
     let manifest_mime = val
@@ -691,52 +690,67 @@ pub fn parse_mpd_manifest(xml: &str) -> Result<Vec<String>, String> {
     let mut init_url = String::new();
     let mut media_template = String::new();
     let mut segment_count = 0usize;
+    let mut start_number = 0usize;
+    let mut base_url = String::new();
+    let mut in_base_url = false;
     let mut direct_urls = Vec::new();
 
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name.ends_with("SegmentTemplate") {
+                let name = e.local_name();
+                if name.as_ref() == b"BaseURL" {
+                    in_base_url = true;
+                } else if name.as_ref() == b"SegmentTemplate" {
                     for attr in e.attributes().flatten() {
                         let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                        let val = String::from_utf8_lossy(&attr.value).to_string();
+                        let val = attr.decode_and_unescape_value(reader.decoder()).map_err(|error|error.to_string())?.into_owned();
                         if key == "initialization" {
                             init_url = val;
                         } else if key == "media" {
                             media_template = val;
+                        } else if key == "startNumber" {
+                            start_number = val.parse().map_err(|_|"Invalid DASH starting segment number")?;
                         }
                     }
-                } else if name.ends_with("S") {
+                } else if name.as_ref() == b"S" {
                     // Segment timeline element: attributes: d, r
                     let mut repeat = 0usize;
                     for attr in e.attributes().flatten() {
                         let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                         let val = String::from_utf8_lossy(&attr.value).to_string();
                         if key == "r" {
-                            repeat = val.parse::<usize>().unwrap_or(0);
+                            repeat = val.parse::<usize>().map_err(|_|"Unsupported DASH segment repeat count")?;
                         }
                     }
-                    segment_count += 1 + repeat;
-                } else if name.ends_with("Initialization") {
+                    segment_count = segment_count.checked_add(repeat).and_then(|count|count.checked_add(1))
+                        .filter(|count|*count <= 100_000).ok_or("DASH segment count exceeded limit")?;
+                } else if name.as_ref() == b"Initialization" {
                     for attr in e.attributes().flatten() {
                         let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                        let val = String::from_utf8_lossy(&attr.value).to_string();
+                        let val = attr.decode_and_unescape_value(reader.decoder()).map_err(|error|error.to_string())?.into_owned();
                         if key == "sourceURL" {
                             init_url = val;
                         }
                     }
-                } else if name.ends_with("SegmentURL") {
+                } else if name.as_ref() == b"SegmentURL" {
                     for attr in e.attributes().flatten() {
                         let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                        let val = String::from_utf8_lossy(&attr.value).to_string();
+                        let val = attr.decode_and_unescape_value(reader.decoder()).map_err(|error|error.to_string())?.into_owned();
                         if key == "media" {
                             direct_urls.push(val);
                         }
                     }
                 }
             }
+            Ok(Event::Text(text)) if in_base_url => {
+                let value = text.unescape().map_err(|error|error.to_string())?.into_owned();
+                base_url = if base_url.is_empty() { value }
+                    else { url::Url::parse(&base_url).and_then(|base|base.join(&value))
+                        .map_err(|_|"Invalid DASH base URL")?.to_string() };
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"BaseURL" => in_base_url = false,
             Ok(Event::Eof) => break,
             Err(e) => return Err(format!("Error parsing MPD XML: {}", e)),
             _ => {}
@@ -744,13 +758,19 @@ pub fn parse_mpd_manifest(xml: &str) -> Result<Vec<String>, String> {
         buf.clear();
     }
 
+    let resolve = |urls: Vec<String>| -> Result<Vec<String>, String> {
+        if base_url.is_empty() { return Ok(urls); }
+        let base = url::Url::parse(&base_url).map_err(|_|"Invalid DASH base URL")?;
+        urls.into_iter().map(|url|base.join(&url).map(|url|url.to_string()).map_err(|_|"Invalid DASH segment URL".into())).collect()
+    };
+
     if !direct_urls.is_empty() {
         let mut all = Vec::new();
         if !init_url.is_empty() {
             all.push(init_url);
         }
         all.extend(direct_urls);
-        return Ok(all);
+        return resolve(all);
     }
 
     if !media_template.is_empty() {
@@ -759,7 +779,8 @@ pub fn parse_mpd_manifest(xml: &str) -> Result<Vec<String>, String> {
             all.push(init_url);
         }
         let total = if segment_count > 0 { segment_count } else { 1 };
-        for i in 0..total {
+        for index in 0..total {
+            let i = start_number.checked_add(index).ok_or("DASH segment number exceeded limit")?;
             let replaced = if media_template.contains("$Number$") {
                 media_template.replace("$Number$", &i.to_string())
             } else if let Some(start_idx) = media_template.find("$Number%") {
@@ -770,7 +791,8 @@ pub fn parse_mpd_manifest(xml: &str) -> Result<Vec<String>, String> {
                         .chars()
                         .filter(|c| c.is_ascii_digit())
                         .collect::<String>();
-                    let width = digits.parse::<usize>().unwrap_or(1);
+                    let width = digits.parse::<usize>().ok().filter(|width|*width <= 12)
+                        .ok_or("Invalid DASH segment number format")?;
                     media_template.replace(spec, &format!("{:0width$}", i, width = width))
                 } else {
                     media_template.replace("$Number$", &i.to_string())
@@ -780,7 +802,7 @@ pub fn parse_mpd_manifest(xml: &str) -> Result<Vec<String>, String> {
             };
             all.push(replaced);
         }
-        return Ok(all);
+        return resolve(all);
     }
 
     Err("Could not extract stream URLs from MPD manifest".to_string())
@@ -928,6 +950,9 @@ pub async fn download_stream(
     }
     }
 
+    if downloaded_bytes_total == 0 {
+        return Err("Audio stream returned an empty download".into());
+    }
     dest_file.flush().map_err(|e| e.to_string())?;
     drop(dest_file);
 
@@ -1046,8 +1071,8 @@ pub fn apply_audio_tags(
             comments.insert("COPYRIGHT".to_string(), c.clone());
         }
         if let Some(bpm) = meta.bpm {
-            if bpm > 0.0 {
-                comments.insert("BPM".to_string(), format!("{:.0}", bpm));
+            if bpm.is_finite() && bpm > 0.0 {
+                comments.insert("BPM".to_string(), bpm.to_string());
             }
         }
         if let Some(ref key) = meta.musical_key {
@@ -1127,7 +1152,8 @@ pub fn apply_audio_tags(
     });
 
     for (key,value) in &meta.credit_tags {
-        if let Some(key)=ItemKey::from_key(tag_type,key) { tag.insert_text(key,value.clone()); }
+        if let Some(key)=ItemKey::from_key(lofty::tag::TagType::VorbisComments, &key.to_uppercase())
+            .or_else(||ItemKey::from_key(tag_type,key)) { tag.insert_text(key,value.clone()); }
     }
 
     // CRITICAL: ALBUMARTIST must be set strictly to the album artist!
@@ -1152,8 +1178,8 @@ pub fn apply_audio_tags(
     }
 
     if let Some(bpm) = meta.bpm {
-        if bpm > 0.0 {
-            tag.insert_text(ItemKey::Bpm, format!("{:.0}", bpm));
+        if bpm.is_finite() && bpm > 0.0 {
+            tag.insert_text(ItemKey::Bpm, bpm.to_string());
         }
     }
 
@@ -1161,6 +1187,21 @@ pub fn apply_audio_tags(
         if let Some(key) = crate::musical_keys::camelot_key(key) {
             tag.insert_text(ItemKey::InitialKey, key);
         }
+    }
+
+    if let Some(release_type) = &meta.release_type {
+        tag.insert_text(ItemKey::MusicBrainzReleaseType, release_type.clone());
+    }
+    if let Some(lyrics) = meta.lyrics.as_ref().or(meta.unsynced_lyrics.as_ref()) {
+        tag.insert_text(ItemKey::Lyrics, lyrics.clone());
+    }
+    for (key, value) in [
+        (ItemKey::ReplayGainAlbumGain, meta.album_replay_gain.map(|value|format!("{value:.2} dB"))),
+        (ItemKey::ReplayGainAlbumPeak, meta.album_peak_amplitude.map(|value|format!("{value:.6}"))),
+        (ItemKey::ReplayGainTrackGain, meta.track_replay_gain.map(|value|format!("{value:.2} dB"))),
+        (ItemKey::ReplayGainTrackPeak, meta.track_peak_amplitude.map(|value|format!("{value:.6}"))),
+    ] {
+        if let Some(value) = value { tag.insert_text(key, value); }
     }
 
     if let Some(cover_bytes) = cover_data {
@@ -1173,6 +1214,22 @@ pub fn apply_audio_tags(
 
     tag.save_to_path(file_path, WriteOptions::default())
         .map_err(|e| format!("Failed saving tags to audio file: {}", e))?;
+
+    // Provider IDs do not have generic ItemKey variants. Persist native MP4
+    // freeform atoms so compressed downloads can still be linked and repaired.
+    if tag_type == lofty::tag::TagType::Mp4Ilst {
+        use lofty::file::AudioFile;
+        use lofty::mp4::{Atom, AtomData, AtomIdent, Mp4File};
+        let mut file = Mp4File::read_from(&mut File::open(file_path).map_err(|error|error.to_string())?, lofty::config::ParseOptions::new())
+            .map_err(|error|error.to_string())?;
+        let native = file.ilst_mut().ok_or("Downloaded MP4 has no writable metadata")?;
+        for (name,value) in [("TIDAL_TRACK_ID", &meta.track_id), ("TIDAL_ALBUM_ID", &meta.album_id)] {
+            native.replace_atom(Atom::new(AtomIdent::Freeform {
+                mean:"com.apple.iTunes".into(), name:name.into(),
+            }, AtomData::UTF8(value.clone())));
+        }
+        native.save_to_path(file_path, WriteOptions::default()).map_err(|error|error.to_string())?;
+    }
 
     Ok(())
 }
@@ -1510,6 +1567,14 @@ fn audio_file_digest(path: &Path) -> Result<[u8; 32], String> {
     Ok(digest.finalize().into())
 }
 
+fn alternate_audio_path(path: &Path) -> Option<PathBuf> {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("flac") => Some(path.with_extension("m4a")),
+        Some("m4a") => Some(path.with_extension("flac")),
+        _ => None,
+    }
+}
+
 pub fn publish_staged_files(stage_dir: &Path, target_root: &Path) -> Result<Vec<PathBuf>, String> {
     fs::create_dir_all(target_root).map_err(|e| e.to_string())?;
     let sources = staged_files(stage_dir)?;
@@ -1534,16 +1599,8 @@ pub fn publish_staged_files(stage_dir: &Path, target_root: &Path) -> Result<Vec<
             if !exists {
                 if let Some(parent) = dst.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
                 validate_publish_path(&dst, target_root)?;
-                if fs::hard_link(&src, &dst).is_err() {
-                    // create_new also protects a destination created after the
-                    // preflight check; fs::copy would overwrite it.
-                    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&dst)
-                        .map_err(|e| e.to_string())?;
-                    created.push(dst.clone());
-                    let mut input = File::open(&src).map_err(|e| e.to_string())?;
-                    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
-                    output.flush().map_err(|e| e.to_string())?;
-                } else { created.push(dst.clone()); }
+                crate::file_publication::publish_staged(&src, &dst).map_err(|e|e.to_string())?;
+                created.push(dst.clone());
             }
             published.push(dst);
         }
@@ -1554,6 +1611,22 @@ pub fn publish_staged_files(stage_dir: &Path, target_root: &Path) -> Result<Vec<
         return Err(format!("Download publication stopped; newly published files removed: {error}"));
     }
     Ok(published)
+}
+
+// Never overwrite a file which appeared after a failed publication. Keep any
+// blocked backups available and report their paths for recovery.
+fn restore_redownload_backups(backups: &[PathBuf], backup_dir: &Path, target_root: &Path) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for old in backups.iter().rev() {
+        let result = old.strip_prefix(backup_dir).map_err(|error|error.to_string()).and_then(|relative| {
+            let target = target_root.join(relative);
+            validate_publish_path(&target, target_root)?;
+            crate::file_publication::publish_staged(old, &target).map_err(|error|error.to_string())
+        });
+        if let Err(error) = result { errors.push(format!("{}: {error}", old.display())); }
+    }
+    if errors.is_empty() { Ok(()) }
+    else { Err(format!("Previous copies retained for recovery; restoration was blocked: {}", errors.join("; "))) }
 }
 
 /// Replace only the requested staged files. Previous copies remain recoverable beside the
@@ -1567,6 +1640,14 @@ pub fn publish_redownloaded_files(stage_dir: &Path, target_root: &Path) -> Resul
         validate_publish_path(&destination, target_root)?;
         if destination.exists() && !destination.is_file() {
             return Err("Redownload destination is not an audio file".into());
+        }
+        // Alternate encodings are replaced too, so validate them before moving
+        // any previous copy. A folder or link must never be treated as audio.
+        if let Some(alternate) = alternate_audio_path(&destination) {
+            validate_publish_path(&alternate, target_root)?;
+            if alternate.exists() && !alternate.is_file() {
+                return Err("Alternate redownload destination is not an audio file".into());
+            }
         }
     }
     let backup_dir = target_root.join(format!(".tibrary-redownload-backup-{}", uuid::Uuid::new_v4()));
@@ -1583,29 +1664,26 @@ pub fn publish_redownloaded_files(stage_dir: &Path, target_root: &Path) -> Resul
                 fs::rename(&destination, &backup).map_err(|e| e.to_string())?;
                 backups.push(backup.clone());
             }
-            let alternate = match destination.extension().and_then(|value| value.to_str()) {
-                Some("flac") => Some(destination.with_extension("m4a")),
-                Some("m4a") => Some(destination.with_extension("flac")),
-                _ => None,
-            };
+            validate_publish_path(&destination, target_root)?;
+            let alternate = alternate_audio_path(&destination);
             if let Some(alternate) = alternate.filter(|path| path.exists()) {
+                validate_publish_path(&alternate, target_root)?;
                 let old = backup_dir.join(alternate.strip_prefix(target_root).map_err(|e| e.to_string())?);
                 if let Some(parent) = old.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
                 fs::rename(&alternate, &old).map_err(|e| e.to_string())?;
                 backups.push(old);
             }
-            fs::rename(&src, &destination).map_err(|e| e.to_string())?;
+            crate::file_publication::publish_staged(&src, &destination).map_err(|e| e.to_string())?;
             published.push(destination);
             Ok(())
         })();
         if let Err(error) = result {
             for path in published.iter().rev() { let _ = fs::remove_file(path); }
-            for old in backups.iter().rev() {
-                if let Ok(relative) = old.strip_prefix(&backup_dir) {
-                    let _ = fs::rename(old, target_root.join(relative));
-                }
-            }
-            return Err(format!("Redownload could not be published; previous copies restored: {error}"));
+            let recovery = restore_redownload_backups(&backups, &backup_dir, target_root);
+            return Err(match recovery {
+                Ok(()) => format!("Redownload could not be published; previous copies restored: {error}"),
+                Err(recovery) => format!("Redownload could not be published: {error}. {recovery}"),
+            });
         }
     }
     Ok((published, backups))
@@ -1825,6 +1903,77 @@ mod tests {
     }
 
     #[test]
+    fn dash_segments_honor_start_number_base_url_and_escaped_query_strings() {
+        let manifest = r#"<MPD><BaseURL>https://audio.example.test/release/</BaseURL><Period><SegmentTemplate startNumber="7" initialization="init.mp4?x=1&amp;y=2" media="chunk_$Number%04d$.mp4?x=1&amp;y=2"><SegmentTimeline><S d="1000" r="1"/></SegmentTimeline></SegmentTemplate></Period></MPD>"#;
+        assert_eq!(parse_mpd_manifest(manifest).unwrap(), [
+            "https://audio.example.test/release/init.mp4?x=1&y=2",
+            "https://audio.example.test/release/chunk_0007.mp4?x=1&y=2",
+            "https://audio.example.test/release/chunk_0008.mp4?x=1&y=2",
+        ]);
+        let direct = r#"<MPD><BaseURL>https://audio.example.test/</BaseURL><SegmentList><Initialization sourceURL="init.mp4?a=1&amp;b=2"/><SegmentURL media="part.mp4?a=3&amp;b=4"/></SegmentList></MPD>"#;
+        assert_eq!(parse_mpd_manifest(direct).unwrap(), [
+            "https://audio.example.test/init.mp4?a=1&b=2", "https://audio.example.test/part.mp4?a=3&b=4",
+        ]);
+    }
+
+    #[test]
+    fn invalid_dash_counts_are_rejected_instead_of_panicking_or_allocating_unboundedly() {
+        for repeat in ["-1", "18446744073709551615", "100001"] {
+            let manifest = format!(r#"<MPD><SegmentTemplate media="part_$Number$.mp4"><SegmentTimeline><S d="1000" r="{repeat}"/></SegmentTimeline></SegmentTemplate></MPD>"#);
+            assert!(parse_mpd_manifest(&manifest).is_err());
+        }
+        assert!(parse_mpd_manifest(r#"<MPD><SegmentTemplate media="part_$Number%99999999d$.mp4"/></MPD>"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_playback_metadata_never_contacts_the_provider() {
+        let error = get_playback_info(&reqwest::Client::new(), "1", "unused-test-token", "LOSSLESS", "GB", &AtomicBool::new(true))
+            .await.unwrap_err();
+        assert!(error.contains("Cancelled"));
+    }
+
+    #[test]
+    fn m4a_download_tags_keep_provider_ids_credits_lyrics_and_fractional_bpm() {
+        let temp = std::env::temp_dir().join(format!("download-tags-{}.m4a", uuid::Uuid::new_v4()));
+        let original = include_bytes!("../tests/fixtures/silence.m4a");
+        fs::write(&temp, original).unwrap();
+        fn audio_payload(bytes: &[u8]) -> &[u8] {
+            let mut offset = 0;
+            while offset + 8 <= bytes.len() {
+                let length = u32::from_be_bytes(bytes[offset..offset+4].try_into().unwrap()) as usize;
+                assert!(length >= 8 && offset + length <= bytes.len());
+                if &bytes[offset+4..offset+8] == b"mdat" { return &bytes[offset+8..offset+length]; }
+                offset += length;
+            }
+            panic!("Fixture has no AAC samples");
+        }
+        let metadata = TrackDownloadMeta { track_id:"101".into(), album_id:"10".into(), title:"Track".into(),
+            album:"Album".into(), album_artist:"Artist".into(), track_artists:vec!["Artist".into()],
+            track_number:1, track_total:12, disc_number:1, disc_total:2, bpm:Some(128.5),
+            musical_key:Some("A minor".into()), isrc:Some("GBAYE9900001".into()), date:Some("2025-06-07".into()),
+            lyrics:Some("[00:01.00]Test lyric".into()), track_replay_gain:Some(-6.25), track_peak_amplitude:Some(0.875),
+            credit_tags:std::collections::HashMap::from([("composer".into(),"A Writer".into()),("producer".into(),"A Producer".into())]),
+            ..Default::default() };
+        apply_audio_tags(&temp, &metadata, None).unwrap();
+        let tagged = crate::scanner::read_audio_metadata(&temp).unwrap();
+        assert_eq!(tagged.title, "Track");
+        assert_eq!(tagged.tidal_track_id.as_deref(), Some("101"));
+        assert_eq!(tagged.tidal_album_id.as_deref(), Some("10"));
+        assert_eq!(tagged.bpm.as_deref(), Some("128.5"));
+        assert_eq!(tagged.musical_key.as_deref(), Some("8A"));
+        assert_eq!(tagged.date.as_deref(), Some("2025-06-07"));
+        assert_eq!(tagged.tracktotal.as_deref(), Some("12"));
+        assert_eq!(tagged.disctotal.as_deref(), Some("2"));
+        assert_eq!(tagged.tags["composer"], ["A Writer"]);
+        assert_eq!(tagged.tags["producer"], ["A Producer"]);
+        assert_eq!(tagged.tags["lyrics"], ["[00:01.00]Test lyric"]);
+        assert_eq!(tagged.tags["replaygain_track_gain"], ["-6.25 dB"]);
+        assert_eq!(tagged.tags["replaygain_track_peak"], ["0.875000"]);
+        assert_eq!(audio_payload(&fs::read(&temp).unwrap()), audio_payload(original));
+        fs::remove_file(temp).unwrap();
+    }
+
+    #[test]
     fn test_flac_tagging_and_claxon_playback() {
         let temp_dir = std::env::temp_dir().join(format!(
             "flac_tag_test_{}",
@@ -1936,6 +2085,7 @@ mod tests {
         assert_eq!(fs::read(&dest_file).unwrap(), b"audio-payload-123");
 
         // Re-publish same file -> succeeds idempotently
+        fs::write(&track_staged, b"audio-payload-123").unwrap();
         let published2 = publish_staged_files(&stage, &dest).expect("Idempotent publish failed");
         assert_eq!(published2.len(), 1);
 
@@ -2038,6 +2188,144 @@ mod tests {
         assert_eq!(fs::read(&backups[0]).unwrap(), b"old audio");
         assert_eq!(fs::read(&backups[1]).unwrap(), b"older alternate");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn redownload_refuses_alternate_folders_and_links_before_changing_audio() {
+        let temp = std::env::temp_dir().join(format!("redownload-alternate-{}", uuid::Uuid::new_v4()));
+        let stage = temp.join("stage");
+        let library = temp.join("library");
+        fs::create_dir_all(&stage).unwrap();
+        fs::create_dir_all(library.join("track.m4a")).unwrap();
+        fs::write(stage.join("track.flac"), b"new audio").unwrap();
+        fs::write(library.join("track.flac"), b"original audio").unwrap();
+        fs::write(library.join("track.m4a/keep.txt"), b"unrelated file").unwrap();
+        assert!(publish_redownloaded_files(&stage, &library).is_err());
+        assert_eq!(fs::read(library.join("track.flac")).unwrap(), b"original audio");
+        assert_eq!(fs::read(library.join("track.m4a/keep.txt")).unwrap(), b"unrelated file");
+        assert_eq!(fs::read(stage.join("track.flac")).unwrap(), b"new audio");
+        #[cfg(unix)] {
+            fs::remove_dir_all(library.join("track.m4a")).unwrap();
+            let outside = temp.join("outside.m4a");
+            fs::write(&outside, b"outside audio").unwrap();
+            std::os::unix::fs::symlink(&outside, library.join("track.m4a")).unwrap();
+            assert!(publish_redownloaded_files(&stage, &library).is_err());
+            assert_eq!(fs::read(library.join("track.flac")).unwrap(), b"original audio");
+            assert!(fs::symlink_metadata(library.join("track.m4a")).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read(outside).unwrap(), b"outside audio");
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn redownload_rollback_preserves_an_occupied_destination_and_retains_backup() {
+        let temp = std::env::temp_dir().join(format!("redownload-rollback-{}", uuid::Uuid::new_v4()));
+        let library = temp.join("library");
+        let backups = library.join(".backup");
+        fs::create_dir_all(&backups).unwrap();
+        let previous = backups.join("track.flac");
+        let destination = library.join("track.flac");
+        fs::write(&previous, b"previous audio").unwrap();
+        fs::write(&destination, b"newly occupied destination").unwrap();
+        let error = restore_redownload_backups(&[previous.clone()], &backups, &library).unwrap_err();
+        assert!(error.contains("retained for recovery"));
+        assert_eq!(fs::read(&previous).unwrap(), b"previous audio");
+        assert_eq!(fs::read(&destination).unwrap(), b"newly occupied destination");
+        fs::remove_file(&destination).unwrap();
+        restore_redownload_backups(&[previous.clone()], &backups, &library).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"previous audio");
+        assert!(!previous.exists());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_truncated_and_rejected_audio_never_leave_a_download() {
+        use std::io::Read;
+        for (response, expected) in [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "empty"),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort", ""),
+            ("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "403"),
+        ] {
+            for concurrency in [1, 2] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let server = std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    let mut served = 0;
+                    while served < concurrency && std::time::Instant::now() < deadline {
+                        match listener.accept() {
+                            Ok((mut socket, _)) => {
+                                socket.set_nonblocking(false).unwrap();
+                                socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                                let mut buffer = [0u8; 1024];
+                                let _ = socket.read(&mut buffer);
+                                let _ = socket.write_all(response.as_bytes());
+                                served += 1;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("Mock server failed: {error}"),
+                        }
+                    }
+                });
+                let destination = std::env::temp_dir().join(format!("failed-audio-{}", uuid::Uuid::new_v4()));
+                let stream = PlaybackStreamInfo { urls: (0..concurrency).map(|n|format!("http://{address}/{n}")).collect(),
+                    codec:"FLAC".into(), mime_type:"audio/flac".into(), is_encrypted:false, security_token:None,
+                    bit_depth:None, sample_rate:None, album_replay_gain:None, album_peak_amplitude:None,
+                    track_replay_gain:None, track_peak_amplitude:None };
+                let result = download_stream(&reqwest::Client::new(), &stream, &destination,
+                    &Arc::new(AtomicBool::new(false)), &|_, _, _| {}, concurrency).await;
+                assert!(result.unwrap_err().contains(expected));
+                assert!(!destination.exists());
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn downloaded_flac_survives_tagging_publication_and_idempotent_retry() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            socket.read(&mut request).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", MINIMAL_FLAC.len()).unwrap();
+            socket.write_all(MINIMAL_FLAC).unwrap();
+        });
+        let temp = std::env::temp_dir().join(format!("download-roundtrip-{}", uuid::Uuid::new_v4()));
+        let stage = temp.join("stage");
+        let library = temp.join("library");
+        let staged = stage.join("Artist/Album/01 - Track.flac");
+        let stream = PlaybackStreamInfo { urls:vec![format!("http://{address}/audio")],
+            codec:"FLAC".into(), mime_type:"audio/flac".into(), is_encrypted:false, security_token:None,
+            bit_depth:Some(16), sample_rate:Some(44100), album_replay_gain:None, album_peak_amplitude:None,
+            track_replay_gain:None, track_peak_amplitude:None };
+        download_stream(&reqwest::Client::new(), &stream, &staged, &Arc::new(AtomicBool::new(false)), &|_,_,_|{}, 2).await.unwrap();
+        server.join().unwrap();
+        let metadata = TrackDownloadMeta { track_id:"101".into(), album_id:"10".into(), title:"Track".into(),
+            album:"Album".into(), album_artist:"Artist".into(), track_artists:vec!["Artist".into(),"Guest".into()],
+            track_number:1, track_total:12, disc_number:1, disc_total:1, bpm:Some(128.5),
+            musical_key:Some("A minor".into()), isrc:Some("GBAYE9900001".into()), ..Default::default() };
+        apply_audio_tags(&staged, &metadata, None).unwrap();
+        let first = publish_staged_files(&stage, &library).unwrap();
+        let before_retry = fs::read(&first[0]).unwrap();
+        fs::write(&staged, &before_retry).unwrap();
+        let second = publish_staged_files(&stage, &library).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::read(&second[0]).unwrap(), before_retry);
+        let tagged = crate::scanner::read_audio_metadata(&first[0]).unwrap();
+        assert_eq!(tagged.title, "Track");
+        assert_eq!(tagged.tracktotal.as_deref(), Some("12"));
+        assert_eq!(tagged.bpm.as_deref(), Some("128.5"));
+        assert_eq!(tagged.musical_key.as_deref(), Some("8A"));
+        assert_eq!(tagged.tidal_track_id.as_deref(), Some("101"));
+        let mut audio = claxon::FlacReader::open(&first[0]).unwrap();
+        assert!(audio.samples().next().transpose().unwrap().is_some());
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]

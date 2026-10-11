@@ -38,7 +38,7 @@ impl Drop for FilePublication {
         if self.committed { return; }
         if self.published { let _ = fs::remove_file(&self.target); }
         if self.backup.exists() {
-            if let Err(error) = fs::rename(&self.backup, &self.source) {
+            if let Err(error) = crate::file_publication::publish_staged(&self.backup, &self.source) {
                 eprintln!("Original file retained at {}: {error}", self.backup.display());
             }
         }
@@ -264,11 +264,11 @@ pub async fn apply_file_item(
         }
         if target == source {
             fs::rename(&source, &publication.backup).map_err(|e| e.to_string())?;
-            fs::rename(&staged, &target).map_err(|e| e.to_string())?;
+            crate::file_publication::publish_staged(&staged, &target).map_err(|e| e.to_string())?;
             publication.published = true;
         } else {
             // An atomic no-overwrite publication; collisions never replace another track.
-            fs::hard_link(&staged, &target).map_err(|e| e.to_string())?;
+            crate::file_publication::publish_staged(&staged, &target).map_err(|e| e.to_string())?;
             publication.published = true;
             fs::rename(&source, &publication.backup).map_err(|e| e.to_string())?;
         }
@@ -361,6 +361,126 @@ mod tests {
     use lofty::probe::Probe;
     use lofty::tag::ItemKey;
     use std::time::SystemTime;
+
+    async fn indexed_fixture(name: &str) -> (PathBuf, TursoDb, PathBuf) {
+        let temp = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("original.flac");
+        fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+        let db = TursoDb::open(temp.join("library.db")).await.unwrap();
+        crate::scanner::scan_library(&db, &temp,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| {}).await.unwrap();
+        (temp, db, path)
+    }
+
+    #[test]
+    fn rollback_keeps_backup_when_an_external_file_occupies_the_original_path() {
+        let temp = std::env::temp_dir().join(format!("maintenance-rollback-collision-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        for published in [false, true] {
+            let source = temp.join(format!("source-{published}.flac"));
+            let target = if published { temp.join("moved.flac") } else { source.clone() };
+            let backup = temp.join(format!("backup-{published}.flac"));
+            fs::write(&source, b"An external file created during the edit").unwrap();
+            fs::write(&backup, b"The untouched original audio").unwrap();
+            if published { fs::write(&target, b"Staged edit awaiting its database update").unwrap(); }
+            drop(FilePublication { source: source.clone(), target: target.clone(), backup: backup.clone(),
+                published, committed: false });
+            assert_eq!(fs::read(source).unwrap(), b"An external file created during the edit");
+            assert_eq!(fs::read(backup).unwrap(), b"The untouched original audio");
+            assert_eq!(target.exists(), !published);
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_tag_and_artwork_edits_and_same_path_database_failure_restore_original() {
+        let (temp, db, source) = indexed_fixture("maintenance-rollback").await;
+        let original = fs::read(&source).unwrap();
+        let before = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap();
+        let mut item = FileApplyItem { path: source.display().to_string(), target: None,
+            artwork: Some(temp.join("missing-cover.png").display().to_string()),
+            tags: HashMap::from([("title".into(), "Edited before artwork failure".into())]) };
+        assert!(apply_file_item(&db, temp.to_str().unwrap(), &item).await.is_err());
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        item.artwork = None;
+        let conn = db.connect().unwrap();
+        conn.execute("ALTER TABLE local_files RENAME TO held_local_files", ()).await.unwrap();
+        assert!(apply_file_item(&db, temp.to_str().unwrap(), &item).await.is_err());
+        conn.execute("ALTER TABLE held_local_files RENAME TO local_files", ()).await.unwrap();
+        assert_eq!(fs::read(&source).unwrap(), original);
+        let after = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].metadata, before[0].metadata);
+        assert_eq!(after[0].mtime, before[0].mtime);
+        assert!(!fs::read_dir(&temp).unwrap().any(|entry|
+            entry.unwrap().file_name().to_string_lossy().starts_with(".tibrary-")));
+
+        apply_file_item(&db, temp.to_str().unwrap(), &item).await.unwrap();
+        let updated = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(crate::workflows::extract_tags_map(&updated[0].metadata)["title"], "Edited before artwork failure");
+        assert!(claxon::FlacReader::open(&source).unwrap().samples().all(|sample| sample.is_ok()));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_reports_collisions_and_missing_files_while_applying_valid_items() {
+        let (temp, db, source) = indexed_fixture("maintenance-batch").await;
+        let occupied = temp.join("occupied.flac");
+        fs::write(&occupied, b"Existing destination must survive").unwrap();
+        let target = temp.join("moved/song.flac");
+        let item = FileApplyItem { path: source.display().to_string(), target: Some(occupied.display().to_string()),
+            artwork: None, tags: HashMap::new() };
+        let missing = FileApplyItem { path: temp.join("missing.flac").display().to_string(), ..item.clone() };
+        let valid = FileApplyItem { target: Some(target.display().to_string()),
+            tags: HashMap::from([("title".into(), "Valid edit".into())]), ..item.clone() };
+        let result = apply_batch(&db, temp.to_str().unwrap(), &[item, missing, valid]).await;
+        assert_eq!(result.applied, 1);
+        assert_eq!(result.failed, 2);
+        assert_eq!(result.errors.len(), 2);
+        assert!(result.errors[0].contains("already exists"));
+        assert!(result.errors[1].contains("does not exist"));
+        assert_eq!(fs::read(&occupied).unwrap(), b"Existing destination must survive");
+        assert!(!source.exists());
+        let files = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, target.display().to_string());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn moves_cannot_escape_the_selected_library_or_follow_external_symlinks() {
+        let (temp, db, source) = indexed_fixture("maintenance-boundaries").await;
+        let outside = std::env::temp_dir().join(format!("maintenance-outside-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&outside).unwrap();
+        let foreign = outside.join("foreign.flac");
+        fs::write(&foreign, crate::stream_download::MINIMAL_FLAC).unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut cases = vec![
+            (source.clone(), outside.join("escaped.flac")),
+            (source.clone(), temp.join("child/../../escaped.flac")),
+            (foreign.clone(), temp.join("foreign.flac")),
+        ];
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(&outside, temp.join("linked-folder")).unwrap();
+            std::os::unix::fs::symlink(&foreign, temp.join("linked-file.flac")).unwrap();
+            cases.push((source.clone(), temp.join("linked-folder/escaped.flac")));
+            cases.push((temp.join("linked-file.flac"), temp.join("relocated.flac")));
+        }
+        for (path, target) in cases {
+            let item = FileApplyItem { path: path.display().to_string(), target: Some(target.display().to_string()),
+                artwork: None, tags: HashMap::from([("title".into(), "Must not be saved".into())]) };
+            assert!(apply_file_item(&db, temp.to_str().unwrap(), &item).await.is_err(), "{item:?}");
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&foreign).unwrap(), crate::stream_download::MINIMAL_FLAC);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap().len(), 1);
+        fs::remove_dir_all(temp).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
 
     #[tokio::test]
     async fn reviewed_move_preserves_audio_links_and_ignore_choices_and_rolls_back_database_errors() {

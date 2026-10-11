@@ -47,7 +47,7 @@ pub fn safe_component(value: &str, _final_part: bool) -> Result<String, String> 
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
         "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
-    if reserved.contains(&upper.as_str()) {
+    if reserved.contains(&upper.split('.').next().unwrap_or("").trim_end()) {
         result = format!("_{}", result);
     }
 
@@ -135,7 +135,7 @@ pub fn format_layout(
             part_str = part_str.replace("{album} ({year})", "{album}");
         }
 
-        if !disc_relevant && part_str.contains("{disc}") {
+        if !disc_relevant && part_str.trim() == "{disc}" && !is_last {
             continue;
         }
 
@@ -154,16 +154,26 @@ pub fn format_layout(
         let track_str = format!("{:02}", track_num);
 
         if year.is_empty() { part_str = part_str.replace(" ({year})", ""); }
-        part_str = part_str
-            .replace("{albumartist}", &artist)
-            .replace("{artist}", tags.get("artist").map(String::as_str).unwrap_or(&artist))
-            .replace("{discnumber}", &format!("{disc_num:02}"))
-            .replace("{album}", &album)
-            .replace("{title}", &title)
-            .replace("{year}", year)
-            .replace("{disc}", &disc_folder)
-            .replace("{disc_prefix}", &disc_prefix)
-            .replace("{tracknumber}", &track_str);
+        // Expand the template once so braces inside a tag remain literal text.
+        let disc_number = format!("{disc_num:02}");
+        let values = HashMap::from([
+            ("albumartist", artist.as_str()),
+            ("artist", tags.get("artist").map(String::as_str).unwrap_or(&artist)),
+            ("discnumber", disc_number.as_str()), ("album", album.as_str()),
+            ("title", title.as_str()), ("year", year), ("disc", disc_folder.as_str()),
+            ("disc_prefix", disc_prefix.as_str()), ("tracknumber", track_str.as_str()),
+        ]);
+        let mut expanded = String::new();
+        let mut rest = part_str.as_str();
+        while let Some(start) = rest.find('{') {
+            expanded.push_str(&rest[..start]);
+            let end = rest[start..].find('}').ok_or("Unclosed variable in folder template")? + start;
+            let token = &rest[start + 1..end];
+            expanded.push_str(values.get(token).ok_or_else(|| format!("Unknown folder template variable: {token}"))?);
+            rest = &rest[end + 1..];
+        }
+        expanded.push_str(rest);
+        part_str = expanded;
 
         // Trim template whitespace without removing literal punctuation from tags.
         part_str = part_str.trim().to_string();
@@ -174,6 +184,9 @@ pub fn format_layout(
 
     // Append extension
     let ext = extension.trim_start_matches('.');
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("Audio extension must contain only letters and numbers".into());
+    }
     let filename = resolved_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -200,10 +213,37 @@ mod tests {
             "A - BCD"
         );
         assert_eq!(safe_component("CON", true).unwrap(), "_CON");
+        assert_eq!(safe_component("con.txt", true).unwrap(), "_con.txt");
+        assert_eq!(safe_component("LPT1.session", false).unwrap(), "_LPT1.session");
         assert_eq!(safe_component("Parallel / S", true).unwrap(), "Parallel - S");
         assert_eq!(safe_component("Belong - Mirth", true).unwrap(), "Belong - Mirth");
         assert_eq!(safe_component("Babsy.", false).unwrap(), "Babsy");
         assert_eq!(safe_component("Ending with dot.", true).unwrap(), "Ending with dot");
+    }
+
+    #[test]
+    fn layout_keeps_literal_tag_tokens_and_inline_optional_disc_text() {
+        let tags = HashMap::from([
+            ("albumartist".into(), "Artist {album}".into()),
+            ("album".into(), "Release {title}".into()),
+            ("title".into(), "Song {year}".into()),
+        ]);
+        assert_eq!(format_layout(Path::new("/Music"), &tags, None, "flac").unwrap(),
+            PathBuf::from("/Music/Artist {album}/Release {title}/01 - Song {year}.flac"));
+        let template = "{albumartist}/{album}/{disc} {tracknumber} - {title}";
+        assert_eq!(format_layout(Path::new("/Music"), &tags, Some(template), ".FLAC").unwrap(),
+            PathBuf::from("/Music/Artist {album}/Release {title}/01 - Song {year}.FLAC"));
+    }
+
+    #[test]
+    fn unsafe_templates_and_extensions_cannot_escape_the_library() {
+        let tags = HashMap::new();
+        for template in ["../{title}", "/{title}", "{title}/..", "{unknown}", "{title"] {
+            assert!(format_layout(Path::new("/Music"), &tags, Some(template), "flac").is_err(), "{template}");
+        }
+        for extension in ["", "../escape", "flac/../../escape", "flac\\escape"] {
+            assert!(format_layout(Path::new("/Music"), &tags, None, extension).is_err(), "{extension}");
+        }
     }
 
     #[test]

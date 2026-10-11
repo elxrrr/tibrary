@@ -4,10 +4,11 @@ import { Check, ChevronDown } from "lucide-react";
 export type ScanScope = "all" | "unscanned";
 
 /** Scope choices select files; only the main button starts an inspection. */
-export function ScanButton({ count, scope, disabled, selectionPending, scanning, onScan, onScope }: {
+export function ScanButton({ count, scope, disabled, scanUnavailable, selectionPending, scanning, onScan, onScope }: {
   count: number;
   scope: ScanScope | null;
   disabled: boolean;
+  scanUnavailable?: string;
   selectionPending: boolean;
   scanning: boolean;
   onScan: () => void;
@@ -43,8 +44,8 @@ export function ScanButton({ count, scope, disabled, selectionPending, scanning,
   }, [open]);
   useEffect(() => { if (disabled) setOpen(false); }, [disabled]);
   return <div className="split-scan" ref={container}>
-    <button className="primary" aria-label="Scan selected tracks" disabled={disabled || selectionPending || !count}
-      title="Read the selected FLAC audio for MQA signals. Saved results for other files are retained."
+    <button className="primary" aria-label="Scan selected tracks" disabled={disabled || !!scanUnavailable || selectionPending || !count}
+      title={scanUnavailable || "Read the selected FLAC audio for MQA signals. Saved results for other files are retained."}
       onClick={onScan}>{scanning ? "Scanning…" : `Scan (${count.toLocaleString()})`}</button>
     <button className="primary scan-scope-trigger" ref={trigger} aria-label="Choose scan scope"
       aria-haspopup="menu" aria-expanded={open} disabled={disabled}

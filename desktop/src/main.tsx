@@ -45,6 +45,7 @@ import {
   Row,
   Job,
   AppState,
+  Availability,
   mergeJob,
   onlineKinds,
 } from "./api";
@@ -55,6 +56,7 @@ import { Selection, selectedReleases } from "./selection";
 import { CoalescedQuery } from "./query";
 import { ScanButton, ScanScope } from "./ScanButton";
 import { ActionButton } from "./ActionButton";
+import { fileActionKinds, unavailableFile, unavailableLibrary } from "./availability";
 import "./style.css";
 import { version as appVersion } from "../package.json";
 const groups = [
@@ -320,6 +322,10 @@ function App() {
     lastRoute = useRef(route),
     stateRef = useRef(state);
   stateRef.current = state;
+  const localUnavailable = unavailableLibrary(state?.roots, root);
+  const downloadUnavailable = state?.download_destination?.available === false
+    ? state.download_destination.reason || "Choose an available download folder in General settings." : "";
+  const fileUnavailable = (path: string) => unavailableFile(state?.roots, path);
   const onlineRoute = ["catalogue", "artists", "links", "favourites", "missing", "metadata", "artwork", "online", "connections", "fix"].includes(route);
   const displayTheme = settings?.general?.theme || state?.settings.theme || "system";
   const localBusy = submitting || active(state?.job);
@@ -359,6 +365,28 @@ function App() {
   useEffect(() => {
     call("settings").then(setSettings).catch(notifyError);
   }, []);
+  // Drive connections change without a database revision. Refresh only their
+  // availability so cached tables, selections and review dialogs stay intact.
+  useEffect(() => {
+    let disposed = false, pending = false;
+    const check = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const availability = await call<Availability>("library.availability");
+        if (!disposed && Array.isArray(availability?.roots)) setState(previous => previous ? {
+          ...previous,
+          roots: previous.roots.map(library => ({...library, ...availability.roots.find(item => item.root === library.root)})),
+          download_destination: availability.download_destination,
+        } : previous);
+      } catch { /* Keep the last known state; file operations check again in the backend. */ }
+      finally { pending = false; }
+    };
+    void check();
+    const timer = window.setInterval(check, 5000);
+    window.addEventListener("focus", check);
+    return () => { disposed = true; window.clearInterval(timer); window.removeEventListener("focus", check); };
+  }, [root, settings?.downloads?.output]);
   useEffect(() => {
     localStorage.setItem("tibrary.root", root);
     setSelected(new Set());
@@ -659,6 +687,9 @@ function App() {
     }
   }, [state?.job, state?.online_job]);
   async function run(kind: string, args: any = {}) {
+    const unavailable = kind === "download" ? downloadUnavailable
+      : fileActionKinds.has(kind) ? unavailableLibrary(state?.roots, args.root ?? root) : "";
+    if (unavailable) { setError(unavailable); return; }
     setError("");
     setSubmitting(true);
     try {
@@ -1028,6 +1059,7 @@ function App() {
                 <div>
                   <strong>{r.root.split("/").pop()}</strong>
                   <small>{r.root}</small>
+                  {r.available === false && <small>Drive unavailable · cached library</small>}
                 </div>
                 <span>
                   {r.tracks.toLocaleString()} tracks ·{" "}
@@ -1112,7 +1144,7 @@ function App() {
   function tableActions() {
     const selectedReleaseCount = Object.keys(selectedReleases(selection)).length;
     const clear = !tree && selected.size > 0 && <button onClick={() => setSelected(new Set())}>Clear selection</button>;
-    const apply = <button disabled={localBusy || active(state?.download_job) || !preview || !selected.size} onClick={prepareApply}>Review & apply ({selected.size})</button>;
+    const apply = <button disabled={localBusy || active(state?.download_job) || !preview || !selected.size} title={localUnavailable ? "Review saved changes. Reconnect the library drive to apply them." : undefined} onClick={prepareApply}>Review & apply ({selected.size})</button>;
     let controls: React.ReactNode;
     if (["correct", "organise"].includes(route)) {
       const operations = route === "correct" ? actions : organisationActions;
@@ -1145,8 +1177,8 @@ function App() {
         ]} />{clear}<div className="table-result-actions"><button disabled={!selected.size} onClick={selectedDetail}>Review match</button></div></>;
     } else if (["metadata", "artwork"].includes(route)) {
       controls = <><ActionButton label={route === "metadata" ? "Find missing tags (online)" : "Find artwork (online)"}
-        onClick={() => run(route,scope())} disabled={submitting || !root || (busy && localBusy)} actionDisabled={busy}
-        title={route === "metadata" ? "Reuse verified links and cached metadata, then fill missing credits, tags and available BPM/key. Files change only after review and approval." : "Reuse saved cover information, then find genuine 1280 × 1280 covers for linked tracks. Files change only after review and approval."}
+        onClick={() => run(route,scope())} disabled={(route === "artwork" && !!localUnavailable) || submitting || !root || (busy && localBusy)} actionDisabled={busy}
+        title={route === "artwork" && localUnavailable ? localUnavailable : route === "metadata" ? "Reuse verified links and cached metadata, then fill missing credits, tags and available BPM/key. Files change only after review and approval." : "Reuse saved cover information, then find genuine 1280 × 1280 covers for linked tracks. Files change only after review and approval."}
         menuLabel={route === "metadata" ? "Metadata lookup options" : "Artwork lookup options"}
         options={[
           {id:"all",label:route === "metadata" ? "Find missing tags for all files" : "Find artwork for all files",note:"Use every indexed file in this library, reusing completed checks where possible.",disabled:busy,onClick:() => run(route)},
@@ -1186,12 +1218,12 @@ function App() {
           onClick={() => mutate("queue.add",{selection:selectedReleases(selection)})}>Queue selected ({selectedReleaseCount})</button></div></>;
     } else if (route === "queue") {
       controls = <ActionButton label={active(state?.download_job) ? "Downloading…" : "Download"} ariaLabel="Download"
-        disabled={submitting} actionDisabled={downloadBusy || !state?.stats.approved_queue}
+        disabled={submitting} actionDisabled={!!downloadUnavailable || downloadBusy || !state?.stats.approved_queue}
         onClick={async () => {
           setSubmitting(true);
           try {setReview({operation:"download",rows:await call("queue.preview")});}
           catch(e) {notifyError(e);} finally {setSubmitting(false);}
-        }} menuLabel="Download options" title="Review and download all approved audio tracks in the queue, including approvals on other pages."
+        }} menuLabel="Download options" title={downloadUnavailable || "Review and download all approved audio tracks in the queue, including approvals on other pages."}
         options={[{id:"export",label:"Export",note:"Save queued release or track links as a text list for an external downloader.",onClick:() => openExport("queue")}]} />;
     } else if (route === "downloaded") {
       controls = <button disabled={submitting} onClick={() => openExport("downloaded")}>Export</button>;
@@ -1283,7 +1315,7 @@ function App() {
         {route !== "mqa" && tableActions()}
         {route === "mqa" && <div className="mqa-actions table-actions" role="group" aria-label="Table actions">
           <ScanButton count={mqaSummaryCurrent ? mqaSummary!.counts.selected : selected.size} scope={mqaScope}
-            disabled={localBusy || !root || mqaScopePending} selectionPending={!mqaSummaryCurrent}
+            disabled={localBusy || !root || mqaScopePending} scanUnavailable={localUnavailable} selectionPending={!mqaSummaryCurrent}
             scanning={active(state?.job) && state?.job?.kind === "mqa"}
             onScope={chooseMqaScope}
             onScan={() => { if (mqaSummaryCurrent && mqaSummary!.ids.length) run("mqa", {ids:mqaSummary!.ids, force:true}); }} />
@@ -1507,6 +1539,7 @@ function App() {
                   <small>
                     {r.linked} / {r.tracks} tracks linked
                   </small>
+                  {r.available === false && <small>Drive unavailable · cached library</small>}
                 </div>
                 <button
                   disabled={busy}
@@ -1569,6 +1602,7 @@ function App() {
           <label className="setting-row">
             <span>Download folder</span>
             <input
+              aria-label="Download folder"
               value={settings.downloads?.output || ""}
               onChange={(e) =>
                 setSettings((previous: any) => ({
@@ -1696,7 +1730,7 @@ function App() {
           }}
           onKeyDown={(e) => {
             if (e.key === "Escape") setMenu(null);
-            const buttons = [...e.currentTarget.querySelectorAll("button")];
+            const buttons = [...e.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
             const i = buttons.indexOf(
               document.activeElement as HTMLButtonElement,
             );
@@ -1726,6 +1760,8 @@ function App() {
             <>
               <button
                 role="menuitem"
+                disabled={!!fileUnavailable(r.path)}
+                title={fileUnavailable(r.path) || undefined}
                 onClick={() => {
                   reveal(r.path).catch(notifyError);
                   setMenu(null);
@@ -1980,13 +2016,20 @@ function App() {
           >
             <option value="">{!state ? "Loading libraries…" : state.roots.length ? "Choose library" : "Add a library to begin"}</option>
             {state?.roots.map((r) => (
-              <option key={r.root} value={r.root}>{r.root.split("/").pop()}</option>
+              <option key={r.root} value={r.root}>{r.root.split("/").pop()}{r.available === false ? " (cached · drive unavailable)" : ""}</option>
             ))}
           </select>
           <span className="sidebar-version">v{appVersion}</span>
         </div>
       </aside>
       <main aria-label={titles[route] || "Overview"}>
+        {localUnavailable && <div className="notice library-unavailable" role="status">
+          <span><strong>Library unavailable · using cached data.</strong> Browse saved music, update online information and download to an available folder. Reconnect the drive to scan, change tags or move files.</span>
+        </div>}
+        {downloadUnavailable && route === "queue" && <div className="notice download-unavailable" role="status">
+          <span>{downloadUnavailable}</span>
+          <button onClick={() => setRoute("general")}>Choose download folder</button>
+        </div>}
         {[state?.job, state?.online_job, state?.download_job].some(job => active(job)) && (
           <header className="page-header">
               <div className="header-workloads" role="status" aria-live="off">
@@ -2078,7 +2121,7 @@ function App() {
             {detail.local_file_release && <section className="metadata-source">
               <h3>{detail.local_file_release.artist} — {detail.local_file_release.release}</h3>
               <p>{detail.local_file_release.path}</p><p>{detail.local_file_release.evidence}</p>
-              <button onClick={() => reveal(detail.local_file_release.path).catch(notifyError)}>Show in Finder</button>
+              <button disabled={!!fileUnavailable(detail.local_file_release.path)} title={fileUnavailable(detail.local_file_release.path) || undefined} onClick={() => reveal(detail.local_file_release.path).catch(notifyError)}>Show in Finder</button>
               <div className="metadata-table"><table aria-label={`Files in ${detail.local_file_release.release}`}>
                 <thead><tr><th>Track</th><th>Disc · track</th><th>Status</th><th>Evidence</th><th>Proposed action</th><th /></tr></thead>
                 <tbody>{(detail.local_file_release.children || []).map((track: Row) => <tr key={track.id}>
@@ -2106,7 +2149,7 @@ function App() {
               <h3>{detail.local_release.artist} — {detail.local_release.release}</h3>
               <p>{detail.local_release.path}</p><p>{detail.local_release.evidence}</p>
               <p>{detail.local_release.tracks} local tracks · {detail.local_release.status}</p>
-              <button onClick={() => reveal(detail.local_release.path).catch(notifyError)}>Show in Finder</button>
+              <button disabled={!!fileUnavailable(detail.local_release.path)} title={fileUnavailable(detail.local_release.path) || undefined} onClick={() => reveal(detail.local_release.path).catch(notifyError)}>Show in Finder</button>
               {detail.local_release.children?.length > 0 && <div className="metadata-table"><table aria-label={`Tracks in ${detail.local_release.release}`}>
                 <thead><tr><th>Track</th><th>Disc · track</th><th>Status</th><th>Evidence</th><th/></tr></thead>
                 <tbody>{(detail.local_release.children || []).map((track: Row) => <tr key={track.id}>
@@ -2123,6 +2166,8 @@ function App() {
                   <p>{detail.path}</p>
                   <p>Local: {detail.local_position}</p>
                   <button
+                    disabled={!!fileUnavailable(detail.path)}
+                    title={fileUnavailable(detail.path) || undefined}
                     onClick={() => reveal(detail.path).catch(notifyError)}
                   >
                     Show in Finder
@@ -2372,7 +2417,7 @@ function App() {
                     {detail.release.downloaded_files.map((path: string) => (
                       <div className="library-row" key={path}>
                         <small>{path}</small>
-                        <button onClick={() => reveal(path).catch(notifyError)}>
+                        <button disabled={!!fileUnavailable(path)} title={fileUnavailable(path) || undefined} onClick={() => reveal(path).catch(notifyError)}>
                           Show in Finder
                         </button>
                       </div>
@@ -2402,6 +2447,8 @@ function App() {
           onClose={() => setReview(null)}
         >
           <div className="modal-body">
+            {review.operation === "download" && downloadUnavailable && <p role="status">{downloadUnavailable}</p>}
+            {!["download", "remove-root", "deep_apply", "component_update"].includes(review.operation) && unavailableLibrary(state?.roots, review.root || root) && <p role="status">{unavailableLibrary(state?.roots, review.root || root)}</p>}
             <p>
               {review.operation === "consolidate"
                 ? "The listed source files will move to macOS Trash only after replacement audio and metadata are verified. Review BPM/key differences below."
@@ -2454,10 +2501,10 @@ function App() {
           <footer>
             <button onClick={() => setReview(null)}>Cancel</button>
             <button className="primary" disabled={review.operation === "download"
-              ? downloadBusy || !review.rows?.length
+              ? !!downloadUnavailable || downloadBusy || !review.rows?.length
               : review.operation === "component_update"
                 ? submitting || active(state?.online_job)
-                : localBusy || active(state?.download_job)} onClick={confirmReview}>
+                : localBusy || active(state?.download_job) || (!["remove-root", "deep_apply"].includes(review.operation) && !!unavailableLibrary(state?.roots, review.root || root))} onClick={confirmReview}>
               {review.operation === "consolidate"
                 ? review.count
                   ? `Move ${review.count} duplicate files to Trash`

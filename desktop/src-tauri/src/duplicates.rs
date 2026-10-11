@@ -688,7 +688,7 @@ pub fn clusters_to_link_rows(clusters: &[DuplicateCluster]) -> Vec<LinkRow> {
 pub async fn trash_file_or_directory(path_str: &str) -> Result<(), String> {
     let path = Path::new(path_str);
     if !path.exists() {
-        return Ok(());
+        return Err(format!("File is unavailable; reconnect its drive before moving it to Trash: {path_str}"));
     }
 
     #[cfg(target_os = "macos")]
@@ -736,13 +736,33 @@ pub async fn consolidate_redundant_releases(
     files_to_delete: &[String],
     folders_to_clean: &[String],
 ) -> Result<usize, String> {
+    consolidate_with_trash(db, files_to_delete, folders_to_clean, |path| async move {
+        trash_file_or_directory(&path).await
+    }).await
+}
+
+async fn consolidate_with_trash<F, Fut>(
+    db: &TursoDb,
+    files_to_delete: &[String],
+    folders_to_clean: &[String],
+    mut trash: F,
+) -> Result<usize, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     let mut deleted_count = 0;
 
     for file_path in files_to_delete {
-        if Path::new(file_path).exists() {
-            trash_file_or_directory(file_path).await?;
-            deleted_count += 1;
+        // An unplugged drive is not evidence that a reviewed duplicate was
+        // removed. Retain its cached index and links until Trash succeeds.
+        let metadata = std::fs::symlink_metadata(file_path)
+            .map_err(|e| format!("Duplicate is unavailable; reconnect the library and refresh the preview: {file_path}: {e}"))?;
+        if !metadata.is_file() {
+            return Err(format!("Duplicate is no longer a regular file: {file_path}"));
         }
+        trash(file_path.clone()).await?;
+        deleted_count += 1;
         db.remove_local_file(file_path).await?;
     }
 
@@ -766,7 +786,7 @@ pub async fn consolidate_redundant_releases(
             };
 
             if is_empty {
-                let _ = trash_file_or_directory(folder).await;
+                let _ = trash(folder.clone()).await;
             }
         }
     }
@@ -778,6 +798,73 @@ pub async fn consolidate_redundant_releases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_duplicates_and_failed_trash_keep_the_cached_index_and_links() {
+        let temp = std::env::temp_dir().join(format!("duplicate-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("song.flac").display().to_string();
+        let db = TursoDb::open(temp.join("library.db")).await.unwrap();
+        db.apply_file_update(&path, &path, temp.to_str().unwrap(), &serde_json::json!({"title":"Song"}), 1, 2).await.unwrap();
+        db.save_track_link(&path, "GB", "[0,0,1,2]", r#"{"status":"linked"}"#).await.unwrap();
+        let missing = consolidate_with_trash(&db, &[path.clone()], &[], |_| async {
+            panic!("Missing files must never be sent to Trash")
+        }).await;
+        assert!(missing.unwrap_err().contains("unavailable"));
+        std::fs::write(&path, b"Original audio").unwrap();
+        let failed = consolidate_with_trash(&db, &[path.clone()], &[], |_| async {
+            Err("Simulated Trash failure".into())
+        }).await;
+        assert_eq!(failed.unwrap_err(), "Simulated Trash failure");
+        assert_eq!(std::fs::read(&path).unwrap(), b"Original audio");
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT present FROM local_files WHERE path=?", (path.as_str(),)).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 1);
+        let mut links = conn.query("SELECT COUNT(*) FROM track_links WHERE path=?", (path.as_str(),)).await.unwrap();
+        assert_eq!(links.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 1);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_duplicate_trash_updates_only_removed_files_and_keeps_sidecars() {
+        let temp = std::env::temp_dir().join(format!("duplicate-trash-{}", uuid::Uuid::new_v4()));
+        let duplicate_dir = temp.join("Duplicate");
+        let empty_dir = temp.join("Empty after removal");
+        let trash_dir = temp.join("Test Trash");
+        for directory in [&duplicate_dir, &empty_dir, &trash_dir] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let duplicate = duplicate_dir.join("song.flac").display().to_string();
+        let master = temp.join("master.flac").display().to_string();
+        let sidecar = duplicate_dir.join("cover.jpg");
+        std::fs::write(&sidecar, b"Keep cover artwork").unwrap();
+        std::fs::write(empty_dir.join(".DS_Store"), b"Folder metadata").unwrap();
+        let db = TursoDb::open(temp.join("library.db")).await.unwrap();
+        for path in [&duplicate, &master] {
+            std::fs::write(path, crate::stream_download::MINIMAL_FLAC).unwrap();
+            db.apply_file_update(path, path, temp.to_str().unwrap(), &serde_json::json!({"title":"Song"}), 1, 2).await.unwrap();
+            db.save_track_link(path, "GB", "[0,0,1,2]", r#"{"status":"linked"}"#).await.unwrap();
+        }
+        let removed = consolidate_with_trash(&db, &[duplicate.clone()],
+            &[duplicate_dir.display().to_string(), empty_dir.display().to_string()], |path| {
+                let target = trash_dir.join(Path::new(&path).file_name().unwrap());
+                async move { std::fs::rename(path, target).map_err(|e| e.to_string()) }
+            }).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(!Path::new(&duplicate).exists());
+        assert!(Path::new(&master).exists());
+        assert!(sidecar.exists());
+        assert!(!empty_dir.exists());
+        assert_eq!(std::fs::read(trash_dir.join("song.flac")).unwrap(), crate::stream_download::MINIMAL_FLAC);
+        let present = crate::actions::files(&db, temp.to_str().unwrap()).await.unwrap();
+        assert_eq!(present.len(), 1);
+        assert_eq!(present[0].path, master);
+        let conn = db.connect().unwrap();
+        let mut links = conn.query("SELECT path FROM track_links", ()).await.unwrap();
+        assert_eq!(links.next().await.unwrap().unwrap().get::<String>(0).unwrap(), master);
+        assert!(links.next().await.unwrap().is_none());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn online_replacements_group_sources_with_exact_unique_recording_gains() {

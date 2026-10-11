@@ -47,7 +47,9 @@ Captured from the current UI with a disposable sample library.
 | --- | --- |
 | ![General settings](desktop/docs/imgs/general_settings.png) | ![Activity](desktop/docs/imgs/activity_log.png) |
 
-See the [guide](desktop/docs/DOCUMENTATION.md) for workflows, cache behaviour and development checks.
+Cached libraries remain browsable when their removable drive is disconnected. Online work and downloads to a connected folder remain available; file-changing actions wait for the library drive.
+
+See the [guide](desktop/docs/DOCUMENTATION.md) for workflows, cache behaviour and the repeatable test suite.
 
 ## Credits and licence
 

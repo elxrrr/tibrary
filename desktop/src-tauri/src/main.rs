@@ -31,6 +31,8 @@ pub mod duplicates;
 pub mod enrichment;
 pub mod flac_container;
 pub mod linking;
+mod library_access;
+mod file_publication;
 pub mod maintenance;
 pub mod matching;
 pub mod mqa;
@@ -904,11 +906,18 @@ fn start_local_scan(app: Option<&tauri::AppHandle>, backend: &Arc<Backend>, db: 
         let mut total = scanner::ScanSummary::default();
         let mut results = Vec::new();
         let mut failed = 0;
+        let mut unavailable = 0;
         let mut checked = 0;
         let count = roots.len();
         for (index, root) in roots.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) { break; }
             let display = root.file_name().and_then(|name|name.to_str()).unwrap_or("Library").to_owned();
+            if startup && library_access::require_library(&root.to_string_lossy()).is_err() {
+                unavailable += 1;
+                backend.log_for("scan", &format!("Using cached library · {display} · reconnect its drive for file operations"), "info");
+                results.push(json!({"root":root,"cached":true,"available":false}));
+                continue;
+            }
             let label = if count > 1 {format!("Library {}/{count} · {display}", index + 1)} else {display};
             let prog_backend = backend.clone();
             let prog_app = app.clone();
@@ -925,6 +934,7 @@ fn start_local_scan(app: Option<&tauri::AppHandle>, backend: &Arc<Backend>, db: 
             match result {
                 Ok(summary) => {
                     total.read += summary.read; total.unchanged += summary.unchanged;
+                    total.properties_refreshed += summary.properties_refreshed;
                     total.errors += summary.errors; total.missing += summary.missing;
                     total.removed += summary.removed; total.restored += summary.restored;
                     if summary.status == "complete" {checked += 1;}
@@ -940,16 +950,16 @@ fn start_local_scan(app: Option<&tauri::AppHandle>, backend: &Arc<Backend>, db: 
         let cancelled = cancel.load(Ordering::Relaxed);
         let status = if cancelled {"cancelled"} else if failed > 0 && checked == 0 {"failed"} else {"complete"};
         let message = if cancelled {"Local check cancelled · completed results retained".to_owned()}
-            else {format!("Local index checked · {checked}/{count} libraries · {} tags read · {} unchanged reused · {} newly missing · {} restored{}",
-                total.read,total.unchanged,total.removed,total.restored,
-                if failed > 0 {format!(" · {failed} unavailable or unreadable")} else {String::new()})};
+            else {format!("Local index checked · {checked}/{count} libraries · {} tags read · {} unchanged reused · {} audio properties cached · {} newly missing · {} restored{}",
+                total.read,total.unchanged,total.properties_refreshed,total.removed,total.restored,
+                if unavailable + failed > 0 {format!(" · {} using saved inventory",unavailable + failed)} else {String::new()})};
         let mutated = db.local_revision.load(Ordering::SeqCst) != before;
         if mutated {backend.previews.lock().unwrap().clear();}
         let final_job = json!({"id":id,"kind":"scan","status":status,"startup":startup,"message":message,"started":started,
             "finished":chrono::Utc::now().timestamp_millis() as f64 / 1000.,
             "result":{"files":total.read+total.unchanged,"read":total.read,"unchanged":total.unchanged,
-                "missing":total.missing,"removed":total.removed,"restored":total.restored,"errors":total.errors,
-                "libraries_checked":checked,"libraries_unavailable":failed,"libraries":results}});
+                "missing":total.missing,"removed":total.removed,"restored":total.restored,"errors":total.errors,"properties_refreshed":total.properties_refreshed,
+                "libraries_checked":checked,"libraries_unavailable":unavailable+failed,"libraries":results}});
         backend.finish_job(final_job.clone());
         let _ = db.set_preference("desktop-last-job", &final_job).await;
         if let Some(app) = app {
@@ -1003,6 +1013,7 @@ async fn handle_rpc_call(
             if rev == revision && created.elapsed().as_secs() < 30 {
                 if method == "state" {
                     refresh_runtime_state(state,&mut value);
+                    library_access::decorate_state(db, &mut value).await?;
                 }
                 return Ok(value);
             }
@@ -1040,6 +1051,7 @@ async fn handle_rpc_uncached(
     mut args: Value,
 ) -> Result<Value, String> {
     let method = if method == "missing.rebuild" { args = json!({"kind":"cached_releases","args":args}); "job.start".to_string() } else { method };
+    if method == "library.availability" { return library_access::snapshot(db).await; }
     if method == "job.status" {
         return Ok(
             json!({"job":state.active_job.lock().unwrap().clone(),"online_job":state.online_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.snapshot(),"activity_epochs":state.activity_epochs(),"download_monitor":state.download_monitor.lock().unwrap().clone(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
@@ -1047,31 +1059,6 @@ async fn handle_rpc_uncached(
     }
     if method == "appearance.accent" {
         return serde_json::to_value(appearance::system_accent(app_handle).await).map_err(|error| error.to_string());
-    }
-    if matches!(method.as_str(), "table" | "table.facets" | "detail" | "job.start" | "mqa.selection")
-        || method.starts_with("turso.") || method.starts_with("release.")
-        || method.starts_with("artists.") || method.starts_with("links.") || method.starts_with("queue.") {
-        let preferences = db.get_settings().await?;
-        let mut market = preferences["general"]["market"]
-            .as_str()
-            .unwrap_or("GB")
-            .to_uppercase();
-        if (method == "job.start" && (is_online_job(args["kind"].as_str().unwrap_or("")) || args["kind"] == "download")
-                && !matches!(args["kind"].as_str(),Some("connections"|"connect_account"|"connect_download")))
-            || matches!(method.as_str(),"turso.discography"|"turso.tidal.artist"|"turso.tidal.search") {
-            let http = network::client(20)?;
-            market = account::ensure_account_market(db, &http, None).await?;
-        }
-        let account_market = db.get_preference("subscriber-account-market").await?
-            .is_some_and(|saved| saved["country_code"].as_str().and_then(account::normalize_market).is_some());
-        if let Some(obj) = args.as_object_mut() {
-            if account_market { obj.insert("market".into(),json!(market)); }
-            else { obj.entry("market").or_insert(json!(market)); }
-        }
-        if let Some(obj) = args.get_mut("args").and_then(Value::as_object_mut) {
-            if account_market { obj.insert("market".into(),json!(market)); }
-            else { obj.entry("market").or_insert(json!(market)); }
-        }
     }
     let _dispatch = if matches!(method.as_str(),"job.start"|"auth.reply"|"turso.tags.write"|"turso.scan"|"turso.discography"|"turso.maintenance.apply") {
         Some(state.dispatch_gate.lock().await)
@@ -1112,6 +1099,32 @@ async fn handle_rpc_uncached(
                 matches!(job["status"].as_str(),Some("running"|"cancelling"))
                 && matches!(job["kind"].as_str(),Some("scan"|"apply"|"deep_apply"|"consolidate"))) {
             return Err("The local index is being updated. This action will be available when it finishes.".into());
+        }
+    }
+    library_access::guard_rpc(db, &method, &args).await?;
+    if matches!(method.as_str(), "table" | "table.facets" | "detail" | "job.start" | "mqa.selection")
+        || method.starts_with("turso.") || method.starts_with("release.")
+        || method.starts_with("artists.") || method.starts_with("links.") || method.starts_with("queue.") {
+        let preferences = db.get_settings().await?;
+        let mut market = preferences["general"]["market"]
+            .as_str()
+            .unwrap_or("GB")
+            .to_uppercase();
+        if (method == "job.start" && (is_online_job(args["kind"].as_str().unwrap_or("")) || args["kind"] == "download")
+                && !matches!(args["kind"].as_str(),Some("connections"|"connect_account"|"connect_download")))
+            || matches!(method.as_str(),"turso.discography"|"turso.tidal.artist"|"turso.tidal.search") {
+            let http = network::client(20)?;
+            market = account::ensure_account_market(db, &http, None).await?;
+        }
+        let account_market = db.get_preference("subscriber-account-market").await?
+            .is_some_and(|saved| saved["country_code"].as_str().and_then(account::normalize_market).is_some());
+        if let Some(obj) = args.as_object_mut() {
+            if account_market { obj.insert("market".into(),json!(market)); }
+            else { obj.entry("market").or_insert(json!(market)); }
+        }
+        if let Some(obj) = args.get_mut("args").and_then(Value::as_object_mut) {
+            if account_market { obj.insert("market".into(),json!(market)); }
+            else { obj.entry("market").or_insert(json!(market)); }
         }
     }
     if method == "job.start" && actions::handles(args["kind"].as_str().unwrap_or("")) {
@@ -1469,6 +1482,7 @@ async fn handle_rpc_uncached(
         } else { db.get_state(active, &logs, root).await? };
         snapshot["catalogue_refresh"] = db.get_preference("catalogue-refresh-checkpoint").await?.unwrap_or(Value::Null);
         refresh_runtime_state(state,&mut snapshot);
+        library_access::decorate_state(db, &mut snapshot).await?;
         return Ok(snapshot);
     }
     if method == "settings" {
@@ -2966,6 +2980,25 @@ mod startup_freshness_tests {
         assert_eq!(unchanged["result"]["read"],0); assert_eq!(unchanged["result"]["unchanged"],3);
         assert_eq!(db.local_revision.load(Ordering::SeqCst),revision);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_with_only_disconnected_libraries_uses_cache_without_failed_jobs() {
+        let temp = std::env::temp_dir().join(format!("cached-startup-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let root = temp.join("unmounted/Music");
+        db.add_root(root.to_str().unwrap()).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        check_libraries_on_startup(None,backend.clone(),db.clone()).await;
+        let job = finished(&backend).await;
+        assert_eq!(job["status"],"complete");
+        assert_eq!(job["result"]["libraries_unavailable"],1);
+        assert_eq!(job["result"]["libraries_checked"],0);
+        assert_eq!(job["result"]["libraries"][0]["cached"],true);
+        assert!(!root.exists());
+        assert!(backend.active_job_cancel.lock().unwrap().is_none());
+        assert!(!backend.startup_scan_pending.load(Ordering::SeqCst));
+        drop(db); std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 import { test, expect, Page, Locator } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, realpathSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, realpathSync, readFileSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -100,6 +100,42 @@ function mockFacets(rows: any[], args: any) {
   const options = [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([value, count]) => ({value, label: value, count}));
   return {options: options.slice(0, args.limit || 100), total: options.length};
 }
+// Change drive visibility while keeping the browser on the same page. Real
+// fixture files are moved out of reach to catch accidental filesystem reads.
+async function driveAvailability(page: Page) {
+  const drive = {library: true, destination: true, checks: 0};
+  await page.route("**/__test_rpc", async route => {
+    const request = route.request().postDataJSON();
+    const availability = {
+      roots: [{root: join(folder, "music"), available: drive.library,
+        unavailable_reason: drive.library ? null : "Reconnect the library drive to use its files."}],
+      download_destination: {path: join(folder, "downloads"), available: drive.destination,
+        reason: drive.destination ? null : "Download folder unavailable. Choose an available folder in General settings."},
+    };
+    if (request.method === "library.availability") {
+      drive.checks++;
+      return route.fulfill({json: {result: availability}});
+    }
+    const response = await rpc(request.method, request.args);
+    if (request.method === "state" && response.result) {
+      response.result.roots = response.result.roots.map((root: any) => ({...root, ...availability.roots.find(item => item.root === root.root)}));
+      response.result.download_destination = availability.download_destination;
+    }
+    return route.fulfill({json: response});
+  });
+  return {
+    drive,
+    async connect(available: boolean) {
+      if (drive.library !== available) renameSync(join(folder, available ? "disconnected-music" : "music"), join(folder, available ? "music" : "disconnected-music"));
+      drive.library = available;
+      await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    },
+    async destination(available: boolean) {
+      drive.destination = available;
+      await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    },
+  };
+}
 test.beforeEach(async ({ page }) => {
   folder = realpathSync(mkdtempSync(join(tmpdir(), "tibrary-browser-")));
   const root = resolve("..");
@@ -115,6 +151,22 @@ test.beforeEach(async ({ page }) => {
       },
     },
   );
+  if (test.info().title.startsWith("disconnected cached library")) {
+    execFileSync("python3", ["-c", `import json,sqlite3,sys
+from pathlib import Path
+from seed_desktop import write_flac
+library=Path(sys.argv[2]); c=sqlite3.connect(sys.argv[1])
+for path,raw in c.execute('SELECT path,metadata FROM local_files').fetchall():
+ metadata=json.loads(raw); metadata.update(sample_rate=8000,bit_depth=16)
+ c.execute('UPDATE local_files SET metadata=? WHERE path=?',(json.dumps(metadata),path))
+path=library/'First Light (single)'/'First Light.flac'
+write_flac(path,'North Assembly','First Light','First Light',1,1)
+metadata={'albumartist':['North Assembly'],'artist':['North Assembly'],'album':['First Light'],'title':['First Light'],'tracknumber':['1/1'],'discnumber':['1/1'],'date':['2020-04-03'],'duration':180.0,'sample_rate':8000,'bit_depth':16}
+c.execute('INSERT INTO local_files VALUES(?,?,?,?,?,NULL,1)',(str(path),str(library),path.stat().st_size,path.stat().st_mtime_ns,json.dumps(metadata)))
+c.commit()`, join(folder,"db"), join(folder,"music")], {
+      env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
+    });
+  }
   if (test.info().title.startsWith("artist context menu opens")) {
   execFileSync("python3", ["-c", `import sqlite3,json,sys
 c=sqlite3.connect(sys.argv[1])
@@ -969,20 +1021,19 @@ test("artist hierarchy shows local release evidence without exposing online IDs 
   await expect(page.getByRole("alert")).toHaveCount(0);
   expect(errors).toEqual([]);
 });
-test("artist hierarchy keeps compilation releases together and resolves selected file paths at every level", async ({page}) => {
+test("artist hierarchy scopes linking to named artists and keeps compilation files accessible in local browsing", async ({page}) => {
   const root=join(folder,"music"), requests:any[]=[];
   const args={route:"links",root,group_releases:true,group_artists:true,sort:"artist",direction:"asc",limit:1};
   const all=(await rpc("table",{...args,limit:100})).result;
-  expect(all.total).toBe(3);
-  expect(all.release_total).toBe(4);
-  expect(all.track_total).toBe(7);
-  const compilation=all.rows.find((row:any)=>row.artist==="Various Artists");
-  expect(compilation.artist_group).toBe(true);
-  expect(compilation.children).toHaveLength(1);
-  expect(compilation.children[0].release).toBe("Night Sessions");
-  expect(compilation.children[0].children.map((row:any)=>row.title)).toEqual(["Opening","Closing"]);
+  expect(all.total).toBe(2);
+  expect(all.release_total).toBe(3);
+  expect(all.track_total).toBe(5);
+  expect(all.rows.some((row:any)=>row.artist==="Various Artists")).toBe(false);
+  const files=(await rpc("table",{route:"files",root,limit:100})).result;
+  expect(files.total).toBe(7);
+  expect(files.rows.filter((row:any)=>row.artist==="Various Artists").map((row:any)=>row.title).sort()).toEqual(["Closing","Opening"]);
   const first=(await rpc("table",args)).result, second=(await rpc("table",{...args,offset:1})).result;
-  expect(first.total).toBe(3);
+  expect(first.total).toBe(2);
   expect(first.rows).toHaveLength(1);
   expect(first.rows[0].id).not.toBe(second.rows[0].id);
   const north=all.rows.find((row:any)=>row.artist==="North Assembly");
@@ -998,7 +1049,7 @@ test("artist hierarchy keeps compilation releases together and resolves selected
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Link releases",exact:true}).click();
   await columnAll(page,"Status");
-  await expect(page.locator("tbody tr")).toHaveCount(3);
+  await expect(page.locator("tbody tr")).toHaveCount(2);
   await page.getByRole("checkbox",{name:"Select North Assembly",exact:true}).check();
   await page.getByRole("button",{name:"Recheck 4 selected",exact:true}).click();
   await expect.poll(()=>requests.length).toBe(1);
@@ -1018,7 +1069,9 @@ test("artist hierarchy keeps compilation releases together and resolves selected
   await page.getByRole("button",{name:"Recheck 1 selected",exact:true}).click();
   await expect.poll(()=>requests.length).toBe(2);
   expect(requests[1].args.args.ids).toEqual([join(root,"North Assembly/Night Maps (2022)/Disc 2/Afterimage.flac")]);
-  await expandLocalArtist(page,"Various Artists");
+  await expect(page.getByRole("button",{name:"Expand Various Artists",exact:true})).toHaveCount(0);
+  await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
+  await page.getByRole("region",{name:"Your libraries",exact:true}).getByRole("button",{name:"Open",exact:true}).click();
   await expect(page.getByRole("button",{name:"Expand Night Sessions",exact:true})).toHaveCount(1);
   await page.getByRole("button",{name:"Expand Night Sessions",exact:true}).click();
   await expect(page.getByRole("checkbox",{name:"Select track Opening",exact:true})).toBeVisible();
@@ -2667,4 +2720,179 @@ test("saved activity loads older pages and searches archived details without exp
   await expect(panel.locator(".log-row").first()).toContainText("Checked recording 1002");
   await expect(panel.locator(".batch-toggle")).toHaveCount(0);
   await page.unrouteAll({behavior:"wait"});
+});
+
+test("disconnected cached library keeps browsing and online work while file actions are inaccessible", async ({page}) => {
+  const availability = await driveAvailability(page);
+  await availability.connect(false);
+  await page.goto("/");
+  await expect(page.locator(".library-unavailable")).toContainText("using cached data");
+  await expect(page.getByLabel("Active library").locator("option:checked")).toContainText("cached");
+  const sidebar = page.locator("aside");
+  await page.getByRole("region", {name:"Your libraries",exact:true}).getByRole("button", {name:"Open",exact:true}).click();
+  await expect(page.locator("tbody")).toContainText("Blue Hours");
+  await expandLocalRelease(page);
+  const row = page.locator("tbody tr").filter({has:page.getByRole("checkbox", {name:"Select track First Light",exact:true})});
+  await row.click({button:"right"});
+  await expect(page.getByRole("menuitem", {name:"Show in Finder",exact:true})).toBeDisabled();
+  await expect(page.getByRole("menuitem", {name:"Copy path",exact:true})).toBeEnabled();
+  await expect(page.getByRole("menuitem", {name:/Recheck .*selected tracks/})).toBeEnabled();
+  await page.getByRole("menuitem", {name:"View metadata / match details",exact:true}).click();
+  await expect(page.getByRole("dialog")).toContainText("First Light");
+  await expect(page.getByRole("dialog").getByRole("button", {name:"Show in Finder",exact:true})).toBeDisabled();
+  await page.getByRole("dialog").getByRole("button", {name:"Done",exact:true}).click();
+  await sidebar.getByRole("button", {name:"Correct tags",exact:true}).click();
+  await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
+  await expect(page.getByRole("button", {name:"Preview changes",exact:true})).toBeEnabled();
+  await page.getByRole("checkbox", {name:"Select visible rows",exact:true}).check();
+  await page.getByRole("button", {name:/Review & apply/}).click();
+  await expect(page.getByRole("dialog").getByRole("table", {name:"Tag comparison"}).first()).toBeVisible();
+  await expect(page.getByRole("dialog").getByRole("button", {name:"Confirm & continue",exact:true})).toBeDisabled();
+  await page.getByRole("dialog").getByRole("button", {name:"Cancel",exact:true}).click();
+  await sidebar.getByRole("button", {name:"Organise files",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Preview moves",exact:true})).toBeEnabled();
+  await expect(page.getByRole("button", {name:/Review & apply/})).toBeDisabled();
+  await sidebar.getByRole("button", {name:"Local duplicates",exact:true}).click();
+  await page.getByRole("button", {name:"Check local duplicates",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Check local duplicates",exact:true})).toBeEnabled();
+  await page.getByRole("checkbox", {name:"Select visible rows",exact:true}).check();
+  await page.getByRole("button", {name:/Review duplicate removal/}).click();
+  await expect(page.getByRole("dialog", {name:"Review duplicate removal",exact:true})).toBeVisible();
+  await expect(page.getByRole("dialog").getByRole("button", {name:/Move .* to Trash/})).toBeDisabled();
+  await page.getByRole("dialog").getByRole("button", {name:"Cancel",exact:true}).click();
+  await sidebar.getByRole("button", {name:"MQA audit",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Scan selected tracks",exact:true})).toBeDisabled();
+  await expect(page.getByRole("button", {name:"Choose scan scope",exact:true})).toBeEnabled();
+  await page.getByRole("button", {name:"Choose scan scope",exact:true}).click();
+  await page.getByRole("menuitemradio", {name:"All releases",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Scan selected tracks",exact:true})).toBeDisabled();
+  await sidebar.getByRole("button", {name:"Fix artwork",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Find artwork (online)",exact:true})).toBeDisabled();
+  await sidebar.getByRole("button", {name:"Add missing tags",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Find missing tags (online)",exact:true})).toBeEnabled();
+  await expect(page.getByRole("button", {name:/Review & apply/})).toBeDisabled();
+  await sidebar.getByRole("button", {name:"Link artists",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Match artist",exact:true})).toBeEnabled();
+  await sidebar.getByRole("button", {name:"Link releases",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Link unresolved tracks",exact:true})).toBeEnabled();
+  await sidebar.getByRole("button", {name:"Online replacements",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Find cached replacements",exact:true})).toBeEnabled();
+  await sidebar.getByRole("button", {name:"Missing releases",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Update missing releases",exact:true})).toBeEnabled();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("disconnecting during a tag review blocks confirmation and reconnecting preserves the review", async ({page}) => {
+  const availability = await driveAvailability(page);
+  const original = readFileSync(join(folder, "music", "First Light.flac"));
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"Correct tags",exact:true}).click();
+  await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
+  await page.getByRole("checkbox", {name:"Select visible rows",exact:true}).check();
+  await page.getByRole("button", {name:/Review & apply/}).click();
+  const dialog = page.getByRole("dialog", {name:"Review changes",exact:true});
+  const confirm = dialog.getByRole("button", {name:"Confirm & continue",exact:true});
+  await expect(confirm).toBeEnabled();
+  const comparison = await dialog.getByRole("table", {name:"Tag comparison"}).first().innerText();
+  await availability.connect(false);
+  await expect(confirm).toBeDisabled();
+  await expect(dialog.getByRole("status")).toContainText("Reconnect");
+  expect(readFileSync(join(folder, "disconnected-music", "First Light.flac"))).toEqual(original);
+  await availability.connect(true);
+  await expect(confirm).toBeEnabled();
+  expect(await dialog.getByRole("table", {name:"Tag comparison"}).first().innerText()).toBe(comparison);
+  await dialog.getByRole("button", {name:"Cancel",exact:true}).click();
+  await expect(page.getByRole("checkbox", {name:"Select visible rows",exact:true})).toBeChecked();
+  expect(readFileSync(join(folder, "music", "First Light.flac"))).toEqual(original);
+  await expect(page.locator(".library-unavailable")).toHaveCount(0);
+});
+
+test("disconnected library can refresh missing releases and download only the approved track to another folder", async ({page}) => {
+  const availability = await driveAvailability(page);
+  const started: any[] = [];
+  await page.route("**/__test_rpc", async route => {
+    const request = route.request().postDataJSON();
+    if (request.method === "job.start" && ["discography", "download"].includes(request.args.kind)) {
+      started.push({...request.args, approved:(await rpc("queue.preview")).result});
+      return route.fulfill({json:{result:{id:`offline-${started.length}`,kind:request.args.kind,status:"complete",started:Date.now()/1000,message:"Completed fixture request"}}});
+    }
+    return route.fallback();
+  });
+  await availability.connect(false);
+  await page.goto("/");
+  const sidebar = page.locator("aside");
+  await sidebar.getByRole("button", {name:"Missing releases",exact:true}).click();
+  await page.getByRole("button", {name:"Update missing releases",exact:true}).click();
+  await expect.poll(() => started.length).toBe(1);
+  expect(started[0].args.root).toBe(join(folder,"music"));
+  await viewOption(page, "Release timeline", "All missing releases");
+  await page.getByRole("button", {name:"Expand Blue Hours",exact:true}).click();
+  await page.getByRole("checkbox", {name:"Select track Low Tide",exact:true}).check();
+  await page.getByRole("button", {name:"Queue selected (1)",exact:true}).click();
+  await sidebar.getByRole("button", {name:"Download queue",exact:true}).click();
+  await expect(page.getByRole("checkbox", {name:"Select Blue Hours",exact:true})).toHaveJSProperty("indeterminate", true);
+  await page.getByRole("button", {name:"Download",exact:true}).click();
+  const dialog = page.getByRole("dialog", {name:"Download approved music",exact:true});
+  await expect(dialog).toContainText("Low Tide");
+  await expect(dialog).not.toContainText("First Light");
+  await dialog.getByRole("button", {name:"Start download",exact:true}).click();
+  await expect.poll(() => started.length).toBe(2);
+  expect(started[1].kind).toBe("download");
+  expect(started[1].approved).toHaveLength(1);
+  expect(started[1].approved[0].selected).toEqual(["91000102"]);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("download destination disconnection blocks an open review while queue export and folder recovery stay usable", async ({page}) => {
+  const availability = await driveAvailability(page);
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"Download queue",exact:true}).click();
+  await page.getByRole("checkbox", {name:"Select Blue Hours",exact:true}).check();
+  await page.getByRole("button", {name:"Download",exact:true}).click();
+  const dialog = page.getByRole("dialog", {name:"Download approved music",exact:true});
+  await expect(dialog.getByRole("button", {name:"Start download",exact:true})).toBeEnabled();
+  await availability.destination(false);
+  await expect(dialog.getByRole("button", {name:"Start download",exact:true})).toBeDisabled();
+  await expect(dialog.getByRole("status")).toContainText("Download folder unavailable");
+  await dialog.getByRole("button", {name:"Cancel",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Download",exact:true})).toBeDisabled();
+  await actionOption(page, "Download options", "Export");
+  await expect(page.getByRole("dialog", {name:"Export queue",exact:true}).getByRole("textbox", {name:"Download links",exact:true})).toContainText("tidal.com");
+  await page.getByRole("dialog").getByRole("button", {name:"Close",exact:true}).click();
+  await page.getByRole("button", {name:"Choose download folder",exact:true}).click();
+  await expect(page.getByLabel("Download folder",{exact:true})).toBeVisible();
+  await availability.destination(true);
+  await page.locator("aside").getByRole("button", {name:"Download queue",exact:true}).click();
+  await expect(page.getByRole("checkbox", {name:"Select Blue Hours",exact:true})).toBeChecked();
+  await expect(page.getByRole("button", {name:"Download",exact:true})).toBeEnabled();
+});
+
+test("idle drive availability polling preserves cached rows and selections through disconnect and reconnect", async ({page}) => {
+  const root = join(folder, "music");
+  const availability = (await rpc("library.availability")).result;
+  expect(availability.roots.find((library:any) => library.root === root)?.available).toBe(true);
+  await page.goto("/");
+  await page.locator("aside").getByRole("button", {name:"MQA audit",exact:true}).click();
+  await expandLocalRelease(page);
+  const first = page.getByRole("checkbox", {name:"Select track First Light",exact:true});
+  const second = page.getByRole("checkbox", {name:"Select track Drift",exact:true});
+  await expect(first).toBeChecked();
+  await second.uncheck();
+  const scan = page.getByRole("button", {name:"Scan selected tracks",exact:true});
+  await expect(scan).toBeEnabled();
+  renameSync(root, join(folder, "disconnected-music"));
+  await expect(page.locator(".library-unavailable")).toBeVisible({timeout:11000});
+  await expect(scan).toBeDisabled();
+  await expect(first).toBeChecked();
+  await expect(second).not.toBeChecked();
+  const saved = (await rpc("state", {root})).result;
+  expect(saved.roots.find((library:any) => library.root === root).tracks).toBe(2);
+  expect(saved.roots.find((library:any) => library.root === root).available).toBe(false);
+  expect((await rpc("table", {root,route:"files"})).result.total).toBe(2);
+  renameSync(join(folder, "disconnected-music"), root);
+  await expect(page.locator(".library-unavailable")).toHaveCount(0, {timeout:11000});
+  await expect(scan).toBeEnabled();
+  await expect(first).toBeChecked();
+  await expect(second).not.toBeChecked();
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });

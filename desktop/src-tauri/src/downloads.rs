@@ -60,6 +60,50 @@ fn nonempty_file(path: &Path) -> bool {
     path.is_file() && path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false)
 }
 
+fn validate_album_relative(destination: Option<&Value>) -> Result<(), String> {
+    let Some(destination) = destination else { return Ok(()); };
+    let relative = destination.get("album_relative").and_then(Value::as_str)
+        .ok_or("Existing release destination needs a relative album folder")?;
+    if Path::new(relative).components().any(|component| !matches!(component,
+        std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+        return Err("Existing release destination must stay within its library folder".into());
+    }
+    Ok(())
+}
+
+fn relative_playlist_path(path: &Path, album_dir: &Path) -> Option<String> {
+    path.strip_prefix(album_dir).ok().map(|relative| relative.to_string_lossy().replace('\\', "/"))
+}
+
+pub(crate) async fn validate_download_destinations(db: &TursoDb) -> Result<(), String> {
+    let fallback = crate::library_access::download_folder(db).await?;
+    let conn = db.connect()?;
+    let mut rows = conn.query("SELECT payload FROM queue WHERE approved=1 AND decision='queued'", ())
+        .await.map_err(|error|error.to_string())?;
+    let mut approved = 0;
+    while let Some(row) = rows.next().await.map_err(|error|error.to_string())? {
+        approved += 1;
+        let payload: String = row.get(0).map_err(|error|error.to_string())?;
+        let release: Value = serde_json::from_str(&payload).map_err(|_|"Queued release is invalid; review the queue")?;
+        validate_album_relative(release.get("existing_destination"))?;
+        let explicit = release["replacement_audit"]["root"].as_str()
+            .or_else(||release["existing_destination"]["root"].as_str());
+        let destination = explicit.map(|path| if let Some(relative) = path.strip_prefix("~/") {
+            std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(relative)
+        } else { PathBuf::from(path) }).unwrap_or_else(||fallback.clone());
+        if explicit.is_some() { crate::library_access::require_library(&destination.to_string_lossy())?; }
+        crate::library_access::require_download_destination(db, &destination).await?;
+        if let Some(root) = release["replacement_audit"]["root"].as_str() {
+            let mut registered = conn.query("SELECT root FROM roots WHERE root=?", (root,)).await.map_err(|error|error.to_string())?;
+            if registered.next().await.map_err(|error|error.to_string())?.is_none() {
+                return Err("Replacement library is no longer registered".into());
+            }
+        }
+    }
+    if approved == 0 { crate::library_access::require_download_destination(db, &fallback).await?; }
+    Ok(())
+}
+
 fn preserve_existing_dj_tags(replacement: &Path, previous: &[PathBuf], explicit_replacement: bool) -> Result<(), String> {
     let fresh = crate::scanner::read_audio_metadata(replacement)?;
     let valid_bpm = |value: Option<&str>| value.and_then(|value| value.trim().parse::<f64>().ok())
@@ -133,6 +177,7 @@ impl DownloadManager {
         progress_cb: impl Fn(String) + Send + Sync + 'static,
         monitor_cb: impl Fn(Value) + Send + Sync + 'static,
     ) -> Result<usize, String> {
+        if cancel_flag.load(Ordering::Relaxed) { return Ok(0); }
         let progress_cb = Arc::new(progress_cb);
         let monitor_cb = Arc::new(monitor_cb);
         let conn = db.connect()?;
@@ -180,6 +225,10 @@ impl DownloadManager {
         } else {
             PathBuf::from(output_str)
         };
+
+        // Check actual release destinations before authentication. An unused
+        // default output folder can be disconnected while explicit targets work.
+        validate_download_destinations(db).await?;
 
         let default_quality = settings
             .get("quality")
@@ -343,6 +392,7 @@ impl DownloadManager {
                 output_path.clone()
             };
 
+            crate::library_access::require_download_destination(db, &item_output).await?;
             fs::create_dir_all(&item_output).map_err(|e| e.to_string())?;
 
             let raw_quality = release
@@ -450,7 +500,7 @@ impl DownloadManager {
             planned_tracks[release_index]=total_tracks;
             let planned_total=if planned_tracks.iter().all(|n|*n>0) {planned_tracks.iter().sum()} else {0};
             monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":0,"status":"running"}));
-            let mut relative_track_filenames = Vec::new();
+            let mut playlist_track_paths = Vec::new();
             let mut existing_published_files = Vec::new();
             let mut replacement_moves = std::collections::HashMap::<PathBuf, PathBuf>::new();
             let mut album_dir_opt: Option<PathBuf> = None;
@@ -490,7 +540,7 @@ impl DownloadManager {
                     if cancel.load(Ordering::Relaxed) { return Err("Download cancelled".into()); }
                     if idx > 0 { tokio::time::sleep(Duration::from_millis(350 * (idx % parallel) as u64)).await; }
                     monitor(json!({"kind":"track","id":track.id,"release_id":release_id,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"preparing","percent":0,"bytes":0}));
-                    let stream = get_playback_info(&http, &track.id, &token, item_quality, &market).await?;
+                    let stream = get_playback_info(&http, &track.id, &token, item_quality, &market, cancel.as_ref()).await?;
                     let extension = if stream.mime_type.contains("mp4") || stream.codec.to_lowercase().contains("mp4") || stream.codec.to_lowercase().contains("aac") { ".m4a" } else { ".flac" };
                     let source = stage.join(format!(".source-{}{}", track.id, extension));
                     let started = std::time::Instant::now();
@@ -565,8 +615,16 @@ impl DownloadManager {
                             track.title
                         ));
                         let actual_dst = if exists_flac { dst_flac } else { dst_m4a };
-                        if let Some(fname) = actual_dst.file_name().and_then(|f| f.to_str()) {
-                            relative_track_filenames.push(fname.to_string());
+                        if let Ok(relative) = actual_dst.strip_prefix(&item_output) {
+                            playlist_track_paths.push(stage_dir.join(relative));
+                        }
+                        if album_dir_opt.is_none() {
+                            if let Some(parent) = actual_dst.parent().and_then(|parent| parent.strip_prefix(&item_output).ok()) {
+                                let parent = stage_dir.join(parent);
+                                album_dir_opt = Some(if disc_total > 1 {
+                                    parent.parent().unwrap_or(&parent).to_path_buf()
+                                } else { parent });
+                            }
                         }
                         existing_published_files.push(actual_dst);
                         monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"already downloaded","percent":100}));
@@ -788,9 +846,7 @@ impl DownloadManager {
                     }
                 }
 
-                if let Some(fname) = target_path_in_stage.file_name().and_then(|f| f.to_str()) {
-                    relative_track_filenames.push(fname.to_string());
-                }
+                playlist_track_paths.push(target_path_in_stage.clone());
                 monitor_cb(json!({"kind":"track","id":track.id,"release_id":ident,"title":track.title,"index":idx+1,"total_tracks":total_tracks,"status":"staged","percent":100}));
                 monitor_cb(json!({"kind":"batch","release_id":ident,"release":release_title,"artist":album_artist_name,"total_tracks":total_tracks,"completed_tracks":idx+1,"status":"running"}));
 
@@ -831,8 +887,11 @@ impl DownloadManager {
             }
 
             // Save _playlist.m3u8 if playlist_create is true
-            if playlist_create && !relative_track_filenames.is_empty() {
+            if playlist_create && !playlist_track_paths.is_empty() {
                 if let Some(ref album_dir) = album_dir_opt {
+                    let relative_track_filenames: Vec<_> = playlist_track_paths.iter()
+                        .filter_map(|path| relative_playlist_path(path, album_dir)).collect();
+                    fs::create_dir_all(album_dir).map_err(|e| e.to_string())?;
                     let _ = stream_download::write_m3u8_playlist(
                         album_dir,
                         "_playlist",
@@ -842,6 +901,7 @@ impl DownloadManager {
             }
 
             // Atomically publish staged files to destination library
+            crate::library_access::require_download_destination(db, &item_output).await?;
             let publish_stage = stage_dir.clone();
             let publish_output = item_output.clone();
             let is_redownload = release["redownload"] == true;
@@ -943,6 +1003,142 @@ impl DownloadManager {
 #[cfg(test)]
 mod live_tests {
     use super::*;
+
+    #[test]
+    fn album_destinations_cannot_escape_staging() {
+        for path in ["../outside", "/absolute", "Album/../../outside"] {
+            assert!(validate_album_relative(Some(&json!({"album_relative":path}))).is_err());
+        }
+        for path in ["", "Artist/Album", "Artist/./Album", "Artist/Album .. special"] {
+            assert!(validate_album_relative(Some(&json!({"album_relative":path}))).is_ok());
+        }
+        assert!(validate_album_relative(Some(&json!({}))).is_err());
+        assert!(validate_album_relative(None).is_ok());
+    }
+
+    #[test]
+    fn multidisc_playlists_keep_disc_folders_and_existing_tracks() {
+        let album = Path::new("stage/Artist/Album");
+        assert_eq!(relative_playlist_path(Path::new("stage/Artist/Album/Disc 1/01 - Intro.flac"), album).as_deref(), Some("Disc 1/01 - Intro.flac"));
+        assert_eq!(relative_playlist_path(Path::new("stage/Artist/Album/Disc 2/01 - Song.flac"), album).as_deref(), Some("Disc 2/01 - Song.flac"));
+        assert_eq!(relative_playlist_path(Path::new("stage/Other/Album/01.flac"), album), None);
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_escaping_download_destinations_fail_before_authentication() {
+        let temp = std::env::temp_dir().join(format!("download-destination-{}", uuid::Uuid::new_v4()));
+        let _cleanup = StagingDirectory(temp.clone());
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let offline = temp.join("disconnected-library");
+        let output = offline.join("New downloads");
+        db.set_preference("downloads", &json!({"output":output})).await.unwrap();
+        db.set_preference("account-disconnected", &json!(true)).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO roots(root,status) VALUES(?,'complete')", (offline.to_string_lossy().to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('10',?,1,'queued')", (json!({"id":"10"}).to_string(),)).await.unwrap();
+        let error = DownloadManager::run_downloads(&db, None, Arc::new(AtomicBool::new(false)), "test", |_|{}, |_|{}).await.unwrap_err();
+        assert!(!error.to_lowercase().contains("sign-in"), "A missing destination must be rejected before authentication: {error}");
+        assert!(!offline.exists(), "A disconnected drive must never be recreated");
+        db.set_preference("downloads", &json!({"output":temp.join("safe-output")})).await.unwrap();
+        let payload = json!({"id":"10","existing_destination":{"root":temp,"album_relative":"../escaped"}});
+        conn.execute("UPDATE queue SET payload=? WHERE id='10'", (payload.to_string(),)).await.unwrap();
+        let error = DownloadManager::run_downloads(&db, None, Arc::new(AtomicBool::new(false)), "test", |_|{}, |_|{}).await.unwrap_err();
+        assert!(error.contains("within its library"));
+        assert!(!temp.join("safe-output").exists());
+        assert_eq!(db.get_queue_rows("queued", None, None, None, None, 0, 10).await.unwrap().total, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_connected_queue_destinations_work_with_an_offline_default() {
+        let temp = std::env::temp_dir().join(format!("explicit-download-output-{}", uuid::Uuid::new_v4()));
+        let _cleanup = StagingDirectory(temp.clone());
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let offline = temp.join("offline-library");
+        let connected = temp.join("connected-library");
+        fs::create_dir_all(&connected).unwrap();
+        db.set_preference("downloads", &json!({"output":offline.join("downloads")})).await.unwrap();
+        let conn = db.connect().unwrap();
+        for root in [&offline, &connected] {
+            conn.execute("INSERT INTO roots(root,status) VALUES(?,'complete')", (root.to_string_lossy().to_string(),)).await.unwrap();
+        }
+        let release = json!({"id":"10","existing_destination":{"root":connected,"album_relative":"Artist/Album"}});
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('10',?,1,'queued')", (release.to_string(),)).await.unwrap();
+        validate_download_destinations(&db).await.unwrap();
+        // An unapproved default-target item must not block the approved work.
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('20','{}',0,'queued')", ()).await.unwrap();
+        validate_download_destinations(&db).await.unwrap();
+        conn.execute("UPDATE queue SET approved=1 WHERE id='20'", ()).await.unwrap();
+        assert!(validate_download_destinations(&db).await.is_err());
+        assert!(!offline.exists());
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_queue_does_not_require_credentials_or_create_output() {
+        let temp = std::env::temp_dir().join(format!("cancelled-download-{}", uuid::Uuid::new_v4()));
+        let _cleanup = StagingDirectory(temp.clone());
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let output = temp.join("output");
+        db.set_preference("downloads", &json!({"output":output})).await.unwrap();
+        db.set_preference("account-disconnected", &json!(true)).await.unwrap();
+        db.connect().unwrap().execute("INSERT INTO queue(id,payload,approved,decision) VALUES('10','{}',1,'queued')", ()).await.unwrap();
+        assert_eq!(DownloadManager::run_downloads(&db, None, Arc::new(AtomicBool::new(true)), "test", |_|{}, |_|{}).await.unwrap(), 0);
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "Opt-in one-track live download; reads saved account, disposable database/output, no credential refresh"]
+    async fn bounded_live_download_with_disconnected_cached_library() {
+        let temp = std::env::temp_dir().join(format!("tibrary-bounded-live-{}", uuid::Uuid::new_v4()));
+        let _cleanup = StagingDirectory(temp.clone());
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let mut token = stream_download::load_saved_token(&db).await
+            .expect("Sign into Tibrary first, then explicitly run this ignored live test without TIBRARY_TEST_MODE");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        assert!(token.expires_at > now + 600.0, "Saved access token needs at least ten minutes remaining; sign into Tibrary again before the live test");
+        // Keep the saved account read-only. Expiration during the run fails the
+        // test instead of updating the real keychain or rotating a refresh token.
+        token.refresh_token = None;
+        db.set_preference("tidal_token", &serde_json::to_value(token).unwrap()).await.unwrap();
+        let output = temp.join("music");
+        let offline = temp.join("disconnected-library");
+        db.set_preference("downloads", &json!({"output":output,"quality":"LOSSLESS","cover_size":0,"skip_existing":true})).await.unwrap();
+        db.set_preference("provider", &json!({"download_delay":false})).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO roots(root,status) VALUES(?,'complete')", (offline.to_string_lossy().to_string(),)).await.unwrap();
+        let release = crate::actions::release(&db, "140303440", "GB", false).await.unwrap();
+        let track = release["tracks"].as_array().unwrap().iter()
+            .min_by(|a,b| a["duration"].as_f64().unwrap_or(f64::MAX).total_cmp(&b["duration"].as_f64().unwrap_or(f64::MAX))).unwrap();
+        let track_id = track["id"].as_str().map(str::to_string).unwrap_or_else(||track["id"].to_string());
+        let mut payload = release.clone();
+        payload["selected_tracks"] = json!([{"id":track_id}]);
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('140303440',?,1,'queued')", (payload.to_string(),)).await.unwrap();
+        let run = || DownloadManager::run_downloads(&db, None, Arc::new(AtomicBool::new(false)), "bounded-live", |_|{}, |_|{});
+        assert_eq!(tokio::time::timeout(Duration::from_secs(180), run()).await.expect("Bounded live download exceeded three minutes").unwrap(), 1);
+        fn collect_audio(path: &Path, files: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { collect_audio(&path, files); }
+                else if path.extension().is_some_and(|ext| ext == "flac") { files.push(path); }
+            }
+        }
+        let mut files = Vec::new();
+        collect_audio(&output, &mut files);
+        assert_eq!(files.len(), 1);
+        let metadata = crate::scanner::read_audio_metadata(&files[0]).unwrap();
+        assert_eq!(metadata.tidal_track_id.as_deref(), Some(track_id.as_str()));
+        assert_eq!(metadata.tidal_album_id.as_deref(), Some("140303440"));
+        assert!(metadata.duration > 0.0);
+        let mut decoder = claxon::FlacReader::open(&files[0]).unwrap();
+        assert!(decoder.samples().take(44100).collect::<Result<Vec<_>,_>>().unwrap().len() > 0);
+        let original = fs::read(&files[0]).unwrap();
+        assert_eq!(run().await.unwrap(), 0, "Completed queue entries must not download again");
+        conn.execute("UPDATE queue SET approved=1,decision='queued' WHERE id='140303440'", ()).await.unwrap();
+        assert_eq!(run().await.unwrap(), 1, "Explicit requeue must reuse the existing downloaded file");
+        assert_eq!(fs::read(&files[0]).unwrap(), original);
+        assert!(!offline.exists(), "Online use must leave the missing library untouched");
+        assert_eq!(db.get_queue_rows("downloaded", None, None, None, None, 0, 10).await.unwrap().total, 1);
+        println!("One live track downloaded, decoded and tagged; completed queue and requeue checks passed with disconnected library");
+    }
 
     #[test]
     fn replacements_preserve_missing_dj_values_only_for_the_same_recording() {

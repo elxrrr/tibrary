@@ -205,6 +205,85 @@ pub async fn get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut count = 0;
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("Expected request did not arrive: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut buffer = [0; 4096];
+                stream.read(&mut buffer).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+                count += 1;
+            }
+            count
+        });
+        (url, server)
+    }
+
+    fn http_response(status: &str, retry_after: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nRetry-After: {retry_after}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}")
+    }
+
+    #[tokio::test]
+    async fn server_errors_retry_only_to_the_requested_limit() {
+        let (url, server) = response_server(vec![http_response("503 Service Unavailable", "0"); 3]);
+        let response = get(reqwest::Client::new().get(url), Duration::ZERO, 3, None).await.unwrap();
+        assert_eq!(response.status().as_u16(), 503);
+        assert_eq!(server.join().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn client_errors_and_long_cooldowns_are_not_replayed() {
+        for status in ["400 Bad Request", "401 Unauthorized", "403 Forbidden", "404 Not Found", "429 Too Many Requests"] {
+            let (url, server) = response_server(vec![http_response(status, "86400")]);
+            let response = tokio::time::timeout(Duration::from_secs(2),
+                get(reqwest::Client::new().get(url), Duration::ZERO, 5, None)).await.unwrap().unwrap();
+            assert_eq!(response.status().as_u16().to_string(), &status[..3]);
+            assert_eq!(server.join().unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_retry_cooldown_and_post_is_never_sent() {
+        let (url, server) = response_server(vec![http_response("429 Too Many Requests", "30")]);
+        let cancel = AtomicBool::new(false);
+        let http = reqwest::Client::new();
+        let pending = get(http.get(&url), Duration::ZERO, 3, Some(&cancel));
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.store(true, Ordering::Relaxed);
+        };
+        let (result, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(1), pending), stop);
+        assert_eq!(result.unwrap().unwrap_err(), "Cancelled");
+        assert_eq!(server.join().unwrap(), 1);
+        assert_eq!(get(http.post(url), Duration::ZERO, 5, None).await.unwrap_err(), "Adaptive requests support GET only");
+    }
+
+    #[test]
+    fn retry_after_handles_dates_invalid_values_and_excessive_cooldowns() {
+        assert_eq!(retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 0), Duration::ZERO);
+        assert_eq!(retry_after(Some("invalid"), 2), Duration::from_secs(8));
+        assert_eq!(retry_after(Some("-1"), 0), Duration::from_secs(2));
+        assert_eq!(retry_after(Some("99999999"), 0), Duration::from_secs(86400));
+        assert_eq!(retry_after(None, usize::MAX), Duration::from_secs(64));
+    }
+
     #[test]
     fn pacing_accelerates_gradually_and_backs_off() {
         let mut p = Pace::new(Duration::from_millis(750), Duration::from_millis(100));
