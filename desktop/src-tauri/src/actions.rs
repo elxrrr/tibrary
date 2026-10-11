@@ -365,8 +365,18 @@ pub(crate) async fn ensure_release_tracks(db: &TursoDb, id: &str, market: &str, 
     if id.is_empty() || !id.bytes().all(|byte|byte.is_ascii_digit()) { return Err("Choose a release with a valid online ID".into()); }
     let gate = release_gate(format!("{}:{market}:{id}",db.path.display()));
     let _guard = release_guard(gate,cancel.as_ref()).await?;
-    let mut value = db.get_detail(&json!({"release_id":id,"market":market})).await?;
-    if value["tracks_loaded"] == true && value["tracks"].as_array().is_some_and(|tracks|!tracks.is_empty()) {
+    let saved = db.get_detail(&json!({"release_id":id,"market":market})).await?;
+    let listed = db.cached_catalogue_release(id,market).await?;
+    // A release-list update can invalidate its old track snapshot. Use the
+    // same reconciliation as Missing releases before declaring those tracks
+    // ready; otherwise this returns a list the table must continue to hide.
+    let mut value = listed.as_ref().map(|listed|crate::db::recommendation_candidate_overlay(listed,saved.clone())).unwrap_or_else(||saved.clone());
+    let summary = db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
+    let saved_fingerprint = saved["recommendation_snapshot"]["summary_fingerprint"].as_str().or_else(||saved["summary_fingerprint"].as_str());
+    let summary_changed = summary.as_ref().zip(saved_fingerprint)
+        .is_some_and(|(summary,pinned)|crate::tidal::summary_fingerprint(summary) != pinned);
+    if !summary_changed && value["recommendation_track_snapshot_conflict"] != true
+        && value["tracks_loaded"] == true && value["tracks"].as_array().is_some_and(|tracks|!tracks.is_empty()) {
         value["track_count"] = json!(value["tracks"].as_array().unwrap().len());
         // Older queue snapshots may still be summaries even when the central
         // release is complete. A single conditional update preserves concurrent
@@ -379,14 +389,50 @@ pub(crate) async fn ensure_release_tracks(db: &TursoDb, id: &str, market: &str, 
         return Ok(value);
     }
     if value["title"] == "Release not found" { return Err("Refresh this release list before opening its tracks".into()); }
+    let recheck_summary = listed.as_ref().and_then(|listed|listed["summary_fingerprint"].as_str())
+        .is_some_and(|current|summary.as_ref().is_none_or(|summary|crate::tidal::summary_fingerprint(summary) != current));
+    if recheck_summary {
+        // Older databases can have a current artist listing but a missing or
+        // older shared summary. Reconcile just this release before asking the
+        // credited-item cache to validate its track list.
+        let mut client = crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
+        let response = client.albums(&[id.to_owned()],market,true).await?;
+        if !response["data"].as_array().is_some_and(|items|items.iter().any(|item|item["id"].as_str() == Some(id))) {
+            return Err("This release is unavailable in the selected market; saved metadata was retained".into());
+        }
+    }
     let http = crate::network::client(20)?;
     let raw = crate::subscriber_metadata::load(db,&http,id,market,cancel,false).await?;
     let mut tracks = crate::subscriber_metadata::tracks(&raw)?;
-    let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(value["tracks"].clone()).unwrap_or_default();
+    // Check again after the read: another catalogue worker can have changed
+    // the summary while the credited list was being fetched. Never relabel
+    // old recordings with the new summary merely to make the table expand.
+    let current_summary = db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
+    let current_listing = db.cached_catalogue_release(id,market).await?;
+    let fingerprint = raw["summary_fingerprint"].as_str();
+    let listing_fingerprint = |value: Option<&Value>|value.and_then(|listed|listed["summary_fingerprint"].as_str()).map(str::to_owned);
+    let listing_changed = listing_fingerprint(current_listing.as_ref()) != listing_fingerprint(listed.as_ref());
+    let use_checked_summary = recheck_summary && !listing_changed;
+    if current_summary.as_ref().is_some_and(|summary|fingerprint != Some(crate::tidal::summary_fingerprint(summary).as_str()))
+        || (!use_checked_summary && current_listing.as_ref().and_then(|listed|listed["summary_fingerprint"].as_str()).is_some_and(|current|fingerprint != Some(current))) {
+        return Err("The release summary changed before its tracks could be verified. Refresh this release's track details and retry; saved metadata was retained.".into());
+    }
+    let old_tracks: Vec<crate::tidal::TidalTrack> = serde_json::from_value(saved["tracks"].clone()).unwrap_or_default();
     crate::subscriber_metadata::supplement(&mut tracks,&old_tracks);
+    if summary_changed || recheck_summary || value["recommendation_track_snapshot_conflict"] == true {
+        // Keep the current listing's facts, without carrying the earlier
+        // edition's optional-metadata completion claims into the new snapshot.
+        value = match current_listing.filter(|_|!use_checked_summary) {
+            Some(listed) => listed,
+            None => serde_json::to_value(crate::tidal::release_from_subscriber(current_summary.as_ref().ok_or("The release summary is no longer cached")?,"")).map_err(|error|error.to_string())?,
+        };
+        value["recommendation_snapshot"] = Value::Null;
+    }
+    if let Some(object) = value.as_object_mut() {object.remove("recommendation_track_snapshot_conflict");}
     // Preserve optional fields already collected by a complete metadata pass;
     // loading the disclosure must not claim unchecked catalogue fields are done.
-    if let Some(fingerprint) = raw["summary_fingerprint"].as_str() {
+    if let Some(fingerprint) = fingerprint {
+        value["summary_fingerprint"] = json!(fingerprint);
         value["recommendation_snapshot"]["schema"] = json!(RECOMMENDATION_SCHEMA);
         value["recommendation_snapshot"]["summary_fingerprint"] = json!(fingerprint);
     }
@@ -646,6 +692,7 @@ async fn publish_release_update(
             let mut queued: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
             queued["tracks"] = value["tracks"].clone();
             queued["tracks_loaded"] = json!(true);
+            queued["track_count"] = value["track_count"].clone();
             drop(q);
             conn.execute(
                 "UPDATE queue SET payload=? WHERE id=?",
@@ -2711,6 +2758,95 @@ mod tests {
         assert!(!dj_check_reusable(&json!({"status":"retry","retry_after":now-1}),now));
         assert!(!dj_check_reusable(&Value::Null,now));
         drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_release_tracks_replace_stale_snapshot_and_refresh_missing_rows() {
+        let dir = std::env::temp_dir().join(format!("selected-release-tracks-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        db.set_preference("account-disconnected",&json!(true)).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let old_summary = json!({"id":10,"title":"Release","artist":{"id":4,"name":"Main"},"releaseDate":"2020-01-01","type":"ALBUM","numberOfTracks":1,"checked_at":now-100});
+        let mut summary = old_summary.clone(); summary["numberOfTracks"]=json!(2); summary["checked_at"]=json!(now);
+        let fingerprint = crate::tidal::summary_fingerprint(&summary);
+        let old_fingerprint = crate::tidal::summary_fingerprint(&old_summary);
+        let old = json!({"id":"10","artist":"Main","title":"Release","date":"2020-01-01","type":"ALBUM","tracks_loaded":true,"track_count":1,"summary_fingerprint":old_fingerprint,
+            "recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":old_fingerprint,"optional_status":"complete"},
+            "tracks":[{"id":"101","title":"Old track name","track_number":1,"disc_number":1,"isrc":"ONE","bpm":124.0,"credits_complete":true,"credits":[]}]});
+        let listed = serde_json::to_value(crate::tidal::release_from_subscriber(&summary,"4")).unwrap();
+        let raw = json!({"schema":2,"checked_at":now,"summary_fingerprint":fingerprint,"items":[
+            {"id":101,"title":"Current track name","trackNumber":1,"volumeNumber":1,"isrc":"ONE","credits":[]},
+            {"id":102,"title":"New second track","trackNumber":2,"volumeNumber":1,"isrc":"TWO","credits":[]}]});
+        db.set_preference("subscriber-summary:GB:10",&summary).await.unwrap();
+        db.set_preference("tag-review:GB:10",&old).await.unwrap();
+        let mut stale_raw=raw.clone(); stale_raw["summary_fingerprint"]=json!(old_fingerprint); stale_raw["items"].as_array_mut().unwrap().pop();
+        db.set_preference("subscriber-items:GB:10",&stale_raw).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Main','4','confirmed')",()).await.unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('4','GB',?)",(json!({"id":"4","name":"Main","releases":[listed]}).to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('10',?,1,'queued')",(json!({"id":"10","selected_track_ids":["101"],"destination":"keep","tracks_loaded":true,"track_count":1,"tracks":old["tracks"]}).to_string(),)).await.unwrap();
+        let before = db.get_missing_rows("GB",None,None,None,None,None,None,None,0,10).await.unwrap();
+        assert_eq!(before.rows.len(),1);
+        assert!(!before.rows[0].expanded_available);
+        assert!(before.rows[0].children.is_empty());
+
+        // A failed request must not claim that the rejected old cache is ready,
+        // nor replace the canonical or catalogue snapshots with partial data.
+        assert!(ensure_release_tracks(&db,"10","GB",Arc::new(AtomicBool::new(false))).await.is_err());
+        assert_eq!(db.get_preference("tag-review:GB:10").await.unwrap().unwrap(),old);
+        assert_eq!(db.cached_catalogue_release("10","GB").await.unwrap().unwrap(),listed);
+        let after_failure = db.get_missing_rows("GB",None,None,None,None,None,None,None,0,10).await.unwrap();
+        assert!(after_failure.rows[0].children.is_empty());
+
+        // Current credited data can already be cached by another workflow.
+        // It must be reused offline, even though the canonical snapshot is old.
+        db.set_preference("subscriber-items:GB:10",&raw).await.unwrap();
+        let loaded = ensure_release_tracks(&db,"10","GB",Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert_eq!(loaded["summary_fingerprint"],fingerprint);
+        assert_eq!(loaded["recommendation_snapshot"]["summary_fingerprint"],fingerprint);
+        assert!(loaded["recommendation_snapshot"]["optional_status"].is_null());
+        assert_eq!(loaded["tracks"][0]["title"],"Current track name");
+        assert_eq!(loaded["tracks"][0]["bpm"],124.0);
+        assert_eq!(loaded["track_count"],2);
+        let updated = db.get_missing_rows("GB",None,None,None,None,None,None,None,0,10).await.unwrap();
+        assert!(updated.revision > before.revision);
+        assert!(updated.rows[0].expanded_available);
+        assert_eq!(updated.rows[0].tracks,2);
+        assert_eq!(updated.rows[0].children.iter().map(|track|track.id.as_str()).collect::<Vec<_>>(),vec!["101","102"]);
+        let mut rows=conn.query("SELECT payload,approved FROM queue WHERE id='10'",()).await.unwrap();
+        let row=rows.next().await.unwrap().unwrap();
+        let queued:Value=serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+        assert_eq!(queued["selected_track_ids"],json!(["101"]));
+        assert_eq!(queued["destination"],"keep");
+        assert_eq!(row.get::<i64>(1).unwrap(),1);
+        assert_eq!(queued["tracks"],loaded["tracks"]);
+        assert_eq!(queued["track_count"],2);
+        drop(rows);
+        let warm = ensure_release_tracks(&db,"10","GB",Arc::new(AtomicBool::new(false))).await.unwrap();
+        assert_eq!(warm["tracks"],loaded["tracks"]);
+        assert_eq!(db.revision.load(Ordering::SeqCst),updated.revision);
+        drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_release_tracks_check_listing_when_shared_summary_is_missing_or_stale() {
+        let dir = std::env::temp_dir().join(format!("selected-release-summary-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        db.set_preference("account-disconnected",&json!(true)).await.unwrap();
+        let old_summary=json!({"id":10,"title":"Earlier edition","numberOfTracks":1,"artist":{"id":4,"name":"Main"}});
+        let current_summary=json!({"id":10,"title":"Current edition","numberOfTracks":2,"artist":{"id":4,"name":"Main"}});
+        let old=json!({"id":"10","title":"Earlier edition","track_count":1,"tracks_loaded":true,"summary_fingerprint":crate::tidal::summary_fingerprint(&old_summary),"tracks":[{"id":"101","title":"Old track"}]});
+        let listed=serde_json::to_value(crate::tidal::release_from_subscriber(&current_summary,"4")).unwrap();
+        db.set_preference("tag-review:GB:10",&old).await.unwrap();
+        let conn=db.connect().unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('4','GB',?)",(json!({"id":"4","name":"Main","releases":[listed]}).to_string(),)).await.unwrap();
+        for saved_summary in [None,Some(&old_summary)] {
+            if let Some(summary)=saved_summary {db.set_preference("subscriber-summary:GB:10",summary).await.unwrap();}
+            assert!(ensure_release_tracks(&db,"10","GB",Arc::new(AtomicBool::new(false))).await.is_err(),"A listing conflict requires a current check, even without a current shared summary");
+            assert_eq!(db.get_preference("tag-review:GB:10").await.unwrap().unwrap(),old);
+            assert_eq!(db.cached_catalogue_release("10","GB").await.unwrap().unwrap(),listed);
+        }
+        drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

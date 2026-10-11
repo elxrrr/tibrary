@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.29** · [Setup and screenshots](../../README.md)
+Version **0.9.30** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -117,7 +117,7 @@ In Downloaded releases, checked releases or tracks limit the export without chan
 
 Activity shows one log, most recent first, with the worker and task named on each row. Use **Action type** to show local actions, online actions, downloads or a specific task such as Scan library or Find missing tags. The filter searches saved history before paging, so older matching actions are included. Search text combines with the selected action type; older saved messages load as you scroll, including after reopening. Release refreshes maintain one saved entry per artist, updating its current stage and final outcome in place. A failed artist shows one error at the stage where it stopped; market codes and artist IDs are omitted. There are no expandable job groups or per-job history controls. Parallel download tracks show their own transfer progress. Three compact worker cards show item counts, percentage and a smoothed ETA where measurable, with independent cancellation controls. **Save activity logs** must remain enabled to retain history; clearing activity removes its saved entries.
 
-Pages load independently during refreshes. A changing catalogue does not discard an in-flight table result: usable rows appear first, followed by one coalesced update. Sorting, selection and expanded releases are retained. Queue approvals, exports and download previews remain available during catalogue updates and local scans. Release disclosure fetches only missing track details through the shared cache without replacing the current refresh task. Reviewed tag changes, moves and duplicate removal cannot overlap downloads; scans and metadata reads can.
+Pages load independently during refreshes. A changing catalogue does not discard an in-flight table result: usable rows appear first, followed by one coalesced update. Sorting, selection and expanded releases are retained. Queue approvals, exports and download previews remain available during catalogue updates and local scans. Release disclosure fetches only missing track details through the shared cache without replacing the current refresh task. If a release summary has changed, opening its tracks replaces the outdated track snapshot and updates the table immediately. Current cached details are reused; failed requests retain the previous saved data. Reviewed tag changes, moves and duplicate removal cannot overlap downloads; scans and metadata reads can.
 
 Closing during downloads asks whether to keep downloading or stop and quit. Completed downloads remain. Interrupted catalogue refreshes retain their checkpoints; explicitly cancelled jobs stay cancelled. File mutations are not automatically replayed.
 

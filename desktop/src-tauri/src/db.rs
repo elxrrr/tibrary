@@ -3938,10 +3938,14 @@ impl TursoDb {
         if let Some(cached) = self.get_preference(&format!("tag-review:{market}:{release_id}")).await? {
             return Ok(Some(cached));
         }
+        self.cached_catalogue_release(release_id, market).await
+    }
+
+    pub(crate) async fn cached_catalogue_release(&self, release_id: &str, market: &str) -> Result<Option<Value>, String> {
         self.ensure_catalogue_release_index().await?;
         let conn = self.connect()?;
         let mut rows = conn.query(
-            "SELECT r.value FROM catalogue_release_index i JOIN catalogue c ON c.artist_id=i.artist_id AND c.market=i.market JOIN json_each(c.payload,'$.releases') r WHERE i.release_id=? AND i.market=? AND CAST(json_extract(r.value,'$.id') AS TEXT)=? LIMIT 1",
+            "SELECT r.value FROM catalogue_release_index i JOIN catalogue c ON c.artist_id=i.artist_id AND c.market=i.market JOIN json_each(c.payload,'$.releases') r WHERE i.release_id=? AND i.market=? AND CAST(json_extract(r.value,'$.id') AS TEXT)=? ORDER BY c.fetched DESC,c.artist_id LIMIT 1",
             (release_id, market, release_id),
         ).await.map_err(|error| error.to_string())?;
         match rows.next().await.map_err(|error| error.to_string())? {
@@ -4250,7 +4254,7 @@ pub(crate) async fn preference_snapshots_for_keys(conn: &Connection, mut keys: V
     Ok(snapshots)
 }
 
-fn recommendation_candidate_overlay(listed: &Value, mut cached: Value) -> Value {
+pub(crate) fn recommendation_candidate_overlay(listed: &Value, mut cached: Value) -> Value {
     if !cached.is_object() {return listed.clone();}
     let paired = cached["recommendation_snapshot"]["summary_fingerprint"].as_str()
         .or_else(||cached["summary_fingerprint"].as_str());

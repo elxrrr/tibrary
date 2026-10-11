@@ -151,6 +151,23 @@ test.beforeEach(async ({ page }) => {
       },
     },
   );
+  if (test.info().title.startsWith("missing release disclosure replaces stale")) {
+    execFileSync("python3", ["-c", `import hashlib,json,sqlite3,sys,time
+c=sqlite3.connect(sys.argv[1]); artist,market,payload=c.execute("SELECT artist_id,market,payload FROM catalogue LIMIT 1").fetchone(); catalogue=json.loads(payload)
+release=next(r for r in catalogue['releases'] if r['id']=='910002')
+summary={'id':910002,'title':'Night Maps','numberOfTracks':3,'artists':[{'id':900001,'name':'North Assembly','type':'MAIN'}],'releaseDate':'2022-09-16','type':'ALBUM','audioQuality':'LOSSLESS'}
+fields={k:summary.get(k) for k in ['title','version','releaseDate','originalReleaseDate','type','audioQuality','audioModes','explicit']}
+fields.update(id='910002',upc='',numberOfTracks=3,numberOfVideos=0,numberOfVolumes=1,artists=[{'id':'900001','name':'North Assembly'}],label='',copyright='')
+fingerprint=hashlib.sha256(json.dumps(fields,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+old={**release,'summary_fingerprint':'older-summary','recommendation_snapshot':{'summary_fingerprint':'older-summary'},'tracks':[{'id':'91000299','title':'Old recording','disc_number':1,'track_number':1}]}
+tracks=[dict(id=int(t['id']),title=t['title'],trackNumber=t['track_number'],volumeNumber=t['disc_number'],duration=t['duration'],isrc=t['isrc'],credits=[]) for t in release['tracks']]
+release.update(summary_fingerprint=fingerprint,tracks_loaded=False,tracks=[])
+c.execute('UPDATE catalogue SET payload=? WHERE artist_id=? AND market=?',(json.dumps(catalogue),artist,market))
+c.execute('CREATE TABLE IF NOT EXISTS app_preferences(key TEXT PRIMARY KEY,payload TEXT)')
+for key,value in [('tag-review:GB:910002',old),('subscriber-summary:GB:910002',summary),('subscriber-items:GB:910002',{'schema':2,'checked_at':int(time.time()),'summary_fingerprint':fingerprint,'items':tracks})]:
+ c.execute('INSERT OR REPLACE INTO app_preferences VALUES(?,?)',(key,json.dumps(value)))
+c.commit()`, join(folder,"db")]);
+  }
   if (test.info().title.startsWith("disconnected cached library")) {
     execFileSync("python3", ["-c", `import json,sqlite3,sys
 from pathlib import Path
@@ -366,6 +383,39 @@ test("tables publish usable results while catalogue revisions keep advancing", a
     await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeVisible({timeout:1500});
     await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeEnabled();
   } finally {await page.evaluate(()=>clearInterval((window as any).refreshTestTimer));}
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("missing release disclosure replaces stale details and preserves table state", async ({page}) => {
+  let requests = 0;
+  await page.route("**/__test_rpc", async route => {
+    const request = route.request().postDataJSON();
+    if (request.method === "release.ensure_tracks") {
+      requests++;
+      await new Promise(resolve => setTimeout(resolve,150));
+    }
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await viewOption(page,"Release timeline","All missing releases");
+  await page.getByRole("button",{name:"Coverage",exact:true}).click();
+  const header=page.locator("th").filter({has:page.getByRole("button",{name:"Coverage",exact:true})});
+  const order=await header.getAttribute("aria-sort");
+  const parent=page.getByRole("checkbox",{name:"Select Night Maps",exact:true});
+  await parent.check();
+  await page.getByRole("button",{name:"Expand Night Maps",exact:true}).click();
+  await expect(page.getByRole("status").filter({hasText:"Loading track details…"})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track Signal",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track Homeward",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track Old recording",exact:true})).toHaveCount(0);
+  await expect(parent).toBeChecked();
+  await expect(header).toHaveAttribute("aria-sort",order!);
+  expect(requests).toBe(1);
+  await page.getByRole("button",{name:"Collapse Night Maps",exact:true}).click();
+  await page.getByRole("button",{name:"Expand Night Maps",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track Signal",exact:true})).toBeVisible();
+  expect(requests).toBe(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
