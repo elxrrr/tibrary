@@ -1965,7 +1965,7 @@ async fn handle_rpc_uncached(
                                     let reference_market = market.clone();
                                     let reference_cancel = cancel_flag.clone();
                                     reference_workers.spawn(async move {
-                                        let result = actions::release_with_cancel(&reference_db, &id, &reference_market, false, reference_cancel).await;
+                                        let result = actions::release_with_cancel_staged(&reference_db, &id, &reference_market, false, reference_cancel).await;
                                         (id, result)
                                     });
                                 }
@@ -1991,6 +1991,12 @@ async fn handle_rpc_uncached(
                             }
                             reference_workers.abort_all();
                             while reference_workers.join_next().await.is_some() {}
+                            // Publish once per batch, including completed work from a
+                            // cancelled worker. Canonical release caches are already durable.
+                            if let Err(error) = actions::publish_catalogue_releases(&db_clone, batch, &market).await {
+                                failure = Some(format!("Could not publish reference details: {error}"));
+                            }
+                            publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
                         }
                     }
                 }
@@ -2076,38 +2082,48 @@ async fn handle_rpc_uncached(
                                     // Each worker owns a complete enrichment pipeline and reads
                                     // its summary through the shared indexed cache selector.
                                     let pending_count = pending.len();
-                                    let mut releases = pending.into_iter();
-                                    let mut metadata = tokio::task::JoinSet::new();
                                     let mut completed_details = 0;
-                                    loop {
-                                        if cancel_flag.load(Ordering::Relaxed) { break; }
-                                        while metadata.len() < network::METADATA_CONCURRENCY {
-                                            let Some(release) = releases.next() else { break; };
-                                            let worker_db = db_clone.clone();
-                                            let worker_market = market.clone();
-                                            let worker_cancel = cancel_flag.clone();
-                                            let force = changed.contains(&release.id);
-                                            metadata.spawn(async move {
-                                                let result = actions::release_with_cancel(&worker_db, &release.id, &worker_market, force, worker_cancel).await;
-                                                (release.title, result)
-                                            });
-                                        }
-                                        let Some(result) = metadata.join_next().await else { break; };
-                                        match result {
-                                            Ok((title, Ok(_))) => {
-                                                completed_details += 1;
-                                                checked_details += 1;
-                                                let message = format!("{checked}/{total} artists complete · {name} · Details and credits {completed_details}/{pending_count} releases · {title} · {} reused", reused.len());
-                                                backend_task.refresh_artist_log(&artist_id, &message, "info");
-                                                backend_task.progress_for("discography", &message);
-                                                publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
+                                    // A large catalogue is written once per 20 releases instead
+                                    // of once per track/album. Partial work remains reusable.
+                                    for batch in pending.chunks(20) {
+                                        let mut releases = batch.iter();
+                                        let mut metadata = tokio::task::JoinSet::new();
+                                        loop {
+                                            if cancel_flag.load(Ordering::Relaxed) { break; }
+                                            while metadata.len() < network::METADATA_CONCURRENCY {
+                                                let Some(release) = releases.next().cloned() else { break; };
+                                                let worker_db = db_clone.clone();
+                                                let worker_market = market.clone();
+                                                let worker_cancel = cancel_flag.clone();
+                                                let force = changed.contains(&release.id);
+                                                metadata.spawn(async move {
+                                                    let result = actions::release_with_cancel_staged(&worker_db, &release.id, &worker_market, force, worker_cancel).await;
+                                                    (release.title, result)
+                                                });
                                             }
-                                            Ok((title, Err(error))) => { failure = Some(format!("{title}: {error}")); break; }
-                                            Err(error) => { failure = Some(format!("Recommendation worker stopped: {error}")); break; }
+                                            let Some(result) = metadata.join_next().await else { break; };
+                                            match result {
+                                                Ok((title, Ok(_))) => {
+                                                    completed_details += 1;
+                                                    checked_details += 1;
+                                                    let message = format!("{checked}/{total} artists complete · {name} · Details and credits {completed_details}/{pending_count} releases · {title} · {} reused", reused.len());
+                                                    backend_task.refresh_artist_log(&artist_id, &message, "info");
+                                                    backend_task.progress_for("discography", &message);
+                                                    publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
+                                                }
+                                                Ok((title, Err(error))) => { failure = Some(format!("{title}: {error}")); break; }
+                                                Err(error) => { failure = Some(format!("Recommendation worker stopped: {error}")); break; }
+                                            }
                                         }
+                                        metadata.abort_all();
+                                        while metadata.join_next().await.is_some() {}
+                                        let batch_ids: Vec<_> = batch.iter().map(|release|release.id.clone()).collect();
+                                        if let Err(error) = actions::publish_catalogue_releases(&db_clone, &batch_ids, &market).await {
+                                            failure = Some(format!("Could not publish release details: {error}"));
+                                        }
+                                        publish_catalogue_changes(app_clone.as_ref(), &db_clone, &mut last_published);
+                                        if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
                                     }
-                                    metadata.abort_all();
-                                    while metadata.join_next().await.is_some() {}
                                 }
                                 if failure.is_some() || cancel_flag.load(Ordering::Relaxed) { break; }
                             }
@@ -2774,6 +2790,9 @@ fn main() {
                 }
             }
 
+            if let Err(error) = actions::recover_catalogue_publications(&turso_db).await {
+                backend.log_with_category(&format!("Saved metadata could not be published: {error}"), "error", Some("online"));
+            }
             check_libraries_on_startup(None, backend.clone(), turso_db.clone()).await;
 
             let stdin = std::io::stdin();
@@ -2860,6 +2879,13 @@ fn main() {
             let resume_backend = backend.clone();
             let resume_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let before = resume_db.revision.load(Ordering::SeqCst);
+                if let Err(error) = actions::recover_catalogue_publications(&resume_db).await {
+                    resume_backend.log_with_category(&format!("Saved metadata could not be published: {error}"), "error", Some("online"));
+                }
+                if resume_db.revision.load(Ordering::SeqCst) != before {
+                    publish_catalogue_changes(Some(&resume_app), &resume_db, &mut None);
+                }
                 if let Ok(Some(saved)) = resume_db.get_preference("catalogue-refresh-checkpoint").await {
                     if saved["status"] == "running" {
                         let args = json!({"kind":"discography","args":{"ids":saved["ids"],"market":saved["market"],"detailed":saved["detailed"],"resume":true}});

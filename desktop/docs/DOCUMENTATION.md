@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.27** · [Setup and screenshots](../../README.md)
+Version **0.9.28** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -87,7 +87,11 @@ All online workflows use one subscriber connection. The catalogue market comes f
 
 Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
 
-The first recommendation-data fill can take hours for a large library. **Check release lists only** provides a lighter discovery check; full updates fill missing recommendation evidence. Recommendation updates keep up to three complete release-detail checks in flight. Local tag/artwork preparation reads chosen links in one batch and reuses each release within the job. A bounded live check of three releases took 1.07 seconds serially and 0.83 seconds with three workers, without rate-limit errors; large refreshes depend on the amount of uncached data and service response times. More audio download connections do not raise the metadata request limit.
+**Check release lists only** provides a lighter discovery check; full updates fill missing recommendation evidence. Complete track details and credits are reused across linking, recommendations and tag preparation. An explicit empty BPM or key in a successful subscriber album response counts as checked; a field that was omitted can still receive an additional lookup. Existing positive values are preserved. Older saved responses acquire these checks without redownloading them. No database reset is needed.
+
+Uncached release and tag checks run with bounded concurrency, pooled connections and shared pacing. Artist catalogue updates are grouped in batches of 20 releases instead of rewriting a whole catalogue for each track. Completed results are saved during the job and recovered after cancellation or restart. More audio download connections do not raise the metadata request limit. A first fill can still take hours when extensive details are missing; subsequent runs fill gaps.
+
+Focused measurements on this build: reading 1,000 cached releases was 3.2 times faster; publishing metadata for 100 synthetic releases was 8.6 times faster. On six live tracks with already-recorded empty BPM/key fields, tag preparation dropped from six redundant requests (1.9 seconds) to zero requests (7 milliseconds). These measure individual stages, not an entire library refresh.
 
 Availability is shared across artist, metadata and release checks for the selected market. Direct release checks are reused for seven days when available, one day when unavailable, and one hour when inconclusive. Artist-list flags are stored separately: they cannot restore a release that a direct check found unavailable. Older cached positives receive a direct check when you use **Check availability**; completed checks are reused. Confirmed unavailable releases leave the default Missing releases view but remain inspectable through **Unavailable**. Timeouts and rate-limit errors (HTTP 429) never mark a release unavailable. Use **Recheck saved availability online** to bypass these checks without resetting the database or rereading track details.
 
@@ -154,7 +158,7 @@ sh desktop/tools/check.sh --live
 
 It refuses expired/near-expiry credentials and never refreshes the saved account. Sign in again in Tibrary if needed. Other authenticated tests and benchmarks remain opt-in; do not run every ignored test indiscriminately. Automated checks do not guarantee every live catalogue item, native Finder interaction, or removable filesystem behaves identically.
 
-Optional focused benchmarks: `metadata_preparation_benchmark -- --ignored --nocapture` uses synthetic database records; `live_metadata_concurrency -- --ignored --nocapture` makes seven read-only credited-release requests through the saved subscriber connection. Add either filter after the Rust test command above. Stop live benchmarking if the service starts throttling.
+Optional focused benchmarks: `metadata_cache_batch_benchmark`, `catalogue_publication_benchmark` and `metadata_preparation_benchmark` use synthetic databases. `live_metadata_preparation_warm_cache_benchmark` checks one credited release, up to six direct track responses, and warm-cache reuse through the saved subscriber connection. `live_catalogue_refresh_pipeline` checks bounded cold/warm refreshes and cancellation. Add one filter followed by `-- --ignored --nocapture` after the Rust test command above. Stop live benchmarking if the service starts throttling.
 
 To refresh the documentation screenshots:
 

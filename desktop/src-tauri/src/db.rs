@@ -4128,9 +4128,15 @@ impl TursoDb {
                         "release":cached["title"].as_str().or(source["album"].as_str()),
                         "artist":cached["artist"],"date":cached["date"],"label":cached["label"],"upc":cached["upc"].as_str().or(cached["barcode"].as_str()),"genres":recording["genres"],"release_genres":cached["genres"],"provider_replacement_id":cached["replacement_id"],
                         "title":recording["title"],"isrc":recording["isrc"],
-                        "bpm":dj.as_ref().and_then(|d|d.get("bpm")).unwrap_or(&recording["bpm"]),
-                        "key":dj.as_ref().and_then(|d|d.get("key")).unwrap_or(&recording["key"]),
-                        "dj_check":if dj.is_some(){"Checked; blank values were not supplied by this source"}else{"No saved additional metadata check"}}));
+                        "bpm":dj.as_ref().and_then(|d|d.get("bpm")).filter(|v|v.as_f64().is_some_and(|bpm|bpm.is_finite() && bpm > 0.)).unwrap_or(&recording["bpm"]),
+                        "key":dj.as_ref().and_then(|d|d.get("key")).filter(|v|v.as_str().is_some_and(|key|!key.trim().is_empty())).unwrap_or(&recording["key"]),
+                        "dj_check":if dj.as_ref().is_some_and(|check|check["status"] == "retry") {
+                            "Additional check incomplete; saved release metadata retained"
+                        } else if dj.is_some() || (recording["bpm_checked"] == true && recording["key_checked"] == true) {
+                            "Checked; blank values were not supplied by this source"
+                        } else if recording["bpm_checked"] == true || recording["key_checked"] == true {
+                            "Partly checked; additional fields can still be checked"
+                        } else {"No saved additional metadata check"}}));
                 }
                 return Ok(
                     json!({"id":p,"path":p,"metadata":meta,"tags":arrays,"linked_ids":link["ids"],"dj_checks":sources,
@@ -4543,6 +4549,28 @@ mod tests {
         assert_eq!(detail["catalogue_options"].as_array().unwrap().len(), 2);
         assert_eq!(detail["catalogue_options"][0]["recording_absent"], true);
         assert!(detail["catalogue_options"][0]["track_id"].is_null());
+        drop(store);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detail_keeps_saved_dj_values_when_additional_checks_are_empty() {
+        let folder = std::env::temp_dir().join(format!("tibrary-dj-detail-{}", uuid::Uuid::new_v4()));
+        let store = super::TursoDb::open(folder.join("db")).await.unwrap();
+        let path = "/synthetic/Artist/Release/Track.flac";
+        let metadata = serde_json::json!({"albumartist":"Artist","album":"Release","title":"Track"});
+        store.apply_file_update(path, path, "/synthetic", &metadata, 10, 20).await.unwrap();
+        store.save_track_link(path,"GB","[0,0,10,20]",&serde_json::json!({"status":"matched","ids":{"album_id":"100","track_id":"101"}}).to_string()).await.unwrap();
+        store.set_preference("tag-review:GB:100",&serde_json::json!({"id":"100","title":"Release","tracks":[{"id":"101","title":"Track","bpm":124.,"key":"C","bpm_checked":true,"key_checked":true}]})).await.unwrap();
+        let args=serde_json::json!({"path":path,"market":"GB"});
+        let detail=store.get_detail(&args).await.unwrap();
+        assert!(detail["dj_checks"][0]["dj_check"].as_str().unwrap().starts_with("Checked;"));
+        for check in [serde_json::json!({"bpm":null,"key":null}),serde_json::json!({"bpm":0,"key":" "}),serde_json::json!({"status":"retry"})] {
+            store.set_preference("dj-check:GB:101",&check).await.unwrap();
+            let detail=store.get_detail(&args).await.unwrap();
+            assert_eq!(detail["dj_checks"][0]["bpm"],124.);
+            assert_eq!(detail["dj_checks"][0]["key"],"C");
+        }
         drop(store);
         std::fs::remove_dir_all(folder).unwrap();
     }

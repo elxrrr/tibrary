@@ -38,6 +38,11 @@ pub struct TidalTrack {
     pub bpm: Option<f64>,
     pub key: Option<String>,
     pub key_scale: Option<String>,
+    /// Explicit fields in a complete subscriber response are checked even when
+    /// null. Old normalized caches default to unchecked; a missing field must
+    /// still be eligible for the recording-level fallback.
+    pub bpm_checked: bool,
+    pub key_checked: bool,
     #[serde(default, deserialize_with = "copyright_from_value")]
     pub copyright: Option<String>,
     #[serde(default, deserialize_with = "nullable_vec")]
@@ -440,18 +445,24 @@ impl TidalClient {
         let mut pending = Vec::new();
         let now = Utc::now().timestamp();
         let mut seen = std::collections::HashSet::new();
+        if ids.iter().any(|id|id.is_empty() || !id.bytes().all(|b|b.is_ascii_digit())) {
+            return Err("Invalid release ID".into());
+        }
+        let mut saved = std::collections::HashMap::new();
+        if !force && !ids.is_empty() {
+            let prefix = format!("subscriber-summary:{market}:");
+            let conn = self.db.connect()?;
+            let mut rows = conn.query("SELECT key,payload FROM app_preferences WHERE key IN (SELECT ? || value FROM json_each(?))",(prefix.as_str(),json!(ids).to_string())).await.map_err(|e|e.to_string())?;
+            while let Some(row) = rows.next().await.map_err(|e|e.to_string())? {
+                let key: String = row.get(0).map_err(|e|e.to_string())?;
+                let raw: String = row.get(1).map_err(|e|e.to_string())?;
+                if let Ok(value) = serde_json::from_str::<Value>(&raw) { saved.insert(key.trim_start_matches(&prefix).to_owned(),value); }
+            }
+        }
         for id in ids {
-            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-                return Err("Invalid release ID".into());
-            }
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let cached = self
-                .db
-                .get_preference(&format!("subscriber-summary:{market}:{id}"))
-                .await?;
-            if let Some(value) = cached.filter(|v| {
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) { return Err("Cancelled".into()); }
+            if !seen.insert(id.clone()) { continue; }
+            if let Some(value) = saved.remove(id).filter(|v| {
                 !force
                     && (v["artist"].is_object() || v["artists"].is_array())
                     && v["title"].is_string()
@@ -871,16 +882,23 @@ impl TidalClient {
                 raw["checked_at"] = json!(Utc::now().timestamp());
                 raw["availability_source"] = json!("artist_list");
                 summaries.push(raw.clone());
-                let mut release = release_from_subscriber(&raw, artist_id);
-                if detailed {
-                    release.tracks = self.get_release_details(&id, market).await?;
-                    release.tracks_loaded = true;
-                    release.track_count = release.tracks.len();
-                }
-                releases.push(release);
+                releases.push(release_from_subscriber(&raw, artist_id));
             }
         }
         self.cache_summaries(&summaries,market,&[],"artist_list").await?;
+        if detailed {
+            // Save summaries before credited lists so their fingerprints pair
+            // on the first fetch. Release-level concurrency shares the API lane.
+            let ids = releases.iter().map(|release|release.id.clone()).collect();
+            let details = crate::subscriber_metadata::prefetch(&self.db,&self.http,ids,market,self.cancel.clone(),|_|{}).await?;
+            for release in &mut releases {
+                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) { return Err("Cancelled".into()); }
+                let raw = details.get(&release.id).ok_or_else(||format!("Could not complete track details for release {}; saved catalogue retained",release.id))?;
+                release.tracks = crate::subscriber_metadata::tracks(raw)?;
+                release.tracks_loaded = true;
+                release.track_count = release.tracks.len();
+            }
+        }
         let extra = if enrich_discovery {
             let (reused, _, _) = crate::actions::recommendation_refresh_plan(&self.db,market,&releases).await?;
             let ids = releases.iter().filter(|r| !reused.contains(&r.id)).map(|r|r.id.clone()).collect::<Vec<_>>();
@@ -898,23 +916,6 @@ impl TidalClient {
             name,
             releases,
         })
-    }
-
-    pub async fn get_release_details(
-        &mut self,
-        id: &str,
-        market: &str,
-    ) -> Result<Vec<TidalTrack>, String> {
-        let raw = crate::subscriber_metadata::load(
-            &self.db,
-            &self.http,
-            id,
-            market,
-            self.cancel.clone(),
-            false,
-        )
-        .await?;
-        crate::subscriber_metadata::tracks(&raw)
     }
 
     pub async fn save_catalogue_to_db(
@@ -1104,6 +1105,10 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
             bpm: a["bpm"].as_f64(),
             key: a["key"].as_str().map(str::to_owned),
             key_scale: a["keyScale"].as_str().map(str::to_owned),
+            // This legacy JSON:API envelope does not prove that subscriber DJ
+            // fields were requested; normalization alone is not a source check.
+            bpm_checked: false,
+            key_checked: false,
             copyright: a["copyright"]
                 .as_str()
                 .or_else(|| a["copyright"]["text"].as_str())
@@ -1754,4 +1759,26 @@ pub fn merge_discovery(value: &mut Value, fields: &Value) {
     }
     value["discovery_checked_at"] = fields["checked_at"].clone();
     value["subscriber_discovery_checked_at"] = fields["checked_at"].clone();
+}
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "Bounded live cache contract check: one artist list and three album summaries, disposable database"]
+async fn live_summary_fingerprint_consistency() {
+    let dir = std::env::temp_dir().join(format!("subscriber-fingerprints-{}",uuid::Uuid::new_v4()));
+    let db = TursoDb::open(dir.join("db")).await.unwrap();
+    let mut client = TidalClient::from_db(&db).await.unwrap();
+    let catalogue = client.get_artist_catalogue_with_discovery("3870503","GB",false,false).await.unwrap();
+    let ids: Vec<_> = catalogue.releases.iter().take(3).map(|release|release.id.clone()).collect();
+    assert_eq!(ids.len(),3);
+    let mut before = std::collections::HashMap::new();
+    for id in &ids { before.insert(id.clone(),db.get_preference(&format!("subscriber-summary:GB:{id}")).await.unwrap().unwrap()); }
+    client.albums(&ids,"GB",true).await.unwrap();
+    for id in ids {
+        let direct = db.get_preference(&format!("subscriber-summary:GB:{id}")).await.unwrap().unwrap();
+        let list = &before[&id];
+        assert_eq!(summary_fingerprint(list),summary_fingerprint(&direct),"Artist-list and direct summary fingerprints must agree for release {id}");
+    }
+    println!("Artist-list and direct album fingerprints agree for three releases");
+    drop(client); drop(db); std::fs::remove_dir_all(dir).unwrap();
 }

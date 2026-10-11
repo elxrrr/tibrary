@@ -14,6 +14,12 @@ pub const METADATA_CONCURRENCY: usize = 3;
 #[cfg(test)]
 static THROTTLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+static REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn request_count() -> usize { REQUESTS.load(Ordering::Relaxed) }
+
 struct Pace {
     interval: Duration,
     next: Instant,
@@ -149,6 +155,8 @@ pub async fn get(
             drop(pace);
             tokio::time::sleep(wait.min(Duration::from_millis(200))).await;
         }
+        #[cfg(test)]
+        REQUESTS.fetch_add(1, Ordering::Relaxed);
         let pending = request
             .try_clone()
             .ok_or("Request cannot be retried")?
@@ -435,4 +443,60 @@ pub fn client(timeout: u64) -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())?;
     clients.insert(timeout, client.clone());
     Ok(client)
+}
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "Explicit read-only subscriber track-batch capability and field-parity benchmark"]
+async fn live_track_batch_metadata() {
+    use serde_json::Value;
+    let dir = std::env::temp_dir().join(format!("tibrary-track-batch-{}", uuid::Uuid::new_v4()));
+    let db = crate::db::TursoDb::open(dir.join("db")).await.unwrap();
+    let http = client(20).unwrap();
+    let token = crate::stream_download::get_valid_token(&db, &http).await.unwrap();
+    let response = get(http.get("https://api.tidal.com/v1/albums/140303440/items/credits")
+        .query(&[("countryCode","GB"),("limit","100")]).bearer_auth(&token),
+        Duration::from_millis(350), 2, None).await.unwrap();
+    assert!(response.status().is_success());
+    let album: Value = response.json().await.unwrap();
+    let ids: Vec<String> = album["items"].as_array().unwrap().iter()
+        .filter(|item|item["type"] == "track")
+        .map(|item|crate::tidal::resource_id(&item["item"]["id"])).take(8).collect();
+    let started = Instant::now();
+    let response = get(http.get("https://api.tidal.com/v1/tracks")
+        .query(&[("countryCode","GB"),("ids",ids.join(",").as_str())]).bearer_auth(&token),
+        Duration::from_millis(350), 2, None).await.unwrap();
+    let status = response.status();
+    println!("track_batch status={} count={} elapsed_ms={}",status.as_u16(),ids.len(),started.elapsed().as_millis());
+    if !status.is_success() {
+        let error: Value = response.json().await.unwrap_or(Value::Null);
+        println!("track_batch_error {}", serde_json::json!({"status":error["status"],"subStatus":error["subStatus"],"userMessage":error["userMessage"]}));
+        // Diagnostic only: do not make unsupported probes part of library jobs.
+    } else {
+        let payload: Value = response.json().await.unwrap();
+        let items = payload.as_array().or_else(||payload["items"].as_array()).expect("Track batch list");
+        assert_eq!(items.len(),ids.len());
+        let before = THROTTLES.load(Ordering::Relaxed);
+        let started = Instant::now();
+        for id in &ids {
+            let item = items.iter().find(|item|crate::tidal::resource_id(&item["id"]) == *id).expect("Requested track");
+            let single: Value = get(http.get(format!("https://api.tidal.com/v1/tracks/{id}"))
+                .query(&[("countryCode","GB")]).bearer_auth(&token),Duration::from_millis(350),2,None)
+                .await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            for field in ["id","isrc","bpm","key","keyScale","copyright","artists","mediaMetadata"] {
+                assert_eq!(item[field],single[field],"Batch differs for {field} on {id}");
+            }
+        }
+        println!("individual_tracks count={} elapsed_ms={} http_429={} fields_equal=true",ids.len(),started.elapsed().as_millis(),THROTTLES.load(Ordering::Relaxed)-before);
+    }
+    let response = get(http.get("https://openapi.tidal.com/v2/tracks")
+        .query(&[("countryCode","GB"),("filter[id]",ids.join(",").as_str())])
+        .header("Accept", "application/vnd.api+json").bearer_auth(&token),
+        Duration::from_millis(350), 2, None).await.unwrap();
+    let status=response.status();
+    let payload: Value=response.json().await.unwrap_or(Value::Null);
+    let items=payload["data"].as_array();
+    println!("v2_track_batch status={} returned={} fields={:?}",status.as_u16(),items.map_or(0,Vec::len),items.and_then(|items|items.first()).and_then(|item|item["attributes"].as_object()).map(|attrs|attrs.keys().collect::<Vec<_>>()));
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
 }

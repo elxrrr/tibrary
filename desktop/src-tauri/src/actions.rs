@@ -5,7 +5,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -399,6 +399,17 @@ pub(crate) async fn ensure_release_tracks(db: &TursoDb, id: &str, market: &str, 
 }
 
 pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, force: bool, cancel: Arc<AtomicBool>) -> Result<Value, String> {
+    release_with_publication(db,id,market,force,cancel,true).await
+}
+
+/// Catalogue refreshes flush canonical snapshots in groups. Completed details
+/// remain durable immediately, while an artist's large JSON is rewritten once
+/// for the group instead of once per release.
+pub(crate) async fn release_with_cancel_staged(db: &TursoDb, id: &str, market: &str, force: bool, cancel: Arc<AtomicBool>) -> Result<Value, String> {
+    release_with_publication(db,id,market,force,cancel,false).await
+}
+
+async fn release_with_publication(db: &TursoDb, id: &str, market: &str, force: bool, cancel: Arc<AtomicBool>, publish_catalogue: bool) -> Result<Value, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
         return Err("Select a release with a valid online ID".into());
     }
@@ -413,6 +424,40 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
                 .await?
         }
     };
+    let previous_summary=db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
+    if !force && previous_summary.as_ref().is_some_and(|summary|recommendation_tracks_current(&value,&crate::tidal::summary_fingerprint(summary)))
+        && recommendation_optional_current(&value,chrono::Utc::now().timestamp()) {
+        return Ok(value);
+    }
+    // Pair the current summary before loading credited items. Otherwise a
+    // first-time request stores an unbound list, discovers the summary later,
+    // and immediately downloads that same list again to establish its identity.
+    let summary_loaded = value["title"] == "Release not found";
+    if summary_loaded {
+        let mut client = crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
+        let raw = client.albums(&[id.to_owned()],market,force).await?;
+        let data = raw["data"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["id"].as_str() == Some(id)))
+            .ok_or("This release is unavailable in the selected market; saved data retained")?;
+        let a = &data["attributes"];
+        let artists = raw["included"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|v| v["type"] == "artists")
+            .filter_map(|v| v["attributes"]["name"].as_str())
+            .next().unwrap_or_default().to_owned();
+        value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"original_release_date":a["originalReleaseDate"],"type":a["albumType"].as_str().unwrap_or("album"),"official":a["official"],"secondary_types":a["secondaryTypes"].as_array().cloned().unwrap_or_default(),"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str().or(a["copyright"]["text"].as_str()),"upc":a["barcodeId"].as_str().or(a["upc"].as_str()),"quality":a["mediaTags"].as_array().map(|values|values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),"audio_modes":a["audioModes"].as_array().cloned().unwrap_or_default(),"media_metadata":a["mediaMetadata"],"remote_metadata":raw});
+        let raw = value["remote_metadata"].clone();
+        apply_release_discovery(&mut value, &raw, id);
+    }
+    if value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || (force && !summary_loaded) {
+        if let Ok(mut client)=crate::tidal::TidalClient::from_db(db).await {
+            client = client.with_cancel(cancel.clone());
+            fill_release_discovery(&mut client, &mut value, id, market, force).await;
+        }
+    }
     let summary = db.get_preference(&format!("subscriber-summary:{market}:{id}")).await?;
     let force = force || value["recommendation_snapshot"]["schema"].as_u64().is_some_and(|schema|schema != u64::from(RECOMMENDATION_SCHEMA)) || summary.as_ref().is_some_and(|summary| {
         value["recommendation_snapshot"]["summary_fingerprint"].as_str().is_some_and(|prior| prior != crate::tidal::summary_fingerprint(summary))
@@ -453,32 +498,6 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
         }
     };
     crate::subscriber_metadata::supplement(&mut tracks,&old_tracks);
-    let summary_loaded = value["title"] == "Release not found";
-    if summary_loaded {
-        let mut client = crate::tidal::TidalClient::from_db(db).await?.with_cancel(cancel.clone());
-        let raw = client.albums(&[id.to_owned()],market,force).await?;
-        let data = raw["data"]
-            .as_array()
-            .and_then(|items| items.iter().find(|item| item["id"].as_str() == Some(id)))
-            .ok_or("This release is unavailable in the selected market; saved data retained")?;
-        let a = &data["attributes"];
-        let artists = raw["included"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|v| v["type"] == "artists")
-            .filter_map(|v| v["attributes"]["name"].as_str())
-            .next().unwrap_or_default().to_owned();
-        value = json!({"id":id,"artist":artists,"title":crate::tidal::format_title(a["title"].as_str().unwrap_or(""),a["version"].as_str()),"date":a["releaseDate"].as_str().unwrap_or(""),"original_release_date":a["originalReleaseDate"],"type":a["albumType"].as_str().unwrap_or("album"),"official":a["official"],"secondary_types":a["secondaryTypes"].as_array().cloned().unwrap_or_default(),"available":a["availability"].as_array().map(|v|v.iter().any(|x|x=="STREAM"||x=="DJ")),"label":a["recordLabel"].as_str().or(a["recordLabel"]["name"].as_str()),"copyright":a["copyright"].as_str().or(a["copyright"]["text"].as_str()),"upc":a["barcodeId"].as_str().or(a["upc"].as_str()),"quality":a["mediaTags"].as_array().map(|values|values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),"audio_modes":a["audioModes"].as_array().cloned().unwrap_or_default(),"media_metadata":a["mediaMetadata"],"remote_metadata":raw});
-        let raw = value["remote_metadata"].clone();
-        apply_release_discovery(&mut value, &raw, id);
-    }
-    if value["discovery_checked_at"].as_i64().is_none_or(|at| chrono::Utc::now().timestamp() - at >= 30 * 86_400) || (force && !summary_loaded) {
-        if let Ok(mut client)=crate::tidal::TidalClient::from_db(db).await {
-            client = client.with_cancel(cancel.clone());
-            fill_release_discovery(&mut client, &mut value, id, market, force).await;
-        }
-    }
     let optional = match crate::tidal::TidalClient::from_db(db).await {
         Ok(client) => match client.with_cancel(cancel.clone()).discovery(&[id.to_owned()],market,force).await {
             Ok(fields) => fields,
@@ -515,7 +534,7 @@ pub(crate) async fn release_with_cancel(db: &TursoDb, id: &str, market: &str, fo
     // Pin the exact summary paired with this track list. A concurrent catalogue
     // write after this point will produce a different fingerprint on the next check.
     record_recommendation_snapshot(db,&mut value,market,current_summary.as_ref(),optional.get(id)).await?;
-    publish_release(db, id, market, value).await
+    publish_release_update(db, id, market, value, None, publish_catalogue).await
 }
 
 async fn fill_release_discovery(client: &mut crate::tidal::TidalClient, value: &mut Value, id: &str, market: &str, force: bool) {
@@ -554,13 +573,23 @@ pub(crate) async fn publish_release(
     market: &str,
     value: Value,
 ) -> Result<Value, String> {
-    publish_release_update(db,id,market,value,None).await
+    publish_release_update(db,id,market,value,None,true).await
 }
 
+#[cfg(test)]
 async fn publish_track_enrichment(db: &TursoDb, id: &str, market: &str, track: &crate::tidal::TidalTrack) -> Result<Value,String> {
+    publish_track_enrichments(db,id,market,std::slice::from_ref(track)).await
+}
+
+#[cfg(test)]
+async fn publish_track_enrichments(db: &TursoDb, id: &str, market: &str, tracks: &[crate::tidal::TidalTrack]) -> Result<Value,String> {
+    publish_track_enrichments_mode(db,id,market,tracks,true).await
+}
+
+async fn publish_track_enrichments_mode(db: &TursoDb, id: &str, market: &str, tracks: &[crate::tidal::TidalTrack], publish_catalogue: bool) -> Result<Value,String> {
     let gate = release_gate(format!("{}:{market}:{id}",db.path.display()));
     let _guard = gate.lock().await;
-    publish_release_update(db,id,market,Value::Null,Some(track)).await
+    publish_release_update(db,id,market,Value::Null,Some(tracks),publish_catalogue).await
 }
 
 async fn publish_release_update(
@@ -568,14 +597,15 @@ async fn publish_release_update(
     id: &str,
     market: &str,
     mut value: Value,
-    track_patch: Option<&crate::tidal::TidalTrack>,
+    track_patches: Option<&[crate::tidal::TidalTrack]>,
+    publish_catalogue: bool,
 ) -> Result<Value,String> {
-    db.ensure_catalogue_release_index().await?;
+    if publish_catalogue { db.ensure_catalogue_release_index().await?; }
     // Publish details to every catalogue reference and existing queue entry.
     let conn = db.connect()?;
     conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|e|e.to_string())?;
     let result = async {
-        if let Some(incoming) = track_patch {
+        if let Some(incoming_tracks) = track_patches {
             // Merge against the latest canonical recording inside the write
             // transaction, preserving parallel updates to all other tracks.
             let mut rows = conn.query("SELECT payload FROM app_preferences WHERE key=?",(format!("tag-review:{market}:{id}"),)).await.map_err(|e|e.to_string())?;
@@ -583,6 +613,7 @@ async fn publish_release_update(
             value = serde_json::from_str(&saved.get::<String>(0).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
             drop(rows);
             let tracks = value["tracks"].as_array_mut().ok_or("Release track list no longer cached")?;
+            for incoming in incoming_tracks {
             let target = tracks.iter_mut().find(|track| track["id"].as_str() == Some(&incoming.id)).ok_or("Recording no longer belongs to this release; refresh it first")?;
             let mut current: crate::tidal::TidalTrack = serde_json::from_value(target.clone()).map_err(|e|e.to_string())?;
             if current.isrc.as_ref().zip(incoming.isrc.as_ref()).is_some_and(|(a,b)|!a.eq_ignore_ascii_case(b)) { return Err("Recording identifier changed; saved metadata retained".to_owned()); }
@@ -591,44 +622,20 @@ async fn publish_release_update(
             current.credits_complete |= incoming.credits_complete;
             current.credits_checked_at = current.credits_checked_at.max(incoming.credits_checked_at);
             *target = json!(current);
+            }
         }
         conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)", (format!("tag-review:{market}:{id}"),value.to_string())).await.map_err(|e|e.to_string())?;
         if let (Some(available), Some(checked_at)) = (value["available"].as_bool(),value["availability_checked_at"].as_i64()) {
             crate::availability::save_observation(&conn, id, market, Some(available), checked_at, value["availability_source"].as_str().unwrap_or("legacy")).await?;
         }
-        let mut rows = conn
-            .query(
-                "SELECT c.artist_id,c.payload FROM catalogue c JOIN catalogue_release_index i ON i.artist_id=c.artist_id AND i.market=c.market WHERE i.market=? AND i.release_id=?",
-                (market,id),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut updates = vec![];
-        while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
-            let artist: String = row.get(0).map_err(|e| e.to_string())?;
-            let raw: String = row.get(1).map_err(|e| e.to_string())?;
-            let mut cat: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            let mut changed = false;
-            if let Some(releases) = cat["releases"].as_array_mut() {
-                for r in releases {
-                    if r["id"].as_str() == Some(id) {
-                        *r = value.clone();
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                updates.push((artist, cat.to_string()));
-            }
-        }
-        drop(rows);
-        for (artist, data) in updates {
-            conn.execute(
-                "UPDATE catalogue SET payload=? WHERE artist_id=? AND market=?",
-                (data.as_str(), artist.as_str(), market),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let pending_key=format!("pending-catalogue:{market}:{id}");
+        if publish_catalogue {
+            publish_catalogue_values(&conn,market,&HashMap::from([(id.to_owned(),value.clone())])).await?;
+            conn.execute("DELETE FROM app_preferences WHERE key=?",(pending_key,)).await.map_err(|error|error.to_string())?;
+        } else {
+            // Durable marker makes cancellation/crash recovery unambiguous:
+            // only completed staged writes may be copied into artist catalogues.
+            conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(pending_key,json!({"id":id,"market":market}).to_string())).await.map_err(|error|error.to_string())?;
         }
         let mut q = conn
             .query("SELECT payload FROM queue WHERE id=?", (id,))
@@ -654,6 +661,87 @@ async fn publish_release_update(
     let value = result?;
     db.bump_revision();
     Ok(value)
+}
+
+/// Apply only current canonical release snapshots, so a delayed batch cannot
+/// overwrite metadata added by a concurrent download/tag job. Queue choices are
+/// never included in these artist-catalogue snapshots.
+pub(crate) async fn publish_catalogue_releases(db: &TursoDb, ids: &[String], market: &str) -> Result<(),String> {
+    if ids.is_empty() { return Ok(()); }
+    let conn=db.connect()?;
+    let mut pending=conn.query("SELECT 1 FROM app_preferences WHERE key IN (SELECT 'pending-catalogue:' || ? || ':' || value FROM json_each(?)) LIMIT 1",(market,json!(ids).to_string())).await.map_err(|error|error.to_string())?;
+    if pending.next().await.map_err(|error|error.to_string())?.is_none() {return Ok(());}
+    drop(pending);
+    db.ensure_catalogue_release_index().await?;
+    conn.execute("BEGIN IMMEDIATE",()).await.map_err(|error|error.to_string())?;
+    let result=async {
+        let mut rows=conn.query("SELECT p.payload,summary.payload FROM app_preferences p JOIN app_preferences pending ON pending.key='pending-catalogue:' || ? || ':' || json_extract(p.payload,'$.id') LEFT JOIN app_preferences summary ON summary.key='subscriber-summary:' || ? || ':' || json_extract(p.payload,'$.id') WHERE p.key IN (SELECT 'tag-review:' || ? || ':' || value FROM json_each(?))",(market,market,market,json!(ids).to_string())).await.map_err(|error|error.to_string())?;
+        let mut values=HashMap::new();
+        let mut completed=Vec::new();
+        while let Some(row)=rows.next().await.map_err(|error|error.to_string())? {
+            let value: Value=serde_json::from_str(&row.get::<String>(0).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+            if let Some(id)=value["id"].as_str() {
+                completed.push(id.to_owned());
+                let summary=row.get::<Option<String>>(1).ok().flatten().and_then(|raw|serde_json::from_str::<Value>(&raw).ok());
+                // An artist refresh may have observed a newer edition while
+                // this canonical update waited for its batch. Clear the stale
+                // marker and let normal fingerprint invalidation refill it.
+                let superseded=summary.as_ref().is_some_and(|summary| value["recommendation_snapshot"]["summary_fingerprint"].as_str() != Some(crate::tidal::summary_fingerprint(summary).as_str()));
+                if !superseded {values.insert(id.to_owned(),value);}
+            }
+        }
+        drop(rows);
+        publish_catalogue_values(&conn,market,&values).await?;
+        conn.execute("DELETE FROM app_preferences WHERE key IN (SELECT 'pending-catalogue:' || ? || ':' || value FROM json_each(?))",(market,json!(completed).to_string())).await.map_err(|error|error.to_string())?;
+        conn.execute("COMMIT",()).await.map_err(|error|error.to_string())?;
+        Ok::<_,String>(!values.is_empty())
+    }.await;
+    if result.is_err() { let _=conn.execute("ROLLBACK",()).await; }
+    if result? {db.bump_revision();}
+    Ok(())
+}
+
+/// Recover only completed staged publications after a restart. No API work is
+/// repeated, and incomplete/failed releases never acquire a pending marker.
+pub(crate) async fn recover_catalogue_publications(db: &TursoDb) -> Result<(),String> {
+    let conn=db.connect()?;
+    let mut rows=conn.query("SELECT payload FROM app_preferences WHERE key LIKE 'pending-catalogue:%'",()).await.map_err(|error|error.to_string())?;
+    let mut markets:HashMap<String,Vec<String>>=HashMap::new();
+    while let Some(row)=rows.next().await.map_err(|error|error.to_string())? {
+        let raw:String=row.get(0).map_err(|error|error.to_string())?;
+        let value:Value=serde_json::from_str(&raw).map_err(|error|error.to_string())?;
+        if let (Some(market),Some(id))=(value["market"].as_str(),value["id"].as_str()) {markets.entry(market.to_owned()).or_default().push(id.to_owned());}
+    }
+    drop(rows);
+    for (market,ids) in markets {publish_catalogue_releases(db,&ids,&market).await?;}
+    Ok(())
+}
+
+async fn publish_catalogue_values(conn: &turso::Connection, market: &str, values: &HashMap<String,Value>) -> Result<(),String> {
+    if values.is_empty() { return Ok(()); }
+    let ids: Vec<_>=values.keys().collect();
+    let mut rows=conn.query(
+        "SELECT c.artist_id,c.payload FROM catalogue c WHERE c.market=? AND c.artist_id IN (SELECT artist_id FROM catalogue_release_index WHERE market=? AND release_id IN (SELECT value FROM json_each(?)))",
+        (market,market,json!(ids).to_string()),
+    ).await.map_err(|error|error.to_string())?;
+    let mut updates=Vec::new();
+    while let Some(row)=rows.next().await.map_err(|error|error.to_string())? {
+        let artist: String=row.get(0).map_err(|error|error.to_string())?;
+        let raw: String=row.get(1).map_err(|error|error.to_string())?;
+        let mut catalogue: Value=serde_json::from_str(&raw).map_err(|error|error.to_string())?;
+        let mut changed=false;
+        for release in catalogue["releases"].as_array_mut().into_iter().flatten() {
+            if let Some(value)=release["id"].as_str().and_then(|id|values.get(id)) {
+                if release != value { *release=value.clone(); changed=true; }
+            }
+        }
+        if changed { updates.push((artist,catalogue.to_string())); }
+    }
+    drop(rows);
+    for (artist,payload) in updates {
+        conn.execute("UPDATE catalogue SET payload=? WHERE artist_id=? AND market=?",(payload,artist,market)).await.map_err(|error|error.to_string())?;
+    }
+    Ok(())
 }
 
 /// A completed optional check may legitimately contain no BPM/key. Failures
@@ -685,6 +773,158 @@ async fn check_dj_metadata(db: &TursoDb, http: &reqwest::Client, track: &str, ma
     };
     db.set_preference(&key,&value).await?;
     Ok(value)
+}
+
+fn metadata_service_paused(error: &str) -> bool {
+    let error=error.to_ascii_lowercase();
+    ["401 unauthorized","403 forbidden","429 too many requests","http 401","http 403","http 429","service cooldown","no tidal login token","login token expired","authentication required","token refresh request failed","token refresh failed"].iter().any(|phrase|error.contains(phrase))
+}
+
+/// Prepare each selected release once. Both the release and recording queues
+/// are bounded; the shared network lane still owns all pacing and 429 cooldowns.
+/// The raw credited list is fetched by release_with_cancel, not fetched in an
+/// earlier pass and then decoded/fetched again for every selected file.
+#[derive(Clone, Copy, Default)]
+struct DjMetadataNeeds { bpm: bool, key: bool }
+
+impl DjMetadataNeeds {
+    fn from_tags(tags: &HashMap<String,String>) -> Self {
+        // Match the missing-tag writer: existing nonempty local values are
+        // preserved, so looking them up cannot produce an additional proposal.
+        Self { bpm: !crate::enrichment::has_any_tag(tags,"bpm"), key: !crate::enrichment::has_any_tag(tags,"initialkey") }
+    }
+    fn missing_from(&self, track: &crate::tidal::TidalTrack) -> bool {
+        (self.bpm && track.bpm.is_none() && !track.bpm_checked) || (self.key && track.key.is_none() && !track.key_checked)
+    }
+}
+
+struct PreparedMetadataRelease {
+    release: crate::tidal::TidalRelease,
+    dj_notes: HashMap<String, String>,
+}
+
+async fn prepare_metadata_release(
+    db: TursoDb, http: reqwest::Client, album: String, selected_tracks: HashMap<String,DjMetadataNeeds>,
+    market: String, cancel: Arc<AtomicBool>, progress_state: Arc<std::sync::Mutex<(usize,String)>>,
+) -> Result<PreparedMetadataRelease, String> {
+    let value=release_with_cancel_staged(&db,&album,&market,false,cancel.clone()).await?;
+    let mut release: crate::tidal::TidalRelease=serde_json::from_value(value).map_err(|error|error.to_string())?;
+    let before:HashMap<_,_>=release.tracks.iter().map(|track|(track.id.clone(),json!(track))).collect();
+    if release.tracks.iter().any(|track|selected_tracks.get(&track.id).is_some_and(|needs|needs.missing_from(track))) {
+        // Legacy canonical rows predate explicit checked-empty flags. Recover
+        // these observations from the validated raw cache without an API call.
+        if let Some(raw)=crate::subscriber_metadata::cached(&db,&album,&market).await? {
+            let normalized=crate::subscriber_metadata::tracks(&raw)?;
+            crate::subscriber_metadata::supplement(&mut release.tracks,&normalized);
+        }
+    }
+    let mut pending: VecDeque<_>=release.tracks.iter()
+        .filter(|track| selected_tracks.get(&track.id).is_some_and(|needs|needs.missing_from(track)))
+        .map(|track|track.id.clone()).collect();
+    {
+        let mut progress=progress_state.lock().unwrap();
+        progress.0 += 1 + selected_tracks.len() - pending.len();
+        progress.1 = format!("{} — {} · saved track details and credits ready",release.artist,release.title);
+    }
+    let mut tasks=tokio::task::JoinSet::new();
+    let mut notes=HashMap::new();
+    loop {
+        if cancel.load(Ordering::Relaxed) { break; }
+        while tasks.len() < crate::network::METADATA_CONCURRENCY {
+            let Some(id)=pending.pop_front() else { break; };
+            let db=db.clone(); let http=http.clone(); let market=market.clone(); let cancel=cancel.clone();
+            tasks.spawn(async move { let result=check_dj_metadata(&db,&http,&id,&market,cancel).await; (id,result) });
+        }
+        let Some(result)=tasks.join_next().await else { break; };
+        let (id,extra)=result.map_err(|error|error.to_string())?;
+        let extra=extra?;
+        if extra["status"] == "retry" {
+            let error=extra["error"].as_str().unwrap_or("Retry paused");
+            if metadata_service_paused(error) { return Err(format!("Metadata checks paused: {error}. Completed results are saved; retry later.")); }
+            notes.insert(id.clone(),error.to_owned());
+        }
+        if let Some(track)=release.tracks.iter_mut().find(|track|track.id == id) {
+            crate::subscriber_metadata::merge(track,&extra);
+            let mut progress=progress_state.lock().unwrap();
+            progress.0 += 1;
+            progress.1 = format!("{} — {} · {} · BPM/key checked",release.artist,release.title,track.title);
+        }
+    }
+    if cancel.load(Ordering::Relaxed) { return Err("Cancelled".into()); }
+    let enriched:Vec<_>=release.tracks.iter().filter(|track|before.get(&track.id) != Some(&json!(track))).cloned().collect();
+    if !enriched.is_empty() {
+        // Stage one patch per release, then publish containing artist catalogues
+        // in groups. Legacy checked-empty normalization must not cause thousands
+        // of complete catalogue rewrites merely to add two booleans.
+        release=serde_json::from_value(publish_track_enrichments_mode(&db,&album,&market,&enriched,false).await?).map_err(|error|error.to_string())?;
+    }
+    Ok(PreparedMetadataRelease {release,dj_notes:notes})
+}
+
+async fn prepare_metadata_releases(
+    db: &TursoDb, http: &reqwest::Client, albums: HashMap<String, HashMap<String,DjMetadataNeeds>>,
+    market: &str, cancel: Arc<AtomicBool>, progress: impl Fn(&str),
+) -> Result<HashMap<String, PreparedMetadataRelease>, String> {
+    let total=albums.len();
+    let total_checks=total + albums.values().map(HashMap::len).sum::<usize>();
+    let all_ids:Vec<_>=albums.keys().cloned().collect();
+    let progress_state=Arc::new(std::sync::Mutex::new((0_usize,String::new())));
+    let mut last_report=std::time::Instant::now();
+    let mut last_completed=0;
+    let mut pending: VecDeque<_>=albums.into_iter().collect();
+    let mut tasks=tokio::task::JoinSet::new();
+    let mut result=HashMap::new();
+    let mut completed_ids=Vec::new();
+    progress(&format!("Preparing missing tags · 0/{total_checks} checks · {total} releases · reusing saved credits, genres and BPM/key; fetching missing data"));
+    let prepared=async {
+        loop {
+            if cancel.load(Ordering::Relaxed) { return Err("Cancelled".to_owned()); }
+            while tasks.len() < crate::network::METADATA_CONCURRENCY {
+                let Some((id,tracks))=pending.pop_front() else { break; };
+                let db=db.clone(); let http=http.clone(); let market=market.to_owned(); let cancel=cancel.clone();
+                let progress_state=progress_state.clone();
+                tasks.spawn(async move {
+                    let prepared=prepare_metadata_release(db,http,id.clone(),tracks,market,cancel,progress_state).await;
+                    (id,prepared)
+                });
+            }
+            if tasks.is_empty() { break; }
+            let completed=tokio::select! {
+                completed=tasks.join_next()=>completed,
+                _=tokio::time::sleep(std::time::Duration::from_millis(100))=>{
+                    // Large editions keep updating the same job line while DJ
+                    // checks run; throttle UI notifications to once per second.
+                    let (checked,detail)=progress_state.lock().unwrap().clone();
+                    if checked != last_completed && last_report.elapsed() >= std::time::Duration::from_secs(1) {
+                        progress(&format!("Preparing missing tags · {checked}/{total_checks} checks · {detail}"));
+                        last_completed=checked; last_report=std::time::Instant::now();
+                    }
+                    continue;
+                }
+            };
+            let Some(completed)=completed else { break; };
+            let (id,prepared)=completed.map_err(|error|error.to_string())?;
+            let prepared=prepared?;
+            let checked=progress_state.lock().unwrap().0;
+            progress(&format!("Missing tags prepared · {checked}/{total_checks} checks · {} of {total} releases ready · {} — {}",result.len()+1,prepared.release.artist,prepared.release.title));
+            last_completed=checked; last_report=std::time::Instant::now();
+            completed_ids.push(id.clone());
+            result.insert(id,prepared);
+            if completed_ids.len() >= 20 {
+                publish_catalogue_releases(db,&completed_ids,market).await?;
+                completed_ids.clear();
+            }
+        }
+        Ok::<_,String>(())
+    }.await;
+    // Wait for aborted workers to release any transaction before flushing. Only
+    // durable staged markers are eligible, including a worker cancelled between
+    // committing its result and returning it to this coordinator.
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    publish_catalogue_releases(db,&all_ids,market).await?;
+    prepared?;
+    Ok(result)
 }
 
 pub async fn execute(
@@ -1627,8 +1867,7 @@ pub async fn execute(
         let mut inspected_paths = vec![];
         let http = crate::network::client(20)?;
         let mut prepared = Vec::new();
-        let mut albums = Vec::new();
-        let mut seen_albums = HashSet::new();
+        let mut albums: HashMap<String, HashMap<String,DjMetadataNeeds>> = HashMap::new();
         let selected_paths: Vec<_> = indexed.iter().filter(|file| ids.is_empty() || ids.contains(&file.path)).map(|file|file.path.as_str()).collect();
         let link_ids = metadata_link_ids(db,&selected_paths,market,cancel.as_ref()).await?;
         for file in indexed.iter().filter(|f| ids.is_empty() || ids.contains(&f.path)) {
@@ -1636,15 +1875,20 @@ pub async fn execute(
             let linked = link_ids.get(&file.path).cloned().unwrap_or(Value::Null);
             let tags = workflows::extract_tags_map(&file.metadata);
             if let Some(album) = args["album_id"].as_str().or(linked["album_id"].as_str()).or_else(||tags.get("tidal_album_id").map(String::as_str)) {
-                if seen_albums.insert(album.to_owned()) { albums.push(album.to_owned()); }
+                let tracks=albums.entry(album.to_owned()).or_default();
+                if let Some(track)=linked["track_id"].as_str().or_else(||tags.get("tidal_track_id").map(String::as_str)) {
+                    let needs=DjMetadataNeeds::from_tags(&tags);
+                    let combined=tracks.entry(track.to_owned()).or_default();
+                    combined.bpm |= needs.bpm; combined.key |= needs.key;
+                }
             }
             // Retain only IDs, not the full candidate/metadata payload for every file.
             prepared.push((file,json!({"linked_ids":linked})));
             if prepared.len() % 100 == 0 { state.progress_for(kind,&format!("Preparing metadata · {} files checked for cached DJ data",prepared.len())); }
         }
         let album_metadata = if kind == "metadata" {
-            crate::subscriber_metadata::prefetch(db, &http, albums, market, cancel.clone(), |message| state.progress_for(kind,message)).await?
-        } else { std::collections::HashMap::new() };
+            prepare_metadata_releases(db, &http, albums, market, cancel.clone(), |message| state.progress_for(kind,message)).await?
+        } else { HashMap::new() };
         let total_files=prepared.len();
         let mut release_cache: std::collections::HashMap<String, crate::tidal::TidalRelease> = Default::default();
         for (position, (file, detail)) in prepared.into_iter().enumerate() {
@@ -1656,12 +1900,11 @@ pub async fn execute(
                 .or_else(|| tags.get("tidal_album_id").map(String::as_str));
             let Some(album) = album else { continue };
             state.progress_for(kind, &format!("Checking missing metadata · {}/{total_files} files · {} — {} · {} · release ID {album}",position+1, tags.get("albumartist").or(tags.get("artist")).map(String::as_str).unwrap_or("Unknown artist"), tags.get("title").map(String::as_str).unwrap_or("Untitled track"), tags.get("album").map(String::as_str).unwrap_or("Unknown release")));
-            let mut rel = if let Some(saved) = release_cache.get(album) { saved.clone() } else {
+            if kind == "manual_candidate" && !release_cache.contains_key(album) {
                 let value = release_with_cancel(db,album,market,false,cancel.clone()).await?;
-                let saved: crate::tidal::TidalRelease = serde_json::from_value(value).map_err(|e|e.to_string())?;
-                release_cache.insert(album.to_owned(),saved.clone());
-                saved
-            };
+                release_cache.insert(album.to_owned(),serde_json::from_value(value).map_err(|e|e.to_string())?);
+            }
+            let rel = album_metadata.get(album).map(|prepared|&prepared.release).or_else(||release_cache.get(album)).ok_or("Release metadata preparation incomplete")?;
             let track_id = detail["linked_ids"]["track_id"]
                 .as_str()
                 .or_else(|| tags.get("tidal_track_id").map(String::as_str));
@@ -1704,31 +1947,13 @@ pub async fn execute(
             else {
                 continue;
             };
-            let mut track = rel.tracks[index].clone();
-            let before_enrichment = json!(track);
-            if let Some(items) = album_metadata.get(album).and_then(|v|v["items"].as_array()) {
-                if let Some(raw) = items.iter().find(|v|v["id"].as_str().map(str::to_owned).unwrap_or_else(||v["id"].to_string()) == track.id) {
-                    crate::subscriber_metadata::merge(&mut track, raw);
-                }
-            }
-
-            let mut dj_note = None;
-            if track.bpm.is_none() || track.key.is_none() {
-                let extra = check_dj_metadata(db,&http,&track.id,market,cancel.clone()).await?;
-                if extra["status"] == "retry" { dj_note = Some(extra["error"].as_str().unwrap_or("Retry paused").to_owned()); }
-                crate::subscriber_metadata::merge(&mut track, &extra);
-            }
-            if json!(track) != before_enrichment {
-                let stored = publish_track_enrichment(db,&rel.id,market,&track).await?;
-                rel = serde_json::from_value(stored).map_err(|e|e.to_string())?;
-                track = rel.tracks.iter().find(|current|current.id == track.id).cloned().ok_or("Recording no longer in saved release")?;
-                release_cache.insert(album.to_owned(),rel.clone());
-            }
-            let mut changes = crate::enrichment::compute_missing_tags(&tags, &rel, &track);
+            let track = &rel.tracks[index];
+            let dj_note = album_metadata.get(album).and_then(|prepared|prepared.dj_notes.get(&track.id));
+            let mut changes = crate::enrichment::compute_missing_tags(&tags, rel, track);
             // Page ownership is not a reliable performer or album-artist credit.
             changes.remove("artist");
             changes.remove("albumartist");
-            output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":changes,"affected":!changes.is_empty(),"size":file.size,"mtime":file.mtime,"status":if changes.is_empty(){"No supplied missing tags"}else{"Missing tags found"},"item":{"path":file.path,"tags":changes},"source_release_id":rel.id,"source_track_id":track.id,"evidence":format!("API BPM: {} · Key: {}{}",track.bpm.map(|n|n.to_string()).unwrap_or("not supplied".into()),track.key.unwrap_or("not supplied".into()),dj_note.map(|note|format!(" · DJ check deferred: {note}")).unwrap_or_default())}));
+            output.push(json!({"id":file.path,"path":file.path,"artist":tags.get("albumartist").or(tags.get("artist")),"release":tags.get("album"),"title":tags.get("title"),"tags":tags,"changes":changes,"affected":!changes.is_empty(),"size":file.size,"mtime":file.mtime,"status":if changes.is_empty(){"No supplied missing tags"}else{"Missing tags found"},"item":{"path":file.path,"tags":changes},"source_release_id":rel.id,"source_track_id":track.id,"evidence":format!("API BPM: {} · Key: {}{}",track.bpm.map(|n|n.to_string()).unwrap_or("not supplied".into()),track.key.as_deref().unwrap_or("not supplied"),dj_note.map(|note|format!(" · DJ check deferred: {note}")).unwrap_or_default())}));
         }
         if kind == "manual_candidate" {
             return Ok(json!({"checked":inspected_paths.len(),"root":root,"inspected_paths":inspected_paths}));
@@ -2232,6 +2457,245 @@ mod tests {
         assert!(publish_track_enrichment(&db,"10","GB",&first).await.is_err());
         assert_eq!(db.get_preference("tag-review:GB:10").await.unwrap().unwrap(),canonical);
         drop(conn); drop(db); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_tag_dj_requests_only_fill_needed_fields() {
+        let track=crate::tidal::TidalTrack {bpm:Some(124.),..Default::default()};
+        let local=HashMap::from([("tkey".into(),"8A".into())]);
+        assert!(!DjMetadataNeeds::from_tags(&local).missing_from(&track),"A missing remote key cannot change an existing local key");
+        assert!(DjMetadataNeeds::from_tags(&HashMap::new()).missing_from(&track));
+        let complete=HashMap::from([("tempo".into(),"124".into()),("initialkey".into(),"8A".into())]);
+        assert!(!DjMetadataNeeds::from_tags(&complete).missing_from(&crate::tidal::TidalTrack::default()));
+    }
+
+    #[tokio::test]
+    async fn metadata_release_preparation_reuses_cache_and_only_checks_requested_recordings() {
+        let dir=std::env::temp_dir().join(format!("metadata-release-warm-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let summary=json!({"id":10,"title":"Release","numberOfTracks":3,"numberOfVolumes":1,"artists":[{"id":1,"name":"Artist"}]});
+        let now=chrono::Utc::now().timestamp();
+        db.set_preference("subscriber-summary:GB:10",&summary).await.unwrap();
+        let tracks: Vec<_>=(101..104).map(|id|crate::tidal::TidalTrack {id:id.to_string(),track_number:id-100,disc_number:1,credits_complete:true,credits:json!([]),..Default::default()}).collect();
+        let release=json!({"id":"10","artist":"Artist","title":"Release","discovery_checked_at":now,"tracks_loaded":true,"track_metadata_source":"subscriber","tracks":tracks,"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":crate::tidal::summary_fingerprint(&summary),"optional_status":"complete","optional_schema":crate::tidal::DISCOVERY_SCHEMA,"optional_valid_until":now+3600}});
+        db.set_preference("tag-review:GB:10",&release).await.unwrap();
+        db.set_preference("dj-check:GB:101",&json!({"id":"101","status":"complete","bpm":124.,"key":"G","checked_at":now})).await.unwrap();
+        // 102 belongs to this album but is not selected. 103 already has local
+        // DJ tags. Neither should create an optional request or retry cache.
+        let selected=HashMap::from([("101".into(),DjMetadataNeeds {bpm:true,key:true}),("103".into(),DjMetadataNeeds::default())]);
+        let albums=HashMap::from([("10".into(),selected)]);
+        let http=reqwest::Client::new();
+        for _ in 0..2 {
+            let prepared=prepare_metadata_releases(&db,&http,albums.clone(),"GB",Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+            assert_eq!(prepared.len(),1);
+            assert_eq!(prepared["10"].release.tracks[0].bpm,Some(124.));
+            assert_eq!(prepared["10"].release.tracks[0].key.as_deref(),Some("G"));
+            assert!(prepared["10"].dj_notes.is_empty());
+            assert!(db.get_preference("dj-check:GB:102").await.unwrap().is_none());
+            assert!(db.get_preference("dj-check:GB:103").await.unwrap().is_none());
+        }
+        let cancel=Arc::new(AtomicBool::new(true));
+        assert!(prepare_metadata_releases(&db,&http,albums,"GB",cancel,|_|{}).await.is_err());
+        assert_eq!(db.get_preference("tag-review:GB:10").await.unwrap().unwrap()["tracks"][0]["bpm"],124.);
+        drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_parallel_metadata_preparation_releases_waiters_without_touching_owner() {
+        let dir=std::env::temp_dir().join(format!("metadata-preparation-cancel-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let summary=json!({"id":10,"title":"Release","numberOfTracks":1});
+        db.set_preference("subscriber-summary:GB:10",&summary).await.unwrap();
+        db.set_preference("tag-review:GB:10",&json!({"id":"10","artist":"Artist","title":"Release","tracks_loaded":true,"track_metadata_source":"subscriber","tracks":[{"id":"101","title":"Track","track_number":1,"disc_number":1,"credits_complete":true,"credits":[]}],"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":crate::tidal::summary_fingerprint(&summary),"optional_status":"complete","optional_schema":crate::tidal::DISCOVERY_SCHEMA,"optional_valid_until":chrono::Utc::now().timestamp()+3600}})).await.unwrap();
+        let gate=release_gate(format!("dj:{}:GB:101",db.path.display()));
+        let owner=gate.clone().lock_owned().await;
+        let cancel=Arc::new(AtomicBool::new(false));
+        let worker_db=db.clone();let worker_cancel=cancel.clone();
+        let worker=tokio::spawn(async move {
+            prepare_metadata_releases(&worker_db,&reqwest::Client::new(),HashMap::from([("10".into(),HashMap::from([("101".into(),DjMetadataNeeds {bpm:true,key:true})]))]),"GB",worker_cancel,|_|{}).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.store(true,Ordering::Relaxed);
+        let result=tokio::time::timeout(std::time::Duration::from_secs(1),worker).await.expect("Cancellation must not wait for another worker's DJ lookup").unwrap();
+        assert!(result.is_err());
+        assert!(gate.try_lock().is_err(),"Other worker still owns its cache fill");
+        assert!(db.get_preference("dj-check:GB:101").await.unwrap().is_none());
+        drop(owner);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_tag_preparation_recovers_explicit_empty_dj_checks_from_legacy_raw_cache() {
+        let dir=std::env::temp_dir().join(format!("legacy-raw-dj-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let summary=json!({"id":10,"title":"Release","numberOfTracks":1});
+        let fingerprint=crate::tidal::summary_fingerprint(&summary);
+        db.set_preference("subscriber-summary:GB:10",&summary).await.unwrap();
+        db.set_preference("tag-review:GB:10",&json!({"id":"10","artist":"Artist","title":"Release","tracks_loaded":true,"track_metadata_source":"subscriber","tracks":[{"id":"101","title":"Track","track_number":1,"disc_number":1,"credits_complete":true,"credits":[],"bpm":null,"key":null}],"recommendation_snapshot":{"schema":RECOMMENDATION_SCHEMA,"summary_fingerprint":fingerprint,"optional_status":"complete","optional_schema":crate::tidal::DISCOVERY_SCHEMA,"optional_valid_until":chrono::Utc::now().timestamp()+3600}})).await.unwrap();
+        db.set_preference("subscriber-items:GB:10",&json!({"schema":2,"summary_fingerprint":fingerprint,"checked_at":chrono::Utc::now().timestamp(),"items":[{"id":101,"title":"Track","trackNumber":1,"volumeNumber":1,"credits":[],"bpm":null,"key":null}]})).await.unwrap();
+        let selected=HashMap::from([("10".into(),HashMap::from([("101".into(),DjMetadataNeeds {bpm:true,key:true})]))]);
+        let progress=std::sync::Mutex::new(Vec::new());
+        let prepared=prepare_metadata_releases(&db,&reqwest::Client::new(),selected,"GB",Arc::new(AtomicBool::new(false)),|message|progress.lock().unwrap().push(message.to_owned())).await.unwrap();
+        let track=&prepared["10"].release.tracks[0];
+        assert!(track.bpm_checked && track.key_checked);
+        assert!(track.bpm.is_none() && track.key.is_none());
+        assert!(prepared["10"].dj_notes.is_empty());
+        assert!(db.get_preference("dj-check:GB:101").await.unwrap().is_none(),"An explicit checked-empty observation is sufficient without a recording GET");
+        assert!(db.get_preference("pending-catalogue:GB:10").await.unwrap().is_none(),"Normal preparation flushes all durable staged markers");
+        assert_eq!(db.get_preference("tag-review:GB:10").await.unwrap().unwrap()["tracks"][0]["bpm_checked"],true);
+        assert!(progress.lock().unwrap().last().unwrap().contains("2/2 checks"));
+        drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Bounded live missing-tag preparation benchmark; reads saved account, one release and at most six DJ lookups"]
+    async fn live_metadata_preparation_warm_cache_benchmark() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
+        let dir=std::env::temp_dir().join(format!("metadata-live-warm-{}",uuid::Uuid::new_v4()));
+        let _cleanup=Cleanup(dir.clone());
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let mut token=crate::stream_download::load_saved_token(&db).await.expect("Sign in before this explicit live benchmark");
+        assert!(token.expires_at > chrono::Utc::now().timestamp() as f64 + 600.,"Saved token needs ten minutes remaining");
+        token.refresh_token=None;
+        db.set_preference("tidal_token",&json!(token)).await.unwrap();
+        let http=crate::network::client(20).unwrap();
+        let cancel=Arc::new(AtomicBool::new(false));
+        // Load the real credited album once to identify a bounded selection;
+        // this is also the normal shared-cache input from a release refresh.
+        let start=std::time::Instant::now();
+        let before=crate::network::request_count();
+        let raw=release_with_cancel(&db,"140303440","GB",false,cancel.clone()).await.unwrap();
+        let release:crate::tidal::TidalRelease=serde_json::from_value(raw).unwrap();
+        let source_gets=crate::network::request_count()-before;
+        let source_ms=start.elapsed().as_millis();
+        let selected:HashMap<_,_>=release.tracks.iter().filter(|track|track.bpm.is_none() || track.key.is_none()).take(6)
+            .map(|track|(track.id.clone(),DjMetadataNeeds {bpm:true,key:true})).collect();
+        assert!(!selected.is_empty(),"Fixture no longer has optional DJ gaps; choose another bounded release");
+        let selected_count=selected.len();
+        let albums=HashMap::from([("140303440".into(),selected)]);
+        let start=std::time::Instant::now();
+        let before=crate::network::request_count();
+        let first=prepare_metadata_releases(&db,&http,albums.clone(),"GB",cancel.clone(),|_|{}).await.unwrap();
+        let cold_gets=crate::network::request_count()-before;
+        let cold_ms=start.elapsed().as_millis();
+        assert!(first["140303440"].dj_notes.is_empty(),"Live DJ checks must finish without a retry");
+        assert!(first["140303440"].release.tracks.iter().all(|track|track.credits_complete));
+        for original in &release.tracks {
+            let current=first["140303440"].release.tracks.iter().find(|track|track.id==original.id).unwrap();
+            assert_eq!(current.isrc,original.isrc);
+            for credit in original.credits.as_array().into_iter().flatten() {assert!(current.credits.as_array().unwrap().contains(credit));}
+            if original.bpm.is_some() {assert_eq!(current.bpm,original.bpm);}
+            if original.key.is_some() {assert_eq!(current.key,original.key);}
+        }
+        let credited=db.get_preference("subscriber-items:GB:140303440").await.unwrap().unwrap();
+        let mut explicit_empty_fields=0;
+        let mut explicit_field_differences=0;
+        for id in albums["140303440"].keys() {
+            let individual=check_dj_metadata(&db,&http,id,"GB",cancel.clone()).await.unwrap();
+            let item=credited["items"].as_array().unwrap().iter().find(|item|crate::tidal::resource_id(&item["id"]) == *id).unwrap();
+            assert_eq!(individual["isrc"],item["isrc"]);
+            for field in ["bpm","key","keyScale"] {
+                if item.get(field).is_some() {
+                    if item[field].is_null() {explicit_empty_fields+=1;}
+                    if item[field] != individual[field] {explicit_field_differences+=1;}
+                }
+            }
+        }
+        println!("metadata_live album_item_vs_individual selected_tracks={selected_count} explicit_empty_fields={explicit_empty_fields} explicit_field_differences={explicit_field_differences}");
+        assert_eq!(explicit_field_differences,0,"Album credited-item DJ observations differ from individual endpoint; do not infer negative-cache equivalence");
+        let start=std::time::Instant::now();
+        let before=crate::network::request_count();
+        let second=prepare_metadata_releases(&db,&http,albums,"GB",cancel,|_|{}).await.unwrap();
+        let warm_gets=crate::network::request_count()-before;
+        let warm_ms=start.elapsed().as_millis();
+        assert_eq!(warm_gets,0,"A complete missing-tag repeat must make zero GETs");
+        assert_eq!(json!(first["140303440"].release),json!(second["140303440"].release));
+        println!("metadata_live selected_tracks={selected_count} source_ms={source_ms} source_gets={source_gets} first_dj_ms={cold_ms} first_dj_gets={cold_gets} warm_ms={warm_ms} warm_gets={warm_gets}");
+    }
+
+    #[tokio::test]
+    async fn staged_catalogue_publication_batches_artists_and_preserves_newer_metadata() {
+        let dir=std::env::temp_dir().join(format!("catalogue-publication-batch-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let conn=db.connect().unwrap();
+        let old:Vec<_>=(10..22).map(|id|json!({"id":id.to_string(),"title":"Before","tracks":[]})).collect();
+        for market in ["GB","US"] {
+            conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('1',?,?)",(market,json!({"id":"1","name":"Artist","releases":old}).to_string())).await.unwrap();
+        }
+        conn.execute("CREATE TABLE writes(count INTEGER)",()).await.unwrap();
+        conn.execute("INSERT INTO writes VALUES(0)",()).await.unwrap();
+        conn.execute("CREATE TRIGGER count_catalogue_writes AFTER UPDATE ON catalogue BEGIN UPDATE writes SET count=count+1; END",()).await.unwrap();
+        let ids:Vec<_>=(10..22).map(|id|id.to_string()).collect();
+        db.set_preference("tag-review:GB:10",&json!({"id":"10","title":"Stale canonical","tracks":[]})).await.unwrap();
+        publish_catalogue_releases(&db,&ids,"GB").await.unwrap();
+        let mut rows=conn.query("SELECT count FROM writes",()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),0,"Never publish a release that failed before staging");drop(rows);
+        for id in &ids {
+            publish_release_update(&db,id,"GB",json!({"id":id,"title":"After","tracks":[]}),None,false).await.unwrap();
+        }
+        let mut rows=conn.query("SELECT count FROM writes",()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),0);drop(rows);
+        // Another workflow adds a field after staging. Flush must use that
+        // latest canonical value, not the job's older in-memory release.
+        db.set_preference("tag-review:GB:10",&json!({"id":"10","title":"After","label":"Newer label","tracks":[]})).await.unwrap();
+        recover_catalogue_publications(&db).await.unwrap();
+        publish_catalogue_releases(&db,&ids,"GB").await.unwrap();
+        assert!(db.get_preference("pending-catalogue:GB:10").await.unwrap().is_none());
+        let mut rows=conn.query("SELECT count FROM writes",()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),1,"One containing artist rewritten once; repeat is a no-op");drop(rows);
+        let mut rows=conn.query("SELECT market,payload FROM catalogue",()).await.unwrap();
+        while let Some(row)=rows.next().await.unwrap() {
+            let market:String=row.get(0).unwrap();
+            let value:Value=serde_json::from_str(&row.get::<String>(1).unwrap()).unwrap();
+            assert_eq!(value["releases"][0]["title"],if market == "GB" {"After"} else {"Before"});
+            if market == "GB" {assert_eq!(value["releases"][0]["label"],"Newer label");}
+        }
+        drop(rows);drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_catalogue_does_not_overwrite_a_newer_authoritative_summary() {
+        let dir=std::env::temp_dir().join(format!("catalogue-newer-summary-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let conn=db.connect().unwrap();
+        let old_summary=json!({"id":10,"title":"Earlier","numberOfTracks":1});
+        let current_summary=json!({"id":10,"title":"Current","numberOfTracks":2});
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('1','GB',?)",(json!({"id":"1","releases":[{"id":"10","title":"Current","tracks":[]}]}).to_string(),)).await.unwrap();
+        publish_release_update(&db,"10","GB",json!({"id":"10","title":"Earlier","tracks":[],"recommendation_snapshot":{"summary_fingerprint":crate::tidal::summary_fingerprint(&old_summary)}}),None,false).await.unwrap();
+        db.set_preference("subscriber-summary:GB:10",&current_summary).await.unwrap();
+        recover_catalogue_publications(&db).await.unwrap();
+        let mut rows=conn.query("SELECT payload FROM catalogue WHERE artist_id='1' AND market='GB'",()).await.unwrap();
+        let value:Value=serde_json::from_str(&rows.next().await.unwrap().unwrap().get::<String>(0).unwrap()).unwrap();
+        assert_eq!(value["releases"][0]["title"],"Current");
+        assert!(db.get_preference("pending-catalogue:GB:10").await.unwrap().is_none());
+        drop(rows);drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_account_failures_stop_remaining_requests() {
+        for error in ["HTTP status client error (401 Unauthorized)","HTTP 403 Forbidden","429 Too Many Requests","Service cooldown · retry later","Tidal login token expired and no refresh token available","Token refresh request failed: HTTP 400 invalid_grant","Token refresh failed: invalid_grant"] {assert!(metadata_service_paused(error));}
+        assert!(!metadata_service_paused("HTTP status client error (404 Not Found) for track 401234"));
+        assert!(!metadata_service_paused("error decoding response body"));
+    }
+
+    #[tokio::test]
+    #[ignore = "Explicit synthetic catalogue publication benchmark; no audio files or API"]
+    async fn catalogue_publication_benchmark() {
+        let dir=std::env::temp_dir().join(format!("catalogue-publish-speed-{}",uuid::Uuid::new_v4()));
+        let db=TursoDb::open(dir.join("db")).await.unwrap();
+        let conn=db.connect().unwrap();
+        let releases:Vec<_>=(1..=100).map(|id|json!({"id":id.to_string(),"title":"Release","tracks":(0..20).map(|track|json!({"id":format!("{id}{track:02}"),"title":"Recording","credits":[{"role":"Composer","name":"Composer Name"}]})).collect::<Vec<_>>()})).collect();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('1','GB',?)",(json!({"id":"1","releases":releases}).to_string(),)).await.unwrap();
+        let start=std::time::Instant::now();
+        for mut value in releases.clone() { let id=value["id"].as_str().unwrap().to_owned(); value["label"]=json!("First"); publish_release(&db,&id,"GB",value).await.unwrap(); }
+        let sequential=start.elapsed();
+        let start=std::time::Instant::now();
+        let mut ids=Vec::new();
+        for mut value in releases { let id=value["id"].as_str().unwrap().to_owned(); value["label"]=json!("Second"); publish_release_update(&db,&id,"GB",value,None,false).await.unwrap(); ids.push(id); }
+        publish_catalogue_releases(&db,&ids,"GB").await.unwrap();
+        let batched=start.elapsed();
+        println!("catalogue_publish releases=100 tracks=2000 immediate_ms={} staged_batch_ms={} speedup={:.2}x",sequential.as_millis(),batched.as_millis(),sequential.as_secs_f64()/batched.as_secs_f64());
+        drop(conn);drop(db);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
