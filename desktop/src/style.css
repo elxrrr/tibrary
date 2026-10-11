@@ -1240,6 +1240,11 @@ dialog p {
   box-sizing: border-box;
   padding: 10px 0;
 }
+/* Unavailable libraries have an extra status line; keep it inside the row. */
+.libraries-card .library-row {
+  height: auto;
+  min-height: 64px;
+}
 .overview-list .library-row > strong {
   flex: 1;
   min-width: 0;

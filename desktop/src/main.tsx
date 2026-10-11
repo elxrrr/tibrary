@@ -2024,7 +2024,7 @@ function App() {
       </aside>
       <main aria-label={titles[route] || "Overview"}>
         {localUnavailable && <div className="notice library-unavailable" role="status">
-          <span><strong>Library unavailable · using cached data.</strong> Browse saved music, update online information and download to an available folder. Reconnect the drive to scan, change tags or move files.</span>
+          <span>Library unavailable · using cached data.</span>
         </div>}
         {downloadUnavailable && route === "queue" && <div className="notice download-unavailable" role="status">
           <span>{downloadUnavailable}</span>
