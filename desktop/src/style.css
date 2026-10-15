@@ -1349,4 +1349,21 @@ tr.missing-artist-row .hierarchy-name {
   max-width: calc(100% - 22px);
   vertical-align: middle;
 }
-tr.missing-release-row td { height: 33px; }
+tr.missing-release-row td { height: 58px; padding-top: 5px; padding-bottom: 5px; }
+tr.missing-release-row td.missing-release-name { padding-left: 18px; }
+.missing-release-content { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.missing-release-content > .disclosure { flex: none; padding-right: 0; }
+.missing-release-content > .hierarchy-name { min-width: 0; white-space: nowrap; }
+.release-artwork {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 48px;
+  width: 48px;
+  height: 48px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--line) 45%, var(--card));
+  color: var(--muted);
+}
+.release-artwork > img { display: block; width: 48px; height: 48px; object-fit: cover; }

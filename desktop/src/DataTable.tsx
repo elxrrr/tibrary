@@ -10,6 +10,7 @@ import {
   MoreHorizontal,
 } from "lucide-react";
 import { Row, readable } from "./api";
+import { ReleaseArtwork } from "./ReleaseArtwork";
 import { Selection, parentState, toggleChild, toggleParent, releaseRows, releaseSelectionState, toggleReleaseRows } from "./selection";
 import { ColumnSelection, columnSelectionLabel, columnValueSelected, toggleColumnValue } from "./columnFilters";
 export type { ColumnSelection } from "./columnFilters";
@@ -726,7 +727,8 @@ export function DataTable({
                     />
                   </td>
                   {columns.map((c, j) => (
-                    <td key={c.key} title={readable(r[c.key])} style={nestedRelease && c.key === "release" ? {paddingLeft:18} : undefined}>
+                    <td key={c.key} title={readable(r[c.key])} className={nestedRelease && c.key === "release" ? "missing-release-name" : undefined}>
+                      <span className={nestedRelease && c.key === "release" ? "missing-release-content" : undefined}>
                       {(fileGroups ? c.key === "release" && r.children?.length : (nestedRelease ? c.key === "release" : j === 0) && (tree || (grouped && r.children?.length))) ? (
                         <button
                           className="disclosure"
@@ -746,6 +748,7 @@ export function DataTable({
                           )}
                         </button>
                       ) : null}
+                      {nestedRelease && c.key === "release" && <ReleaseArtwork releaseId={r.id} metadata={r} />}
                       {nestedRelease && c.key === "artist" ? "" : (fileGroups || nestedRelease) && c.key === "release" ? <button
                         className="hierarchy-name"
                         style={{ background: "none", border: 0, borderRadius: 0, padding: 0, color: "inherit", font: "inherit", display: "inline", maxWidth: "100%", verticalAlign: "middle" }}
@@ -765,6 +768,7 @@ export function DataTable({
                       ) : (
                         readable(r[c.key])
                       )}
+                      </span>
                     </td>
                   ))}
                   <td className="more">

@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.31** · [Setup and screenshots](../../README.md)
+Version **0.9.32** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -58,7 +58,7 @@ Link releases hides the Various Artists compilation group, including its filter 
 
 Missing releases defaults to **My album artists** and **Recommended and potential**, using album-level artist IDs and the same confidence filter as Overview. Artist scope and recommendation confidence have separate filters, so you can combine **My album artists** with **Recommended**, or inspect other appearances and low-confidence results. Recommendation references come from present local files and their verified online links. Contributor IDs and roles, independent recordings, labels and copyright holders strengthen a match; common distributors, technical credits and genres provide context. Conflicting artists, compilations and unofficial releases cannot become Recommended. A fully checked release with populated creative credits and rights/label metadata, but no shared recording, creative contributor in the same role, specific label or copyright holder, is **Suspect / Low match** when there are at least two independent downloaded creative-credit references. An artist-page ID alone cannot override this check. Incomplete, stale or empty credit checks remain neutral; a label change alone does not disqualify a release. Low-match results remain inspectable by checking **Suspect** in the Recommendation column menu, or choosing **Select all** there.
 
-Missing releases groups album artists above their releases and tracks. By default, the artist with the newest matching release appears first, with releases ordered newest first inside each group. Expand an artist to browse releases, then expand a release for its tracks. Artist checkboxes select its displayed releases; individual tracks can still be queued separately. Pagination counts artists and shows the matching release total; column filters still apply to releases. Artist pages are capped at 50 groups to keep browsing responsive, while smaller configured page sizes are respected.
+Missing releases groups album artists above their releases and tracks. By default, the artist with the newest matching release appears first, with releases ordered newest first inside each group. Expand an artist to browse releases, then expand a release for its tracks. Artist checkboxes select its displayed releases; individual tracks can still be queued separately. Pagination counts artists and shows the matching release total; column filters still apply to releases. Artist pages are capped at 50 groups to keep browsing responsive, while smaller configured page sizes are respected. Release artwork loads only as its row becomes visible. Small 160 × 160 covers are saved on disk and reused across sessions; missing artwork never blocks browsing or triggers a metadata scan.
 
 The Overview count includes all missing, incomplete and queued releases within **My album artists → Recommended and potential**, regardless of the filters currently used on the Missing releases page. Clicking that card opens the same scope.
 

@@ -891,7 +891,9 @@ function App() {
     }
   }
   const columns: Column[] = tree
-    ? releaseColumns
+    ? route === "missing" ? releaseColumns.map(column => ({...column, width: ({
+        artist:"18%", release:"30%", date:"9%", type:"7%", tracks:"5%", status:"12%", recommendation:"13%",
+      } as Record<string,string>)[column.key]})) : releaseColumns
     : route === "links"
       ? [
           {key:"artist",label:"Album artist",width:"20%"},

@@ -57,12 +57,12 @@ async function expandLocalArtist(page: Page, artist = "North Assembly") {
   if (await expander.getAttribute("aria-expanded") !== "true") await expander.click();
 }
 async function expandMissingArtist(page: Page, artist = "North Assembly") {
-  const expander = page.getByRole("button", {name:`Expand ${artist}`,exact:true});
-  const expanded = page.getByRole("button", {name:`Collapse ${artist}`,exact:true});
-  if (await expanded.count()) return;
-  await expect(expander).toBeVisible();
-  await expander.click();
+  const row = page.locator(".missing-artist-row").filter({has:page.getByRole("button",{name:artist,exact:true})});
+  const button = row.locator("button.disclosure");
+  await expect(button).toBeVisible();
+  if(await button.getAttribute("aria-expanded") !== "true") await button.click();
 }
+
 async function localTrackRow(page: Page, title: string, release = "Blue Hours", artist = "North Assembly"): Promise<Locator> {
   await expandLocalArtist(page, artist);
   return localFileRow(page, title, release);
@@ -2172,6 +2172,70 @@ test("missing releases group album artists and queue exact release or track choi
 
 });
 
+test("missing artwork loads only visible releases and reuses successful thumbnails", async ({page}) => {
+  const requests:string[]=[];
+  let inFlight=0,maxInFlight=0;
+  const pixel="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAACKADAAQAAAABAAAACAAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZjwCyBOmACZjs+EJ+/8AAEQgACAAIAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIBAgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/bAEMAAgICAgICAwICAwUDAwMFBgUFBQUGCAYGBgYGCAoICAgICAgKCgoKCgoKCgwMDAwMDA4ODg4ODw8PDw8PDw8PD//bAEMBAgICBAQEBwQEBxALCQsQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEP/dAAQAAf/aAAwDAQACEQMRAD8A+3NQ1H9oEfH62s7Wz8Tf2Y3ieLdMpuzpg0sXcgkDKUFoIfsuwqQzPuzn5uF/R75qb/y0/CpK6ZSPAweCS5/ee76n/9k=";
+  const releases=Array.from({length:80},(_,index)=>({
+    id:String(930000+index),online_id:String(930000+index),artist:"North Assembly",
+    release:`Artwork release ${String(index).padStart(2,"0")}`,date:"2026-10-01",type:"SINGLE",tracks:1,
+    status:"Missing release",recommendation:"Potential",expanded_available:true,
+    children:[{id:String(940000+index),title:`Artwork track ${index}`,position:"1 · 1",duration:180}]
+  }));
+  const group={id:"missing-artist:artwork-test",artist:"North Assembly",artist_group:true,missing_artist_group:true,
+    release:"80 releases",releases:80,tracks:80,date:"2026-10-01",children:releases};
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="table" && request.args.route==="missing")
+      return route.fulfill({json:{result:{rows:[group],total:1,artist_total:1,release_total:80,revision:1}}});
+    if(request.method==="artwork.thumbnail") {
+      const id=String(request.args.release_id);
+      requests.push(id);maxInFlight=Math.max(maxInFlight,++inFlight);
+      await new Promise(resolve=>setTimeout(resolve,60));
+      inFlight--;
+      return route.fulfill({json:id==="930004" ? {error:"Image unavailable"} : {result:{src:pixel,cover_id:id,size:160}}});
+    }
+    return route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Expand North Assembly",exact:true})).toBeVisible();
+  expect(requests).toEqual([]);
+  await expandMissingArtist(page);
+  const artwork=(id:string)=>page.locator(`.release-artwork[data-release-id="${id}"]`);
+  await expect(artwork("930000").locator("img")).toBeVisible();
+  await expect.poll(()=>requests.includes("930004")).toBe(true);
+  await expect.poll(()=>inFlight).toBe(0);
+  expect(requests.length).toBeLessThan(25);
+  expect(requests).not.toContain("930079");
+  expect(maxInFlight).toBeLessThanOrEqual(4);
+  expect(requests.filter(id=>id==="930004")).toHaveLength(1);
+  await expect(artwork("930004").locator("img")).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  const box=await artwork("930000").boundingBox();
+  expect(box?.width).toBe(48);expect(box?.height).toBe(48);
+  await page.getByRole("checkbox",{name:"Select Artwork release 00",exact:true}).check();
+  await page.getByRole("button",{name:"Expand Artwork release 00",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track Artwork track 0",exact:true})).toBeChecked();
+  await expect(page.getByRole("button",{name:"Queue selected (1)",exact:true})).toBeEnabled();
+  await page.getByRole("button",{name:"Expand Artwork release 79",exact:true}).scrollIntoViewIfNeeded();
+  await expect(artwork("930079").locator("img")).toBeVisible();
+  expect(requests.filter(id=>id==="930079")).toHaveLength(1);
+  await page.getByRole("button",{name:"Collapse North Assembly",exact:true}).click();
+  await expect(page.locator(".release-artwork")).toHaveCount(0);
+  await expandMissingArtist(page);
+  await expect(artwork("930000").locator("img")).toBeVisible();
+  expect(requests.filter(id=>id==="930000")).toHaveLength(1);
+  expect(maxInFlight).toBeLessThanOrEqual(4);
+  await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await expandMissingArtist(page);
+  await expect(artwork("930000").locator("img")).toBeVisible();
+  expect(requests.filter(id=>id==="930000")).toHaveLength(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  if(process.env.TIBRARY_ARTWORK_SCREENSHOT) await page.screenshot({path:"/private/tmp/tibrary-missing-artwork.png"});
+});
+
 test("missing release filters, bidirectional sort and paging preserve the release rows", async ({page}) => {
   await rpc("queue.decision",{ids:["910002","910003","910004","910005","910006"],decision:"removed"});
   const args={route:"missing",timeline:"All missing releases",artist_scope:"My album artists",sort:"release",direction:"asc",limit:2};
@@ -2265,7 +2329,7 @@ test("missing release defaults keep low matches inspectable without inflating ov
 
 test("column menus filter, sort and preserve table interaction state", async ({page}) => {
   await rpc("settings.save",{section:"general",values:{page_size:100}});
-  const rows=Array.from({length:60},(_,index)=>({id:`header-release-${index}`,artist:"North Assembly",release:`Release ${String(index).padStart(2,"0")}`,date:"2026-01-01",type:index%2 ? "EP" : "ALBUM",tracks:1,status:"Missing release",recommendation:"Potential",expanded_available:true,children:[{id:`header-track-${index}`,title:`Track ${index}`,position:"01",duration:180}]}));
+  const rows=Array.from({length:40},(_,index)=>({id:`header-release-${index}`,artist:"North Assembly",release:`Release ${String(index).padStart(2,"0")}`,date:"2026-01-01",type:index%2 ? "EP" : "ALBUM",tracks:1,status:"Missing release",recommendation:"Potential",expanded_available:true,children:[{id:`header-track-${index}`,title:`Track ${index}`,position:"01",duration:180}]}));
   const queries:any[]=[];
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
@@ -2308,7 +2372,7 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   await releaseHeader.click({button:"right"});
   await menu.getByRole("menuitemradio",{name:"Sort descending",exact:true}).click();
   await expect(releaseHeader).toHaveAttribute("aria-sort","descending");
-  await expect(page.locator("tbody tr").first()).toContainText("Release 59");
+  await expect(page.locator("tbody tr").first()).toContainText("Release 39");
   await expect(page.getByRole("button",{name:"Collapse Release 00",exact:true})).toHaveCount(1);
   await expect(selected).toBeChecked();
   const count=queries.length;
@@ -2329,7 +2393,7 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   await recommendationMenu.press("Escape");
   await columnOnly(page,"Type",["ALBUM"]);
   await expect(page.getByRole("button",{name:"Filter Type",exact:true})).toHaveClass(/active/);
-  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–30 of 30");
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–20 of 20");
   await expect(selected).toBeChecked();
   await expect(page.getByRole("button",{name:"Collapse Release 00",exact:true})).toHaveCount(1);
   const typeMenu=await columnMenu(page,"Type");
@@ -2338,9 +2402,9 @@ test("column menus filter, sort and preserve table interaction state", async ({p
   if(process.env.TIBRARY_SCREENSHOTS) await page.screenshot({path:"/tmp/tibrary-column-checkbox-filters.png"});
   await columnValue(typeMenu,"EP").click();
   await expect(typeMenu).toBeVisible();
-  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–60 of 60");
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–40 of 40");
   await columnValue(typeMenu,"ALBUM").click();
-  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–30 of 30");
+  await expect(page.getByRole("navigation",{name:"Table pagination",exact:true})).toContainText("1–20 of 20");
   await typeMenu.getByRole("menuitem",{name:"Select all",exact:true}).click();
   await typeMenu.press("Escape");
   await expect(page.getByRole("button",{name:"Filter Type",exact:true})).not.toHaveClass(/active/);

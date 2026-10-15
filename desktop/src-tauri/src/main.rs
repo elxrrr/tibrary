@@ -10,6 +10,7 @@ mod network;
 mod progress;
 mod subscriber_metadata;
 mod appearance;
+mod artwork;
 mod table_filters;
 use serde_json::{json, Value};
 use std::{
@@ -326,6 +327,7 @@ pub struct Backend {
     pub view_cache: Mutex<HashMap<String, (u64, std::time::Instant, Value)>>,
     pub pending_pkce: Mutex<Option<crate::stream_download::PkceFlow>>,
     pub persist_logs: Arc<AtomicBool>,
+    thumbnails: artwork::ThumbnailService,
 }
 
 impl Default for Backend {
@@ -360,6 +362,7 @@ impl Default for Backend {
             view_cache: Mutex::new(HashMap::new()),
             pending_pkce: Mutex::new(None),
             persist_logs: Arc::new(AtomicBool::new(true)),
+            thumbnails: artwork::ThumbnailService::default(),
         }
     }
 }
@@ -1056,6 +1059,9 @@ async fn handle_rpc_uncached(
         return Ok(
             json!({"job":state.active_job.lock().unwrap().clone(),"online_job":state.online_job.lock().unwrap().clone(),"download_job":state.download_job.lock().unwrap().clone(),"logs":state.logs.snapshot(),"activity_epochs":state.activity_epochs(),"download_monitor":state.download_monitor.lock().unwrap().clone(),"auth_url":state.pending_pkce.lock().unwrap().as_ref().map(|f|f.login_url.clone())}),
         );
+    }
+    if method == "artwork.thumbnail" {
+        return Ok(state.thumbnails.thumbnail(db, args["release_id"].as_str().unwrap_or(""), args["market"].as_str()).await);
     }
     if method == "appearance.accent" {
         return serde_json::to_value(appearance::system_accent(app_handle).await).map_err(|error| error.to_string());
