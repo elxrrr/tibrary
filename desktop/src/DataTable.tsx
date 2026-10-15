@@ -661,6 +661,7 @@ export function DataTable({
               </tr>;
             }
             const nestedRelease = releaseGroups && nestedReleaseIds.has(r.id);
+            const artworkRow = !!tree && !r.artist_group;
             const state = tree
               ? parentState(
                   treeSelection?.[r.id],
@@ -673,6 +674,7 @@ export function DataTable({
               <Fragment key={r.id}>
                 <tr
                   className={
+                    (artworkRow ? "release-artwork-row " : "") +
                     (nestedRelease ? "missing-release-row " : "") +
                     (selected.has(r.id) || ((fileGroups || grouped) && state === "checked") ? "selected " : "") +
                     (r.ignored || (tree && state === "empty") ? "inactive" : "")
@@ -728,7 +730,7 @@ export function DataTable({
                   </td>
                   {columns.map((c, j) => (
                     <td key={c.key} title={readable(r[c.key])} className={nestedRelease && c.key === "release" ? "missing-release-name" : undefined}>
-                      <span className={nestedRelease && c.key === "release" ? "missing-release-content" : undefined}>
+                      <span className={artworkRow && c.key === "release" ? "release-name-content" : undefined}>
                       {(fileGroups ? c.key === "release" && r.children?.length : (nestedRelease ? c.key === "release" : j === 0) && (tree || (grouped && r.children?.length))) ? (
                         <button
                           className="disclosure"
@@ -748,7 +750,7 @@ export function DataTable({
                           )}
                         </button>
                       ) : null}
-                      {nestedRelease && c.key === "release" && <ReleaseArtwork releaseId={r.id} metadata={r} />}
+                      {artworkRow && c.key === "release" && <ReleaseArtwork releaseId={r.id} metadata={r} />}
                       {nestedRelease && c.key === "artist" ? "" : (fileGroups || nestedRelease) && c.key === "release" ? <button
                         className="hierarchy-name"
                         style={{ background: "none", border: 0, borderRadius: 0, padding: 0, color: "inherit", font: "inherit", display: "inline", maxWidth: "100%", verticalAlign: "middle" }}
@@ -765,6 +767,8 @@ export function DataTable({
                         >
                           {readable(r[c.key])}
                         </span>
+                      ) : artworkRow && c.key === "release" ? (
+                        <span className="release-name-text">{readable(r[c.key])}</span>
                       ) : (
                         readable(r[c.key])
                       )}

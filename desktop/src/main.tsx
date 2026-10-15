@@ -156,13 +156,13 @@ const fileColumns: Column[] = [
   { key: "evidence", label: "Evidence" },
 ];
 const releaseColumns: Column[] = [
-  { key: "artist", label: "Album artist" },
-  { key: "release", label: "Release" },
-  { key: "date", label: "Date" },
-  { key: "type", label: "Type" },
-  { key: "tracks", label: "Tracks" },
-  { key: "status", label: "Coverage" },
-  { key: "recommendation", label: "Recommendation" },
+  { key: "artist", label: "Album artist", width: "18%" },
+  { key: "release", label: "Release", width: "30%" },
+  { key: "date", label: "Date", width: "9%" },
+  { key: "type", label: "Type", width: "7%" },
+  { key: "tracks", label: "Tracks", width: "5%" },
+  { key: "status", label: "Coverage", width: "12%" },
+  { key: "recommendation", label: "Recommendation", width: "13%" },
 ];
 const defaultRecommendation = "Recommended and potential";
 const defaultArtistScope = "My album artists";
@@ -891,9 +891,7 @@ function App() {
     }
   }
   const columns: Column[] = tree
-    ? route === "missing" ? releaseColumns.map(column => ({...column, width: ({
-        artist:"18%", release:"30%", date:"9%", type:"7%", tracks:"5%", status:"12%", recommendation:"13%",
-      } as Record<string,string>)[column.key]})) : releaseColumns
+    ? releaseColumns
     : route === "links"
       ? [
           {key:"artist",label:"Album artist",width:"20%"},

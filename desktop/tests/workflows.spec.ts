@@ -2172,7 +2172,7 @@ test("missing releases group album artists and queue exact release or track choi
 
 });
 
-test("missing artwork loads only visible releases and reuses successful thumbnails", async ({page}) => {
+test("release artwork loads only visible rows and is reused across missing, queue and downloaded", async ({page}) => {
   const requests:string[]=[];
   let inFlight=0,maxInFlight=0;
   const pixel="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAACKADAAQAAAABAAAACAAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZjwCyBOmACZjs+EJ+/8AAEQgACAAIAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIBAgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/bAEMAAgICAgICAwICAwUDAwMFBgUFBQUGCAYGBgYGCAoICAgICAgKCgoKCgoKCgwMDAwMDA4ODg4ODw8PDw8PDw8PD//bAEMBAgICBAQEBwQEBxALCQsQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEP/dAAQAAf/aAAwDAQACEQMRAD8A+3NQ1H9oEfH62s7Wz8Tf2Y3ieLdMpuzpg0sXcgkDKUFoIfsuwqQzPuzn5uF/R75qb/y0/CpK6ZSPAweCS5/ee76n/9k=";
@@ -2188,6 +2188,8 @@ test("missing artwork loads only visible releases and reuses successful thumbnai
     const request=route.request().postDataJSON();
     if(request.method==="table" && request.args.route==="missing")
       return route.fulfill({json:{result:{rows:[group],total:1,artist_total:1,release_total:80,revision:1}}});
+    if(request.method==="table" && ["queue","downloaded"].includes(request.args.route))
+      return route.fulfill({json:{result:{rows:releases.map(row=>({...row,selected:[]})),total:releases.length,revision:1}}});
     if(request.method==="artwork.thumbnail") {
       const id=String(request.args.release_id);
       requests.push(id);maxInFlight=Math.max(maxInFlight,++inFlight);
@@ -2234,6 +2236,29 @@ test("missing artwork loads only visible releases and reuses successful thumbnai
   expect(requests.filter(id=>id==="930000")).toHaveLength(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
   if(process.env.TIBRARY_ARTWORK_SCREENSHOT) await page.screenshot({path:"/private/tmp/tibrary-missing-artwork.png"});
+  // Queue and completed downloads use the same cache and release-only layout.
+  // Visiting either view must not fetch every row or repeat successful images.
+  expect(requests).not.toContain("930040");
+  for(const view of ["Download queue","Downloaded releases"]) {
+    await page.locator("aside").getByRole("button",{name:view,exact:true}).click();
+    await expect(artwork("930000").locator("img")).toBeVisible();
+    expect(requests.filter(id=>id==="930000")).toHaveLength(1);
+    const releaseCell=artwork("930000").locator("..");
+    await expect(releaseCell).toContainText("Artwork release 00");
+    const dimensions=await artwork("930000").boundingBox();
+    expect(dimensions?.width).toBe(48);expect(dimensions?.height).toBe(48);
+    const expand=page.getByRole("button",{name:/^(Expand|Collapse) Artwork release 00$/});
+    if(await expand.getAttribute("aria-expanded")!=="true") await expand.click();
+    await expectTrackPositionInTracks(page,"Artwork track 0","1 · 1");
+    await expect(page.locator("tr.track-row .release-artwork")).toHaveCount(0);
+    if(process.env.TIBRARY_ARTWORK_SCREENSHOT) await page.screenshot({path:`/private/tmp/tibrary-${view==="Download queue" ? "queue" : "downloaded"}-artwork.png`});
+    if(view==="Download queue") expect(requests).not.toContain("930040");
+    await page.getByRole("button",{name:"Expand Artwork release 40",exact:true}).scrollIntoViewIfNeeded();
+    await expect(artwork("930040").locator("img")).toBeVisible();
+    expect(requests.filter(id=>id==="930040")).toHaveLength(1);
+    expect(maxInFlight).toBeLessThanOrEqual(4);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  }
 });
 
 test("missing release filters, bidirectional sort and paging preserve the release rows", async ({page}) => {

@@ -1349,11 +1349,12 @@ tr.missing-artist-row .hierarchy-name {
   max-width: calc(100% - 22px);
   vertical-align: middle;
 }
-tr.missing-release-row td { height: 58px; padding-top: 5px; padding-bottom: 5px; }
+tr.release-artwork-row td { height: 58px; padding-top: 5px; padding-bottom: 5px; }
 tr.missing-release-row td.missing-release-name { padding-left: 18px; }
-.missing-release-content { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.missing-release-content > .disclosure { flex: none; padding-right: 0; }
-.missing-release-content > .hierarchy-name { min-width: 0; white-space: nowrap; }
+.release-name-content { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.release-name-content > .disclosure { flex: none; padding-right: 0; }
+.release-name-content > .hierarchy-name,
+.release-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .release-artwork {
   display: inline-flex;
   align-items: center;
