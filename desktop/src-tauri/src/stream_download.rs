@@ -1305,6 +1305,8 @@ pub async fn fetch_cover_art(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TidalAlbumInfo {
     pub id: String,
+    #[serde(default, deserialize_with = "crate::tidal::strict_optional_bool")]
+    pub ai: Option<bool>,
     pub title: String,
     pub artist_name: Option<String>,
     pub cover: Option<String>,
@@ -1317,6 +1319,8 @@ pub struct TidalAlbumInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TidalAlbumTrack {
     pub id: String,
+    #[serde(default, deserialize_with = "crate::tidal::strict_optional_bool")]
+    pub ai: Option<bool>,
     pub title: String,
     pub track_number: u32,
     pub volume_number: u32,
@@ -1382,6 +1386,7 @@ pub fn album_info_from_value(val: &Value) -> Result<TidalAlbumInfo, String> {
 
     Ok(TidalAlbumInfo {
         id,
+        ai: val["ai"].as_bool(),
         title,
         artist_name,
         cover,
@@ -1406,7 +1411,7 @@ pub async fn fetch_album_tracks(
     Ok(tracks.into_iter().map(|track| {
         let raw=value["items"].as_array().unwrap().iter().find(|v|v["id"].as_str().map(str::to_owned).unwrap_or_else(||v["id"].to_string())==track.id).unwrap();
         TidalAlbumTrack {
-            id:track.id,title:track.title,track_number:track.track_number,volume_number:track.disc_number,
+            id:track.id,ai:track.ai,title:track.title,track_number:track.track_number,volume_number:track.disc_number,
             duration:track.duration,isrc:track.isrc,copyright:track.copyright,explicit:raw["explicit"].as_bool().unwrap_or(false),
             artists:raw["artists"].as_array().into_iter().flatten().filter_map(|a|a["name"].as_str().map(str::to_owned)).collect(),
             bpm:track.bpm,key:track.key.map(|key|track.key_scale.map_or_else(||key.clone(),|scale|format!("{key} {scale}"))),

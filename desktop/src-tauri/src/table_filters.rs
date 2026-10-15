@@ -373,7 +373,7 @@ fn grouped_missing_page(mut page: Value, filters: &ColumnFilters, args: &Value, 
 }
 
 fn local_file_route(route: &str) -> bool {
-    matches!(route, "files" | "correct" | "organise" | "metadata" | "artwork" | "mqa")
+    matches!(route, "files" | "correct" | "organise" | "metadata" | "artwork" | "mqa" | "ai_review")
 }
 
 fn current_file_position(tags: &HashMap<String, String>) -> Option<String> {
@@ -807,7 +807,9 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
             let source=preview_inputs(db,operation).await?;
             preview=preview.filter(|p|p["source_inputs"]==source && p["root"]==args["root"] && p["operation"]==operation);
         }
-        let mut cached_rows = if let Some(ref p) = preview {
+        let mut cached_rows = if route == "ai_review" {
+            Some(db.get_ai_review_rows(args["root"].as_str(), args["market"].as_str().unwrap_or("GB")).await?)
+        } else if let Some(ref p) = preview {
             p["rows"].as_array().cloned()
         } else if ["mqa", "local", "online"].contains(&route) {
             Some(
@@ -914,11 +916,31 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
             cached_rows = Some(rows);
         }
         if route == "online" && cached_rows.as_ref().is_some_and(|rows|!rows.is_empty()) {
-            let rows = cached_rows.take().unwrap_or_default();
+            let market = args["market"].as_str().unwrap_or("GB");
+            let ai = crate::ai_policy::flags(db,market).await?;
+            let mut rows = Vec::new();
+            for row in cached_rows.take().unwrap_or_default() {
+                let id=row["online_id"].as_str().unwrap_or_default();
+                if ai.release_blocked(id) || (ai.payload_blocked(id,&row["target_metadata"])
+                    && crate::ai_policy::payload_blocked(db,market,id,&row["target_metadata"]).await?) { continue; }
+                rows.push(row);
+            }
             let missing_targets = rows.iter().filter(|row|!row["target_metadata"].is_object())
                 .filter_map(|row|row["online_id"].as_str().map(str::to_owned)).collect();
             let market = args["market"].as_str().unwrap_or("GB");
             let targets = db.cached_replacement_releases(market, &missing_targets).await?;
+            // Older plans contain only the target ID. Their recovered snapshot
+            // is subject to the same policy before grouping it as a suggestion.
+            let mut allowed = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id = row["online_id"].as_str().unwrap_or_default();
+                if let Some(target) = targets.get(id) {
+                    if ai.payload_blocked(id,target)
+                        && crate::ai_policy::payload_blocked(db, market, id, target).await? { continue; }
+                }
+                allowed.push(row);
+            }
+            let rows = allowed;
             let mut dates = HashMap::<String, String>::new();
             if rows.iter().any(|row|row["date"].as_str().is_none_or(str::is_empty)) {
                 for file in db.get_local_files_for_release_tables(args["root"].as_str()).await? {
@@ -1146,6 +1168,9 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
 }
 
 pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_facet: bool) -> Result<Value, String> {
+    if matches!(args["route"].as_str(), Some("missing" | "online" | "queue" | "downloaded" | "ai_review")) {
+        crate::ai_policy::flags(db,args["market"].as_str().unwrap_or("GB")).await?;
+    }
     let filters = parse(args.get("column_filters"))?;
     let grouped_links = args["route"] == "links" && args["group_releases"] == true;
     let grouped_missing = args["route"] == "missing" && args["group_artists"] == true;
@@ -1229,6 +1254,23 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ai_legacy_replacement_target_is_checked_after_metadata_recovery() {
+        let temp = std::env::temp_dir().join(format!("ai-replacement-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let state = Arc::new(Backend::default());
+        let target = json!({"id":"200","artist":"Example","title":"Larger release","date":"2020-01-01","track_count":2,"tracks":[],"catalogue_attributes":{"ai":true}});
+        db.connect().unwrap().execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('77','GB',?)",(json!({"id":"77","name":"Example","releases":[target]}).to_string(),)).await.unwrap();
+        db.set_preference("desktop-online:/unmounted",&json!([{"id":"200::local","online_id":"200","artist":"Example","release":"Old single","date":"2019-01-01","tracks":1,"path":"/unmounted/Old single","affected":true}])).await.unwrap();
+        let args = json!({"route":"online","root":"/unmounted","market":"GB"});
+        let blocked = get_table_page(&state,&db,&args).await.unwrap();
+        assert_eq!(blocked["total"],0,"Recovered catalogue flags must not become replacement suggestions");
+        db.set_preference("subscriber-summary:GB:200",&json!({"id":200,"ai":false})).await.unwrap();
+        let corrected = get_table_page(&state,&db,&args).await.unwrap();
+        assert_eq!(corrected["total"],1,"A current explicit provider correction overrides the older snapshot");
+        drop(db); std::fs::remove_dir_all(temp).unwrap();
+    }
 
     fn missing_release(id: &str, artist: &str, date: &str, recommendation: &str) -> Value {
         json!({"id":id,"online_id":id,"artist":artist,"release":format!("Release {id}"),

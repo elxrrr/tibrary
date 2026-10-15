@@ -329,6 +329,24 @@ write_flac(Path(sys.argv[1])/'First Light.flac','North Assembly','Blue Hours','C
       env:{...process.env,PYTHONPATH:join(root,"desktop/tests")},
     });
   }
+  if (test.info().title.startsWith("AI policy")) {
+    // Existing metadata caches must be sufficient: no account or online scan is
+    // involved in filtering previously saved releases and flagging local files.
+    execFileSync("python3", ["-c", `import json,sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); track_only=sys.argv[2]=='track-only'
+def cache(key,value):
+ c.execute('INSERT OR REPLACE INTO app_preferences VALUES(?,?)',(key,json.dumps(value)))
+cache('subscriber-summary:GB:910001',{'id':'910001','title':'Blue Hours','ai':not track_only})
+if track_only:
+ cache('subscriber-items:GB:910001',{'schema':2,'album':{'id':'910001'},'items':[{'id':'91000100','ai':True},{'id':'91000101','ai':False}]})
+cache('subscriber-items:GB:910002',{'schema':2,'album':{'id':'910002'},'items':[{'id':'91000200','ai':True}]})
+cache('subscriber-summary:GB:910006',{'id':'910006','title':'Glass','ai':True})
+c.execute("UPDATE queue SET decision='removed',approved=0")
+c.execute("UPDATE queue SET decision='queued',approved=1 WHERE id='910001'")
+c.execute("UPDATE queue SET decision='queued' WHERE id='910005'")
+c.execute("UPDATE queue SET decision='downloaded' WHERE id='910006'")
+c.commit()`, join(folder,"db"), test.info().title.includes("track-only") ? "track-only" : "release"]);
+  }
   child = spawn(
     join(root, "desktop/src-tauri/target/debug/tibrary"),
     ["--rpc", "--db", join(folder, "db")],
@@ -3110,5 +3128,73 @@ test("idle drive availability polling preserves cached rows and selections throu
   await expect(scan).toBeEnabled();
   await expect(first).toBeChecked();
   await expect(second).not.toBeChecked();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+
+test("AI policy uses saved labels to hide suggestions, block downloads and review disconnected local files", async ({page}) => {
+  const root=join(folder,"music");
+  const originals=new Map(["First Light.flac","Drift.flac"].map(name=>[name,readFileSync(join(root,name))]));
+  const missing=await rpc("table",{route:"missing",root,limit:100,timeline:"All releases",artist_scope:"All artist appearances",recommendation:"All recommendations",include_unavailable:true});
+  expect(missing.error).toBeUndefined();
+  for (const blocked of ["910001","910002","910006"]) expect(missing.result.rows.map((row:any)=>row.id)).not.toContain(blocked);
+  expect(missing.result.rows.some((row:any)=>row.id==="910005")).toBe(true);
+  // Backend enforcement cannot be bypassed through an old selection or caller.
+  expect((await rpc("queue.add",{selection:{"910001":null}})).error).toMatch(/AI/i);
+  const availability=await driveAvailability(page);
+  await availability.connect(false);
+  await page.goto("/");
+  await expect(page.locator(".ai-review-notice")).toContainText("2 files flagged for removal");
+  await page.getByRole("button",{name:"Review files",exact:true}).click();
+  await expect(page.getByRole("main",{name:"AI review",exact:true})).toBeVisible();
+  const first=await localFileRow(page,"First Light");
+  await expect(first).toContainText("AI-labelled release");
+  await expect(first).toContainText("910001");
+  await expect(await localFileRow(page,"Drift")).toContainText("AI-labelled release");
+  await first.getByRole("checkbox").check();
+  await expect(page.getByRole("button",{name:"Show in Finder",exact:true})).toBeDisabled();
+  await page.getByRole("button",{name:"View metadata",exact:true}).click();
+  const detail=page.getByRole("dialog",{name:"AI removal review",exact:true});
+  await expect(detail).toContainText("First Light");
+  await expect(detail).toContainText("Review for removal");
+  await detail.getByRole("button",{name:"Done",exact:true}).click();
+
+  await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeDisabled();
+  await page.getByRole("checkbox",{name:"Select visible rows",exact:true}).check();
+  await expect(page.getByRole("checkbox",{name:"Select Distant Rooms",exact:true})).toBeChecked();
+  await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).not.toBeChecked();
+  await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
+  await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeDisabled();
+  await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).toBeDisabled();
+  await page.getByRole("button",{name:"Actions for Blue Hours",exact:true}).click();
+  await expect(page.getByRole("menuitem",{name:"Queue whole release",exact:true})).toBeDisabled();
+  await page.getByRole("menu").press("Escape");
+  await expect.poll(async () => (await rpc("queue.preview")).result?.map((row:any)=>row.id)).toEqual(["910005"]);
+
+  await page.locator("aside").getByRole("button",{name:"Downloaded releases",exact:true}).click();
+  await page.getByRole("button",{name:"Actions for Glass",exact:true}).click();
+  await expect(page.getByRole("menuitem",{name:"Redownload release",exact:true})).toBeDisabled();
+  await page.getByRole("menu").press("Escape");
+  await page.getByRole("button",{name:"Expand Glass",exact:true}).click();
+  await page.getByRole("button",{name:"Actions for track Glass",exact:true}).click();
+  await expect(page.getByRole("menuitem",{name:"Redownload track",exact:true})).toBeDisabled();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  for (const [name,bytes] of originals) expect(readFileSync(join(folder,"disconnected-music",name))).toEqual(bytes);
+});
+
+test("AI policy track-only labels flag the affected recording without labelling its local siblings", async ({page}) => {
+  const root=join(folder,"music");
+  const review=await rpc("table",{route:"ai_review",root,limit:100});
+  expect(review.error).toBeUndefined();
+  expect(review.result.rows).toHaveLength(1);
+  expect(review.result.rows[0]).toMatchObject({title:"First Light",status:"AI-generated"});
+  await page.goto("/");
+  await expect(page.locator(".ai-review-notice")).toContainText("1 file flagged for removal");
+  await page.locator("aside").getByRole("button",{name:"AI review",exact:true}).click();
+  const first=await localFileRow(page,"First Light");
+  await expect(first).toContainText("AI-generated");
+  await expect(first).toContainText("91000100");
+  await expect(page.locator("tbody")).not.toContainText("Drift");
   await expect(page.getByRole("alert")).toHaveCount(0);
 });

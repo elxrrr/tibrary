@@ -569,10 +569,21 @@ mod tests {
                                 reply.clone(),
                             );
                             workers.push(std::thread::spawn(move || {
+                                // BSD sockets can inherit the listener's
+                                // nonblocking mode. Read the complete request
+                                // before replying; closing with unread headers
+                                // can reset an otherwise valid JPEG response.
+                                stream.set_nonblocking(false).unwrap();
                                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                                let mut request = [0; 4096];
-                                let length = stream.read(&mut request).unwrap_or(0);
-                                let path = String::from_utf8_lossy(&request[..length]).split_whitespace().nth(1).unwrap_or("").to_owned();
+                                let mut request = Vec::new();
+                                while !request.windows(4).any(|bytes|bytes == b"\r\n\r\n") {
+                                    let mut chunk = [0; 4096];
+                                    let length = stream.read(&mut chunk).expect("Local HTTP fixture request headers");
+                                    if length == 0 { return; }
+                                    request.extend_from_slice(&chunk[..length]);
+                                    assert!(request.len() <= 16_384,"Local HTTP fixture headers exceed limit");
+                                }
+                                let path = String::from_utf8_lossy(&request).split_whitespace().nth(1).unwrap_or("").to_owned();
                                 requests.lock().unwrap().push(path.clone());
                                 let count = active.fetch_add(1, Ordering::SeqCst) + 1;
                                 maximum.fetch_max(count, Ordering::SeqCst);

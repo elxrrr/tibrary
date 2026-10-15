@@ -48,6 +48,7 @@ pub struct StatsRecord {
     pub downloaded: usize,
     pub missing_releases: usize,
     pub correct: usize,
+    pub ai_review: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +86,8 @@ pub struct MissingChildTrack {
 pub struct MissingRow {
     pub id: String,
     pub downloaded_files: Vec<String>,
+    #[serde(default)]
+    pub ai_blocked: bool,
     pub artist: String,
     pub release: String,
     pub date: String,
@@ -122,6 +125,7 @@ pub struct TursoDb {
     pub local_revision: Arc<std::sync::atomic::AtomicU64>,
     missing_rows_gate: Arc<tokio::sync::Mutex<()>>,
     missing_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<MissingRow>)>>>,
+    ai_review_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<Value>)>>>,
     link_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<LinkRow>)>>>,
     favourite_rows_cache: Arc<std::sync::Mutex<HashMap<String, (u64, Vec<Value>)>>>,
 }
@@ -146,6 +150,7 @@ impl TursoDb {
             local_revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             missing_rows_gate: Arc::new(tokio::sync::Mutex::new(())),
             missing_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ai_review_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             link_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             favourite_rows_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
@@ -929,9 +934,10 @@ impl TursoDb {
         let artists = artists_set.len();
         let unresolved_artists = artists_set.difference(&mapped_artists).count();
 
-        // Queue counts
+        // Queue counts use the same AI exclusion as queue approvals and downloads.
+        let ai = crate::ai_policy::flags(self, market).await?;
         let mut q_rows = conn
-            .query("SELECT decision, approved FROM queue", ())
+            .query("SELECT decision, approved, id, payload FROM queue", ())
             .await
             .map_err(|e| e.to_string())?;
 
@@ -945,7 +951,9 @@ impl TursoDb {
 
             if decision == "queued" {
                 queued += 1;
-                if approved != 0 {
+                let id: String = row.get(2).unwrap_or_default();
+                let payload: Value = serde_json::from_str(&row.get::<String>(3).unwrap_or_default()).unwrap_or(Value::Null);
+                if approved != 0 && !ai.release_blocked(&id) && !(ai.payload_blocked(&id,&payload) && crate::ai_policy::payload_blocked(self,market,&id,&payload).await?) {
                     approved_queue += 1;
                 }
             } else if decision == "downloaded" {
@@ -972,6 +980,7 @@ impl TursoDb {
             Err(_) => 0,
         } } else { 0 };
 
+        let ai_review = self.get_ai_review_rows(root, market).await?.len();
         Ok(StatsRecord {
             track_count,
             linked_tracks,
@@ -985,6 +994,7 @@ impl TursoDb {
             downloaded,
             missing_releases,
             correct: correct_issues,
+            ai_review,
         })
     }
 
@@ -1013,7 +1023,90 @@ impl TursoDb {
         )
         .await
         .map_err(|e| e.to_string())?;
+        crate::ai_policy::cache_written(self, key, val).await?;
         Ok(())
+    }
+
+    async fn account_ai_flags(&self) -> Result<(String, Arc<crate::ai_policy::AiFlags>), String> {
+        let settings = self.get_preference("desktop").await?
+            .or(self.get_preference("ui").await?).unwrap_or(Value::Null);
+        let market = crate::account::catalogue_market(self, settings["market"].as_str()).await?;
+        let flags = crate::ai_policy::flags(self, &market).await?;
+        Ok((market, flags))
+    }
+
+    async fn ensure_ai_download_allowed(&self, market: &str, ai: &crate::ai_policy::AiFlags, id: &str) -> Result<(), String> {
+        if ai.release_blocked(id) { return Err(ai_download_error(id)); }
+        let conn = self.connect()?;
+        let mut rows = conn.query("SELECT payload FROM queue WHERE id=?", (id,))
+            .await.map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+            let payload: Value = serde_json::from_str(&row.get::<String>(0).unwrap_or_default()).unwrap_or(Value::Null);
+            if ai.payload_blocked(id,&payload) && crate::ai_policy::payload_blocked(self,market,id,&payload).await? { return Err(ai_download_error(id)); }
+        }
+        Ok(())
+    }
+
+    /// Removal review is derived from cached provider labels and exact saved IDs.
+    /// No filesystem access is needed, including for an unplugged library.
+    pub async fn get_ai_review_rows(&self, root: Option<&str>, market: &str) -> Result<Vec<Value>, String> {
+        let ai = crate::ai_policy::flags(self, market).await?;
+        if ai.is_empty() { return Ok(Vec::new()); }
+        let revision = crate::ai_policy::local_generation(self).await?;
+        let clean = root.unwrap_or("").trim_end_matches('/');
+        let key = format!("{market}:{clean}:{}", ai.review_signature());
+        if let Some((_, rows)) = self.ai_review_cache.lock().unwrap().get(&key).filter(|(saved,_)|*saved==revision) {
+            return Ok(rows.clone());
+        }
+        let conn = self.connect()?;
+        let mut files = conn.query(
+            "SELECT f.path,f.metadata,COALESCE(f.size,0),COALESCE(f.mtime,0),l.stamp,l.payload
+             FROM local_files f LEFT JOIN track_links l ON l.path=f.path AND l.market=?
+             WHERE f.present=1 AND (?='' OR f.root=? OR f.root=?) ORDER BY f.path",
+            (market, clean, clean, format!("{clean}/")),
+        ).await.map_err(|e| e.to_string())?;
+        let mut result = Vec::new();
+        while let Some(row) = files.next().await.map_err(|e| e.to_string())? {
+            let path: String = row.get(0).map_err(|e| e.to_string())?;
+            let metadata: Value = row.get::<Option<String>>(1).ok().flatten()
+                .and_then(|raw|serde_json::from_str(&raw).ok()).unwrap_or(Value::Null);
+            let tags = crate::workflows::extract_tags_map(&Some(metadata));
+            let stamp: String = row.get(4).unwrap_or_default();
+            let payload: Value = row.get::<Option<String>>(5).ok().flatten()
+                .and_then(|raw|serde_json::from_str(&raw).ok()).unwrap_or(Value::Null);
+            let mut sources = Vec::<(String,String)>::new();
+            if (payload["status"] == "linked" || payload["status"].is_null())
+                && link_stamp_matches(&stamp,row.get(2).unwrap_or_default(),row.get(3).unwrap_or_default()) {
+                for source in std::iter::once(&payload["ids"]).chain(payload["placements"].as_array().into_iter().flatten()) {
+                    sources.push((provider_id(&source["album_id"]),provider_id(&source["track_id"])));
+                }
+            }
+            // Embedded IDs provide provenance for downloads even before linking.
+            sources.push((tags.get("tidal_album_id").cloned().unwrap_or_default(),tags.get("tidal_track_id").cloned().unwrap_or_default()));
+            let mut evidence = Vec::new();
+            let mut exact_track = false;
+            let mut source_release = String::new();
+            let mut source_track = String::new();
+            for (release, track) in sources {
+                if let Some(note) = ai.evidence(&release, &track) {
+                    exact_track |= ai.track_labelled(&track);
+                    if source_release.is_empty() { source_release=release; source_track=track; }
+                    if !evidence.contains(&note) { evidence.push(note); }
+                }
+            }
+            if evidence.is_empty() { continue; }
+            let artist=tags.get("albumartist").or_else(||tags.get("artist")).cloned().unwrap_or_default();
+            let release=tags.get("album").cloned().unwrap_or_default();
+            let title=tags.get("title").cloned().unwrap_or_else(||std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy().into_owned());
+            result.push(json!({"id":path,"path":path,"artist":artist,"release":release,"title":title,
+                "status":if exact_track {"AI-generated"} else {"AI-labelled release"},
+                "evidence":evidence.join(" "),"affected":true,"target":"Review for removal","changes":"","position":"",
+                "source_release_id":source_release,"source_track_id":source_track,"tags":tags}));
+        }
+        let mut cache = self.ai_review_cache.lock().unwrap();
+        if cache.len() >= 8 { cache.clear(); }
+        cache.insert(key,(revision,result.clone()));
+        Ok(result)
     }
 
     pub async fn get_local_files_page(
@@ -1616,6 +1709,7 @@ impl TursoDb {
 
     #[allow(clippy::too_many_arguments)]
     async fn build_missing_rows(&self, market: &str) -> Result<Vec<MissingRow>, String> {
+        let ai = crate::ai_policy::flags(self, market).await?;
         let conn = self.connect()?;
         #[derive(Default)]
         struct LocalEdition {
@@ -1918,7 +2012,7 @@ impl TursoDb {
                     .get("id")
                     .map(|v| v.to_string().trim_matches('"').to_string())
                     .unwrap_or_default();
-                if id.is_empty() {
+                if id.is_empty() || ai.release_blocked(&id) || (ai.payload_blocked(&id,rel) && crate::ai_policy::payload_blocked(self,market,&id,rel).await?) {
                     continue;
                 }
 
@@ -2298,6 +2392,7 @@ impl TursoDb {
                 MissingRow {
                     id: rel.id.clone(),
                     downloaded_files: Vec::new(),
+                    ai_blocked: false,
                     artist: display_artist,
                     release: rel.title,
                     date: rel.date,
@@ -2395,6 +2490,8 @@ impl TursoDb {
         include_unavailable: bool,
     ) -> Result<TablePage<MissingRow>, String> {
         let build_guard = self.missing_rows_gate.lock().await;
+        // Consume committed raw metadata changes before consulting cached views.
+        crate::ai_policy::flags(self, market).await?;
         let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
         let key = format!("{market}:{}", chrono::Utc::now().format("%Y-%m-%d"));
         let cached = self
@@ -2996,6 +3093,7 @@ impl TursoDb {
         offset: usize,
         limit: usize,
     ) -> Result<TablePage<MissingRow>, String> {
+        let (market, ai) = self.account_ai_flags().await?;
         let conn = self.connect()?;
         let decision = if route == "downloaded" {
             "downloaded"
@@ -3025,6 +3123,7 @@ impl TursoDb {
                 None => continue,
             };
 
+            let ai_blocked = ai.release_blocked(&id) || (ai.payload_blocked(&id,&rel) && crate::ai_policy::payload_blocked(self,&market,&id,&rel).await?);
             let artist = rel
                 .get("artist")
                 .and_then(|v| v.as_str())
@@ -3085,7 +3184,7 @@ impl TursoDb {
                 }
             }
 
-            let sel_tracks = if approved != 0 {
+            let sel_tracks = if approved != 0 && !ai_blocked {
                 rel.get("selected_tracks")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
@@ -3103,22 +3202,25 @@ impl TursoDb {
             rows.push(MissingRow {
                 id: id.clone(),
                 downloaded_files: Vec::new(),
+                ai_blocked,
                 artist,
                 release,
                 date,
                 r#type: rel_type,
                 tracks,
-                status: if dec == "downloaded" {
+                status: if ai_blocked {
+                    "AI-generated".into()
+                } else if dec == "downloaded" {
                     "Owned complete".to_string()
                 } else {
                     "Queued".to_string()
                 },
                 online_id: id,
-                recommendation: String::new(),
-                evidence: Vec::new(),
+                recommendation: if ai_blocked { "AI-generated".into() } else { String::new() },
+                evidence: if ai_blocked { vec!["The online catalogue labels this release or one of its tracks as AI-generated. Downloads are blocked; existing files are retained for removal review.".into()] } else { Vec::new() },
                 expanded_available: tracks_loaded,
                 available,
-                approved: approved != 0,
+                approved: approved != 0 && !ai_blocked,
                 selected: sel_tracks,
                 children,
                 newest_local_date: None,
@@ -3174,7 +3276,12 @@ impl TursoDb {
         &self,
         selection: &HashMap<String, Option<Vec<String>>>,
     ) -> Result<(), String> {
+        let (market, ai) = self.account_ai_flags().await?;
         let conn = self.connect()?;
+        for (id, selected) in selection {
+            if selected.as_ref().is_some_and(Vec::is_empty) { continue; }
+            self.ensure_ai_download_allowed(&market, &ai, id).await?;
+        }
         let now_iso = chrono::Utc::now().to_rfc3339();
         for (ident, sel) in selection {
             let mut stmt = conn
@@ -3265,6 +3372,8 @@ impl TursoDb {
         release_id: &str,
         track_id: Option<&str>,
     ) -> Result<(), String> {
+        let (market, ai) = self.account_ai_flags().await?;
+        self.ensure_ai_download_allowed(&market, &ai, release_id).await?;
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -3322,13 +3431,16 @@ impl TursoDb {
 
         let settings = self.get_preference("desktop").await?
             .or(self.get_preference("ui").await?).unwrap_or(Value::Null);
-        let market = settings["market"].as_str().unwrap_or("GB");
+        let market = crate::account::catalogue_market(self, settings["market"].as_str()).await?;
+        let ai = crate::ai_policy::flags(self, &market).await?;
         let mut prepared = Vec::with_capacity(selection.len());
         for (ident, sel_tracks) in selection {
-            let mut release = self.cached_release(ident, market).await?.ok_or_else(|| {
+            self.ensure_ai_download_allowed(&market, &ai, ident).await?;
+            let mut release = self.cached_release(ident, &market).await?.ok_or_else(|| {
                 format!("Release {ident} has no cached metadata; refresh it before queueing")
             })?;
 
+            if ai.payload_blocked(ident,&release) && crate::ai_policy::payload_blocked(self,&market,ident,&release).await? { return Err(ai_download_error(ident)); }
             if let Some(ids) = sel_tracks {
                 if ids.is_empty() {
                     return Err("Select at least one audio track".into());
@@ -3396,6 +3508,7 @@ impl TursoDb {
         selection: Option<&HashMap<String, Option<Vec<String>>>>,
     ) -> Result<String, String> {
         let dec = decision.unwrap_or("queued");
+        let (market, ai) = self.account_ai_flags().await?;
         let conn = self.connect()?;
         let mut stmt = conn
             .query(
@@ -3420,6 +3533,10 @@ impl TursoDb {
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
             {
+                if ai.release_blocked(&id) || (ai.payload_blocked(&id,&p) && crate::ai_policy::payload_blocked(self,&market,&id,&p).await?) {
+                    if scoped.is_some() { return Err(ai_download_error(&id)); }
+                    continue;
+                }
                 if let Some(choice) = scoped {
                     if !p.is_object() {
                         return Err(format!("Release {id} has incomplete cached metadata"));
@@ -4500,6 +4617,14 @@ fn extract_tag_f64(val: &Value, keys: &[&str]) -> Option<f64> {
     None
 }
 
+fn provider_id(value: &Value) -> String {
+    value.as_str().map(str::to_owned).or_else(||value.as_u64().map(|id|id.to_string())).unwrap_or_default()
+}
+
+fn ai_download_error(id: &str) -> String {
+    format!("Download blocked: release {id} is labelled AI-generated or contains an AI-generated track")
+}
+
 pub fn link_stamp_matches(raw: &str, size: i64, mtime: i64) -> bool {
     let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(raw) else { return false; };
     let offset = if parts.len() >= 4 { 2 } else if parts.len() == 2 { 0 } else { return false; };
@@ -4516,6 +4641,103 @@ fn is_compilation_artist(artist: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ai_policy_excludes_suggestions_and_preflights_queue_batches() {
+        use super::*;
+        let folder = std::env::temp_dir().join(format!("tibrary-ai-views-{}",uuid::Uuid::new_v4()));
+        let store = TursoDb::open(folder.join("db")).await.unwrap();
+        let conn=store.connect().unwrap();
+        let release=|id:&str,title:&str,tracks:Value| json!({"id":id,"artist":"Example","artist_ids":["77"],"title":title,
+            "date":"2020-01-01","type":"ALBUM","available":true,"track_count":tracks.as_array().unwrap().len(),"tracks_loaded":true,"tracks":tracks});
+        let track=|id:&str|json!({"id":id,"title":"Song","isrc":"GBEX12345","duration":180.0,"track_number":1,"disc_number":1});
+        let safe=release("100","Song",json!([track("1001")]));
+        let labelled=release("200","Other",json!([track("2001")]));
+        let mixed=release("300","Larger",json!([track("1001"),track("3002")]));
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Example','77','confirmed')",()).await.unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('77','GB',?)",(json!({"id":"77","name":"Example","releases":[safe,labelled,mixed]}).to_string(),)).await.unwrap();
+        store.apply_file_update("/not-mounted/local.flac","/not-mounted/local.flac","/not-mounted",&json!({"albumartist":"Example","album":"Existing","title":"Existing"}),1,1).await.unwrap();
+        // Warm a view before discovering the labels to exercise invalidation.
+        let before=store.get_missing_rows("GB",Some("All missing releases"),Some("All recommendations"),None,None,None,None,None,0,100).await.unwrap();
+        assert!(before.rows.iter().any(|row|row.id=="200"));
+        store.set_preference("subscriber-summary:GB:200",&json!({"id":200,"ai":true})).await.unwrap();
+        store.set_preference("subscriber-items:GB:300",&json!({"items":[{"id":1001,"ai":false},{"id":3002,"ai":true}]})).await.unwrap();
+        let page=store.get_missing_rows_scoped_including_unavailable("GB",Some("All missing releases"),Some("All recommendations"),Some("All appearances"),None,None,None,None,None,0,100,true).await.unwrap();
+        assert_eq!(page.rows.iter().map(|row|row.id.as_str()).collect::<Vec<_>>(),vec!["100"]);
+        assert_ne!(page.rows[0].recommendation,"Superseded","AI-containing albums must not suppress safe releases");
+        assert!(store.queue_add(&HashMap::from([("100".into(),None),("200".into(),None)])).await.unwrap_err().contains("AI-generated"));
+        assert_eq!(store.get_queue_rows("queue",None,None,None,None,0,100).await.unwrap().total,0,"Batch queueing is atomic");
+        store.queue_add(&HashMap::from([("100".into(),None)])).await.unwrap();
+        // Simulate a saved queue from before the policy existed.
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES('200',?,1,'queued')",(labelled.to_string(),)).await.unwrap();
+        let queued=store.get_queue_rows("queue",None,None,None,None,0,100).await.unwrap();
+        let blocked=queued.rows.iter().find(|row|row.id=="200").unwrap();
+        assert!(blocked.ai_blocked && !blocked.approved);
+        assert_eq!(blocked.selected,Some(vec![]));
+        assert!(store.queue_select(&HashMap::from([("100".into(),Some(vec![])),("200".into(),None)])).await.is_err());
+        let unchanged=store.get_queue_rows("queue",None,None,None,None,0,100).await.unwrap();
+        assert!(unchanged.rows.iter().find(|row|row.id=="100").unwrap().approved,"No partial approval changes on policy failure");
+        assert_eq!(store.queue_export("text",None).await.unwrap(),"https://tidal.com/album/100\n");
+        let stats=store.get_stats("GB",Some("/not-mounted")).await.unwrap();
+        assert_eq!(stats.approved_queue,1);
+        assert!(store.queue_redownload("200",None).await.unwrap_err().contains("AI-generated"));
+        store.queue_select(&HashMap::from([("200".into(),Some(vec![]))])).await.unwrap();
+        // A new explicit provider correction must override old normalized snapshots.
+        let mut stale=labelled.clone();stale["ai"]=json!(true);
+        conn.execute("UPDATE queue SET payload=? WHERE id='200'",(stale.to_string(),)).await.unwrap();
+        store.set_preference("subscriber-summary:GB:200",&json!({"id":200,"ai":false})).await.unwrap();
+        store.queue_select(&HashMap::from([("200".into(),None)])).await.unwrap();
+        assert!(!store.get_queue_rows("queue",None,None,None,None,0,100).await.unwrap().rows.iter().find(|row|row.id=="200").unwrap().ai_blocked);
+        // Direct transactional writers must also invalidate cached suggestions.
+        let before=store.get_missing_rows("GB",Some("All missing releases"),Some("All recommendations"),None,None,None,None,None,0,100).await.unwrap();
+        assert!(before.rows.iter().any(|row|row.id=="100"));
+        conn.execute("INSERT OR REPLACE INTO app_preferences VALUES('subscriber-summary:GB:100',?)",(json!({"id":100,"ai":true}).to_string(),)).await.unwrap();
+        assert!(!store.get_missing_rows("GB",Some("All missing releases"),Some("All recommendations"),None,None,None,None,None,0,100).await.unwrap().rows.iter().any(|row|row.id=="100"));
+        // A known labelled recording remains blocked on another cached edition
+        // even when that edition's shorter payload omits its optional ai flag.
+        let alternate=release("400","Alternate",json!([track("3002")]));
+        let catalogue=json!({"id":"77","name":"Example","releases":[alternate]});
+        conn.execute("UPDATE catalogue SET payload=? WHERE artist_id='77' AND market='GB'",(catalogue.to_string(),)).await.unwrap();
+        TursoDb::index_catalogue(&conn,"77","GB",&catalogue).await.unwrap();
+        store.bump_revision();
+        assert!(store.get_missing_rows("GB",Some("All missing releases"),Some("All recommendations"),None,None,None,None,None,0,100).await.unwrap().rows.is_empty());
+        assert!(store.queue_add(&HashMap::from([("400".into(),None)])).await.unwrap_err().contains("AI-generated"));
+        drop(conn);drop(store);let _=std::fs::remove_dir_all(folder);
+    }
+
+    #[tokio::test]
+    async fn ai_review_uses_exact_saved_provenance_and_updates_when_files_move() {
+        use super::*;
+        let folder=std::env::temp_dir().join(format!("tibrary-ai-local-{}",uuid::Uuid::new_v4()));
+        let store=TursoDb::open(folder.join("db")).await.unwrap();
+        let conn=store.connect().unwrap();
+        store.set_preference("subscriber-items:GB:10",&json!({"items":[{"id":101,"ai":true},{"id":102,"ai":false}]})).await.unwrap();
+        for (name,track,status,stamp,embedded) in [
+            ("labelled", "101", "linked", "[0,0,1,1]",false),
+            ("human", "102", "linked", "[0,0,1,1]",false),
+            ("candidate", "101", "needs_choice", "[0,0,1,1]",false),
+            ("stale", "101", "linked", "[0,0,2,1]",false),
+            ("embedded", "101", "unlinked", "[]",true),
+        ] {
+            let path=format!("/unmounted/{name}.flac");
+            let mut tags=json!({"albumartist":"Artist","album":"Mixed release","title":name});
+            if embedded {tags["tidal_album_id"]=json!("10");tags["tidal_track_id"]=json!("101");}
+            store.apply_file_update(&path,&path,"/unmounted",&tags,1,1).await.unwrap();
+            conn.execute("INSERT INTO track_links(path,market,stamp,payload) VALUES(?,'GB',?,?)",(path,stamp,json!({"status":status,"ids":{"album_id":"10","track_id":track}}).to_string())).await.unwrap();
+        }
+        store.bump_revision();
+        let rows=store.get_ai_review_rows(Some("/unmounted"),"GB").await.unwrap();
+        assert_eq!(rows.len(),2);
+        assert!(rows.iter().all(|row|row["status"]=="AI-generated" && row["evidence"].as_str().unwrap().contains("101")));
+        assert!(store.get_ai_review_rows(Some("/unmounted"),"US").await.unwrap().is_empty());
+        let tags=json!({"albumartist":"Artist","album":"Mixed release","title":"labelled"});
+        store.apply_file_update("/unmounted/labelled.flac","/unmounted/New/labelled.flac","/unmounted",&tags,1,2).await.unwrap();
+        let moved=store.get_ai_review_rows(Some("/unmounted"),"GB").await.unwrap();
+        assert!(moved.iter().any(|row|row["path"]=="/unmounted/New/labelled.flac"));
+        store.set_preference("subscriber-items:GB:10",&json!({"items":[{"id":101,"ai":false},{"id":102,"ai":false}]})).await.unwrap();
+        assert!(store.get_ai_review_rows(Some("/unmounted"),"GB").await.unwrap().is_empty());
+        drop(conn);drop(store);let _=std::fs::remove_dir_all(folder);
+    }
+
     #[tokio::test]
     async fn omitted_recordings_remain_unlinked_without_hiding_inspectable_editions() {
         let folder = std::env::temp_dir().join(format!("tibrary-omitted-choices-{}", uuid::Uuid::new_v4()));

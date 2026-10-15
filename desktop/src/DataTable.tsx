@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { Row, readable } from "./api";
 import { ReleaseArtwork } from "./ReleaseArtwork";
-import { Selection, parentState, toggleChild, toggleParent, releaseRows, releaseSelectionState, toggleReleaseRows } from "./selection";
+import { Selection, toggleChild, releaseRows, releaseSelectionState, toggleReleaseRows } from "./selection";
 import { ColumnSelection, columnSelectionLabel, columnValueSelected, toggleColumnValue } from "./columnFilters";
 export type { ColumnSelection } from "./columnFilters";
 export type Column = { key: string; label: string; width?: number | string };
@@ -443,7 +443,8 @@ export function DataTable({
       if (groupState(row) === "empty") onSelect(new Set([row.id]));
     } else if (!selected.has(row.id)) onSelect(new Set([row.id]));
   }
-  const visibleStates = rows.map((r) =>
+  const selectableRows = tree ? rows.filter(row => !row.ai_blocked) : rows;
+  const visibleStates = selectableRows.map((r) =>
     tree
       ? releaseSelectionState(treeSelection || {}, r)
       : grouped || fileSelection ? groupState(r) : selected.has(r.id) ? "checked" : "empty",
@@ -465,13 +466,13 @@ export function DataTable({
               <Check
                 label="Select visible rows"
                 state={
-                  rows.length && checked === rows.length
+                  selectableRows.length && checked === selectableRows.length
                     ? "checked"
                     : anySelected
                       ? "mixed"
                       : "empty"
                 }
-                disabled={busy && tree}
+                disabled={!!tree && (busy || !selectableRows.length)}
                 onChange={(yes) => {
                   if (tree && onTreeSelect) {
                     onTreeSelect(toggleReleaseRows(treeSelection || {}, rows, yes));
@@ -663,10 +664,7 @@ export function DataTable({
             const nestedRelease = releaseGroups && nestedReleaseIds.has(r.id);
             const artworkRow = !!tree && !r.artist_group;
             const state = tree
-              ? parentState(
-                  treeSelection?.[r.id],
-                  (r.children || []).map((c: Row) => c.id),
-                )
+              ? releaseSelectionState(treeSelection || {}, r)
               : grouped || fileGroups ? groupState(r) : selected.has(r.id)
                 ? "checked"
                 : "empty";
@@ -690,7 +688,7 @@ export function DataTable({
                     if (e.key === "Enter") onDetail(r);
                     if (e.key === " ") {
                       e.preventDefault();
-                      if (tree) { if (!busy) onTreeSelect?.(toggleParent(treeSelection || {},r.id,state !== "checked")); return; }
+                      if (tree) { if (!busy && !r.ai_blocked) onTreeSelect?.(toggleReleaseRows(treeSelection || {},[r],state !== "checked")); return; }
                       if (fileGroups) { toggleFiles(r,state !== "checked"); return; }
                       if (grouped) { toggleGrouped(r,state !== "checked"); return; }
                       const s = new Set(selected);
@@ -712,11 +710,11 @@ export function DataTable({
                     <Check
                       label={(fileGroups ? `Select ${r.release || r.artist}` : selectionLabel?.(r)) || `Select ${r.release || r.title || r.artist}`}
                       state={state}
-                      disabled={busy && tree}
+                      disabled={!!tree && (busy || !!r.ai_blocked)}
                       onChange={(yes) => {
                         if (tree && onTreeSelect)
                           onTreeSelect(
-                            toggleParent(treeSelection || {}, r.id, yes),
+                            toggleReleaseRows(treeSelection || {}, [r], yes),
                           );
                         else if (fileGroups) toggleFiles(r,yes);
                         else if (grouped) toggleGrouped(r,yes);
@@ -853,19 +851,19 @@ export function DataTable({
                             ? "inactive"
                             : "")
                         }
-                        onDoubleClick={() => onDetail({ ...t, parent: r.id, online_id: t.id })}
-                        onContextMenu={(e) => {e.preventDefault(); onMenu({...t,parent:r.id,online_id:t.id},e.clientX,e.clientY);}}
+                        onDoubleClick={() => onDetail({ ...t, parent: r.id, online_id: t.id, ai_blocked: !!r.ai_blocked || !!t.ai_blocked })}
+                        onContextMenu={(e) => {e.preventDefault(); onMenu({...t,parent:r.id,online_id:t.id,ai_blocked:!!r.ai_blocked || !!t.ai_blocked},e.clientX,e.clientY);}}
                       >
                         <td>
                           <Check
                             label={`Select track ${t.title}`}
                             state={
-                              treeSelection?.[r.id] === null ||
-                              treeSelection?.[r.id]?.includes(t.id)
+                              !r.ai_blocked && !t.ai_blocked && (treeSelection?.[r.id] === null ||
+                              treeSelection?.[r.id]?.includes(t.id))
                                 ? "checked"
                                 : "empty"
                             }
-                            disabled={busy}
+                            disabled={busy || !!r.ai_blocked || !!t.ai_blocked}
                             onChange={(yes) =>
                               onTreeSelect?.(
                                 toggleChild(
@@ -892,7 +890,7 @@ export function DataTable({
                           <td>{t.duration ? `${Math.floor(t.duration / 60)}:${String(Math.round(t.duration % 60)).padStart(2, "0")}` : "—"}</td>
                           <td title={t.isrc || "No recording identifier"}>{t.isrc || "No ISRC"}</td>
                         </>}
-                        <td className="more"><button aria-label={`Actions for track ${t.title}`} onClick={(e)=>{e.stopPropagation();onMenu({...t,parent:r.id,online_id:t.id},e.clientX,e.clientY);}}><MoreHorizontal size={16}/></button></td>
+                        <td className="more"><button aria-label={`Actions for track ${t.title}`} onClick={(e)=>{e.stopPropagation();onMenu({...t,parent:r.id,online_id:t.id,ai_blocked:!!r.ai_blocked || !!t.ai_blocked},e.clientX,e.clientY);}}><MoreHorizontal size={16}/></button></td>
                       </tr>
                     ))
                   ))}

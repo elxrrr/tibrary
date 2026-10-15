@@ -68,6 +68,7 @@ const groups = [
       ["correct", "Correct tags", Tags],
       ["organise", "Organise files", Folder],
       ["local", "Local duplicates", Music2],
+      ["ai_review", "AI review", ShieldCheck],
     ],
   },
   {
@@ -144,7 +145,7 @@ const organisationActions = [
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
 const groupRoutes = Object.fromEntries(groups.map(group => [group.id, group.items[0][0]]));
-const fileGroupRoutes = new Set(["files", "correct", "organise", "metadata", "artwork", "mqa"]);
+const fileGroupRoutes = new Set(["files", "correct", "organise", "metadata", "artwork", "mqa", "ai_review"]);
 function linkedFiles(rows: Row[]): Row[] {
   return rows.flatMap(row => row.artist_group || row.link_group || row.file_group ? linkedFiles(row.children || []) : [row]);
 }
@@ -745,7 +746,7 @@ function App() {
       } else if (route === "local" || route === "online") {
         setDetail({operation: row});
       } else if (row.path || route === "links") {
-        setDetail({...await call("detail", { root, path: row.path || row.id, check_availability: route === "links" }), proposed: row.changes, folder_target: route === "organise" ? (row.target || row.path || row.id) : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
+        setDetail({...await call("detail", { root, path: row.path || row.id, check_availability: route === "links" }), proposed: row.changes, folder_target: route === "organise" ? (row.target || row.path || row.id) : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, ai_evidence: route === "ai_review" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
       }
     } catch (e) {
       notifyError(e);
@@ -937,7 +938,7 @@ function App() {
               { key: "gained", label: "Tracks gained" },
               { key: "evidence", label: "Evidence" },
             ]
-        : route === "mqa"
+        : route === "mqa" || route === "ai_review"
           ? [
               { key: "artist", label: "Artist" },
               { key: "release", label: "Release" },
@@ -1045,6 +1046,10 @@ function App() {
                 ArrowDownToLine,
               )}
         </div>
+        {(s.ai_review || 0) > 0 && <div className="notice ai-review-notice" role="status">
+          <span><strong>{s.ai_review.toLocaleString()} {s.ai_review === 1 ? "file" : "files"} flagged for removal</strong> · AI-labelled by the online catalogue</span>
+          <button onClick={() => setRoute("ai_review")}>Review files <ChevronRight size={14} /></button>
+        </div>}
         <section className="card libraries-card">
           <div className="section-heading">
             <div>
@@ -1161,6 +1166,13 @@ function App() {
         title="Preview one operation at a time. Files change only after you review and apply the selected proposals."
         options={operations.map(([id,label,note]) => ({id,label,note,selected:action === id,onClick:() => chooseOperation(id)}))} />
         {clear}<div className="table-result-actions">{apply}</div></>;
+    } else if (route === "ai_review") {
+      const file = linkedFiles(data.rows).find(row => selected.has(row.id));
+      controls = <>{clear}<span className="ai-review-help">AI-labelled files · review for removal</span><div className="table-result-actions">
+        <button disabled={selected.size !== 1 || !file} title="Select one file to inspect its metadata" onClick={selectedDetail}>View metadata</button>
+        <button disabled={selected.size !== 1 || !file?.path || !!fileUnavailable(file.path)} title={selected.size === 1 && file?.path ? fileUnavailable(file.path) || file.path : "Select one file to reveal it in Finder"}
+          onClick={() => {if (file?.path) reveal(file.path).catch(notifyError);}}>Show in Finder</button>
+      </div></>;
     } else if (route === "files") {
       controls = clear;
     } else if (route === "links") {
@@ -1864,7 +1876,7 @@ function App() {
           {route === "downloaded" && (
             <>
               <hr />
-              <button role="menuitem" disabled={queueBusy || active(state?.download_job)} onClick={() => {
+              <button role="menuitem" disabled={queueBusy || active(state?.download_job) || !!r.ai_blocked} title={r.ai_blocked ? "AI-labelled music is excluded from downloads" : undefined} onClick={() => {
                 mutate("queue.redownload", { release_id: r.parent || r.id, ...(r.parent ? { track_id: r.id } : {}) });
                 setMenu(null);
               }}>{r.parent ? "Redownload track" : "Redownload release"}</button>
@@ -1875,7 +1887,8 @@ function App() {
               <hr />
               <button
                 role="menuitem"
-                disabled={queueBusy}
+                disabled={queueBusy || !!r.ai_blocked}
+                title={r.ai_blocked ? "AI-labelled music is excluded from downloads" : undefined}
                 onClick={() => {
                   if (route === "missing")
                     mutate("queue.add", {
@@ -2118,7 +2131,7 @@ function App() {
       {detail && (
         <Modal
           title={
-            detail.operation ? route === "online" ? "Replacement release details" : "Local duplicate details"
+            detail.ai_evidence ? "AI removal review" : detail.operation ? route === "online" ? "Replacement release details" : "Local duplicate details"
               : detail.local_file_release ? "Release review" : detail.local_artist ? "Artist release links" : detail.local_release ? "Local release details" : detail.artist && !detail.tags
               ? "Artist candidates"
               : detail.release
@@ -2129,6 +2142,7 @@ function App() {
           onClose={() => setDetail(null)}
         >
           <div className="modal-body">
+            {detail.ai_evidence && <div className="notice ai-review-notice"><span>{detail.ai_evidence}</span></div>}
             {detail.local_file_release && <section className="metadata-source">
               <h3>{detail.local_file_release.artist} — {detail.local_file_release.release}</h3>
               <p>{detail.local_file_release.path}</p><p>{detail.local_file_release.evidence}</p>

@@ -56,3 +56,12 @@ describe("artist release selection", () => {
     expect(releaseSelectionState({}, {id:"empty-group",artist_group:true,children:[]})).toBe("empty");
   });
 });
+
+  it("never approves AI-blocked releases through parent or select-all cascades", () => {
+    const rows = [{id:"artist",artist_group:true,children:[{id:"allowed"},{id:"blocked",ai_blocked:true}]}];
+    const selection = toggleReleaseRows({blocked:null},rows,true);
+    expect(selectedReleases(selection)).toEqual({allowed:null});
+    expect(releaseSelectionState(selection,rows[0])).toBe("checked");
+    expect(releaseSelectionState({blocked:null},rows[0].children[1])).toBe("empty");
+    expect(selectedReleases(toggleReleaseRows(selection,rows,false))).toEqual({});
+  });

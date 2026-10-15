@@ -690,6 +690,7 @@ async fn publish_release_update(
         if let Some(row) = q.next().await.map_err(|e| e.to_string())? {
             let raw: String = row.get(0).map_err(|e| e.to_string())?;
             let mut queued: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if value["ai"].is_boolean() { queued["ai"] = value["ai"].clone(); }
             queued["tracks"] = value["tracks"].clone();
             queued["tracks_loaded"] = json!(true);
             queued["track_count"] = value["track_count"].clone();
@@ -1607,6 +1608,7 @@ pub async fn execute(
         drop(query);
         let mut rows = vec![];
         let mut seen = HashSet::new();
+        let ai = crate::ai_policy::flags(db,market).await?;
         let remote_total = remote.len();
         for (position, mut target) in remote.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
@@ -1622,7 +1624,9 @@ pub async fn execute(
                     ),
                 );
             }
-            if target.available != Some(true)
+            let ai_snapshot = target.ai_policy_payload();
+            if ai.release_blocked(&target.id) || (ai.payload_blocked(&target.id,&ai_snapshot) && crate::ai_policy::payload_blocked(db,market,&target.id,&ai_snapshot).await?)
+                || target.available != Some(true)
                 || target.date.as_str() > chrono::Utc::now().format("%Y-%m-%d").to_string().as_str()
             {
                 continue;
@@ -1642,7 +1646,8 @@ pub async fn execute(
                 target = serde_json::from_value(release(db, &target.id, market, false).await?)
                     .map_err(|e| e.to_string())?;
             }
-            if !target.tracks_loaded {
+            let ai_snapshot = target.ai_policy_payload();
+            if !target.tracks_loaded || crate::ai_policy::payload_blocked(db,market,&target.id,&ai_snapshot).await? {
                 continue;
             }
             for local in relevant {

@@ -6,6 +6,7 @@ mod release_context;
 #[cfg(test)]
 mod release_context_tests;
 mod availability;
+mod ai_policy;
 mod network;
 mod progress;
 mod subscriber_metadata;

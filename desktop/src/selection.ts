@@ -38,6 +38,7 @@ export function selectedReleases(selection: Selection): Selection {
 export type ReleaseSelectionRow = {
   id: string;
   artist_group?: boolean;
+  ai_blocked?: boolean;
   children?: ReleaseSelectionRow[];
 };
 /** Artist rows are display containers; only real release IDs enter queue/API state. */
@@ -50,7 +51,7 @@ export function releaseSelectionState(
   selection: Selection,
   row: ReleaseSelectionRow,
 ): "checked" | "mixed" | "empty" {
-  const states = releaseRows([row]).map(release =>
+  const states = releaseRows([row]).filter(release => !release.ai_blocked).map(release =>
     parentState(selection[release.id], (release.children || []).map(track => track.id)));
   if (states.length && states.every(state => state === "checked")) return "checked";
   return states.some(state => state !== "empty") ? "mixed" : "empty";
@@ -61,6 +62,6 @@ export function toggleReleaseRows(
   checked: boolean,
 ): Selection {
   const next = { ...selection };
-  releaseRows(rows).forEach(release => { next[release.id] = checked ? null : []; });
+  releaseRows(rows).forEach(release => { next[release.id] = checked && !release.ai_blocked ? null : []; });
   return next;
 }

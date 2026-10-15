@@ -10,7 +10,7 @@
 
 ## What it does
 
-- **Prepare your library:** preview tag corrections, organise folders and review local duplicates.
+- **Prepare your library:** preview tag corrections, organise folders, review local duplicates and flag AI-labelled files for removal.
 - **Link your collection:** match album artists, recordings and whole releases using cached catalogue evidence.
 - **Find missing music:** discover new releases and incomplete albums, filter recommendations, and queue selected tracks.
 - **Update your files:** fill available tags—including BPM and Camelot keys—improve artwork, and audit MQA files.

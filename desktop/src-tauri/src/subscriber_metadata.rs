@@ -23,6 +23,7 @@ pub fn merge(track: &mut TidalTrack, raw: &Value) {
     if id != track.id || track.isrc.as_deref().zip(raw["isrc"].as_str()).is_some_and(|(a,b)| !a.eq_ignore_ascii_case(b)) {
         return;
     }
+    if let Some(flag) = raw["ai"].as_bool() { track.ai = Some(flag); }
     track.bpm_checked |= raw.get("bpm").is_some();
     track.key_checked |= raw.get("key").is_some();
     if track.artists.is_empty() {track.artists=artist_credits(raw);}
@@ -199,6 +200,7 @@ pub fn tracks(value: &Value) -> Result<Vec<TidalTrack>, String> {
                 item["version"].as_str(),
             ),
             isrc: item["isrc"].as_str().map(str::to_owned),
+            ai: item["ai"].as_bool(),
             track_number: position as u32,
             disc_number: disc as u32,
             duration: item["duration"].as_f64().unwrap_or(0.),
@@ -341,12 +343,12 @@ async fn saved_dj_checks(conn: &turso::Connection, market: &str, ids: &[String])
 
 fn supplement_response(value: &mut Value, prior: Option<&Value>, checks: &HashMap<String,Value>) {
     let canonical: HashMap<_,_> = prior.and_then(|prior|serde_json::from_value::<Vec<TidalTrack>>(prior["tracks"].clone()).ok()).unwrap_or_default()
-        .into_iter().map(|track|(track.id.clone(),json!({"id":track.id,"isrc":track.isrc,"bpm":track.bpm,"key":track.key,"keyScale":track.key_scale,"copyright":track.copyright}))).collect();
+        .into_iter().map(|track|(track.id.clone(),json!({"id":track.id,"isrc":track.isrc,"ai":track.ai,"bpm":track.bpm,"key":track.key,"keyScale":track.key_scale,"copyright":track.copyright}))).collect();
     for item in value["items"].as_array_mut().into_iter().flatten() {
         let id = crate::tidal::resource_id(&item["id"]);
         for source in canonical.get(&id).into_iter().chain(checks.get(&id)) {
             if item["isrc"].as_str().zip(source["isrc"].as_str()).is_some_and(|(a,b)|!a.eq_ignore_ascii_case(b)) { continue; }
-            for field in ["isrc","bpm","key","keyScale","copyright"] {
+            for field in ["isrc","ai","bpm","key","keyScale","copyright"] {
                 let absent = item[field].is_null() || item[field].as_str().is_some_and(|value|value.trim().is_empty()) || (field == "bpm" && item[field].as_f64().is_some_and(|value|value <= 0.));
                 if field == "keyScale" && item["key"].as_str().zip(source["key"].as_str()).is_some_and(|(a,b)|a != b) { continue; }
                 if absent && !source[field].is_null() { item[field] = source[field].clone(); }
@@ -439,6 +441,7 @@ pub fn supplement(new: &mut [TidalTrack], old: &[TidalTrack]) {
         }) else {
             continue;
         };
+        track.ai = track.ai.or(prior.ai);
         track.bpm = track.bpm.or(prior.bpm);
         track.bpm_checked |= prior.bpm_checked;
         track.key_checked |= prior.key_checked;
@@ -554,6 +557,27 @@ pub async fn prefetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ai_track_metadata_keeps_unknown_distinct_and_accepts_false_corrections() {
+        let raw = json!({"items":[{"id":121,"title":"Song","trackNumber":1,"volumeNumber":1,"credits":[],"ai":true}]});
+        let mut parsed = tracks(&raw).unwrap();
+        assert_eq!(parsed[0].ai,Some(true));
+        let mut sparse = TidalTrack {id:"121".into(),..Default::default()};
+        supplement(std::slice::from_mut(&mut sparse),&parsed);
+        assert_eq!(sparse.ai,Some(true));
+        merge(&mut parsed[0],&json!({"id":121,"ai":false}));
+        supplement(&mut parsed,std::slice::from_ref(&sparse));
+        assert_eq!(parsed[0].ai,Some(false),"A new explicit correction must not be poisoned by older cache data");
+        merge(&mut parsed[0],&json!({"id":121,"ai":"true"}));
+        assert_eq!(parsed[0].ai,Some(false));
+        merge(&mut parsed[0],&json!({"id":122,"ai":true}));
+        assert_eq!(parsed[0].ai,Some(false));
+        let mut response = json!({"items":[{"id":121},{"id":122,"ai":false}]});
+        supplement_response(&mut response,Some(&json!({"tracks":[{"id":"121","ai":true},{"id":"122","ai":true}]})),&HashMap::new());
+        assert_eq!(response["items"][0]["ai"],true);
+        assert_eq!(response["items"][1]["ai"],false);
+    }
+
     #[test]
     fn credited_audio_excludes_video_and_keeps_roles_and_supplements() {
         let page = json!([

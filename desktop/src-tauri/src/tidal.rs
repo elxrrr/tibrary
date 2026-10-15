@@ -32,6 +32,9 @@ pub struct TidalTrack {
     #[serde(default, deserialize_with = "nullable_vec")]
     pub artists: Vec<Value>,
     pub isrc: Option<String>,
+    /// Provider classification only; absent or non-boolean values stay unknown.
+    #[serde(default, deserialize_with = "strict_optional_bool")]
+    pub ai: Option<bool>,
     pub track_number: u32,
     pub disc_number: u32,
     pub duration: f64,
@@ -73,6 +76,8 @@ pub struct TidalRelease {
     pub availability_source: Option<String>,
     pub track_count: usize,
     pub explicit: bool,
+    #[serde(default, deserialize_with = "strict_optional_bool")]
+    pub ai: Option<bool>,
     #[serde(default, deserialize_with = "copyright_from_value")]
     pub copyright: Option<String>,
     pub label: Option<String>,
@@ -81,6 +86,8 @@ pub struct TidalRelease {
     pub providers: Vec<Value>,
     pub catalogue_metadata_status: Value,
     pub catalogue_metadata: Value,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub catalogue_attributes: Value,
     pub quality: String,
     #[serde(default, deserialize_with = "nullable_vec")]
     pub tracks: Vec<TidalTrack>,
@@ -106,6 +113,18 @@ pub struct TidalRelease {
     /// The artist-list summary which last described this release, excluding
     /// request timestamps and availability. Stable credits need no repeat fetch.
     pub summary_fingerprint: Option<String>,
+}
+
+impl TidalRelease {
+    /// Keep safety checks cheap: credits and other extended metadata do not
+    /// need copying just to inspect the provider's exact classification.
+    pub(crate) fn ai_policy_payload(&self) -> Value {
+        json!({"ai":self.ai,
+            "catalogue_attributes":{"ai":self.catalogue_attributes["ai"]},
+            "catalogue_metadata":{"data":{"attributes":{"ai":self.catalogue_metadata.pointer("/data/attributes/ai")}}},
+            "tracks":self.tracks.iter()
+                .map(|track|json!({"id":track.id,"ai":track.ai})).collect::<Vec<_>>()})
+    }
 }
 
 fn nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -152,6 +171,14 @@ where
     }
 }
 
+/// A classification must be an actual boolean, never inferred from text or IDs.
+pub(crate) fn strict_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)?.as_bool())
+}
+
 fn optional_bool_from_value<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -167,6 +194,71 @@ where
 
 #[cfg(test)]
 mod release_payload_tests {
+    #[test]
+    fn ai_classification_is_boolean_and_survives_adapters() {
+        use super::*;
+        for value in [Value::Null, json!("true"), json!(1), json!({"ai":true})] {
+            let release: TidalRelease = serde_json::from_value(json!({"ai":value})).unwrap();
+            let track: TidalTrack = serde_json::from_value(json!({"ai":value})).unwrap();
+            assert_eq!(release.ai, None);
+            assert_eq!(track.ai, None);
+        }
+        for flag in [true,false] {
+            let raw = json!({"id":12,"title":"Release","ai":flag});
+            assert_eq!(release_from_subscriber(&raw,"1").ai,Some(flag));
+            let fields = discovery_fields(&json!({"id":"12","attributes":{"ai":flag}}),&[],1);
+            let mut merged = json!({"ai":!flag});
+            merge_discovery(&mut merged,&fields);
+            assert_eq!(merged["ai"],flag);
+            let payload = json!({"data":[{"id":"121","type":"tracks"}],"included":[{"id":"121","type":"tracks","attributes":{"ai":flag}}]});
+            assert_eq!(parse_release_tracks(&payload).unwrap()[0].ai,Some(flag));
+        }
+        assert_eq!(serde_json::from_value::<TidalRelease>(json!({})).unwrap().ai,None);
+        for legacy in [json!({"catalogue_attributes":{"ai":true}}),json!({"catalogue_metadata":{"data":{"attributes":{"ai":true}}}})] {
+            let release: TidalRelease = serde_json::from_value(legacy).unwrap();
+            assert!(crate::ai_policy::AiFlags::default().payload_blocked(&release.id,&release.ai_policy_payload()));
+            assert!(release.ai_policy_payload()["tracks"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_summary_cache_retains_omitted_flags_and_accepts_explicit_corrections() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("ai-summary-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(dir.join("db")).await.unwrap();
+        let client = TidalClient::from_db(&db).await.unwrap();
+        for (raw,expected) in [
+            (json!({"id":12,"ai":true}),true),
+            (json!({"id":12,"title":"Sparse summary"}),true),
+            (json!({"id":12,"ai":false}),false),
+            (json!({"id":12,"ai":null}),false),
+        ] {
+            client.cache_summaries(&[raw],"GB",&[],"artist_list").await.unwrap();
+            assert_eq!(db.get_preference("subscriber-summary:GB:12").await.unwrap().unwrap()["ai"],expected);
+        }
+        let mut catalogue = TidalCatalogue { id:"1".into(), name:"Artist".into(), releases:vec![TidalRelease {id:"12".into(),ai:Some(true),..Default::default()}] };
+        for (incoming, expected) in [(Some(true),true),(None,true),(Some(false),false)] {
+            catalogue.releases[0].ai = incoming;
+            client.save_catalogue_to_db(&db,"GB",&catalogue).await.unwrap();
+            let conn = db.connect().unwrap();
+            let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id='1' AND market='GB'",()).await.unwrap();
+            let payload: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&payload).unwrap()["releases"][0]["ai"],expected);
+        }
+        let mut legacy = json!(catalogue);
+        legacy["releases"][0]["ai"] = Value::Null;
+        legacy["releases"][0]["catalogue_attributes"] = json!({"ai":true});
+        db.connect().unwrap().execute("UPDATE catalogue SET payload=? WHERE artist_id='1' AND market='GB'",(legacy.to_string(),)).await.unwrap();
+        catalogue.releases[0].ai = None;
+        client.save_catalogue_to_db(&db,"GB",&catalogue).await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT payload FROM catalogue WHERE artist_id='1' AND market='GB'",()).await.unwrap();
+        let payload: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&payload).unwrap()["releases"][0]["ai"],true,"Sparse refresh preserves legacy nested evidence");
+        drop(rows); drop(conn);
+        drop(client);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn optional_metadata_reuses_successful_absence_and_global_retry_without_authentication() {
         use super::*;
@@ -532,9 +624,25 @@ impl TidalClient {
         let conn = self.db.connect()?;
         conn.execute("BEGIN IMMEDIATE",()).await.map_err(|error|error.to_string())?;
         let result = async {
+            // Some summary endpoints omit optional flags. Retain a previously
+            // observed boolean, while an explicit fresh false can clear true.
+            let keys: Vec<_> = values.iter().filter(|raw| raw["ai"].as_bool().is_none())
+                .map(|raw| format!("subscriber-summary:{market}:{}", resource_id(&raw["id"]))).collect();
+            let mut known_ai = std::collections::HashMap::new();
+            if !keys.is_empty() {
+                let mut saved = conn.query("SELECT key,payload FROM app_preferences WHERE key IN (SELECT value FROM json_each(?))", (json!(keys).to_string(),)).await.map_err(|error|error.to_string())?;
+                while let Some(row) = saved.next().await.map_err(|error|error.to_string())? {
+                    let key: String = row.get(0).map_err(|error|error.to_string())?;
+                    let raw: String = row.get(1).map_err(|error|error.to_string())?;
+                    if let Some(flag) = serde_json::from_str::<Value>(&raw).ok().and_then(|value|value["ai"].as_bool()) { known_ai.insert(key,flag); }
+                }
+            }
             for raw in values {
                 let id = resource_id(&raw["id"]);
                 let mut raw = raw.clone();
+                if raw["ai"].as_bool().is_none() {
+                    if let Some(flag) = known_ai.get(&format!("subscriber-summary:{market}:{id}")) { raw["ai"] = json!(flag); }
+                }
                 raw["availability_source"] = json!(source);
                 conn.execute("INSERT OR REPLACE INTO app_preferences(key,payload) VALUES(?,?)",(format!("subscriber-summary:{market}:{id}"),raw.to_string())).await.map_err(|error|error.to_string())?;
                 let artists = album_artists(&raw);
@@ -944,6 +1052,10 @@ impl TidalClient {
                     ) {
                         for release in fresh {
                             if let Some(cached) = prior.iter().find(|r| r["id"] == release["id"]) {
+                                if let Some(flag) = crate::ai_policy::payload_label(release)
+                                    .or_else(||crate::ai_policy::payload_label(cached)) {
+                                    release["ai"] = json!(flag);
+                                }
                                 for field in [
                                     "upc",
                                     "original_release_date",
@@ -955,6 +1067,7 @@ impl TidalClient {
                                     "providers",
                                     "catalogue_metadata_status",
                                     "catalogue_metadata",
+                                    "catalogue_attributes",
                                     "official",
                                     "release_group_id",
                                     "primary_type",
@@ -1090,6 +1203,7 @@ pub fn parse_release_tracks(payload: &Value) -> Result<Vec<TidalTrack>, String> 
             }).collect(),
             title: format_title(a["title"].as_str().unwrap_or(""), a["version"].as_str()),
             isrc: a["isrc"].as_str().map(str::to_owned),
+            ai: a["ai"].as_bool(),
             track_number: m["trackNumber"]
                 .as_u64()
                 .or_else(|| a["trackNumber"].as_u64())
@@ -1202,7 +1316,7 @@ fn discovery_fields(resource: &Value, included: &[Value], now: i64) -> Value {
         .filter_map(|reference|reference["type"].as_str().zip(reference["id"].as_str()).map(|(kind,id)|(kind.to_owned(),id.to_owned()))).collect();
     let related:Vec<_>=included.iter().filter(|value|value["type"].as_str().zip(value["id"].as_str()).is_some_and(|(kind,id)|references.contains(&(kind.to_owned(),id.to_owned())))).cloned().collect();
     json!({"schema":DISCOVERY_SCHEMA,"checked_at":now,"valid_until":now+if complete {DISCOVERY_MAX_AGE} else {3600},"genres":genres,"replacement_id":replacement,
-        "label":label,"providers":providers,"official":attrs["official"],"original_release_date":attrs["originalReleaseDate"],"source":"subscriber",
+        "label":label,"providers":providers,"official":attrs["official"],"ai":attrs["ai"].as_bool(),"original_release_date":attrs["originalReleaseDate"],"source":"subscriber",
         "catalogue_metadata":{"data":resource,"included":related},
         "catalogue_metadata_status":{"status":"checked","checked_at":now,"fields":{"genres":genre_status,"label":if label.is_some() {"supplied"} else {"not_supplied"},"providers":provider_status,"replacement":replacement_status,"original_release_date":if attrs["originalReleaseDate"].as_str().is_some_and(|date|!date.is_empty()) {"supplied"} else {"not_supplied"}}}})
 }
@@ -1413,6 +1527,7 @@ pub(crate) fn release_from_subscriber(raw: &Value, artist_id: &str) -> TidalRele
         availability_source: raw["availability_source"].as_str().map(str::to_owned),
         track_count: raw["numberOfTracks"].as_u64().unwrap_or(0) as usize,
         explicit: raw["explicit"].as_bool().unwrap_or(false),
+        ai: raw["ai"].as_bool(),
         copyright: raw["copyright"].as_str().map(str::to_owned),
         label: raw["label"]
             .as_str()
@@ -1740,6 +1855,7 @@ async fn live_optional_discovery_contract() {
 /// Preserve known metadata when optional fields are absent or empty upstream.
 pub fn merge_discovery(value: &mut Value, fields: &Value) {
     for field in [
+        "ai",
         "genres",
         "replacement_id",
         "label",
