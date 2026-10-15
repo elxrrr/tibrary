@@ -56,6 +56,13 @@ async function expandLocalArtist(page: Page, artist = "North Assembly") {
   await expect(expander).toBeVisible();
   if (await expander.getAttribute("aria-expanded") !== "true") await expander.click();
 }
+async function expandMissingArtist(page: Page, artist = "North Assembly") {
+  const expander = page.getByRole("button", {name:`Expand ${artist}`,exact:true});
+  const expanded = page.getByRole("button", {name:`Collapse ${artist}`,exact:true});
+  if (await expanded.count()) return;
+  await expect(expander).toBeVisible();
+  await expander.click();
+}
 async function localTrackRow(page: Page, title: string, release = "Blue Hours", artist = "North Assembly"): Promise<Locator> {
   await expandLocalArtist(page, artist);
   return localFileRow(page, title, release);
@@ -69,9 +76,9 @@ async function localFileRow(page: Page, title: string, release = "Blue Hours"): 
   await expandLocalRelease(page, release);
   return page.locator("tbody tr").filter({has: page.getByRole("checkbox", {name: `Select track ${title}`, exact: true})});
 }
-async function expectTrackPositionInTracks(page: Page, title: string, position: string) {
+async function expectTrackPositionInTracks(page: Page, title: string, position: string, titleColumn = 1) {
   const row = page.locator("tbody tr").filter({has: page.getByRole("checkbox", {name: `Select track ${title}`, exact: true})});
-  await expect(row.locator("td").nth(1)).toHaveText(title);
+  await expect(row.locator("td").nth(titleColumn)).toHaveText(title);
   const positionCell = row.getByRole("cell", {name: position, exact: true});
   await expect(positionCell).toBeVisible();
   const header = page.locator("thead th").filter({has: page.getByRole("button", {name: "Tracks", exact: true})});
@@ -151,6 +158,20 @@ test.beforeEach(async ({ page }) => {
       },
     },
   );
+  if (test.info().title.startsWith("missing releases group album artists")) {
+    execFileSync("python3", ["-c", `import json,sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+track={'id':'92000100','title':'Orbit','duration':180.0,'track_number':1,'disc_number':1,'isrc':'GBTEST260001'}
+base={'artist':'South Circuit','available':True,'quality':'LOSSLESS','tracks_loaded':True,'type':'SINGLE','explicit':False}
+older={**base,'id':'920001','title':'Orbit','date':'2025-01-01','track_count':1,'tracks':[track]}
+newer={**base,'id':'920002','title':'After Orbit','type':'EP','date':'2026-09-01','track_count':2,'tracks':[{**track,'id':'92000200'},{**track,'id':'92000201','title':'Landing','track_number':2,'isrc':'GBTEST260002'}]}
+c.execute("INSERT INTO mappings VALUES('South Circuit','900002','confirmed','fixture',1)")
+c.execute("INSERT INTO catalogue VALUES('900002','GB',?,'2026-10-01')",(json.dumps({'id':'900002','name':'South Circuit','releases':[older,newer]}),))
+for r in [older,newer]:
+ c.execute('INSERT INTO app_preferences VALUES(?,?)',('release-artists:GB:'+r['id'],json.dumps({'ids':['900002'],'checked_at':1790000000,'source':'fixture album credits'})))
+c.execute("UPDATE queue SET decision='removed'")
+c.commit()`, join(folder,"db")]);
+  }
   if (test.info().title.startsWith("missing release disclosure replaces stale")) {
     execFileSync("python3", ["-c", `import hashlib,json,sqlite3,sys,time
 c=sqlite3.connect(sys.argv[1]); artist,market,payload=c.execute("SELECT artist_id,market,payload FROM catalogue LIMIT 1").fetchone(); catalogue=json.loads(payload)
@@ -377,6 +398,7 @@ test("tables publish usable results while catalogue revisions keep advancing", a
   await viewOption(page, "Release timeline", "All missing releases");
   await page.evaluate(()=>{(window as any).refreshTestTimer=setInterval(()=>(window as any).emitBackendEvent({event:"changed"}),80);});
   try {
+    await expandMissingArtist(page);
     await expect(page.locator("tbody")).toContainText("Night Maps",{timeout:1800});
     await expect(page.getByRole("button",{name:"Update missing releases",exact:true})).toBeDisabled();
     await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
@@ -402,6 +424,7 @@ test("missing release disclosure replaces stale details and preserves table stat
   await page.getByRole("button",{name:"Coverage",exact:true}).click();
   const header=page.locator("th").filter({has:page.getByRole("button",{name:"Coverage",exact:true})});
   const order=await header.getAttribute("aria-sort");
+  await expandMissingArtist(page);
   const parent=page.getByRole("checkbox",{name:"Select Night Maps",exact:true});
   await parent.check();
   await page.getByRole("button",{name:"Expand Night Maps",exact:true}).click();
@@ -1283,10 +1306,11 @@ test("missing releases queue only the selected audio tracks", async ({
     .getByRole("button", { name: "Missing releases", exact: true })
     .click();
   await viewOption(page, "Release timeline", "All missing releases");
+  await expandMissingArtist(page);
   await page
     .getByRole("button", { name: "Expand Blue Hours", exact: true })
     .click();
-  await expectTrackPositionInTracks(page, "First Light", "1 · 1");
+  await expectTrackPositionInTracks(page, "First Light", "1 · 1", 2);
   await page
     .getByRole("checkbox", { name: "Select Blue Hours", exact: true })
     .check();
@@ -2100,6 +2124,54 @@ test("match unresolved artists skips confirmed artists without network work", as
   expect(status.result.online_job.result.checked).toBe(0);
 });
 
+
+test("missing releases group album artists and queue exact release or track choices", async ({page}) => {
+  const args={route:"missing",group_artists:true,timeline:"All missing releases",artist_scope:"My album artists",recommendation:"Recommended and potential",sort:"date",direction:"desc",limit:1};
+  const first=(await rpc("table",args)).result;
+  const second=(await rpc("table",{...args,offset:1})).result;
+  expect(first.total).toBe(2);
+  expect(first.rows[0].artist).toBe("South Circuit");
+  expect(second.rows[0].artist).toBe("North Assembly");
+  expect(first.rows[0].children.map((release:any)=>release.id)).toEqual(["920002"]);
+  expect(first.release_total).toBeGreaterThan(first.total);
+  const superseded=(await rpc("table",{...args,recommendation:"Superseded",limit:100})).result;
+  expect(superseded.rows[0].children.map((release:any)=>release.id)).toContain("920001");
+  const queues:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="queue.add") queues.push(request.args.selection);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
+  await viewOption(page,"Release timeline","All missing releases");
+  await expect(page.locator("tbody tr").first()).toContainText("South Circuit");
+  await expect(page.getByRole("navigation",{name:"Table pagination"})).toContainText("2 artists");
+  await expandMissingArtist(page,"South Circuit");
+  await expect(page.getByRole("checkbox",{name:"Select Orbit",exact:true})).toHaveCount(0);
+  await page.getByRole("button",{name:"Expand After Orbit",exact:true}).click();
+  await page.getByRole("checkbox",{name:"Select track Orbit",exact:true}).check();
+  await expect(page.getByRole("checkbox",{name:"Select After Orbit",exact:true})).toHaveJSProperty("indeterminate",true);
+  await page.getByRole("button",{name:"Queue selected (1)",exact:true}).click();
+  await expect.poll(()=>queues.length).toBe(1);
+  expect(queues[0]).toEqual({"920002":["92000200"]});
+  if(process.env.TIBRARY_GROUP_SCREENSHOT) {await expandMissingArtist(page);await page.screenshot({path:"/private/tmp/tibrary-missing-artist-groups.png"});}
+  await page.getByRole("button",{name:"Album artist",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Collapse South Circuit",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select track Orbit",exact:true})).toBeChecked();
+  await page.getByRole("checkbox",{name:"Select visible rows",exact:true}).check();
+  const button=page.getByRole("button",{name:/^Queue selected \(\d+\)$/});
+  await button.click();
+  await expect.poll(()=>queues.length).toBe(2);
+  expect(Object.keys(queues[1]).every(id=>/^\d+$/.test(id))).toBe(true);
+  expect(Object.values(queues[1]).every(value=>value===null)).toBe(true);
+  await columnOnly(page,"Recommendation",["Superseded"]);
+  await expect(page.getByRole("checkbox",{name:"Select Orbit",exact:true})).toBeVisible();
+  await expect(page.getByRole("checkbox",{name:"Select After Orbit",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+
+});
+
 test("missing release filters, bidirectional sort and paging preserve the release rows", async ({page}) => {
   await rpc("queue.decision",{ids:["910002","910003","910004","910005","910006"],decision:"removed"});
   const args={route:"missing",timeline:"All missing releases",artist_scope:"My album artists",sort:"release",direction:"asc",limit:2};
@@ -2114,6 +2186,7 @@ test("missing release filters, bidirectional sort and paging preserve the releas
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
   await columnOnly(page, "Type", ["EP"]);
+  await expandMissingArtist(page);
   await expect(page.locator("tbody")).toContainText("Between Stations");
   await expect(page.locator("tbody")).not.toContainText("Night Maps");
   await columnAll(page, "Type");
@@ -2366,6 +2439,7 @@ test("missing release metadata shows saved credits and independent confidence fi
   await columnOnly(page,"Recommendation",["Potential"]);
   await expect.poll(()=>queries.some(args=>args.artist_scope==="My album artists" && args.column_filters?.recommendation?.include?.join()==="Potential")).toBe(true);
   await columnAll(page,"Recommendation");
+  await expandMissingArtist(page);
   const row=page.locator("tbody tr").filter({hasText:"Night Maps"}).first();
   await expect(row).toBeVisible();
   await row.click({button:"right"});
@@ -2408,7 +2482,7 @@ test("catalogue refresh publishes partial results without resetting table state 
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
     if(request.method==="job.start") starts++;
-    const response=await rpc(request.method,request.args);
+    const response=await rpc(request.method,request.method==="table" && request.args.route==="missing" ? {...request.args,group_artists:false} : request.args);
     if(["state","job.status"].includes(request.method) && response.result) {
       response.result.online_job=job;
       if(request.method==="state") {stateCalls++;response.result.revision=500+phase;}
@@ -2479,6 +2553,7 @@ test("missing release availability checks use the requested scope and preserve u
   await columnAll(page,"Recommendation");
   await viewOption(page,"Album artist scope","All artist appearances");
   await columnOnly(page,"Coverage",["Unavailable"]);
+  await expandMissingArtist(page);
   await expect(page.locator("tbody")).toContainText("Private Weather");
   await expect(page.getByRole("button",{name:"View options",exact:true})).toHaveAttribute("title",/All missing releases/);
   await columnAll(page, "Coverage");
@@ -2499,6 +2574,7 @@ test("missing release availability checks use the requested scope and preserve u
   await actionOption(page, "Release update options", "Check availability");
   await expect.poll(()=>checks.length).toBe(2);
   expect([...checks[1].ids].sort()).toEqual(visible.map((row:any)=>row.id).sort());
+  await expandMissingArtist(page);
   await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
   await page.getByRole("button",{name:"Actions for track First Light",exact:true}).click();
   await page.getByRole("menuitem",{name:"Check release availability",exact:true}).click();
@@ -2876,6 +2952,7 @@ test("disconnected library can refresh missing releases and download only the ap
   await expect.poll(() => started.length).toBe(1);
   expect(started[0].args.root).toBe(join(folder,"music"));
   await viewOption(page, "Release timeline", "All missing releases");
+  await expandMissingArtist(page);
   await page.getByRole("button", {name:"Expand Blue Hours",exact:true}).click();
   await page.getByRole("checkbox", {name:"Select track Low Tide",exact:true}).check();
   await page.getByRole("button", {name:"Queue selected (1)",exact:true}).click();

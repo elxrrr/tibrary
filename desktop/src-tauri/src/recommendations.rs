@@ -801,11 +801,15 @@ pub fn local_credit_names(metadata: &Value) -> HashSet<String> {
 /// identified. Unknown track lists, unique mixes and territory failures stay visible.
 pub fn subsumed_releases(
     releases: &[crate::tidal::TidalRelease],
+    usable_targets: &HashSet<String>,
 ) -> std::collections::HashMap<String, String> {
     use crate::release_matching::{clean_isrc, recording_matches};
     let eligible = |r: &crate::tidal::TidalRelease| {
         r.tracks_loaded
             && !r.tracks.is_empty()
+            // Normalized counts describe audio tracks only. A video bundled
+            // with an album does not count as a missing audio recording.
+            && r.track_count == r.tracks.len()
             && r.available == Some(true)
             && r.official != Some(false)
             && !r.r#type.eq_ignore_ascii_case("compilation")
@@ -817,7 +821,9 @@ pub fn subsumed_releases(
     };
     let mut index: std::collections::HashMap<(String, String), Vec<usize>> =
         std::collections::HashMap::new();
-    for (i, r) in releases.iter().enumerate().filter(|(_, r)| eligible(r)) {
+    // Filter before choosing the largest edition: a suspect, ignored or
+    // collapsed catalogue ID must not block another usable containing release.
+    for (i, r) in releases.iter().enumerate().filter(|(_, r)| eligible(r) && usable_targets.contains(&r.id)) {
         for t in &r.tracks {
             if let Some(isrc) = clean_isrc(t.isrc.as_deref()).filter(|s| !s.is_empty()) {
                 index
@@ -844,14 +850,16 @@ pub fn subsumed_releases(
                     || target.date < source.date
                     || target.tracks.len() <= source.tracks.len()
                     || target.explicit != source.explicit
-                    || target.audio_modes != source.audio_modes
+                    || !equivalent_audio_modes(&target.audio_modes, &source.audio_modes)
+                    || !release_quality_at_least(&source.quality, &target.quality)
                 {
                     return false;
                 }
                 let mut used = HashSet::new();
                 source.tracks.iter().all(|s| {
                     target.tracks.iter().enumerate().any(|(i, t)| {
-                        let same = s.isrc.as_ref().is_some_and(|id| !id.is_empty())
+                        let same = s.duration.is_finite() && t.duration.is_finite()
+                            && clean_isrc(s.isrc.as_deref()).is_some_and(|id| !id.is_empty())
                             && clean_isrc(s.isrc.as_deref()) == clean_isrc(t.isrc.as_deref())
                             && recording_matches(
                                 &s.title,
@@ -878,6 +886,32 @@ pub fn subsumed_releases(
         }
     }
     result
+}
+
+fn equivalent_audio_modes(left: &[String], right: &[String]) -> bool {
+    let normalized = |modes: &[String]| modes.iter()
+        .map(|mode| mode.trim().to_ascii_uppercase())
+        .filter(|mode| !mode.is_empty()).collect::<HashSet<_>>();
+    normalized(left) == normalized(right)
+}
+
+fn release_quality_at_least(source: &str, target: &str) -> bool {
+    let normalize = |quality: &str| quality.trim().to_ascii_uppercase().replace('-', "_");
+    let source = normalize(source);
+    let target = normalize(target);
+    let rank = |quality: &str| match quality {
+        "HI_RES_LOSSLESS" | "HIRES_LOSSLESS" => Some(4),
+        "LOSSLESS" => Some(3),
+        "HIGH" => Some(2),
+        "LOW" => Some(1),
+        _ => None,
+    };
+    match (rank(&source), rank(&target)) {
+        (Some(source), Some(target)) => target >= source,
+        // Unknown/legacy quality names establish no upgrade or downgrade.
+        // Equal values retain compatibility with older complete caches.
+        _ => source == target,
+    }
 }
 
 #[cfg(test)]
@@ -1177,6 +1211,7 @@ mod tests {
         };
         let older = TidalRelease {
             id: "old".into(),
+            track_count: 1,
             artist: "Artist".into(),
             date: "2020-01-01".into(),
             tracks_loaded: true,
@@ -1186,6 +1221,7 @@ mod tests {
         };
         let mut newer = TidalRelease {
             id: "new".into(),
+            track_count: 2,
             date: "2021-01-01".into(),
             tracks: vec![
                 track.clone(),
@@ -1199,15 +1235,93 @@ mod tests {
             ..older.clone()
         };
         assert_eq!(
-            subsumed_releases(&[older.clone(), newer.clone()])
+            subsumed_releases(&[older.clone(), newer.clone()], &HashSet::from(["new".into()]))
                 .get("old")
                 .map(String::as_str),
             Some("new")
         );
         newer.tracks[0].title = "Song (Extended Mix)".into();
-        assert!(subsumed_releases(&[older.clone(), newer.clone()]).is_empty());
+        assert!(subsumed_releases(&[older.clone(), newer.clone()], &HashSet::from(["new".into()])).is_empty());
         newer.tracks[0] = track;
         newer.available = Some(false);
-        assert!(subsumed_releases(&[older, newer]).is_empty());
+        assert!(subsumed_releases(&[older, newer], &HashSet::from(["new".into()])).is_empty());
+    }
+
+    #[test]
+    fn supersession_uses_the_largest_usable_complete_edition() {
+        use crate::tidal::{TidalRelease, TidalTrack};
+        let release = |id: &str, count: usize, date: &str| TidalRelease {
+            id: id.into(), artist: "Example".into(), date: date.into(),
+            available: Some(true), tracks_loaded: true, track_count: count,
+            quality: "LOSSLESS".into(), audio_modes: vec!["STEREO".into()],
+            tracks: (0..count).map(|index| TidalTrack {
+                title: format!("Song {index}"), isrc: Some(format!("GB000{index}")),
+                duration: 180.0, ..Default::default()
+            }).collect(), ..Default::default()
+        };
+        let single = release("single", 1, "2020-01-01");
+        let ep = release("ep", 2, "2020-02-01");
+        let album = release("album", 3, "2020-03-01");
+        let blocked = release("unusable", 4, "2020-04-01");
+        let releases = vec![single.clone(), ep.clone(), album.clone(), blocked];
+        let selected = subsumed_releases(&releases, &HashSet::from(["ep".into(), "album".into()]));
+        assert_eq!(selected.get("single").map(String::as_str), Some("album"));
+        assert_eq!(selected.get("ep").map(String::as_str), Some("album"));
+        assert!(!selected.contains_key("album"));
+        let selected = subsumed_releases(&releases, &HashSet::from(["ep".into()]));
+        assert_eq!(selected.get("single").map(String::as_str), Some("ep"));
+        assert!(!selected.contains_key("ep"));
+
+        let mut unloaded = album.clone();
+        unloaded.tracks_loaded = false;
+        assert!(subsumed_releases(&[single.clone(), unloaded], &HashSet::from(["album".into()])).is_empty());
+        let mut incomplete = album.clone();
+        incomplete.track_count += 1;
+        assert!(subsumed_releases(&[single.clone(), incomplete], &HashSet::from(["album".into()])).is_empty());
+        let mut partial_source = ep;
+        partial_source.track_count += 1;
+        assert!(subsumed_releases(&[partial_source, album], &HashSet::from(["album".into()])).is_empty());
+    }
+
+    #[test]
+    fn supersession_preserves_quality_modes_and_unique_versions_and_ignores_videos() {
+        use crate::tidal::TidalTrack;
+        let track = TidalTrack {title:"Song".into(),isrc:Some("GB123".into()),duration:180.0,..Default::default()};
+        let mut source = crate::tidal::release_from_subscriber(&serde_json::json!({
+            "id":1,"title":"Single","artist":{"id":7,"name":"Example"},
+            "releaseDate":"2020-01-01","numberOfTracks":1,"numberOfVideos":0,
+            "audioQuality":"LOSSLESS","audioModes":["STEREO"],"allowStreaming":true,"streamReady":true
+        }), "7");
+        source.tracks = vec![track.clone()];
+        source.tracks_loaded = true;
+        let mut album = crate::tidal::release_from_subscriber(&serde_json::json!({
+            "id":2,"title":"Album with video","artist":{"id":7,"name":"Example"},
+            "releaseDate":"2021-01-01","numberOfTracks":2,"numberOfVideos":1,
+            "audioQuality":"HI_RES_LOSSLESS","audioModes":["STEREO","STEREO"],"allowStreaming":true,"streamReady":true
+        }), "7");
+        album.tracks = vec![track, TidalTrack {title:"Bonus".into(),isrc:Some("GB456".into()),duration:200.0,..Default::default()}];
+        album.tracks_loaded = true;
+        let targets = HashSet::from(["2".into()]);
+        assert_eq!(album.track_count, 2, "Videos are excluded by the subscriber adapter");
+        assert_eq!(subsumed_releases(&[source.clone(), album.clone()], &targets).get("1").map(String::as_str),Some("2"));
+        // An unrelated bonus recording need not have an ISRC to prove that
+        // the fully identified source recording is included.
+        album.tracks[1].isrc = None;
+        assert_eq!(subsumed_releases(&[source.clone(), album.clone()], &targets).get("1").map(String::as_str),Some("2"));
+        let valid = album.clone();
+        for case in ["lossy", "unknown quality", "spatial", "different mix", "featured performance", "missing duration", "different ISRC"] {
+            album = valid.clone();
+            match case {
+                "lossy" => album.quality = "HIGH".into(),
+                "unknown quality" => album.quality.clear(),
+                "spatial" => album.audio_modes = vec!["DOLBY_ATMOS".into()],
+                "different mix" => album.tracks[0].title = "Song (Extended Mix)".into(),
+                "featured performance" => album.tracks[0].title = "Song (feat. Another Artist)".into(),
+                "missing duration" => album.tracks[0].duration = 0.0,
+                "different ISRC" => album.tracks[0].isrc = Some("US999".into()),
+                _ => unreachable!(),
+            }
+            assert!(subsumed_releases(&[source.clone(), album], &targets).is_empty(), "{case}");
+        }
     }
 }

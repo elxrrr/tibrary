@@ -1,6 +1,6 @@
 # Tibrary guide
 
-Version **0.9.30** · [Setup and screenshots](../../README.md)
+Version **0.9.31** · [Setup and screenshots](../../README.md)
 
 ## Everyday workflows
 
@@ -58,13 +58,15 @@ Link releases hides the Various Artists compilation group, including its filter 
 
 Missing releases defaults to **My album artists** and **Recommended and potential**, using album-level artist IDs and the same confidence filter as Overview. Artist scope and recommendation confidence have separate filters, so you can combine **My album artists** with **Recommended**, or inspect other appearances and low-confidence results. Recommendation references come from present local files and their verified online links. Contributor IDs and roles, independent recordings, labels and copyright holders strengthen a match; common distributors, technical credits and genres provide context. Conflicting artists, compilations and unofficial releases cannot become Recommended. A fully checked release with populated creative credits and rights/label metadata, but no shared recording, creative contributor in the same role, specific label or copyright holder, is **Suspect / Low match** when there are at least two independent downloaded creative-credit references. An artist-page ID alone cannot override this check. Incomplete, stale or empty credit checks remain neutral; a label change alone does not disqualify a release. Low-match results remain inspectable by checking **Suspect** in the Recommendation column menu, or choosing **Select all** there.
 
+Missing releases groups album artists above their releases and tracks. By default, the artist with the newest matching release appears first, with releases ordered newest first inside each group. Expand an artist to browse releases, then expand a release for its tracks. Artist checkboxes select its displayed releases; individual tracks can still be queued separately. Pagination counts artists and shows the matching release total; column filters still apply to releases. Artist pages are capped at 50 groups to keep browsing responsive, while smaller configured page sizes are respected.
+
 The Overview count includes all missing, incomplete and queued releases within **My album artists → Recommended and potential**, regardless of the filters currently used on the Missing releases page. Clicking that card opens the same scope.
 
 All main table headers support sorting. Filter icons appear on descriptive columns such as artist, release title, date and status; counts, positions and evidence have no filter menus. Multiple checked values in one column are combined; filters on different columns apply together. Searchable value lists cover the full matching dataset before pagination. **Select all** includes every value, including values beyond the loaded list; **Clear selection** lets you choose just the values you need. **Reset column filters** clears all column selections. Keyboard users can focus a header and press **Shift+F10**; **Escape** closes the menu.
 
 The duplicate filter dropdowns have been removed. Missing releases keeps album-artist scope and release range in **View options**, since these describe the whole view. Confidence, coverage, type, artist and other fields use their column menus. Tag-correction previews initially exclude blank proposed changes; folder previews exclude **No change**. Use the corresponding column menu or **Reset column filters** to show everything. Unavailable releases remain inspectable by selecting all Recommendation values and checking **Unavailable** in Coverage; artist scope and release range still apply.
 
-A release is marked superseded only when cached evidence shows a newer available release contains all its recordings. Exclusive mixes remain protected; superseded items remain inspectable.
+A release is marked superseded only when complete cached audio lists show a newer available release contains all its recordings without a known quality downgrade. Unavailable, ignored or low-confidence editions cannot displace a valid recommendation. Exclusive mixes remain protected. Superseded releases are excluded from the default recommendations and remain inspectable through the Recommendation column filter.
 
 Local duplicates and Online replacements group the release to keep or acquire above its redundant local releases. Expand a group to inspect evidence and select individual releases. Online replacement groups reuse saved results; selecting a group queues its replacement once, while selecting a child retains that child's original plan scope. Originals remain in place. View metadata / match details shows the affected local folders.
 

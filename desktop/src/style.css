@@ -1335,3 +1335,18 @@ thead, thead tr, thead th { background: var(--table-header); opacity: 1; }
 .history-feedback { color: var(--muted); padding: 8px 12px; margin: 0; font-size: 12px; }
 .log-error .log-message { color: var(--danger); }
 .history-sentinel { height: 1px; }
+
+/* Missing releases: one artist heading, releases beneath it, then audio tracks. */
+tr.missing-artist-row { font-weight: 600; }
+tr.missing-artist-row .hierarchy-name {
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  display: inline;
+  max-width: calc(100% - 22px);
+  vertical-align: middle;
+}
+tr.missing-release-row td { height: 33px; }

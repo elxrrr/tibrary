@@ -34,3 +34,33 @@ export function selectedReleases(selection: Selection): Selection {
     Object.entries(selection).filter(([, v]) => v === null || v.length > 0),
   );
 }
+
+export type ReleaseSelectionRow = {
+  id: string;
+  artist_group?: boolean;
+  children?: ReleaseSelectionRow[];
+};
+/** Artist rows are display containers; only real release IDs enter queue/API state. */
+export function releaseRows<T extends ReleaseSelectionRow>(rows: T[]): T[] {
+  return rows.flatMap(row => row.artist_group
+    ? releaseRows((row.children || []) as T[])
+    : [row]);
+}
+export function releaseSelectionState(
+  selection: Selection,
+  row: ReleaseSelectionRow,
+): "checked" | "mixed" | "empty" {
+  const states = releaseRows([row]).map(release =>
+    parentState(selection[release.id], (release.children || []).map(track => track.id)));
+  if (states.length && states.every(state => state === "checked")) return "checked";
+  return states.some(state => state !== "empty") ? "mixed" : "empty";
+}
+export function toggleReleaseRows(
+  selection: Selection,
+  rows: ReleaseSelectionRow[],
+  checked: boolean,
+): Selection {
+  const next = { ...selection };
+  releaseRows(rows).forEach(release => { next[release.id] = checked ? null : []; });
+  return next;
+}

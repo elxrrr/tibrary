@@ -2319,8 +2319,11 @@ impl TursoDb {
             .collect();
 
         let catalogue: Vec<_> = full_releases.values().cloned().collect();
-        let superseded = crate::recommendations::subsumed_releases(&catalogue);
-        let usable: HashSet<_> = rows.iter().filter(|r| r.available == Some(true) && (r.recommendation == "Recommended" || r.recommendation == "Potential")).map(|r| r.id.clone()).collect();
+        let usable: HashSet<_> = rows.iter().filter(|r| r.available == Some(true)
+            && r.status != "Ignored"
+            && (r.recommendation == "Recommended" || r.recommendation == "Potential"))
+            .map(|r| r.id.clone()).collect();
+        let superseded = crate::recommendations::subsumed_releases(&catalogue, &usable);
         for row in &mut rows {
             let replacement = superseded.get(&row.id).or_else(|| full_releases.get(&row.id).and_then(|r| r.replacement_id.as_ref()));
             if let Some(id) = replacement.filter(|id| usable.contains(*id)) {
@@ -5411,6 +5414,41 @@ with sqlite3.connect('{db}') as db:
         assert_eq!(row.get::<i64>(0).unwrap(),1);
         assert_eq!(row.get::<String>(1).unwrap(),"queued","Filtering must preserve saved queue decisions");
         drop(queue);
+        drop(conn);
+        drop(store);
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_supersession_chooses_a_usable_target_and_keeps_older_releases_inspectable() {
+        let temp_dir = std::env::temp_dir().join(format!("missing_supersession_{}", uuid::Uuid::new_v4()));
+        let store = TursoDb::open(temp_dir.join("library.sqlite3")).await.unwrap();
+        let conn = store.connect().unwrap();
+        let release = |id: &str, title: &str, count: usize| json!({
+            "id":id,"artist":"Example","title":title,"date":"2020-01-01","type":"ALBUM",
+            "track_count":count,"available":true,"primary_artist_verified":true,"official":true,
+            "quality":"LOSSLESS","audio_modes":["STEREO"],"tracks_loaded":true,
+            "tracks":(0..count).map(|index|json!({"id":format!("{id}-{index}"),"title":format!("Song {index}"),
+                "isrc":format!("GB000{index}"),"duration":180.0,"disc_number":1,"track_number":index+1})).collect::<Vec<_>>()
+        });
+        let mut suspect = release("30", "Unofficial larger release", 3);
+        suspect["official"] = json!(false);
+        let releases = vec![release("10", "Single", 1), release("20", "Complete EP", 2),
+            suspect, release("40", "Ignored larger release", 4)];
+        conn.execute("INSERT INTO mappings(artist,tidal_id,status) VALUES('Example','artist','confirmed')",()).await.unwrap();
+        conn.execute("INSERT INTO catalogue(artist_id,market,payload) VALUES('artist','GB',?)",
+            (json!({"id":"artist","name":"Example","releases":releases}).to_string(),)).await.unwrap();
+        conn.execute("INSERT INTO queue(id,payload,approved,decision,updated) VALUES('40','{}',0,'ignored','2026-01-01')",()).await.unwrap();
+        let rows = store.build_missing_rows("GB").await.unwrap();
+        let single = rows.iter().find(|row|row.id == "10").unwrap();
+        assert_eq!(single.recommendation, "Superseded");
+        assert!(single.evidence.iter().any(|reason|reason.contains("Complete EP · release 20")));
+        assert_ne!(rows.iter().find(|row|row.id == "20").unwrap().recommendation,"Superseded");
+        let recommended = store.get_missing_rows("GB",Some("All missing releases"),Some("Recommended and potential"),None,None,None,None,None,0,100).await.unwrap();
+        assert_eq!(recommended.rows.iter().map(|row|row.id.as_str()).collect::<Vec<_>>(),vec!["20"]);
+        let superseded = store.get_missing_rows("GB",Some("All missing releases"),Some("Superseded"),None,None,None,None,None,0,100).await.unwrap();
+        assert_eq!(superseded.rows.iter().map(|row|row.id.as_str()).collect::<Vec<_>>(),vec!["10"]);
+        assert_eq!(superseded.rows[0].children.len(),1,"Manual review retains the old recording and queue choice");
         drop(conn);
         drop(store);
         std::fs::remove_dir_all(temp_dir).unwrap();

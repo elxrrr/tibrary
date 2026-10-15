@@ -52,7 +52,7 @@ import {
 import { DataTable, Column, HeaderFilter, ColumnSelection, ColumnFilterOptions } from "./DataTable";
 import { ActivityView, streamFor, mergeActivitySnapshot, mergeDownloadMonitor } from "./ActivityView";
 import { workload, jobTitle } from "./ActivityView";
-import { Selection, selectedReleases } from "./selection";
+import { Selection, selectedReleases, releaseRows, toggleReleaseRows } from "./selection";
 import { CoalescedQuery } from "./query";
 import { ScanButton, ScanScope } from "./ScanButton";
 import { ActionButton } from "./ActionButton";
@@ -488,7 +488,9 @@ function App() {
       contrast.removeEventListener("change",refresh);
     };
   }, [displayTheme]);
-  const pageSize = Number(settings?.general?.page_size || 50);
+  const configuredPageSize = Number(settings?.general?.page_size || 50);
+  // Each missing artist includes complete release groups and their cached tracks.
+  const pageSize = route === "missing" ? Math.min(configuredPageSize, 50) : configuredPageSize;
   useEffect(() => { setOffset(0); }, [pageSize]);
   const activeColumnSelections = availableColumnSelections(route, columnSelections);
   const viewArgs = {
@@ -509,7 +511,7 @@ function App() {
     type: "All types",
     include_unavailable: route === "missing",
     group_releases: route === "links" || fileGroupRoutes.has(route),
-    group_artists: route === "links",
+    group_artists: route === "links" || route === "missing",
     local_releases: ["artists", "favourites"].includes(route),
   };
   useEffect(() => {
@@ -720,7 +722,9 @@ function App() {
   async function loadDetail(row: Row) {
     setMenu(null);
     try {
-      if (row.artist_group && route === "links") {
+      if (row.artist_group && route === "missing") {
+        setExpanded(previous => {const next=new Set(previous);next.has(row.id)?next.delete(row.id):next.add(row.id);return next;});
+      } else if (row.artist_group && route === "links") {
         setDetail({local_artist: row});
       } else if (row.file_group) {
         setDetail({local_file_release: row});
@@ -1139,7 +1143,7 @@ function App() {
   }
   function selectedDetail() {
     const id = [...selected][0];
-    if (id) loadDetail((route === "links" || fileGroupRoutes.has(route) ? linkedFiles(data.rows) : data.rows).find(row => row.id === id) || {id, artist:id});
+    if (id) loadDetail((route === "links" || fileGroupRoutes.has(route) ? linkedFiles(data.rows) : route === "missing" ? releaseRows(data.rows) : data.rows).find(row => row.id === id) || {id, artist:id});
   }
   function tableActions() {
     const selectedReleaseCount = Object.keys(selectedReleases(selection)).length;
@@ -1210,7 +1214,7 @@ function App() {
           ...(resumable ? [{id:"resume",label:`Resume refresh (${refresh.completed.length}/${refresh.ids.length})`,note:"Continue the saved refresh from the last completed artist.",onClick:() => run("discography",{...refresh,resume:true})}] : []),
           {id:"lists",label:"Check release lists only",note:"A quicker discovery check that reuses saved track details and credits. No audio is downloaded.",onClick:() => run("discography")},
           {id:"artists",label:"Fill missing release artists",note:"Complete missing album artist evidence for saved releases in the current release range.",onClick:() => run("release_artists",{timeline})},
-          {id:"selected-availability",label:"Check availability",note:selectedReleaseCount ? "Check the selected releases, reusing recent availability checks." : "Check the releases on this page, reusing recent availability checks.",disabled:loading || (!data.rows.length && !selectedReleaseCount),onClick:() => run("check_availability",{ids:selectedReleaseCount ? Object.keys(selectedReleases(selection)) : data.rows.map(row => row.id)})},
+          {id:"selected-availability",label:"Check availability",note:selectedReleaseCount ? "Check the selected releases, reusing recent availability checks." : "Check the releases on this page, reusing recent availability checks.",disabled:loading || (!data.rows.length && !selectedReleaseCount),onClick:() => run("check_availability",{ids:selectedReleaseCount ? Object.keys(selectedReleases(selection)) : releaseRows(data.rows).map(row => row.id)})},
           {id:"saved-availability",label:"Check saved release availability",note:"Check all saved missing releases for linked album artists, reusing recent checks.",onClick:() => run("check_availability")},
           {id:"fresh-availability",label:"Recheck saved availability online",note:"Request fresh availability for all saved releases, including unavailable ones. Bypasses saved availability checks.",onClick:() => run("check_availability",{force:true})},
           {id:"cached",label:"Recalculate saved results",note:"Update ownership and recommendations from the central cache. Makes no network requests.",onClick:() => run("cached_releases")},
@@ -1237,6 +1241,7 @@ function App() {
           ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
           : "No items"}
         {route === "links" && data.total > 0 && ` artists · ${(data.release_total || 0).toLocaleString()} releases · ${(data.track_total || 0).toLocaleString()} tracks`}
+        {route === "missing" && data.artist_total !== undefined && data.total > 0 && ` ${data.artist_total === 1 ? "artist" : "artists"} · ${(data.release_total || 0).toLocaleString()} ${data.release_total === 1 ? "release" : "releases"}`}
         {fileGroupRoutes.has(route) && data.total > 0 && " releases"}
       </span>
       <div>
@@ -1300,7 +1305,7 @@ function App() {
           tree={tree}
           grouped={["local", "online"].includes(route)}
           fileGroups={fileGroupRoutes.has(route)}
-          hierarchy={route === "links" ? "links" : ["artists", "favourites"].includes(route) ? "artists" : undefined}
+          hierarchy={route === "links" ? "links" : route === "missing" ? "missing" : ["artists", "favourites"].includes(route) ? "artists" : undefined}
           treeSelection={selection}
           onTreeSelect={selectTree}
           expanded={expanded}
@@ -1712,10 +1717,11 @@ function App() {
   function contextMenu() {
     if (!menu) return null;
     const r = menu.row;
+    const missingArtistGroup = route === "missing" && !!r.artist_group;
     const replacementGroup = ["local", "online"].includes(route) && !!r.children?.length;
     const groupSelected = ["local", "online"].includes(route) && data.rows.some(parent =>
       selected.has(parent.id) && (parent.children || []).some((child: Row) => child.id === r.id));
-    const ids: string[] = (route === "links" && (r.artist_group || r.link_group)) || r.file_group
+    const ids: string[] = missingArtistGroup ? (selected.size ? [...selected] : releaseRows([r]).map(release => release.id)) : (route === "links" && (r.artist_group || r.link_group)) || r.file_group
       ? (selected.size ? [...selected] : linkedFiles([r]).map(child => child.id))
       : replacementGroup || selected.has(r.id) || groupSelected ? (selected.size ? [...selected] : [r.id]) : [r.id];
     return (
@@ -1744,9 +1750,14 @@ function App() {
             }
           }}
         >
-          <button role="menuitem" onClick={() => loadDetail(r)}>
+          {missingArtistGroup ? <>
+            <button role="menuitem" onClick={() => {setMenu(null);setExpanded(previous => {const next=new Set(previous);next.has(r.id)?next.delete(r.id):next.add(r.id);return next;});}}>{expanded.has(r.id) ? "Collapse" : "Expand"} releases</button>
+            <button role="menuitem" disabled={queueBusy} onClick={() => {selectTree(toggleReleaseRows(selection,ids.map(id => ({id})),true));setMenu(null);}}>Select releases</button>
+            <button role="menuitem" disabled={queueBusy} onClick={() => {selectTree(toggleReleaseRows(selection,ids.map(id => ({id})),false));setMenu(null);}}>Clear release selection</button>
+            <button role="menuitem" disabled={busy} onClick={() => {run("check_availability",{ids});setMenu(null);}}>Check release availability</button>
+          </> : <button role="menuitem" onClick={() => loadDetail(r)}>
             View metadata / match details
-          </button>
+          </button>}
           {route === "artists" && <>
             <button role="menuitem" disabled={busy} onClick={() => {setMenu(null); run("match_artists", {artists: ids});}}>Recheck selected artists</button>
             <button role="menuitem" disabled={busy} onClick={() => unlinkArtists(ids)}>Unlink selected artists</button>
@@ -1836,14 +1847,14 @@ function App() {
               </button>
             </>
           )}
-          {["missing", "queue", "downloaded"].includes(route) && (
+          {!missingArtistGroup && ["missing", "queue", "downloaded"].includes(route) && (
             <button role="menuitem" disabled={busy}
               title="Refresh track metadata and credits using your streaming account. Saved metadata is retained if the request fails."
               onClick={() => {run("release_details", {id:r.parent || r.id, force:true}); setMenu(null);}}>
               Refresh track details and credits
             </button>
           )}
-          {["missing", "queue"].includes(route) && (
+          {!missingArtistGroup && ["missing", "queue"].includes(route) && (
             <button role="menuitem" disabled={busy}
               title="Recheck this release in your configured market, replacing its saved availability check."
               onClick={() => {run("check_availability", {ids:[r.parent || r.id], force:true}); setMenu(null);}}>
@@ -1876,7 +1887,7 @@ function App() {
                   setMenu(null);
                 }}
               >
-                Queue whole release
+                {missingArtistGroup ? `Queue ${ids.length} releases` : "Queue whole release"}
               </button>
               <button
                 role="menuitem"
@@ -1888,7 +1899,7 @@ function App() {
               >
                 Ignore selected releases
               </button>
-              <button
+              {!missingArtistGroup && <button
                 role="menuitem"
                 disabled={queueBusy}
                 onClick={() => {
@@ -1897,7 +1908,7 @@ function App() {
                 }}
               >
                 Remove from queue
-              </button>
+              </button>}
             </>
           )}
         </div>
