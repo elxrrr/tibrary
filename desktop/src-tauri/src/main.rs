@@ -12,6 +12,7 @@ mod progress;
 mod subscriber_metadata;
 mod appearance;
 mod artwork;
+mod browse;
 mod table_filters;
 use serde_json::{json, Value};
 use std::{
@@ -91,6 +92,7 @@ fn publish_catalogue_changes(
 }
 
 const ONLINE_JOB_KINDS: &[&str] = &[
+    "browse",
     "link", "check_availability", "cached_releases", "release_artists",
     "discography", "release_details", "release_tracks", "connections", "favourites",
     "match_artists", "metadata", "manual_candidate", "artwork",
@@ -1038,6 +1040,7 @@ async fn handle_rpc_call(
         || method.starts_with("auth.")
         || method.starts_with("settings.")
         || method.starts_with("queue.")
+        || method == "browse.queue"
         || method.starts_with("links.")
         || method.starts_with("artists.")
         || method.starts_with("files.")
@@ -1066,6 +1069,32 @@ async fn handle_rpc_uncached(
     }
     if method == "appearance.accent" {
         return serde_json::to_value(appearance::system_accent(app_handle).await).map_err(|error| error.to_string());
+    }
+    if method.starts_with("browse.") {
+        // Browsing is an independent, bounded read path. It must not wait for
+        // the full-library worker or widen the user's linked-artist scope.
+        let result = match method.as_str() {
+            "browse.home" => browse::home(db, &args).await,
+            "browse.search" => browse::search(db, &args).await,
+            "browse.artist" => browse::artist(db, &args).await,
+            "browse.release" => browse::release(db, &args).await,
+            "browse.resolve" => browse::resolve(db, &args).await,
+            "browse.queue" => browse::queue(db, &args).await,
+            _ => Err("Unknown browse action".into()),
+        };
+        // Keep browse messages independent of any other online job running.
+        let context = json!({"kind":"browse", "status":"complete"});
+        if method == "browse.queue" {
+            if let Ok(ref value) = result {
+                state.log_with_job(&format!("Queued {} tracks from {} releases while browsing",
+                    value["queued_tracks"], value["queued_releases"]), "info", Some("online"), Some(&context));
+                if let Some(app) = app_handle { let _ = app.emit("backend-event", json!({"event":"changed"})); }
+            }
+        }
+        if let Err(ref error) = result {
+            state.log_with_job(&format!("Browse music: {error}"), "error", Some("online"), Some(&context));
+        }
+        return result;
     }
     let _dispatch = if matches!(method.as_str(),"job.start"|"auth.reply"|"turso.tags.write"|"turso.scan"|"turso.discography"|"turso.maintenance.apply") {
         Some(state.dispatch_gate.lock().await)

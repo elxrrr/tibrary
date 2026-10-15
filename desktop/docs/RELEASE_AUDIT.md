@@ -1,8 +1,23 @@
-# Release audit — 0.9.35
+# Release audit — 0.9.36
 
 Audit date: 15 October 2026. Changes were developed in an isolated copy and promoted after verification. Personal music and the live application database were not modified by tests.
 
-## Changes found by the audit
+## Browse music — 0.9.36
+
+- Added an independent artwork-led catalogue browser: live home sections, artist/release/track search, paginated artist discographies, release track selection and catalogue-link opening. Back/Forward preserves results and scroll position.
+- Browse uses the subscriber account and shared metadata/artwork caches. It does not add browsed artists to library discovery or change local links. Page caches have bounded retention and market/account separation; stale results remain labelled and cannot authorize downloads.
+- Full releases and selected tracks merge into the reviewed download queue transactionally. Known-unavailable and AI-labelled music is excluded. Browse remains usable without a local library and while independent jobs run.
+- Fixed a download-completion race: adding tracks or changing a queue decision during a download no longer lets the older batch mark the newer selection complete.
+- Fixed Activity history loading additional pages from an obsolete intersection notification. Pagination now waits for committed rows and checks the current scroll position.
+- Added focused browser/backend tests, fresh screenshots and concise usage documentation. The native macOS bundle is version 0.9.36.
+
+Validation passed **34 frontend unit tests, 303 Rust tests and three FFmpeg checks**, the correctness lint and the production frontend build. All **81 functional WebKit workflows** passed across the full run and focused repair checks: the full run found one Activity pagination race; after fixing it, the four affected cases passed three consecutive runs, including a deterministic stale-observer regression. The separate Browse screenshot capture also passed. Twenty-one opt-in Rust tests remain excluded from the ordinary suite.
+
+The live browser test used the saved subscriber account in a disposable database: home sections, all three search types, a paginated artist release list, catalogue-link resolution, credited audio tracks, an exact single-track queue selection and a real FLAC download. It verified decoding, release/track tags and the terminal queue state. Cassie's edition with 13 catalogue items correctly exposed 12 audio tracks. Cached browsing worked after disconnecting the test account, and browsing did not expand the local artist catalogue. The final live sample passed in 4.50 seconds; this is a bounded check, not a whole-library performance guarantee.
+
+The final 0.9.36 app passed strict signature verification, native startup, disposable database reopening and the macOS appearance probe. Dark/Light layouts, the new Browse screenshots and the existing documentation gallery were inspected. No live music files were changed.
+
+## Previous core audit — 0.9.35
 
 - Missing releases, Queue and Downloaded now share album artist → release → track browsing, lazy cached artwork, selection rules and context actions. Queue/Downloaded use a useful Status column instead of an empty recommendation column. Cached track names and ISRCs are searchable.
 - Artist selection and keyboard selection respect AI exclusions. Synthetic group IDs never become download IDs. Metadata actions follow the online worker's state, independently of local scans.

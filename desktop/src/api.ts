@@ -3,7 +3,7 @@ export type Row = { id: string; [key: string]: any };
 export type LibraryAvailability = {root: string; available?: boolean; unavailable_reason?: string};
 export type DownloadDestination = {available: boolean; path: string; reason?: string};
 export type Availability = {roots: LibraryAvailability[]; download_destination: DownloadDestination};
-export const onlineKinds = new Set(["link", "discography", "cached_releases", "check_availability", "release_artists", "release_details", "release_tracks", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
+export const onlineKinds = new Set(["browse", "link", "discography", "cached_releases", "check_availability", "release_artists", "release_details", "release_tracks", "connections", "favourites", "match_artists", "metadata", "manual_candidate", "artwork", "check_replacements", "optimizations", "deep_review", "deep_preview", "connect_account", "connect_download"]);
 export type Job = {
   id: string;
   kind: string;

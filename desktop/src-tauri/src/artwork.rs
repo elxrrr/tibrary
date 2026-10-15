@@ -346,7 +346,7 @@ fn matching_album_cover(value: &Value, release: &str) -> Option<String> {
 
 async fn cached_cover(db: &TursoDb, release: &str, market: &str) -> Option<String> {
     // A stale cover UUID is still useful; do not refresh metadata to paint a row.
-    for prefix in ["subscriber-summary", "tag-review"] {
+    for prefix in ["subscriber-summary", "tag-review", "browse-cover"] {
         if let Some(value) = db
             .get_preference(&format!("{prefix}:{market}:{release}"))
             .await

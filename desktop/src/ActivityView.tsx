@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useRef, memo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState, useRef, memo } from "react";
 import { Copy, Trash2 } from "lucide-react";
 import { call, active, Job, Row, onlineKinds } from "./api";
 
@@ -32,7 +32,7 @@ export function streamFor(entry: ActivityEntry): ActivityStream {
   return "local";
 }
 
-const actionTitles: Record<string, string> = {discography: "Refresh releases", favourites: "Sync favourite artists", release_artists: "Check release artists", cached_releases: "Recheck cached releases", check_availability: "Check release availability", link: "Link releases", match_artists: "Match artists", preview: "Review local changes", mqa: "MQA audit", queue_mqa: "Queue MQA replacements", queue_replacements: "Queue online replacements", check_replacements: "Check online replacements", release_details: "Fetch track details and credits", release_tracks: "Load track details", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Download music", scan: "Scan library", apply: "Apply reviewed changes", deep_review: "Find release matches", deep_preview: "Review release links", deep_apply: "Save reviewed release links", review_consolidation: "Review duplicate removal", consolidate: "Remove reviewed duplicates", manual_candidate: "Inspect a release match", connections: "Test connection", connect_account: "Connect account", connect_download: "Connect account", component_check: "Check streaming components", component_update: "Update streaming components", component_rollback: "Restore streaming components"};
+const actionTitles: Record<string, string> = {browse: "Browse music", discography: "Refresh releases", favourites: "Sync favourite artists", release_artists: "Check release artists", cached_releases: "Recheck cached releases", check_availability: "Check release availability", link: "Link releases", match_artists: "Match artists", preview: "Review local changes", mqa: "MQA audit", queue_mqa: "Queue MQA replacements", queue_replacements: "Queue online replacements", check_replacements: "Check online replacements", release_details: "Fetch track details and credits", release_tracks: "Load track details", metadata: "Find missing tags", artwork: "Find artwork", local_duplicates: "Check local duplicates", optimizations: "Check replacements", download: "Download music", scan: "Scan library", apply: "Apply reviewed changes", deep_review: "Find release matches", deep_preview: "Review release links", deep_apply: "Save reviewed release links", review_consolidation: "Review duplicate removal", consolidate: "Remove reviewed duplicates", manual_candidate: "Inspect a release match", connections: "Test connection", connect_account: "Connect account", connect_download: "Connect account", component_check: "Check streaming components", component_update: "Update streaming components", component_rollback: "Restore streaming components"};
 
 export function jobTitle(kind?: string): string {
   return actionTitles[kind || ""] || kind?.replaceAll("_", " ") || "Task";
@@ -236,6 +236,13 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
   const [error, setError] = useState("");
   const [clearing, setClearing] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
+  const [pageRevision, setPageRevision] = useState(0);
+  const nextPageRevision = useRef(0);
+  const committedPageRevision = useRef(0);
+  const checkPagination = useRef<(() => void) | null>(null);
+  const historyScope = JSON.stringify([query,actionFilter,historyRevision]);
+  const renderedHistoryScope = useRef(historyScope);
+  renderedHistoryScope.current = historyScope;
   const sentinel = useRef<HTMLDivElement>(null);
   const requestGeneration = useRef(0);
   const recentWork = useRef(0);
@@ -243,36 +250,38 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
   if (working) recentWork.current = Date.now();
   useEffect(() => { const timer = window.setTimeout(() => setQuery(search.trim()), 250); return () => window.clearTimeout(timer); }, [search]);
   useEffect(() => {
-    let disposed = false, requesting = false, before: number | null = null, initialized = false;
+    let disposed = false, requesting = false, before: number | null = null, initialized = false, expectedPageRevision = 0;
     const generation = ++requestGeneration.current;
-    const current = () => !disposed && generation === requestGeneration.current;
+    const current = () => !disposed && generation === requestGeneration.current && renderedHistoryScope.current === historyScope;
     const marker = sentinel.current;
     const root = marker?.closest(".activity-log") || null;
+    function checkMore() {
+      // An observer notification can describe the empty viewport from before
+      // React committed a fetched page. Both pagination paths must wait for
+      // that commit, then measure the current sentinel rather than the entry.
+      if (!current() || requesting || !initialized || before == null || !marker || !root || committedPageRevision.current !== expectedPageRevision) return;
+      const tail = marker.getBoundingClientRect(), viewport = root.getBoundingClientRect();
+      if (tail.top <= viewport.bottom + 200 && tail.bottom >= viewport.top) void load(true);
+    }
+    checkPagination.current = checkMore;
     async function load(older: boolean) {
       if (!current() || requesting || older && (!initialized || before == null)) return;
       requesting = true;
-      let loaded = false;
       setLoading(true);
       try {
         const page = await call<HistoryPage>("logs.history", {limit:500, search:query || undefined, ...activityFilterParameters(actionFilter), ...(older ? {before_id:before} : {})});
         if (!current()) return;
+        expectedPageRevision = ++nextPageRevision.current;
         setSaved(old => mergeActivityHistory(old, page.entries));
+        setPageRevision(expectedPageRevision);
         if (older || !initialized) before = page.next_before_id;
         initialized = true;
-        loaded = true;
         setError("");
       } catch (e) { if (current()) setError(String(e)); }
       finally {
         requesting = false;
         if (current()) {
           setLoading(false);
-          // IntersectionObserver may already consider the sentinel visible
-          // before the first page arrives. Recheck after React lays out rows.
-          window.requestAnimationFrame(() => {
-            if (!loaded || !current() || before == null || !marker || !root) return;
-            const tail = marker.getBoundingClientRect(), viewport = root.getBoundingClientRect();
-            if (tail.top <= viewport.bottom + 200 && tail.bottom >= viewport.top) void load(true);
-          });
         }
       }
     }
@@ -283,16 +292,20 @@ export function ActivityView({ logs, monitor, job, onlineJob, downloadJob, onCle
     // visible immediately; buffered persistence and page loads never clear it.
     const timer = window.setInterval(() => { if (Date.now() - recentWork.current < 15000) void load(false); }, 5000);
     const observer = new IntersectionObserver(entries => {
-      if (entries.some(entry => entry.isIntersecting)) void load(true);
+      if (entries.some(entry => entry.isIntersecting)) checkMore();
     }, {root, rootMargin:"200px"});
     if (marker) observer.observe(marker);
-    return () => { disposed = true; observer.disconnect(); window.clearInterval(timer); };
+    return () => { disposed = true; if (checkPagination.current === checkMore) checkPagination.current = null; observer.disconnect(); window.clearInterval(timer); };
   }, [query,actionFilter,historyRevision]);
   const entries = useMemo(() => {
     const all = mergeActivityHistory(saved, logs);
     return mergeActivityHistory(retireWorkerProgress(all), downloadActivity(monitor,downloadJob));
   }, [saved,logs,monitor,downloadJob]);
   const filtered = useMemo(() => entries.filter(entry => matchesActivityFilter(entry,actionFilter) && (!search.trim() || `${entry.message} ${jobTitle(entry.job_kind)} ${streamFor(entry)}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()))), [entries,search,actionFilter]);
+  useLayoutEffect(() => {
+    committedPageRevision.current = pageRevision;
+    checkPagination.current?.();
+  }, [saved,pageRevision,filtered.length]);
   async function clear() {
     setClearing(true);
     // Reject any archive reply that began before Clear, including a slow page.

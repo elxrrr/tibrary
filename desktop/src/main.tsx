@@ -15,6 +15,7 @@ import {
   ChevronRight,
   PanelLeft,
   Copy,
+  Compass,
   Disc,
   Download,
   Folder,
@@ -57,6 +58,7 @@ import { CoalescedQuery } from "./query";
 import { ScanButton, ScanScope } from "./ScanButton";
 import { ActionButton } from "./ActionButton";
 import { fileActionKinds, unavailableFile, unavailableLibrary } from "./availability";
+import { BrowseView, BrowseLocation, clearBrowseCache } from "./BrowseView";
 import "./style.css";
 import { version as appVersion } from "../package.json";
 const groups = [
@@ -114,6 +116,7 @@ const groups = [
 ] as const;
 const titles: Record<string, string> = {
   overview: "Overview",
+  browse: "Browse music",
   files: "Local files",
   ...Object.fromEntries(
     groups.flatMap((g) => [
@@ -144,7 +147,7 @@ const organisationActions = [
   ],
   ["singles", "Redundant singles", "Review singles already held on albums"],
 ];
-const groupRoutes = Object.fromEntries(groups.map(group => [group.id, group.items[0][0]]));
+const groupRoutes: Partial<Record<string, string>> = Object.fromEntries(groups.map(group => [group.id, group.items[0][0]]));
 const fileGroupRoutes = new Set(["files", "correct", "organise", "metadata", "artwork", "mqa", "ai_review"]);
 function linkedFiles(rows: Row[]): Row[] {
   return rows.flatMap(row => row.artist_group || row.link_group || row.file_group ? linkedFiles(row.children || []) : [row]);
@@ -213,21 +216,28 @@ function Modal({
     </dialog>
   );
 }
+type NavigationPage = { route: string; browse?: BrowseLocation };
+const browseHome: BrowseLocation = { kind: "home" };
+
 function App() {
   const initialRoute: string = "overview";
   const [state, setState] = useState<AppState | null>(null),
     [root, setRoot] = useState(localStorage.getItem("tibrary.root") || "");
   const currentRoot = useRef(root);
   currentRoot.current = root;
-  const [navigation, setNavigation] = useState({ pages: ["overview"], index: 0 });
-  const route = navigation.pages[navigation.index];
-  const setRoute = useCallback((target: string) => {
-    const page = groupRoutes[target] || (["connections", "downloads"].includes(target) ? "general" : target);
-    setNavigation(previous =>
-    previous.pages[previous.index] === page ? previous : {
+  const [navigation, setNavigation] = useState<{ pages: NavigationPage[]; index: number }>({ pages: [{ route: "overview" }], index: 0 });
+  const currentPage = navigation.pages[navigation.index];
+  const route = currentPage.route;
+  const navigate = useCallback((page: NavigationPage) => {
+    setNavigation(previous => JSON.stringify(previous.pages[previous.index]) === JSON.stringify(page) ? previous : {
       pages: [...previous.pages.slice(0, previous.index + 1), page], index: previous.index + 1,
     });
   }, []);
+  const setRoute = useCallback((target: string) => {
+    const route = groupRoutes[target] || (["connections", "downloads"].includes(target) ? "general" : target);
+    navigate(route === "browse" ? { route, browse: browseHome } : { route });
+  }, [navigate]);
+  const navigateBrowse = useCallback((browse: BrowseLocation) => navigate({ route: "browse", browse }), [navigate]);
   const [sidebarVisible, setSidebarVisible] = useState(() => localStorage.getItem("tibrary.sidebar") !== "hidden");
   function moveHistory(offset: number) {
     setNavigation(previous => ({ ...previous, index: Math.max(0, Math.min(previous.pages.length - 1, previous.index + offset)) }));
@@ -517,7 +527,7 @@ function App() {
   };
   useEffect(() => {
     if (!state || (root && !state.roots.some((r) => r.root === root))
-      || ["overview", "prepare", "catalogue", "complete", "fix", "settings", "general", "connections", "downloads", "activity"].includes(route)) {
+      || ["overview", "browse", "prepare", "catalogue", "complete", "fix", "settings", "general", "connections", "downloads", "activity"].includes(route)) {
       tableReader.clear();
       return;
     }
@@ -711,6 +721,7 @@ function App() {
     setError("");
     try {
       const result = await call(method, args);
+      if (method === "account.disconnect" || method.startsWith("queue.")) clearBrowseCache();
       await refresh();
       return result;
     } catch (e) {
@@ -1999,6 +2010,10 @@ function App() {
           <House size={18} />
           Overview
         </button>
+        <button className={"nav-item " + (route === "browse" ? "current" : "")} onClick={() => setRoute("browse")}>
+          <Compass size={18} />
+          Browse music
+        </button>
         {groups.map((g) => (
           <div className="nav-group" key={g.id}>
             <div className="nav-heading">
@@ -2060,7 +2075,7 @@ function App() {
         </div>
       </aside>
       <main aria-label={titles[route] || "Overview"}>
-        {localUnavailable && <div className="notice library-unavailable" role="status">
+        {localUnavailable && route !== "browse" && <div className="notice library-unavailable" role="status">
           <span>Library unavailable · using cached data.</span>
         </div>}
         {downloadUnavailable && route === "queue" && <div className="notice download-unavailable" role="status">
@@ -2109,6 +2124,11 @@ function App() {
               >
           {route === "overview" ? (
             overviewPage()
+          ) : route === "browse" ? (
+            <BrowseView location={currentPage.browse || browseHome} onNavigate={navigateBrowse}
+              cacheScope={JSON.stringify([Boolean(state?.connections.account), state?.connections.tidal?.user_id || "", state?.settings.market || ""])}
+              onOpenQueue={() => setRoute("queue")} onOpenSettings={() => setRoute("general")}
+              onQueued={async () => { await refresh(); }} />
           ) : ["general", "connections", "downloads"].includes(route) ? (
             settingsPage()
           ) : route === "activity" ? (

@@ -53,6 +53,21 @@ async fn ai_allowed_queue(db: &TursoDb, market: &str, items: Vec<(String, Value)
     Ok((allowed, blocked))
 }
 
+/// A user can add tracks or change approvals while this batch downloads.
+/// Complete only the selection generation that this batch actually processed.
+/// Metadata enrichment may update the payload without changing user intent.
+async fn complete_queue_snapshot(
+    db: &TursoDb,
+    id: &str,
+    updated: Option<&str>,
+) -> Result<bool, String> {
+    let changed = db.connect()?.execute(
+        "UPDATE queue SET decision='downloaded',approved=0,updated=? WHERE id=? AND updated IS ? AND decision='queued' AND approved=1",
+        (chrono::Utc::now().to_rfc3339(), id, updated),
+    ).await.map_err(|error| error.to_string())?;
+    Ok(changed > 0)
+}
+
 fn sequential_download_pauses(min: Option<f64>, max: Option<f64>) -> (f64, f64) {
     // Settings can come from older databases or hand-edited imports. Keep both
     // the random range and Duration/Instant construction finite and bounded.
@@ -265,17 +280,20 @@ impl DownloadManager {
         let conn = db.connect()?;
         let mut queue_stmt = conn
             .query(
-                "SELECT id, payload FROM queue WHERE approved = 1 AND decision = 'queued' ORDER BY id",
+                "SELECT id, payload, updated FROM queue WHERE approved = 1 AND decision = 'queued' ORDER BY id",
                 (),
             )
             .await
             .map_err(|e| e.to_string())?;
 
         let mut items = Vec::new();
+        let mut snapshots = std::collections::HashMap::new();
         while let Some(row) = queue_stmt.next().await.map_err(|e| e.to_string())? {
             let id: String = row.get(0).map_err(|e| e.to_string())?;
             let payload_str: String = row.get(1).map_err(|e| e.to_string())?;
             if let Ok(release) = serde_json::from_str::<Value>(&payload_str) {
+                let updated: Option<String> = row.get(2).map_err(|e| e.to_string())?;
+                snapshots.insert(id.clone(), updated);
                 items.push((id, release));
             }
         }
@@ -1070,13 +1088,15 @@ impl DownloadManager {
                 }
             }
             if index_ok {
-                let now_iso = chrono::Utc::now().to_rfc3339();
-                if let Err(error) = conn.execute(
-                    "UPDATE queue SET decision = 'downloaded', approved = 0, updated = ? WHERE id = ?",
-                    (now_iso.as_str(), ident.as_str()),
-                ).await {
-                    index_ok = false;
-                    progress_cb(format!("Audio saved; queue update needs retry · {release_title} · {error}"));
+                if let Some(updated) = snapshots.get(ident) {
+                    match complete_queue_snapshot(db, ident, updated.as_deref()).await {
+                        Ok(true) => {},
+                        Ok(false) => progress_cb(format!("Saved audio · {release_title} · queue selection changed during download; the updated selection remains for the next batch")),
+                        Err(error) => {
+                            index_ok = false;
+                            progress_cb(format!("Audio saved; queue update needs retry · {release_title} · {error}"));
+                        },
+                    }
                 }
             }
             if !index_ok {
@@ -1116,6 +1136,38 @@ impl DownloadManager {
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    #[tokio::test]
+    async fn download_completion_preserves_queue_changes_made_in_flight() {
+        let temp = std::env::temp_dir().join(format!("queue-completion-{}", uuid::Uuid::new_v4()));
+        let _cleanup = StagingDirectory(temp.clone());
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let conn = db.connect().unwrap();
+        let initial = r#"{ "id": "10", "selected_tracks": [{"id":"101"}] }"#;
+        let expanded = json!({"id":"10","selected_tracks":[{"id":"101"},{"id":"102"}]}).to_string();
+        conn.execute("INSERT INTO queue(id,payload,approved,decision,updated) VALUES('10',?,1,'queued','first')", (initial,)).await.unwrap();
+        conn.execute("UPDATE queue SET payload=?,updated='second' WHERE id='10'", (expanded.as_str(),)).await.unwrap();
+        assert!(!complete_queue_snapshot(&db,"10",Some("first")).await.unwrap());
+        let mut rows=conn.query("SELECT decision,approved,payload FROM queue WHERE id='10'",()).await.unwrap();
+        let row=rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(),"queued");
+        assert_eq!(row.get::<i64>(1).unwrap(),1);
+        assert_eq!(row.get::<String>(2).unwrap(),expanded);
+        drop(rows);
+        // Loading current release details changes cached metadata, not the selection.
+        conn.execute("UPDATE queue SET payload=? WHERE id='10'", (json!({
+            "id":"10", "selected_tracks":[{"id":"101"},{"id":"102"}],
+            "tracks_loaded":true, "tracks":[{"id":"101","title":"First"},{"id":"102","title":"Second"}]
+        }).to_string(),)).await.unwrap();
+        assert!(complete_queue_snapshot(&db,"10",Some("second")).await.unwrap());
+        conn.execute("UPDATE queue SET approved=1,decision='queued',updated='third' WHERE id='10'",()).await.unwrap();
+        assert!(!complete_queue_snapshot(&db,"10",Some("second")).await.unwrap());
+        conn.execute("UPDATE queue SET decision='ignored' WHERE id='10'",()).await.unwrap();
+        assert!(!complete_queue_snapshot(&db,"10",Some("third")).await.unwrap());
+        // Older databases may have no update timestamp.
+        conn.execute("UPDATE queue SET approved=1,decision='queued',updated=NULL WHERE id='10'",()).await.unwrap();
+        assert!(complete_queue_snapshot(&db,"10",None).await.unwrap());
+    }
+
     #[tokio::test]
     async fn ai_download_preflight_blocks_before_audio_or_replacement_files() {
         for album_ai in [true,false] {

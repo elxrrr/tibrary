@@ -448,7 +448,7 @@ impl TidalClient {
 
     /// All network requests use the single subscriber session. Paths are internal,
     /// never taken from response links, so bearer tokens cannot leave the API host.
-    async fn request(
+    pub(crate) async fn request(
         &mut self,
         path: &str,
         market: &str,
@@ -619,7 +619,7 @@ impl TidalClient {
         self.cache_summaries(std::slice::from_ref(raw),market,&[],"album_lookup").await
     }
 
-    async fn cache_summaries(&self, values: &[Value], market: &str, requested: &[String], source: &str) -> Result<(), String> {
+    pub(crate) async fn cache_summaries(&self, values: &[Value], market: &str, requested: &[String], source: &str) -> Result<(), String> {
         if values.is_empty() && requested.is_empty() { return Ok(()); }
         let conn = self.db.connect()?;
         conn.execute("BEGIN IMMEDIATE",()).await.map_err(|error|error.to_string())?;

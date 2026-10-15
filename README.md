@@ -12,6 +12,7 @@
 
 - **Prepare your library:** preview tag corrections, organise folders, review local duplicates and flag AI-labelled files for removal.
 - **Link your collection:** match album artists, recordings and whole releases using cached catalogue evidence.
+- **Browse online music:** explore new releases, search artists or tracks, paste a catalogue link, and queue full releases or selected songs.
 - **Find missing music:** browse artists, releases and tracks with cached artwork; filter recommendations and queue exactly what you want.
 - **Update your files:** fill available tags—including BPM and Camelot keys—improve artwork, and audit MQA files.
 - **Follow the work:** one searchable activity log with action filters, saved details and separate cancellation controls for local tasks, online checks and downloads.
@@ -39,6 +40,10 @@ npm --prefix desktop run tauri dev
 
 Captured from the current UI with a disposable sample library.
 
+| Browse music | Release details |
+| --- | --- |
+| ![Browse music](desktop/docs/imgs/browse_music.png) | ![Release details](desktop/docs/imgs/browse_release.png) |
+
 | Link releases | Missing releases |
 | --- | --- |
 | ![Link releases](desktop/docs/imgs/link_releases.png) | ![Missing releases](desktop/docs/imgs/missing_releases.png) |
@@ -62,5 +67,7 @@ Built with [Tauri](https://v2.tauri.app/), [React](https://react.dev/), [Lofty](
 MQA detection references: [AudioAuditor](https://github.com/Angel2mp3/AudioAuditor), [purpl3F0x](https://github.com/purpl3F0x/MQA_identifier) and [Dniel97](https://github.com/Dniel97/MQA-identifier-python).
 
 Subscriber API and download references: [Tidaler](https://github.com/maya-doshi/tidaler) and [Minim](https://minim.readthedocs.io/en/latest/_modules/minim/tidal.html).
+
+Browse-interface inspiration: [Waves](https://github.com/iamprivacy/Waves).
 
 [MIT licence](LICENSE).

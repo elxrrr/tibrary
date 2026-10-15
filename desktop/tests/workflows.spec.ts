@@ -1528,6 +1528,25 @@ test("activity has one verbose log and independent worker controls", async ({pag
 });
 
 test("activity action filters search saved history beyond the recent page and keep the log flat", async ({page}) => {
+  // A browser may deliver an intersection observed while the list was empty
+  // after its first page has rendered. Pagination must recheck current geometry.
+  await page.addInitScript(() => {
+    const NativeObserver = window.IntersectionObserver;
+    let stale: (() => void) | undefined;
+    window.IntersectionObserver = class extends NativeObserver {
+      constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+        super(callback, options);
+        const observe = this.observe.bind(this);
+        this.observe = target => {
+          if (target.classList.contains("history-sentinel")) {
+            stale = () => callback([{target, isIntersecting:true, intersectionRatio:1} as IntersectionObserverEntry], this);
+          }
+          observe(target);
+        };
+      }
+    };
+    (window as any).emitStaleHistoryIntersection = () => { if (!stale) throw new Error("History observer not installed"); stale(); };
+  });
   const old = [
     {saved_id:1,at:"2026-09-30T12:00:00Z",message:"Adjusted first date",job_kind:"apply",category:"local"},
     {saved_id:2,at:"2026-09-30T12:00:01Z",message:"Adjusted second date",job_kind:"apply",category:"local"},
@@ -1556,6 +1575,18 @@ test("activity action filters search saved history beyond the recent page and ke
   const panel=page.getByRole("region",{name:"Activity log",exact:true});
   await expect(panel.locator(".log-row")).toHaveCount(501);
   await expect(panel).not.toContainText("Adjusted first date");
+  await page.evaluate(async () => {
+    (window as any).emitStaleHistoryIntersection();
+    // Wait for the browser's layout and observer delivery cycle, not a network
+    // timeout. The stale observation must not start an older-history request.
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+  await expect(panel.locator(".log-row")).toHaveCount(501);
+  expect(requests.filter(request => request.before_id)).toHaveLength(0);
+  await panel.locator(".activity-log").evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await expect(panel.locator(".log-row")).toHaveCount(506);
+  await expect(panel).toContainText("Adjusted first date");
+  expect(requests.some(request => request.before_id)).toBe(true);
   const filter=panel.getByRole("combobox",{name:"Action type"});
   await filter.selectOption("apply");
   await expect(panel.locator(".log-row")).toHaveCount(2);
