@@ -1,154 +1,116 @@
 # Tibrary guide
 
-Version **0.9.34** · [Setup and screenshots](../../README.md)
+Version **0.9.35** · [Setup and screenshots](../../README.md) · [Release audit](RELEASE_AUDIT.md)
 
-## Everyday workflows
+## Everyday use
 
-Libraries and their indexed/linked track counts load first. Local dashboard statistics follow independently; missing-release recommendations are calculated by their own cached query and do not hold up library selection or local tools.
-
-| Area | What to do |
+| Area | Purpose |
 | --- | --- |
-| Overview | Add a library, inspect indexed/linked counts and browse recent missing releases. |
-| Prepare library | Correct local tags, preview folder changes, review local duplicates and flag AI-labelled files for removal. |
-| Link catalogue | Match album artists and recordings to online releases; inspect or choose ambiguous placements. |
-| Complete library | Find missing releases, select whole releases or individual tracks, and manage downloads. |
-| Update library | Audit MQA files, fill missing metadata, improve artwork and review online replacements. |
-| Settings → General | Manage the subscriber connection, libraries, appearance, downloads and matching preferences. |
-| Settings → Activity | Search one saved activity log; inspect detailed checks and cancel individual workers. |
+| Overview | Indexed and linked counts, your libraries and recent missing releases. |
+| Prepare library | Correct tags, organise folders, review duplicates and flag AI-labelled files. |
+| Link catalogue | Match album artists and recordings; review ambiguous release placements. |
+| Complete library | Browse missing music, approve releases or tracks, and manage downloads. |
+| Update library | Audit MQA, fill missing tags, improve artwork and review online replacements. |
+| Settings → General | Account, libraries, appearance, download folders, audio and matching options. |
+| Settings → Activity | Search saved activity and cancel individual local, online or download jobs. |
 
-Choose the active library at the bottom of the sidebar, above the version. Its selection applies across pages. Table pages start with search, column filters and pagination, with workflow actions below. Use the arrow beside an action to choose a correction, scan scope or related check; choosing a correction does not apply it. Secondary actions explain whether they use selected rows, the visible page or the whole library.
+Choose the library at the bottom of the sidebar. Category headings open their first workflow. Overview is the dashboard; its recent-release list scrolls independently.
 
-Latest missing releases scrolls within its Overview card, with the same edge fades as Settings. The dashboard stays in place while you browse the list.
+### Tables and selection
 
-Local file tables group tracks beneath their release, including every Correct tags operation, Organise files, MQA audit, AI review, Add missing tags and Fix artwork. Expand a release to inspect each file's evidence, position and proposed action. Filters apply to files before grouping; selecting a release selects its displayed files. Review and apply still use individual file paths. Expansion reads the saved index and preview without another scan.
+Missing releases, Download queue and Downloaded releases use the same **album artist → release → track** hierarchy. Expand in place to browse artwork and cached tracks. Artist checkboxes select their displayed releases; release checkboxes select their tracks. Partial selection appears on the parent. Sorting and filters preserve whole groups, expansion and individual selections. Missing releases puts the artist with the newest matching release first.
 
-### Local changes
+Small covers load only for visible release rows, are cached on disk and are reused across all three pages. Unavailable artwork does not block browsing. Queue and Downloaded show download status; Missing releases also shows recommendation confidence and coverage. Search includes cached track names and ISRCs.
 
-Use the arrow beside **Preview** to choose one correction or organisation operation, then preview and review the affected files before applying it. Previews use the shared local index and are reused until their inputs change. Tag corrections and folder moves are separate actions. Folder previews show current and proposed paths, including whitespace changes.
+Local file tables group files beneath releases. Link releases also groups by album artist. Link artists and Favourite artists expand only to local releases. Local duplicates and Online replacements group the release to keep/acquire above the redundant releases, so the proposed outcome remains clear.
 
-Track/disc matching treats `01` and `1` equally. Number corrections use padded tags and flag impossible totals such as `04/1`. Consistent local or cached online evidence can supply replacement totals; ambiguous cases require review.
+Use column headers to sort and their filter buttons to choose checked values. Numeric counts, positions and evidence have no filter menus. Values within a column are combined; filters across columns apply together, before pagination. **Reset column filters** clears them. **Shift+F10** opens a focused header's menu; **Escape** closes it.
 
-Duplicate removal uses the system Trash and preserves the chosen keeper. MQA signals are audit evidence; replacement is a separate action. In MQA audit, use the arrow beside **Scan** to check **All releases** or **Unscanned releases only** (new or changed FLAC tracks). Scope choices change checkmarks; **Scan** inspects just the checked tracks and preserves other saved results. Individual checkmarks and selections across pages are respected. **Find online matches** saves links for selected MQA tracks that need a match. **Queue replacements** adds only selected, matched MQA tracks to the lossless download queue. Files change only when you approve and download those replacements. Review proposed changes before applying them.
+Workflow actions sit below the table. The arrow beside the main action contains related operations or scan scopes. Choosing a correction does not apply it: review affected files and their proposed changes first.
 
-At launch, Tibrary checks each registered library for added, changed or removed files. Unchanged tags are reused. Files changed through the app update the shared index and dependent views immediately; navigating between pages does not reread tags. Make external edits while Tibrary is closed. Keep the database: it holds links, cached metadata and saved decisions.
+## Files and tags
 
-A disconnected removable library stays available from its saved index. Browse releases, inspect cached tags and matches, update online metadata, and queue or download music to a connected folder. File scans, tag writes, moves, duplicate removal and replacements into the missing drive are disabled. Open reviews update when the drive disconnects or reconnects; startup checks skip disconnected libraries without removing their cached tracks or links. Download checks use the actual approved queue destinations, including replacement paths. Older indices fill missing sample-rate and bit-depth information once from connected files without rereading tags; saved quality then supports duplicate comparisons while disconnected.
+Startup checks for files added, changed or removed while the app was closed. Unchanged tags and audits are reused. Changes made inside Tibrary update the shared index and relevant views as they complete. Navigation neither rereads tags nor cancels work. Make external edits while Tibrary is closed.
 
-Reviewed moves keep their links and ignore choices; equivalent number formatting does not invalidate a recording link. Scans exclude temporary working audio files. If a file/tag update cannot be indexed, the original path and tags are restored.
+- **Correct tags:** preview one correction, inspect the old/new values, then apply. Matching treats `01` and `1` equally. Text tags and filenames use padded numbers. MP4/M4A stores numeric fields as integers, so it is not repeatedly offered an unpersistable padding change.
+- **Invalid totals:** values such as `04/1` are flagged. Consistent siblings and cached online placements can supply the correct total; conflicting evidence requires review.
+- **Organise files:** inspect current and proposed paths, including whitespace changes. Missing required tags and invalid templates appear as evidence rather than silently disappearing. These rows cannot be applied until corrected.
+- **Local duplicates:** review the keeper, affected files and recording/quality evidence. Removal uses Trash. Different mixes, featured performers or lower-quality replacements must not be treated as interchangeable.
+- **MQA audit:** choose All releases or Unscanned releases only from Scan's arrow, then scan the checked files. Find online matches and Queue replacements are separate steps. Replacement happens only after approval in the download queue.
+- **Missing tags and artwork:** use verified links and shared cached metadata. Existing valid tags are preserved. API fields that are absent are not invented.
+
+Reviewed moves preserve links and ignore choices. File mutations retain an original until indexing succeeds; failed publication restores the original. Tag and move tests verify the encoded audio remains unchanged. Replacements verify the recording and preserve valid local BPM/key values when the replacement provides none.
+
+### Disconnected drives
+
+A cached library remains browsable while its drive is unplugged. Online checks and downloads to a connected folder still work. Scans, tag changes, moves, removal and replacements into the disconnected drive are unavailable. Open reviews respond to drive availability. An offline library is not treated as an empty library; its cached tracks and links remain.
+
+Keep the application database. It contains links, metadata, decisions and history; no database reset is required for an upgrade.
 
 ### AI-labelled music
 
-Music explicitly labelled AI-generated by the online catalogue is excluded from Missing releases, Overview suggestions and online replacements. Saved queue entries remain visible but cannot be approved, exported for download or redownloaded. Download preflight checks the latest retrieved release and track labels before transferring audio.
+Explicit online AI labels exclude music from suggestions and replacement recommendations. Flagged queue entries remain visible but cannot be approved, exported for download or redownloaded. Download preflight checks retrieved release and track labels.
 
-**Prepare library → AI review** flags indexed files using verified links or embedded online IDs, with the specific catalogue evidence. A labelled track does not flag unrelated tracks on the same release. Review works from the saved index with a disconnected drive; use **Show in Finder** to review files when connected. Files are never automatically deleted. Existing cached labels are reused and refreshed with metadata; an absent label is unknown, not proof that a recording is human-made.
+**Prepare library → AI review** identifies local files using verified links or embedded online IDs. A track label does not label unrelated siblings. Files are never automatically removed. An absent label means unknown, not verified human-made.
 
-### Linking and recommendations
+## Linking and missing releases
 
-Sidebar category headings open their first workflow directly. Overview remains the dashboard, with recent missing releases filling the available space and scrolling independently. Match, tag-review and download dialogs use more of the window.
+Linking updates database associations. File-tag corrections are reviewed separately. Existing matches are retained when unrelated tags or locations change. Strong, consistent sibling links can resolve another track into the **same release**, provided recording and placement evidence agree. A recording match on a different edition is not proof of the local release's structure. Audio track totals exclude videos.
 
-Link artists and Favourite artists expand to locally indexed releases without another scan. Favourite artists shows a separate Catalogue link status, including local-only artists with a saved online identity. Confirmed online identities combine differently named local aliases into one favourite row. Artist selections target artist mappings; release summaries have no artist mutation controls.
+Link artists uses album artists. Favourite artists shows the catalogue-link state separately from whether the artist is favourited or present locally. Local aliases with the same confirmed online identity can share one row.
 
-Artist matching starts from local **Album Artist** tags. Compilation placeholders such as “Various artists” are excluded from the artist inbox. Confirmed artists are skipped during unresolved matching; select them explicitly to recheck or unlink.
+Missing releases starts with **My album artists → Recommended and potential**. Overview uses that same scope, independent of temporary table filters. Use View options for artist scope and release range; the Recommendation and Coverage column filters expose low-confidence, superseded or unavailable releases.
 
-Link releases groups album artists, then local release folders, then tracks. Disc folders are combined; separate editions stay separate. Compilation releases appear under one Various artists group without entering artist matching. Expand an artist and release to inspect linked and unresolved tracks. Selecting an artist or release selects its matching files; filters apply before grouping, and the page reports artist, release and track counts. Recheck, ignore and unlink use the selected file paths.
+Recommendations compare candidates with local recordings and their verified online metadata. Exact recordings, contributor IDs and creative roles, specific labels and copyright holders provide supporting evidence. Genres and generic distributors are weaker context. An artist-page association alone cannot override substantial contradictory evidence. Missing or incomplete credits are neutral. No artist-specific exceptions are used.
 
-Recording matches use ISRC, title, duration, release structure and track positions. Linking writes associations to the database, not file tags. Multiple compatible editions can supply metadata, but conflicting totals, mixes or recording evidence require review.
+A newer release supersedes an older recommendation only when complete cached audio lists contain all its recordings without a known fidelity downgrade. Unavailable, ignored or low-confidence editions do not displace valid recommendations; exclusive mixes remain protected.
 
-**Use this placement** links only the track displayed in the match dialog. Release-only candidates offer **Inspect release** until a track placement is available. Cached title, mix and duration matches remain reviewable when ISRCs differ; the dialog shows the conflict.
+### What each online action fetches
 
-Linking scans reuse existing track links to identify the local release before requesting more online data. Two independent verified sibling links, or a two-thirds majority of exact recordings in a complete local release, can establish its edition. Remaining tracks are checked only within that edition: positions, unique recordings, mix identity and durations within three seconds must agree. A complete release can explain a differing local ISRC; cached performer identities can explain featured-artist or remixer aliases. Writing or production credits alone cannot establish a featured performance. The evidence stays visible and file tags stay unchanged. Real duration or mix conflicts stay under review without blocking matching siblings. The established primary release is preferred; additional metadata sources must have the same complete audio sequence, not be standalone singles or later rolling releases. Selected scans only save the selected tracks, and existing links are retained.
-
-Multi-disc matching recognises a consistent whole-release track total repeated on every disc when every audio position is present. Videos do not count as audio tracks. Incomplete albums retain their declared edition totals and existing sibling context. Incorrect track order or disc splits are offered as reviewed **Correct tags → Track and disc numbers** proposals when a complete, unique recording sequence and current links agree. Applying those corrections rechecks the affected tracks from cache; no manual relinking or full-library scan is needed. Use **Link unresolved tracks** to apply improved linking rules to existing review results.
-
-Link releases hides the Various Artists compilation group, including its filter values, while retaining its files and saved links for other library workflows. A recording missing from an online edition remains unlinked; sibling links cannot create a placement for a song that edition does not contain. The evidence includes the local and online audio counts and distinguishes a missing recording from conflicting positions or recording details. Editions verified to omit the recording remain inspectable, but do not count as available choices.
-
-Missing releases defaults to **My album artists** and **Recommended and potential**, using album-level artist IDs and the same confidence filter as Overview. Artist scope and recommendation confidence have separate filters, so you can combine **My album artists** with **Recommended**, or inspect other appearances and low-confidence results. Recommendation references come from present local files and their verified online links. Contributor IDs and roles, independent recordings, labels and copyright holders strengthen a match; common distributors, technical credits and genres provide context. Conflicting artists, compilations and unofficial releases cannot become Recommended. A fully checked release with populated creative credits and rights/label metadata, but no shared recording, creative contributor in the same role, specific label or copyright holder, is **Suspect / Low match** when there are at least two independent downloaded creative-credit references. An artist-page ID alone cannot override this check. Incomplete, stale or empty credit checks remain neutral; a label change alone does not disqualify a release. Low-match results remain inspectable by checking **Suspect** in the Recommendation column menu, or choosing **Select all** there.
-
-Missing releases groups album artists above their releases and tracks. By default, the artist with the newest matching release appears first, with releases ordered newest first inside each group. Expand an artist to browse releases, then expand a release for its tracks. Artist checkboxes select its displayed releases; individual tracks can still be queued separately. Pagination counts artists and shows the matching release total; column filters still apply to releases. Artist pages are capped at 50 groups to keep browsing responsive, while smaller configured page sizes are respected. Missing releases, Download queue and Downloaded releases share artwork thumbnails. Covers load only when their release rows are visible. Small 160 × 160 images are saved on disk and reused across pages and sessions; missing artwork never blocks browsing or triggers a metadata scan.
-
-The Overview count includes all missing, incomplete and queued releases within **My album artists → Recommended and potential**, regardless of the filters currently used on the Missing releases page. Clicking that card opens the same scope.
-
-All main table headers support sorting. Filter icons appear on descriptive columns such as artist, release title, date and status; counts, positions and evidence have no filter menus. Multiple checked values in one column are combined; filters on different columns apply together. Searchable value lists cover the full matching dataset before pagination. **Select all** includes every value, including values beyond the loaded list; **Clear selection** lets you choose just the values you need. **Reset column filters** clears all column selections. Keyboard users can focus a header and press **Shift+F10**; **Escape** closes the menu.
-
-The duplicate filter dropdowns have been removed. Missing releases keeps album-artist scope and release range in **View options**, since these describe the whole view. Confidence, coverage, type, artist and other fields use their column menus. Tag-correction previews initially exclude blank proposed changes; folder previews exclude **No change**. Use the corresponding column menu or **Reset column filters** to show everything. Unavailable releases remain inspectable by selecting all Recommendation values and checking **Unavailable** in Coverage; artist scope and release range still apply.
-
-A release is marked superseded only when complete cached audio lists show a newer available release contains all its recordings without a known quality downgrade. Unavailable, ignored or low-confidence editions cannot displace a valid recommendation. Exclusive mixes remain protected. Superseded releases are excluded from the default recommendations and remain inspectable through the Recommendation column filter.
-
-Local duplicates and Online replacements group the release to keep or acquire above its redundant local releases. Expand a group to inspect evidence and select individual releases. Online replacement groups reuse saved results; selecting a group queues its replacement once, while selecting a child retains that child's original plan scope. Originals remain in place. View metadata / match details shows the affected local folders.
-
-### Cache and refresh controls
-
-| Action | When to use it |
+| Action | Work performed |
 | --- | --- |
-| Update missing releases | Fill missing evidence for your downloaded, linked releases first, then check artist release lists and complete new, changed or incomplete candidates. |
-| Release update options → Check release lists only | Check for new releases without collecting additional track details. |
-| Release update options → Fill missing release artists | Fill album artist evidence for older cached releases. |
-| Release update options → Check availability | Check selected releases, or the visible page; reuse recent market checks. |
-| Release update options → Check saved release availability | Check all saved missing releases for your linked album artists using cached checks where possible. |
-| Release update options → Recheck saved availability online | Request fresh checks, including previously unavailable releases; bypass cached availability. |
-| Release update options → Recalculate saved results | Recalculate ownership and recommendations locally, without API requests. |
-| Get missing metadata in a release’s metadata view | Complete that release’s missing metadata, reusing checked track details and credits. |
-| Refresh track details and credits | Request a fresh check for a particular release. |
-| Recheck availability | Request a fresh market-availability check. |
+| Update missing releases | Fill missing metadata for linked local references, check artist release lists, then complete new, changed or incomplete candidates. |
+| Check release lists only | Discover releases without fetching every track's extended details. |
+| Fill missing release artists | Complete album-artist evidence for older cached releases. |
+| Check availability | Check the selected releases, or visible page, reusing recent market checks. |
+| Check saved release availability | Check saved candidates for linked album artists. |
+| Recheck saved availability online | Bypass saved availability checks, including previous negative results. |
+| Recalculate saved results | Recompute ownership and recommendations without network requests. |
+| Get missing metadata | Complete one release's missing details using the shared cache. |
+| Refresh track details and credits | Explicitly request fresh details for a release. |
 
-All online workflows use one subscriber connection. The catalogue market comes from the account country and is remembered for offline browsing; it is no longer a manual setting. Sign-in and connection checks refresh the saved country, and online actions fill it once if an older session has no saved country. Refreshes keep up to three artists in flight, sharing the same adaptive metadata request limit; audio transfers have separate limits. Release lists are checked for new music, then compared with the saved catalogue. Complete details for unchanged releases are reused; new or changed releases and missing data are fetched. This includes audio track lists, artist/contributor credits, genres, recording IDs, release IDs and available BPM/key data. Metadata found during tagging, linking or downloading is shared with the other tools. Activity reports which artist and release is being checked and how much data was fetched or reused. Use **Refresh track details and credits** to request fresh details for a particular release.
+One subscriber account supplies catalogue data and downloads. The market comes from that account and is remembered for offline browsing. No developer credentials are required.
 
-Requests reuse pooled connections and market-scoped caches, with shared rate-limit backoff. A release index updates only the relevant cached artist pages; existing databases are indexed automatically without losing links or cached details. Provider errors are not treated as proof that a release is unavailable.
+Metadata requests reuse pooled connections, a shared cache, bounded concurrency and adaptive backoff. Audio transfers have separate connection limits. Artist refreshes compare summaries with saved versions; complete unchanged track lists and credits are reused. New, changed or incomplete releases fill their gaps. Successful checks that returned no BPM/key are cached too; omitted fields can still need a lookup. Raw online responses and available genres, UPC, ISRC, credits, dates, audio modes and replacement IDs are retained.
 
-**Check release lists only** provides a lighter discovery check; full updates fill missing recommendation evidence. Complete track details and credits are reused across linking, recommendations and tag preparation. An explicit empty BPM or key in a successful subscriber album response counts as checked; a field that was omitted can still receive an additional lookup. Existing positive values are preserved. Older saved responses acquire these checks without redownloading them. No database reset is needed.
+Availability checks are cached for seven days when available, one day when unavailable and one hour when inconclusive. Artist-list flags cannot revive a release withdrawn by a direct check. Rate limits, timeouts and server failures never prove unavailability. Optional label/genre/provider/replacement checks have separate retry windows; they do not redownload complete credits.
 
-Uncached release and tag checks run with bounded concurrency, pooled connections and shared pacing. Artist catalogue updates are grouped in batches of 20 releases instead of rewriting a whole catalogue for each track. Completed results are saved during the job and recovered after cancellation or restart. More audio download connections do not raise the metadata request limit. A first fill can still take hours when extensive details are missing; subsequent runs fill gaps.
+A first comprehensive fill can still take hours. More audio download connections do not increase the metadata quota. If upstream tags change without a summary change, use the release's explicit detail refresh. Completed results are saved during work; cancellation keeps them and a saved catalogue refresh can resume.
 
-Focused measurements on this build: reading 1,000 cached releases was 3.2 times faster; publishing metadata for 100 synthetic releases was 8.6 times faster. On six live tracks with already-recorded empty BPM/key fields, tag preparation dropped from six redundant requests (1.9 seconds) to zero requests (7 milliseconds). These measure individual stages, not an entire library refresh.
+## Downloads and activity
 
-Availability is shared across artist, metadata and release checks for the selected market. Direct release checks are reused for seven days when available, one day when unavailable, and one hour when inconclusive. Artist-list flags are stored separately: they cannot restore a release that a direct check found unavailable. Older cached positives receive a direct check when you use **Check availability**; completed checks are reused. Confirmed unavailable releases leave the default Missing releases view but remain inspectable through **Unavailable**. Timeouts and rate-limit errors (HTTP 429) never mark a release unavailable. Use **Recheck saved availability online** to bypass these checks without resetting the database or rereading track details.
+Set the destination, folder template and audio options in General. Approve whole releases or individual tracks, review the download table, then start. Videos are excluded. Existing output is reused only after checking its audio metadata and recording identity; a conflicting or invalid file produces a reviewable error.
 
-Metadata views show the actual saved release fields, performers and contributor credits. They distinguish unchecked fields, incomplete checks and successful checks where the service supplied no value. A provider/distributor is displayed separately from a record label. Genre names use the catalogue’s `genreName` field. Optional label, genre, provider and replacement checks are cached for 30 days after a complete result; incomplete checks have a shorter retry window and share endpoint cooldowns. These checks do not redownload complete track credits. Raw returned catalogue and track data are retained for future interpretation.
+Downloaded releases offers release/track redownload actions without duplicate queue records. Export saves plain text with one album or track URL per line for an external downloader. Checked items limit the export; otherwise saved approvals/completed selections are used. Unapproved and AI-blocked items are excluded. Tidaler accepts the list with `tidaler dl --list acquisition-queue.txt`.
 
-If upstream tags change without changing a release's summary, use its manual detail refresh. Missing fields are not negative matching evidence, and the app does not guess a label or genre when the service supplies none.
+Activity is one searchable log with Action type filters and saved history. Artist refreshes update one row per artist with progress and final outcome. Concurrent audio transfers have separate progress rows. Local, online and download workers have independent cancellation controls, with percentages and smoothed ETA when measurable.
 
-Navigating between pages does not start or cancel scans. Jobs finish in the background and publish their results to every relevant view. Catalogue refreshes publish saved artist results while the job is still running, retaining table sorting and expanded tracks. Cancellation retains completed checks. Artwork dimensions and MQA audits are cached per file; unchanged files are reused. Reviewed tag-only moves retain valid inspections, while artwork or relevant MQA tag changes invalidate the corresponding result. Local duplicate checks reuse the saved analysis until the indexed file manifest changes.
+You can browse, filter and approve the queue while independent jobs run. Scans and online reads can run alongside downloads; file-changing jobs and downloads exclude each other. Closing during active work asks whether to continue or stop safely. Completed files remain; unfinished work stays queued. File mutations are never automatically replayed after restart.
 
-BPM, key, genres, credits, UPC and replacement IDs are retained when supplied. Missing fields are not invented. Missing-tag previews preserve existing tags. No developer credentials or database reset are needed.
+## Development and verification
 
-### Downloads and activity
-
-Highlights follow the colour selected in macOS **Appearance**, including Multicolour and Graphite. Native colours adapt to Light, Dark and increased contrast; controls, selections and menus share the same palette. The app has no separate highlight colour setting.
-
-Choose the destination, template and audio options in General. Approve releases or individual tracks in the queue before starting a download. Videos are excluded. Download progress is separate from local work. Stalled transfers can be cancelled; failed transfers remove their partial files. Downloads publish only after the release has been staged and destination collisions checked. File moves and tag updates keep an original until the database update succeeds. Replacements retain valid existing BPM/key tags when the matching recording has no new values.
-
-MQA replacements use the selected library's existing file paths, including multiple copies of a recording. Previous copies stay recoverable until the replacement audio and queue status are indexed. Recording, mix and duration conflicts stop the replacement for review.
-
-The arrow beside **Download** includes **Export**; Downloaded releases keeps its own Export action. **Export** saves a plain-text list of media URLs, one per line, for an external downloader. Whole approved releases produce album URLs; individually approved tracks produce track URLs. Unapproved and empty selections are omitted. Tidaler accepts this list with `tidaler dl --list acquisition-queue.txt`.
-
-In Downloaded releases, checked releases or tracks limit the export without changing the saved queue. With no checked items, the export uses the saved completed-download selections.
-
-Activity shows one log, most recent first, with the worker and task named on each row. Use **Action type** to show local actions, online actions, downloads or a specific task such as Scan library or Find missing tags. The filter searches saved history before paging, so older matching actions are included. Search text combines with the selected action type; older saved messages load as you scroll, including after reopening. Release refreshes maintain one saved entry per artist, updating its current stage and final outcome in place. A failed artist shows one error at the stage where it stopped; market codes and artist IDs are omitted. There are no expandable job groups or per-job history controls. Parallel download tracks show their own transfer progress. Three compact worker cards show item counts, percentage and a smoothed ETA where measurable, with independent cancellation controls. **Save activity logs** must remain enabled to retain history; clearing activity removes its saved entries.
-
-Pages load independently during refreshes. A changing catalogue does not discard an in-flight table result: usable rows appear first, followed by one coalesced update. Sorting, selection and expanded releases are retained. Queue approvals, exports and download previews remain available during catalogue updates and local scans. Release disclosure fetches only missing track details through the shared cache without replacing the current refresh task. If a release summary has changed, opening its tracks replaces the outdated track snapshot and updates the table immediately. Current cached details are reused; failed requests retain the previous saved data. Reviewed tag changes, moves and duplicate removal cannot overlap downloads; scans and metadata reads can.
-
-Closing during downloads asks whether to keep downloading or stop and quit. Completed downloads remain. Interrupted catalogue refreshes retain their checkpoints; explicitly cancelled jobs stay cancelled. File mutations are not automatically replayed.
-
-## Development
-
-The running app uses React/TypeScript for its interface and Rust for scanning, matching, metadata, database access and downloads. Python is only used by the disposable test fixtures.
+The application uses React/TypeScript and Rust. Python is only used for disposable test fixtures. Runtime data lives at `~/Library/Application Support/Tibrary/library.sqlite3`; migrations must preserve it.
 
 | Location | Responsibility |
 | --- | --- |
-| `desktop/src/` | Views, tables, dialogs, navigation and activity. |
-| `desktop/src-tauri/src/main.rs`, `actions.rs`, `workflows.rs` | Commands, jobs and state propagation. |
-| `db.rs`, `scanner.rs`, `tag_writer.rs` | SQLite state, local indexing and Lofty tag access. |
-| `tidal.rs`, `subscriber_metadata.rs`, `network.rs` | Subscriber catalogue, metadata caching and request scheduling. |
-| `linking.rs`, `release_matching.rs`, `recommendations.rs` | Recording/release matching and recommendation evidence. |
-| `downloads.rs`, `stream_download.rs` | Queue execution and audio transfers. |
-| `maintenance.rs`, `organisation.rs`, `duplicates.rs`, `mqa.rs` | File operations, layout, duplicates and MQA auditing. |
-| `desktop/tests/` | Disposable file/database fixtures and WebKit workflow tests. |
-
-The macOS database is `~/Library/Application Support/Tibrary/library.sqlite3`. Schema changes must preserve existing data. Never point file-operation tests at a personal library.
-
-### Checks
-
-Install the development dependencies and WebKit once, then run the repeatable suite:
+| `desktop/src/` | Pages, tables, dialogs, selection and activity. |
+| `desktop/src-tauri/src/main.rs`, `actions.rs` | RPC commands, workers and publication. |
+| `db.rs`, `scanner.rs`, `workflows.rs`, `tag_writer.rs` | Shared index, previews, file metadata and tags. |
+| `tidal.rs`, `subscriber_metadata.rs`, `network.rs` | Subscriber API, metadata cache and pacing. |
+| `linking.rs`, `release_matching.rs`, `recommendations.rs` | Matching and recommendation evidence. |
+| `downloads.rs`, `stream_download.rs`, `file_publication.rs` | Transfers and atomic output publication. |
+| `maintenance.rs`, `organisation.rs`, `duplicates.rs`, `mqa.rs` | Local changes and audits. |
+| `desktop/tests/` | WebKit workflows and disposable audio/database fixtures. |
 
 ```sh
 npm --prefix desktop ci
@@ -156,35 +118,22 @@ npm --prefix desktop ci
 sh desktop/tools/check.sh
 ```
 
-The suite builds the app and checks Rust services, frontend state, and WebKit workflows against temporary files and databases. It covers cache reuse, linking, recommendation filters, queue selection, HTTP retry/cancellation, parallel transfers, FLAC/M4A tag preservation, folder moves, duplicate removal, rollback, and unplug/reconnect behavior. FFmpeg is required for the lossless remux checks. Mock HTTP servers require localhost access. No personal library is used.
+The suite covers Rust services, frontend state and browser workflows with temporary audio and mock HTTP services. FFmpeg is needed for remux checks; HTTP fixtures require localhost access. No personal library is modified.
 
-The separate live check uses the signed-in subscriber account, downloads one track into a temporary folder, verifies audio and tags, and checks repeat-download behavior while its test library is disconnected:
+The bounded live check uses the saved subscriber session, downloads one track into a temporary directory and verifies its audio, tags, queue and disconnected-library behaviour:
 
 ```sh
 sh desktop/tools/check.sh --live
 ```
 
-It refuses expired/near-expiry credentials and never refreshes the saved account. Sign in again in Tibrary if needed. Other authenticated tests and benchmarks remain opt-in; do not run every ignored test indiscriminately. Automated checks do not guarantee every live catalogue item, native Finder interaction, or removable filesystem behaves identically.
-
-Optional focused benchmarks: `metadata_cache_batch_benchmark`, `catalogue_publication_benchmark` and `metadata_preparation_benchmark` use synthetic databases. `live_metadata_preparation_warm_cache_benchmark` checks one credited release, up to six direct track responses, and warm-cache reuse through the saved subscriber connection. `live_catalogue_refresh_pipeline` checks bounded cold/warm refreshes and cancellation. Add one filter followed by `-- --ignored --nocapture` after the Rust test command above. Stop live benchmarking if the service starts throttling.
-
-To refresh the documentation screenshots:
+Live checks refuse credentials close to expiry rather than refreshing the account. Other ignored tests and benchmarks are opt-in; do not run them indiscriminately. See the [release audit](RELEASE_AUDIT.md) for what was actually tested and the remaining manual checks.
 
 ```sh
 TIBRARY_SCREENSHOTS=1 npm --prefix desktop run test:e2e -- --grep 'all workflow routes render'
-```
-
-These capture the web interface with sample data, not the native macOS window frame.
-
-### Build and release
-
-```sh
 npm --prefix desktop run tauri build -- --bundles app
 codesign --verify --deep --strict desktop/src-tauri/target/release/bundle/macos/Tibrary.app
 ```
 
-`Start.command` opens the built app. `desktop/tools/Demo.command` uses a separate demo database.
+Screenshots use sample data and exclude the native window frame. `Start.command` opens the built app; `desktop/tools/Demo.command` uses a separate demo database. The editable icon is `desktop/icon.svg`.
 
-The editable app icon is `desktop/icon.svg`; platform icon files are in `desktop/src-tauri/icons/`. Regenerate them with the Tauri icon command when the artwork changes.
-
-Before distributing an updated app build, increment the patch version (for example, `0.9.2` → `0.9.3`) in `desktop/package.json`, `desktop/package-lock.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/Cargo.lock` and `desktop/src-tauri/tauri.conf.json`. Keep these versions identical; the sidebar reads the package version automatically. Run the checks, refresh screenshots, commit and tag the tested revision. GitHub releases publish source only; do not attach the locally built app or installers. The local build is ad-hoc signed, not notarised.
+Increment the patch version in the frontend package/lockfile, Rust manifest/lockfile and Tauri configuration together. Verify, build, update screenshots and commit the tested source. GitHub releases contain source only; local builds are ad-hoc signed, not notarised.

@@ -490,8 +490,8 @@ function App() {
     };
   }, [displayTheme]);
   const configuredPageSize = Number(settings?.general?.page_size || 50);
-  // Each missing artist includes complete release groups and their cached tracks.
-  const pageSize = route === "missing" ? Math.min(configuredPageSize, 50) : configuredPageSize;
+  // Each artist includes complete release groups and their cached tracks.
+  const pageSize = tree ? Math.min(configuredPageSize, 50) : configuredPageSize;
   useEffect(() => { setOffset(0); }, [pageSize]);
   const activeColumnSelections = availableColumnSelections(route, columnSelections);
   const viewArgs = {
@@ -512,7 +512,7 @@ function App() {
     type: "All types",
     include_unavailable: route === "missing",
     group_releases: route === "links" || fileGroupRoutes.has(route),
-    group_artists: route === "links" || route === "missing",
+    group_artists: route === "links" || tree,
     local_releases: ["artists", "favourites"].includes(route),
   };
   useEffect(() => {
@@ -526,7 +526,7 @@ function App() {
         setData(value);
         if (!preview && value.preview_id) setPreview(value.preview_id);
         if (route === "queue" && !queueSelectionGuard.current.pending && readRevision >= queueSelectionGuard.current.minRevision)
-          setSelection(Object.fromEntries(value.rows.map((r:Row)=>[r.id,r.selected])));
+          setSelection(Object.fromEntries(releaseRows(value.rows as Row[]).map((r:Row)=>[r.id,r.selected])));
       }}, query ? 150 : 0);
   }, [
     tableRefresh,
@@ -723,7 +723,7 @@ function App() {
   async function loadDetail(row: Row) {
     setMenu(null);
     try {
-      if (row.artist_group && route === "missing") {
+      if (row.artist_group && tree) {
         setExpanded(previous => {const next=new Set(previous);next.has(row.id)?next.delete(row.id):next.add(row.id);return next;});
       } else if (row.artist_group && route === "links") {
         setDetail({local_artist: row});
@@ -746,7 +746,7 @@ function App() {
       } else if (route === "local" || route === "online") {
         setDetail({operation: row});
       } else if (row.path || route === "links") {
-        setDetail({...await call("detail", { root, path: row.path || row.id, check_availability: route === "links" }), proposed: row.changes, folder_target: route === "organise" ? (row.target || row.path || row.id) : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, ai_evidence: route === "ai_review" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
+        setDetail({...await call("detail", { root, path: row.path || row.id, check_availability: route === "links" }), proposed: row.changes, folder_review: route === "organise", folder_target: route === "organise" && !row.folder_error ? (row.target || row.path || row.id) : undefined, folder_error: route === "organise" ? row.folder_error : undefined, folder_evidence: route === "organise" ? row.evidence : undefined, ai_evidence: route === "ai_review" ? row.evidence : undefined, source_release_id: row.source_release_id, source_track_id: row.source_track_id});
       }
     } catch (e) {
       notifyError(e);
@@ -892,7 +892,7 @@ function App() {
     }
   }
   const columns: Column[] = tree
-    ? releaseColumns
+    ? route === "missing" ? releaseColumns : releaseColumns.filter(column => column.key !== "recommendation").map(column => column.key === "status" ? {...column,label:"Status"} : column)
     : route === "links"
       ? [
           {key:"artist",label:"Album artist",width:"20%"},
@@ -1148,12 +1148,14 @@ function App() {
   }
   function selectedDetail() {
     const id = [...selected][0];
-    if (id) loadDetail((route === "links" || fileGroupRoutes.has(route) ? linkedFiles(data.rows) : route === "missing" ? releaseRows(data.rows) : data.rows).find(row => row.id === id) || {id, artist:id});
+    if (id) loadDetail((route === "links" || fileGroupRoutes.has(route) ? linkedFiles(data.rows) : tree ? releaseRows(data.rows) : data.rows).find(row => row.id === id) || {id, artist:id});
   }
   function tableActions() {
     const selectedReleaseCount = Object.keys(selectedReleases(selection)).length;
     const clear = !tree && selected.size > 0 && <button onClick={() => setSelected(new Set())}>Clear selection</button>;
-    const apply = <button disabled={localBusy || active(state?.download_job) || !preview || !selected.size} title={localUnavailable ? "Review saved changes. Reconnect the library drive to apply them." : undefined} onClick={prepareApply}>Review & apply ({selected.size})</button>;
+    const visibleFiles = new Map(linkedFiles(data.rows).map(row => [row.id, row]));
+    const applicableCount = [...selected].filter(id => visibleFiles.get(id)?.affected !== false).length;
+    const apply = <button disabled={localBusy || active(state?.download_job) || !preview || !applicableCount} title={localUnavailable ? "Review saved changes. Reconnect the library drive to apply them." : undefined} onClick={prepareApply}>Review & apply ({applicableCount})</button>;
     let controls: React.ReactNode;
     if (["correct", "organise"].includes(route)) {
       const operations = route === "correct" ? actions : organisationActions;
@@ -1253,7 +1255,7 @@ function App() {
           ? `${offset + 1}–${Math.min(offset + pageSize, data.total)} of ${data.total.toLocaleString()}`
           : "No items"}
         {route === "links" && data.total > 0 && ` artists · ${(data.release_total || 0).toLocaleString()} releases · ${(data.track_total || 0).toLocaleString()} tracks`}
-        {route === "missing" && data.artist_total !== undefined && data.total > 0 && ` ${data.artist_total === 1 ? "artist" : "artists"} · ${(data.release_total || 0).toLocaleString()} ${data.release_total === 1 ? "release" : "releases"}`}
+        {tree && data.artist_total !== undefined && data.total > 0 && ` ${data.artist_total === 1 ? "artist" : "artists"} · ${(data.release_total || 0).toLocaleString()} ${data.release_total === 1 ? "release" : "releases"}`}
         {fileGroupRoutes.has(route) && data.total > 0 && " releases"}
       </span>
       <div>
@@ -1317,7 +1319,7 @@ function App() {
           tree={tree}
           grouped={["local", "online"].includes(route)}
           fileGroups={fileGroupRoutes.has(route)}
-          hierarchy={route === "links" ? "links" : route === "missing" ? "missing" : ["artists", "favourites"].includes(route) ? "artists" : undefined}
+          hierarchy={route === "links" ? "links" : tree ? "releases" : ["artists", "favourites"].includes(route) ? "artists" : undefined}
           treeSelection={selection}
           onTreeSelect={selectTree}
           expanded={expanded}
@@ -1359,6 +1361,8 @@ function App() {
     key: string,
     options?: (string | { value: string | number; label: string })[],
     number = false,
+    help?: string,
+    disabled = false,
   ) {
     let curVal = settings[section]?.[key] ?? "";
     if (key === "page_size" && (!curVal || curVal === "")) {
@@ -1388,10 +1392,11 @@ function App() {
     }
 
     return (
-      <label className="setting-row">
+      <label className="setting-row" title={help}>
         <span>{label}</span>
         {options ? (
           <select
+            disabled={disabled}
             value={String(curVal)}
             onChange={(e) => {
               const val = number ? Number(e.target.value) : e.target.value;
@@ -1417,6 +1422,7 @@ function App() {
           </select>
         ) : (
           <input
+            disabled={disabled}
             type={number ? "number" : "text"}
             value={settings[section]?.[key] ?? ""}
             onChange={(e) =>
@@ -1691,18 +1697,22 @@ function App() {
             true,
           )}
           {field(
-            "Minimum release pause (seconds)",
+            "Minimum pause between tracks (seconds)",
             "provider",
             "download_delay_min_sec",
             undefined,
             true,
+            "Used when Parallel downloads is 1. Parallel downloads use the service rate limit without an extra pause between tracks.",
+            Number(settings.provider?.download_concurrency ?? 2) !== 1,
           )}
           {field(
-            "Maximum release pause (seconds)",
+            "Maximum pause between tracks (seconds)",
             "provider",
             "download_delay_max_sec",
             undefined,
             true,
+            "Used when Parallel downloads is 1. Parallel downloads use the service rate limit without an extra pause between tracks.",
+            Number(settings.provider?.download_concurrency ?? 2) !== 1,
           )}
           <div className="toolbar">
             <button
@@ -1729,13 +1739,16 @@ function App() {
   function contextMenu() {
     if (!menu) return null;
     const r = menu.row;
-    const missingArtistGroup = route === "missing" && !!r.artist_group;
+    const releaseArtistGroup = tree && !!r.artist_group;
+    const metadataBusy = submitting || active(state?.online_job);
     const replacementGroup = ["local", "online"].includes(route) && !!r.children?.length;
     const groupSelected = ["local", "online"].includes(route) && data.rows.some(parent =>
       selected.has(parent.id) && (parent.children || []).some((child: Row) => child.id === r.id));
-    const ids: string[] = missingArtistGroup ? (selected.size ? [...selected] : releaseRows([r]).map(release => release.id)) : (route === "links" && (r.artist_group || r.link_group)) || r.file_group
+    const ids: string[] = releaseArtistGroup ? (selected.size ? [...selected] : releaseRows([r]).map(release => release.id)) : (route === "links" && (r.artist_group || r.link_group)) || r.file_group
       ? (selected.size ? [...selected] : linkedFiles([r]).map(child => child.id))
       : replacementGroup || selected.has(r.id) || groupSelected ? (selected.size ? [...selected] : [r.id]) : [r.id];
+    const visibleReleases = new Map(releaseRows(data.rows).map(release => [release.id, release]));
+    const scopedReleases = ids.map(id => visibleReleases.get(id) || {id});
     return (
       <>
         <div className="menu-scrim" onClick={() => setMenu(null)} />
@@ -1762,11 +1775,11 @@ function App() {
             }
           }}
         >
-          {missingArtistGroup ? <>
+          {releaseArtistGroup ? <>
             <button role="menuitem" onClick={() => {setMenu(null);setExpanded(previous => {const next=new Set(previous);next.has(r.id)?next.delete(r.id):next.add(r.id);return next;});}}>{expanded.has(r.id) ? "Collapse" : "Expand"} releases</button>
-            <button role="menuitem" disabled={queueBusy} onClick={() => {selectTree(toggleReleaseRows(selection,ids.map(id => ({id})),true));setMenu(null);}}>Select releases</button>
-            <button role="menuitem" disabled={queueBusy} onClick={() => {selectTree(toggleReleaseRows(selection,ids.map(id => ({id})),false));setMenu(null);}}>Clear release selection</button>
-            <button role="menuitem" disabled={busy} onClick={() => {run("check_availability",{ids});setMenu(null);}}>Check release availability</button>
+            <button role="menuitem" disabled={queueBusy || scopedReleases.every(release => release.ai_blocked)} onClick={() => {selectTree(toggleReleaseRows(selection,scopedReleases,true));setMenu(null);}}>{route === "queue" ? "Approve releases" : "Select releases"}</button>
+            <button role="menuitem" disabled={queueBusy} onClick={() => {selectTree(toggleReleaseRows(selection,scopedReleases,false));setMenu(null);}}>{route === "queue" ? "Clear approval" : "Clear release selection"}</button>
+            {route !== "downloaded" && <button role="menuitem" disabled={metadataBusy} onClick={() => {run("check_availability",{ids});setMenu(null);}}>Check release availability</button>}
           </> : <button role="menuitem" onClick={() => loadDetail(r)}>
             View metadata / match details
           </button>}
@@ -1859,21 +1872,21 @@ function App() {
               </button>
             </>
           )}
-          {!missingArtistGroup && ["missing", "queue", "downloaded"].includes(route) && (
-            <button role="menuitem" disabled={busy}
+          {!releaseArtistGroup && ["missing", "queue", "downloaded"].includes(route) && (
+            <button role="menuitem" disabled={metadataBusy}
               title="Refresh track metadata and credits using your streaming account. Saved metadata is retained if the request fails."
               onClick={() => {run("release_details", {id:r.parent || r.id, force:true}); setMenu(null);}}>
               Refresh track details and credits
             </button>
           )}
-          {!missingArtistGroup && ["missing", "queue"].includes(route) && (
-            <button role="menuitem" disabled={busy}
+          {!releaseArtistGroup && ["missing", "queue"].includes(route) && (
+            <button role="menuitem" disabled={metadataBusy}
               title="Recheck this release in your configured market, replacing its saved availability check."
               onClick={() => {run("check_availability", {ids:[r.parent || r.id], force:true}); setMenu(null);}}>
               Check release availability
             </button>
           )}
-          {route === "downloaded" && (
+          {route === "downloaded" && !releaseArtistGroup && (
             <>
               <hr />
               <button role="menuitem" disabled={queueBusy || active(state?.download_job) || !!r.ai_blocked} title={r.ai_blocked ? "AI-labelled music is excluded from downloads" : undefined} onClick={() => {
@@ -1885,9 +1898,9 @@ function App() {
           {!r.parent && ["queue", "missing"].includes(route) && (
             <>
               <hr />
-              <button
+              {(route !== "queue" || !releaseArtistGroup) && <button
                 role="menuitem"
-                disabled={queueBusy || !!r.ai_blocked}
+                disabled={queueBusy || !!r.ai_blocked || (releaseArtistGroup && releaseRows([r]).every(release => release.ai_blocked))}
                 title={r.ai_blocked ? "AI-labelled music is excluded from downloads" : undefined}
                 onClick={() => {
                   if (route === "missing")
@@ -1896,12 +1909,12 @@ function App() {
                         ids.map((id) => [id, null]),
                       ),
                     });
-                  else mutate("queue.decision", { ids, decision: "queued" });
+                  else selectTree(toggleReleaseRows(selection,scopedReleases,true));
                   setMenu(null);
                 }}
               >
-                {missingArtistGroup ? `Queue ${ids.length} releases` : "Queue whole release"}
-              </button>
+                {route === "queue" ? `Approve ${ids.length === 1 ? "release" : "selected releases"}` : releaseArtistGroup ? `Queue ${ids.length} releases` : "Queue whole release"}
+              </button>}
               <button
                 role="menuitem"
                 disabled={queueBusy}
@@ -1912,7 +1925,7 @@ function App() {
               >
                 Ignore selected releases
               </button>
-              {!missingArtistGroup && <button
+              {(route === "queue" || !releaseArtistGroup) && <button
                 role="menuitem"
                 disabled={queueBusy}
                 onClick={() => {
@@ -2136,7 +2149,7 @@ function App() {
               ? "Artist candidates"
               : detail.release
                 ? "Release details"
-                : detail.folder_target ? "Folder layout preview" : "Recording & release match"
+                : detail.folder_review ? "Folder layout preview" : "Recording & release match"
           }
           wide
           onClose={() => setDetail(null)}
@@ -2198,11 +2211,12 @@ function App() {
                     Show in Finder
                   </button>
                 </div>
+                {detail.folder_error && <section className="metadata-source"><h3>Folder layout needs review</h3><p role="status">{detail.folder_error}</p><p>Update the folder template in General settings before previewing moves again.</p></section>}
                 {detail.folder_target && <section className="metadata-source"><h3>Proposed folder layout</h3><p>{detail.folder_evidence}</p><dl><dt>Current path</dt><dd style={{whiteSpace:"break-spaces"}}>{detail.path}</dd><dt>Proposed path</dt><dd style={{whiteSpace:"break-spaces"}}>{detail.folder_target}</dd></dl><p>{detail.folder_target === detail.path ? "This file already follows the saved folder template. No change is proposed." : "Only the file location or filename changes. Tags remain unchanged."}</p></section>}
                 {detail.proposed && Object.keys(detail.proposed).length > 0 && <section><h3>Proposed changes</h3>
                   {detail.source_release_id && <p>Online source · Release {detail.source_release_id} · Track {detail.source_track_id}</p>}
                   <TagChanges changes={detail.proposed} current={detail.tags}/></section>}
-                {!detail.folder_target && <><h3>{detail.catalogue_options?.some((option: any) => option.recording_absent) ? "Inspected releases and placements" : "Available placements"}</h3>
+                {!detail.folder_review && <><h3>{detail.catalogue_options?.some((option: any) => option.recording_absent) ? "Inspected releases and placements" : "Available placements"}</h3>
                 {detail.availability_note && <><p>{detail.availability_note}</p><button disabled={detail.availability_checking} onClick={async () => {
                   const path = detail.path;
                   setDetail({...detail, availability_checking:true});
@@ -2323,10 +2337,10 @@ function App() {
                 </div>
                 </>}
                 <details>
-                  <summary>{detail.folder_target ? "Saved file tags" : "All saved tags & DJ checks"}</summary>
+                  <summary>{detail.folder_review ? "Saved file tags" : "All saved tags & DJ checks"}</summary>
                   <h4>Local file tags</h4>
                   <MetadataView value={detail.tags} title="Local file tags"/>
-                  {!detail.folder_target && <><h4>Online metadata by release</h4>
+                  {!detail.folder_review && <><h4>Online metadata by release</h4>
                   <MetadataView value={detail.dj_checks} title="Online source"/></>}
                   {detail.catalogue_note && <p>{readable(detail.catalogue_note)}</p>}
 

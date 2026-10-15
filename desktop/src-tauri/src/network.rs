@@ -210,12 +210,28 @@ pub async fn get(
     Err("Network retry limit reached".into())
 }
 
+/// HTTP fixtures must consume complete headers before responding. A single
+/// TCP read may deliver only a prefix, even on localhost.
+#[cfg(test)]
+pub(crate) fn read_test_request(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut request = Vec::new();
+    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+        let mut chunk = [0; 1024];
+        let count = stream.read(&mut chunk).unwrap();
+        assert!(count > 0, "Request ended before its headers");
+        request.extend_from_slice(&chunk[..count]);
+        assert!(request.len() <= 16384, "Fixture request headers exceeded the limit");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn response_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<usize>) {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -234,8 +250,7 @@ mod tests {
                 };
                 stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut buffer = [0; 4096];
-                stream.read(&mut buffer).unwrap();
+                read_test_request(&mut stream);
                 stream.write_all(response.as_bytes()).unwrap();
                 count += 1;
             }
@@ -310,14 +325,13 @@ mod tests {
     }
     #[tokio::test]
     async fn throttled_get_retries_but_cancelled_get_does_not_send() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for status in ["429 Too Many Requests", "200 OK"] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0; 4096];
-                stream.read(&mut buffer).unwrap();
+                read_test_request(&mut stream);
                 write!(stream,"HTTP/1.1 {status}\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
             }
         });
@@ -358,6 +372,7 @@ mod tests {
 async fn live_metadata_concurrency() {
     let dir = std::env::temp_dir().join(format!("tibrary-concurrency-{}", uuid::Uuid::new_v4()));
     let db = crate::db::TursoDb::open(dir.join("db")).await.unwrap();
+    crate::stream_download::use_read_only_saved_account(&db).await;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -452,6 +467,7 @@ async fn live_track_batch_metadata() {
     use serde_json::Value;
     let dir = std::env::temp_dir().join(format!("tibrary-track-batch-{}", uuid::Uuid::new_v4()));
     let db = crate::db::TursoDb::open(dir.join("db")).await.unwrap();
+    crate::stream_download::use_read_only_saved_account(&db).await;
     let http = client(20).unwrap();
     let token = crate::stream_download::get_valid_token(&db, &http).await.unwrap();
     let response = get(http.get("https://api.tidal.com/v1/albums/140303440/items/credits")

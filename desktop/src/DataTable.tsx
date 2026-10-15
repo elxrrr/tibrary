@@ -97,7 +97,7 @@ export function DataTable({
   /** Local releases whose child selections are actual file IDs, not release IDs. */
   fileGroups?: boolean;
   /** Cached local release summaries, optionally including their indexed files. */
-  hierarchy?: "artists" | "links" | "missing";
+  hierarchy?: "artists" | "links" | "releases";
   treeSelection?: Selection;
   onTreeSelect?: (s: Selection) => void;
   onExpand?: (r: Row) => void;
@@ -112,7 +112,7 @@ export function DataTable({
   selectionLabel?: (row: Row) => string;
 }) {
   const fileSelection = fileGroups || hierarchy === "links";
-  const releaseGroups = hierarchy === "missing";
+  const releaseGroups = hierarchy === "releases";
   const localHierarchy = hierarchy && !releaseGroups;
   const displayedRows = releaseGroups
     ? rows.flatMap(row => row.artist_group && expanded.has(row.id) ? [row, ...(row.children || [])] : [row])
@@ -443,7 +443,7 @@ export function DataTable({
       if (groupState(row) === "empty") onSelect(new Set([row.id]));
     } else if (!selected.has(row.id)) onSelect(new Set([row.id]));
   }
-  const selectableRows = tree ? rows.filter(row => !row.ai_blocked) : rows;
+  const selectableRows = tree ? rows.filter(row => releaseRows([row]).some(release => !release.ai_blocked)) : rows;
   const visibleStates = selectableRows.map((r) =>
     tree
       ? releaseSelectionState(treeSelection || {}, r)
@@ -633,16 +633,17 @@ export function DataTable({
               const state = releaseSelectionState(treeSelection || {}, r);
               const isExpanded = expanded.has(r.id);
               const highlighted = releaseRows([r]).every(release => selected.has(release.id));
+              const blocked = releaseRows([r]).every(release => release.ai_blocked);
               return <tr key={r.id} className={`missing-artist-row${highlighted ? " selected" : ""}`} tabIndex={0}
                 onClick={event => select(r,i,event)}
                 onDoubleClick={event => { if (!(event.target as Element).closest("button,input")) toggleExpanded(r); }}
                 onKeyDown={event => {
                   if (event.target !== event.currentTarget) return;
                   if (event.key === "Enter" || (event.key === "ArrowRight" && !isExpanded) || (event.key === "ArrowLeft" && isExpanded)) {event.preventDefault();toggleExpanded(r);}
-                  if (event.key === " " && !busy) {event.preventDefault();onTreeSelect?.(toggleReleaseRows(treeSelection || {},[r],state !== "checked"));}
+                  if (event.key === " " && !busy && !blocked) {event.preventDefault();onTreeSelect?.(toggleReleaseRows(treeSelection || {},[r],state !== "checked"));}
                 }}
                 onContextMenu={event => {event.preventDefault();selectForMenu(r);onMenu(r,event.clientX,event.clientY);}}>
-                <td className="check"><Check label={`Select releases by ${r.artist}`} state={state} disabled={busy}
+                <td className="check"><Check label={`Select releases by ${r.artist}`} state={state} disabled={busy || blocked}
                   onChange={yes => onTreeSelect?.(toggleReleaseRows(treeSelection || {},[r],yes))} /></td>
                 {columns.map(column => <td key={column.key} title={column.key === "date" ? `Newest release: ${readable(r.date)}` : readable(r[column.key])}>
                   {column.key === "artist" ? <>
@@ -843,8 +844,18 @@ export function DataTable({
                     (r.children || []).map((t: Row) => (
                       <tr
                         key={r.id + ":" + t.id}
+                        tabIndex={0}
+                        onKeyDown={event => {
+                          if (event.target !== event.currentTarget) return;
+                          if (event.key === "Enter") onDetail({...t,parent:r.id,online_id:t.id,ai_blocked:!!r.ai_blocked || !!t.ai_blocked});
+                          if (event.key === " " && !busy && !r.ai_blocked && !t.ai_blocked) {
+                            event.preventDefault();
+                            const checked = treeSelection?.[r.id] === null || !!treeSelection?.[r.id]?.includes(t.id);
+                            onTreeSelect?.(toggleChild(treeSelection || {},r.id,t.id,r.children.map((track:Row)=>track.id),!checked));
+                          }
+                        }}
                         className={
-                          "child " +
+                          "child track-row " +
                           (state === "empty" ||
                           (treeSelection?.[r.id] !== null &&
                             !treeSelection?.[r.id]?.includes(t.id))
@@ -877,19 +888,13 @@ export function DataTable({
                             }
                           />
                         </td>
-                        {nestedRelease ? columns.map(column => {
+                        {columns.map(column => {
                           const value = column.key === "release" ? t.title
                             : column.key === "tracks" ? t.position
-                            : column.key === "status" ? (t.duration ? `${Math.floor(t.duration / 60)}:${String(Math.round(t.duration % 60)).padStart(2,"0")}` : "—")
-                            : column.key === "recommendation" ? t.isrc || "No ISRC" : "";
+                            : column.key === "status" ? (r.ai_blocked ? "AI-generated" : t.status || "") : "";
                           return <td key={column.key} className={column.key === "release" ? "track-title" : column.key === "tracks" ? "track-position" : undefined}
-                            title={column.key === "tracks" ? `Disc · track: ${t.position}` : column.key === "recommendation" ? t.isrc || "No recording identifier" : readable(value)}>{value}</td>;
-                        }) : <>
-                          <td className="track-title" colSpan={Math.max(1, columns.length - 3)}>{t.title}</td>
-                          <td className="track-position" title="Disc · track">{t.position}</td>
-                          <td>{t.duration ? `${Math.floor(t.duration / 60)}:${String(Math.round(t.duration % 60)).padStart(2, "0")}` : "—"}</td>
-                          <td title={t.isrc || "No recording identifier"}>{t.isrc || "No ISRC"}</td>
-                        </>}
+                            title={column.key === "tracks" ? `Disc · track: ${t.position}` : column.key === "release" ? [t.title, t.duration ? `${Math.floor(t.duration / 60)}:${String(Math.round(t.duration % 60)).padStart(2,"0")}` : "", t.isrc ? `ISRC ${t.isrc}` : ""].filter(Boolean).join(" · ") : readable(value)}>{value}</td>;
+                        })}
                         <td className="more"><button aria-label={`Actions for track ${t.title}`} onClick={(e)=>{e.stopPropagation();onMenu({...t,parent:r.id,online_id:t.id,ai_blocked:!!r.ai_blocked || !!t.ai_blocked},e.clientX,e.clientY);}}><MoreHorizontal size={16}/></button></td>
                       </tr>
                     ))

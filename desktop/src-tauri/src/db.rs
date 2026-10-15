@@ -3277,64 +3277,55 @@ impl TursoDb {
         selection: &HashMap<String, Option<Vec<String>>>,
     ) -> Result<(), String> {
         let (market, ai) = self.account_ai_flags().await?;
-        let conn = self.connect()?;
         for (id, selected) in selection {
             if selected.as_ref().is_some_and(Vec::is_empty) { continue; }
             self.ensure_ai_download_allowed(&market, &ai, id).await?;
         }
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        for (ident, sel) in selection {
-            let mut stmt = conn
-                .query(
+        let conn = self.connect()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        // Read the latest payload under the same transaction that changes its
+        // approvals. A stale selection must not partially update a batch or
+        // overwrite metadata published by another worker.
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|error| error.to_string())?;
+        let result = async {
+            for (id, selected) in selection {
+                let mut rows = conn.query(
                     "SELECT payload FROM queue WHERE id = ? AND decision = 'queued'",
-                    (ident.as_str(),),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            if let Some(row) = stmt.next().await.map_err(|e| e.to_string())? {
-                let payload_str: String = row.get(0).map_err(|e| e.to_string())?;
-                let mut release: Value =
-                    serde_json::from_str(&payload_str).map_err(|e| e.to_string())?;
-                let approved: i64;
-                if let Some(selected_ids) = sel {
-                    let id_set: std::collections::HashSet<String> =
-                        selected_ids.iter().cloned().collect();
-                    if let Some(tracks) = release.get("tracks").and_then(|v| v.as_array()) {
-                        let filtered: Vec<Value> = tracks
-                            .iter()
-                            .filter(|t| {
-                                t.get("id")
-                                    .map(|i| id_set.contains(i.to_string().trim_matches('"')))
-                                    .unwrap_or(false)
-                            })
-                            .cloned()
-                            .collect();
-                        approved = if filtered.is_empty() { 0 } else { 1 };
-                        if filtered.len() != id_set.len() {
-                            return Err("Some selected tracks are no longer in the cached release; refresh its details".into());
-                        }
-                        release["selected_tracks"] = json!(filtered);
-                    } else {
-                        approved = 0;
+                    (id.as_str(),),
+                ).await.map_err(|error| error.to_string())?;
+                let row = rows.next().await.map_err(|error| error.to_string())?;
+                let Some(row) = row else {
+                    if selected.as_ref().is_some_and(Vec::is_empty) { continue; }
+                    return Err("A selected release is no longer queued; refresh the queue".into());
+                };
+                let raw: String = row.get(0).map_err(|error| error.to_string())?;
+                drop(rows);
+                let mut release: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+                let approved = if let Some(ids) = selected {
+                    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+                    let tracks: Vec<Value> = release["tracks"].as_array().into_iter().flatten()
+                        .filter(|track| track.get("id").is_some_and(|id| wanted.contains(id.to_string().trim_matches('"'))))
+                        .cloned().collect();
+                    if tracks.len() != wanted.len() {
+                        return Err("Some selected tracks are no longer in the cached release; refresh its details".into());
                     }
+                    let approved = !tracks.is_empty();
+                    release["selected_tracks"] = json!(tracks);
+                    approved
                 } else {
                     release["selected_tracks"] = Value::Null;
-                    approved = 1;
-                }
-                let updated_payload = serde_json::to_string(&release).map_err(|e| e.to_string())?;
+                    true
+                };
                 conn.execute(
                     "UPDATE queue SET payload = ?, approved = ?, updated = ? WHERE id = ?",
-                    (
-                        updated_payload.as_str(),
-                        approved,
-                        now_iso.as_str(),
-                        ident.as_str(),
-                    ),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+                    (release.to_string(), i64::from(approved), now.as_str(), id.as_str()),
+                ).await.map_err(|error| error.to_string())?;
             }
-        }
+            conn.execute("COMMIT", ()).await.map_err(|error| error.to_string())?;
+            Ok::<_, String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        result?;
         self.bump_revision();
         Ok(())
     }
@@ -3375,41 +3366,49 @@ impl TursoDb {
         let (market, ai) = self.account_ai_flags().await?;
         self.ensure_ai_download_allowed(&market, &ai, release_id).await?;
         let conn = self.connect()?;
-        let mut rows = conn
-            .query(
-                "SELECT payload FROM queue WHERE id = ? AND decision = 'downloaded'",
-                (release_id,),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("Choose a completed download to redownload")?;
-        let raw: String = row.get(0).map_err(|e| e.to_string())?;
-        let mut release: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        if let Some(track_id) = track_id {
-            let tracks = release["tracks"]
-                .as_array()
-                .ok_or("Load cached track details first")?;
-            let selected: Vec<Value> = tracks
-                .iter()
-                .filter(|track| track["id"].as_str() == Some(track_id))
-                .cloned()
-                .collect();
-            if selected.len() != 1 {
-                return Err("Selected track is absent from the cached release".into());
+        conn.execute("BEGIN IMMEDIATE", ()).await.map_err(|error| error.to_string())?;
+        let result = async {
+            let mut rows = conn
+                .query(
+                    "SELECT payload FROM queue WHERE id = ? AND decision = 'downloaded'",
+                    (release_id,),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let row = rows
+                .next()
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Choose a completed download to redownload")?;
+            let raw: String = row.get(0).map_err(|e| e.to_string())?;
+            drop(rows);
+            let mut release: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if let Some(track_id) = track_id {
+                let tracks = release["tracks"]
+                    .as_array()
+                    .ok_or("Load cached track details first")?;
+                let selected: Vec<Value> = tracks
+                    .iter()
+                    .filter(|track| track.get("id").is_some_and(|id| id.to_string().trim_matches('"') == track_id))
+                    .cloned()
+                    .collect();
+                if selected.len() != 1 {
+                    return Err("Selected track is absent from the cached release".into());
+                }
+                release["selected_tracks"] = json!(selected);
+            } else {
+                release["selected_tracks"] = Value::Null;
             }
-            release["selected_tracks"] = json!(selected);
-        } else {
-            release["selected_tracks"] = Value::Null;
-        }
-        release["redownload"] = json!(true);
-        let payload = serde_json::to_string(&release).map_err(|e| e.to_string())?;
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute("UPDATE queue SET payload = ?, approved = 1, decision = 'queued', updated = ? WHERE id = ?",
-            (payload.as_str(), now.as_str(), release_id)).await.map_err(|e| e.to_string())?;
+            release["redownload"] = json!(true);
+            let payload = serde_json::to_string(&release).map_err(|e| e.to_string())?;
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute("UPDATE queue SET payload = ?, approved = 1, decision = 'queued', updated = ? WHERE id = ?",
+                (payload.as_str(), now.as_str(), release_id)).await.map_err(|e| e.to_string())?;
+            conn.execute("COMMIT", ()).await.map_err(|error| error.to_string())?;
+            Ok::<_, String>(())
+        }.await;
+        if result.is_err() { let _ = conn.execute("ROLLBACK", ()).await; }
+        result?;
         self.bump_revision();
         Ok(())
     }
@@ -6083,6 +6082,50 @@ with sqlite3.connect('{db}') as db:
     }
 
     #[tokio::test]
+    async fn queue_approval_batches_rollback_stale_tracks_and_keep_metadata() {
+        let dir = std::env::temp_dir().join(format!("queue-atomic-{}", uuid::Uuid::new_v4()));
+        let store = TursoDb::open(dir.join("db")).await.unwrap();
+        let conn = store.connect().unwrap();
+        for id in ["101", "102"] {
+            let payload = json!({"id":id,"title":"Release","tracks":[{"id":"501"},{"id":"502"}],
+                "selected_tracks":null,"credits":{"composer":"Retain this"}});
+            conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES (?,?,1,'queued')",
+                (id,payload.to_string())).await.unwrap();
+        }
+        let mut selection = HashMap::from([
+            ("101".to_string(),Some(vec!["501".to_string()])),
+            ("102".to_string(),Some(vec!["501".to_string()])),
+        ]);
+        // Make the second entry fail after the first update, independent of the
+        // randomized HashMap iteration order.
+        let second = selection.keys().nth(1).unwrap().clone();
+        selection.insert(second.clone(),Some(vec!["stale-track".into()]));
+        let revision = store.revision.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(store.queue_select(&selection).await.unwrap_err().contains("no longer"));
+        assert_eq!(store.revision.load(std::sync::atomic::Ordering::SeqCst),revision);
+        let mut rows=conn.query("SELECT payload,approved FROM queue",()).await.unwrap();
+        while let Some(row)=rows.next().await.unwrap() {
+            let value:Value=serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+            assert!(value["selected_tracks"].is_null(),"the earlier approval must roll back");
+            assert_eq!(row.get::<i64>(1).unwrap(),1);
+        }
+        drop(rows);
+        selection.insert(second,Some(vec![]));
+        store.queue_select(&selection).await.unwrap();
+        let mut rows=conn.query("SELECT id,payload,approved FROM queue",()).await.unwrap();
+        while let Some(row)=rows.next().await.unwrap() {
+            let id=row.get::<String>(0).unwrap();
+            let value:Value=serde_json::from_str(&row.get::<String>(1).unwrap()).unwrap();
+            let expected=selection[&id].as_ref().unwrap().len();
+            assert_eq!(value["selected_tracks"].as_array().unwrap().len(),expected);
+            assert_eq!(row.get::<i64>(2).unwrap(),i64::from(expected>0));
+            assert_eq!(value["credits"]["composer"],"Retain this");
+        }
+        drop(rows); drop(conn); drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_state_settings_and_queue_flow() {
         let temp_dir = std::env::temp_dir().join(format!(
             "turso_state_queue_test_{}",
@@ -6207,6 +6250,27 @@ with sqlite3.connect('{db}') as db:
         assert_eq!(dl_rows.rows[0].release, "Kid A");
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn redownload_accepts_numeric_ids_and_invalid_choices_keep_completed_history() {
+        let dir=std::env::temp_dir().join(format!("redownload-id-{}",uuid::Uuid::new_v4()));
+        let store=TursoDb::open(dir.join("db")).await.unwrap();
+        let conn=store.connect().unwrap();
+        let payload=json!({"id":"101","tracks":[{"id":501,"title":"One"},{"id":"502","title":"Two"}],
+            "credits":{"producer":"Retained"}});
+        conn.execute("INSERT INTO queue(id,payload,approved,decision) VALUES ('101',?,0,'downloaded')",(payload.to_string(),)).await.unwrap();
+        assert!(store.queue_redownload("101",Some("unknown")).await.is_err());
+        assert_eq!(store.get_queue_rows("downloaded",None,None,None,None,0,10).await.unwrap().total,1);
+        store.queue_redownload("101",Some("501")).await.unwrap();
+        let queued=store.get_queue_rows("queue",None,None,None,None,0,10).await.unwrap();
+        assert_eq!(queued.total,1);
+        assert_eq!(queued.rows[0].selected,Some(vec!["501".into()]));
+        let mut rows=conn.query("SELECT payload FROM queue WHERE id='101'",()).await.unwrap();
+        let raw:String=rows.next().await.unwrap().unwrap().get(0).unwrap();
+        let actual:Value=serde_json::from_str(&raw).unwrap();
+        assert_eq!(actual["credits"],payload["credits"]);
+        drop(rows); drop(conn); drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -1747,6 +1747,7 @@ mod subscriber_tests {
         let dir =
             std::env::temp_dir().join(format!("subscriber-workflows-{}", uuid::Uuid::new_v4()));
         let db = TursoDb::open(dir.join("db")).await.unwrap();
+        crate::stream_download::use_read_only_saved_account(&db).await;
         let mut client = TidalClient::from_db(&db).await.unwrap();
         let artists = client.search_artists("Canopy", "GB").await.unwrap();
         assert!(artists.iter().any(|a| a.id == "3870503"));
@@ -1816,7 +1817,7 @@ mod subscriber_tests {
             .await
             .unwrap();
         println!("Favourites passed: {}", favourites["artists"]);
-        println!("Temporary test data: {}", dir.display());
+        drop(client); drop(db); std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -1826,6 +1827,7 @@ mod subscriber_tests {
 async fn live_optional_discovery_contract() {
     let dir=std::env::temp_dir().join(format!("tibrary-discovery-contract-{}",uuid::Uuid::new_v4()));
     let db=TursoDb::open(dir.join("db")).await.unwrap();
+    crate::stream_download::use_read_only_saved_account(&db).await;
     let mut client=TidalClient::from_db(&db).await.unwrap();
     let ids=vec!["140303440".to_owned(),"234657671".to_owned(),"447957706".to_owned()];
     client.albums(&ids,"GB",true).await.unwrap();
@@ -1883,6 +1885,7 @@ pub fn merge_discovery(value: &mut Value, fields: &Value) {
 async fn live_summary_fingerprint_consistency() {
     let dir = std::env::temp_dir().join(format!("subscriber-fingerprints-{}",uuid::Uuid::new_v4()));
     let db = TursoDb::open(dir.join("db")).await.unwrap();
+    crate::stream_download::use_read_only_saved_account(&db).await;
     let mut client = TidalClient::from_db(&db).await.unwrap();
     let catalogue = client.get_artist_catalogue_with_discovery("3870503","GB",false,false).await.unwrap();
     let ids: Vec<_> = catalogue.releases.iter().take(3).map(|release|release.id.clone()).collect();

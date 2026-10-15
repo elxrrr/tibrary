@@ -71,6 +71,7 @@ async fn fetch(
 ) -> Result<(String, Value), String> {
     let mut items = Vec::new();
     let mut offset = 0;
+    let mut seen = HashSet::new();
     loop {
         let response = crate::network::get(
             http.get(format!(
@@ -97,7 +98,7 @@ async fn fetch(
         let page = payload["items"]
             .as_array()
             .ok_or("Album metadata has no track list")?;
-        items.extend(audio_items(page)?);
+        items.extend(unique_audio_items(page, &mut seen)?);
         if page.is_empty()
             && payload["totalNumberOfItems"]
                 .as_u64()
@@ -136,6 +137,19 @@ fn audio_items(page: &[Value]) -> Result<Vec<Value>, String> {
         }
         item["credits"] = entry["credits"].clone();
         items.push(item);
+    }
+    Ok(items)
+}
+
+// Reject overlapping/repeated pages as soon as they arrive. Continuing to the
+// pagination limit wastes requests and cannot produce a valid snapshot.
+fn unique_audio_items(page: &[Value], seen: &mut HashSet<String>) -> Result<Vec<Value>, String> {
+    let items = audio_items(page)?;
+    for item in &items {
+        let id = crate::tidal::resource_id(&item["id"]);
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) || !seen.insert(id) {
+            return Err("Repeated or invalid credited recording; saved cache retained".into());
+        }
     }
     Ok(items)
 }
@@ -579,6 +593,17 @@ mod tests {
     }
 
     #[test]
+    fn credited_pagination_stops_repeated_or_overlapping_pages_immediately() {
+        let track = |id| json!({"type":"track","item":{"id":id,"trackNumber":1,"volumeNumber":1},"credits":[]});
+        let mut seen = HashSet::new();
+        assert_eq!(unique_audio_items(&[track(1),track(2)], &mut seen).unwrap().len(),2);
+        assert!(unique_audio_items(&[track(2),track(3)], &mut seen).unwrap_err().contains("Repeated"));
+        assert!(unique_audio_items(&[track(4),track(4)], &mut HashSet::new()).is_err());
+        assert!(unique_audio_items(&[json!({"type":"track","item":{"id":{}},"credits":[]})], &mut HashSet::new()).is_err());
+        assert!(unique_audio_items(&[json!({"type":"video","item":{"id":2}})], &mut seen).unwrap().is_empty());
+    }
+
+    #[test]
     fn credited_audio_excludes_video_and_keeps_roles_and_supplements() {
         let page = json!([
             {"type":"track","item":{"id":1,"title":"Audio","trackNumber":1,"volumeNumber":1,"isrc":"ABC","bpm":120,"key":"C","keyScale":"MINOR","artists":[{"id":10,"name":"Main artist","type":"MAIN"},{"id":11,"name":"Guest","type":"FEATURED"}],"genres":[{"genreName":"House"}]},"credits":[{"type":"Composer","contributors":[{"name":"Writer","id":2}]},{"type":"Producer","contributors":[{"name":"Writer","id":2}]},{"type":"Guitar","contributors":[{"name":"Player"}]}]},
@@ -814,6 +839,7 @@ mod tests {
 async fn live_parallel_cache() {
     let dir = std::env::temp_dir().join(format!("subscriber-live-{}", uuid::Uuid::new_v4()));
     let db = TursoDb::open(dir.join("db")).await.unwrap();
+    crate::stream_download::use_read_only_saved_account(&db).await;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()

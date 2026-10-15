@@ -199,6 +199,7 @@ mod tests {
     async fn live_release_availability() {
         let dir = std::env::temp_dir().join(format!("availability-live-{}", uuid::Uuid::new_v4()));
         let db = TursoDb::open(dir.join("db")).await.unwrap();
+        crate::stream_download::use_read_only_saved_account(&db).await;
         let ids = ["234657671", "545357878", "429043587", "461260542", "455460887", "136650046",
             "564687865", "564688398", "564688396", "564687589", "564687867"].map(str::to_owned);
         let result = check(&db, &ids, "GB")

@@ -23,6 +23,20 @@ pub struct WorkflowRowPlan {
     pub issues: Vec<String>,
 }
 
+impl WorkflowRowPlan {
+    pub fn folder_operation(&self) -> &'static str {
+        if self.target.is_none() && !self.issues.is_empty() {
+            "Needs review"
+        } else {
+            crate::organisation::folder_operation(&self.path, self.target.as_deref())
+        }
+    }
+
+    pub fn folder_error(&self) -> Option<String> {
+        (self.target.is_none() && !self.issues.is_empty()).then(|| self.issues.join("; "))
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PlanScope {
     database: PathBuf,
@@ -148,12 +162,21 @@ fn total(tags: &HashMap<String, String>, key: &str, position: &str) -> u32 {
         tags.get(position).and_then(|s| s.split('/').nth(1)).and_then(|s| s.trim().parse().ok()).unwrap_or(0)
     }
 }
-pub(crate) fn release_key(row: &LocalFileRecord, tags: &HashMap<String, String>) -> (String, String, String) {
-    let mut folder = Path::new(&row.path).parent().unwrap_or(Path::new(&row.root));
-    if folder.file_name().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("disc ")) {
-        folder = folder.parent().unwrap_or(folder);
+
+fn stored_number(path: &str, value: u32) -> String {
+    // MP4 stores track/disc positions and totals as integers, not text. Asking
+    // it to save "04" produces "4" and an endless correction on the next scan.
+    // FLAC and text-based tags retain the requested two-digit spelling.
+    let extension = Path::new(path).extension().and_then(|value| value.to_str()).unwrap_or("");
+    if ["m4a", "mp4", "alac"].iter().any(|candidate| extension.eq_ignore_ascii_case(candidate)) {
+        value.to_string()
+    } else {
+        format!("{value:02}")
     }
-    (folder.display().to_string(), tags.get("albumartist").or(tags.get("artist")).cloned().unwrap_or_default(), tags.get("album").cloned().unwrap_or_default())
+}
+
+pub(crate) fn release_key(row: &LocalFileRecord, tags: &HashMap<String, String>) -> (String, String, String) {
+    (crate::duplicates::extract_release_folder(&row.path), tags.get("albumartist").or(tags.get("artist")).cloned().unwrap_or_default(), tags.get("album").cloned().unwrap_or_default())
 }
 
 /// Uses the shared catalogue snapshot only: opening Correct tags never fetches online data.
@@ -215,7 +238,7 @@ pub async fn plan_cached(db: &crate::db::TursoDb, rows: &[LocalFileRecord], acti
             if counts.len() == 1 {
                 let count = *counts.iter().next().unwrap();
                 if count >= max_position {
-                    plan.changes.insert(total_key.into(), format!("{count:02}"));
+                    plan.changes.insert(total_key.into(), stored_number(&plan.path, count));
                     plan.issues.retain(|issue| !issue.starts_with(&format!("{total_key} ")));
                     plan.issues.push(format!("{total_key}: {count:02} confirmed by cached release(s) {} with matching recordings and positions", candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")));
                 }
@@ -230,7 +253,7 @@ pub async fn plan_cached(db: &crate::db::TursoDb, rows: &[LocalFileRecord], acti
             let tags = extract_tags_map(&file.metadata);
             let count = group.release.tracks.iter().filter(|t|t.disc_number == track.disc_number).count() as u32;
             let corrected = [("tracknumber", track.track_number),("discnumber",track.disc_number),("tracktotal",count),("disctotal",discs)];
-            let changes: HashMap<String,String> = corrected.into_iter().filter_map(|(k,n)| { let v=format!("{n:02}"); (tags.get(k)!=Some(&v)).then(||(k.to_string(),v)) }).collect();
+            let changes: HashMap<String,String> = corrected.into_iter().filter_map(|(k,n)| { let v=stored_number(&file.path,n); (tags.get(k)!=Some(&v)).then(||(k.to_string(),v)) }).collect();
             if changes.is_empty() { continue; }
             let index = plans.iter().position(|p|p.path == file.path).unwrap_or_else(|| {
                 plans.push(WorkflowRowPlan {path:file.path.clone(),root:file.root.clone(),title:tags.get("title").cloned().unwrap_or_default(),artist:tags.get("albumartist").or(tags.get("artist")).cloned().unwrap_or_default(),album:tags.get("album").cloned().unwrap_or_default(),current_tags:tags.clone(),changes:HashMap::new(),target:None,issues:vec![]});
@@ -328,7 +351,7 @@ pub fn plan_workflow(
                         let parts: Vec<_> = value.split('/').collect();
                         if let Ok(n) = parts[0].trim().parse::<u32>() {
                             if n > 0 {
-                                let formatted = format!("{n:02}");
+                                let formatted = stored_number(&row.path, n);
                                 if &formatted != value {
                                     changes.insert(number.into(), formatted);
                                 }
@@ -337,15 +360,16 @@ pub fn plan_workflow(
                         if !current_tags.contains_key(total) && parts.len() == 2 {
                             if let Ok(n) = parts[1].trim().parse::<u32>() {
                                 if n > 0 {
-                                    changes.insert(total.into(), format!("{n:02}"));
+                                    changes.insert(total.into(), stored_number(&row.path, n));
                                 }
                             }
                         }
                     }
                     if let Some(value) = current_tags.get(total) {
-                        if let Ok(n) = value.parse::<u32>() {
-                            if n > 0 && value != &format!("{n:02}") {
-                                changes.insert(total.into(), format!("{n:02}"));
+                        if let Ok(n) = value.trim().parse::<u32>() {
+                            let formatted = stored_number(&row.path, n);
+                            if n > 0 && value != &formatted {
+                                changes.insert(total.into(), formatted);
                             }
                         }
                     }
@@ -360,7 +384,7 @@ pub fn plan_workflow(
                         let known: std::collections::HashSet<_> = peers.iter().map(|t| total(t,total_key,position)).filter(|n| *n >= max_position).collect();
                         if known.len() == 1 {
                             let count = *known.iter().next().unwrap();
-                            changes.insert(total_key.into(), format!("{count:02}"));
+                            changes.insert(total_key.into(), stored_number(&row.path, count));
                             issues.push(format!("{total_key} {saved} is below position {max_position}; sibling tags agree on {count:02}"));
                         } else {
                             issues.push(format!("{total_key} {saved} is below position {max_position}; a verified release total is needed (local files may be incomplete)"));
@@ -381,9 +405,8 @@ pub fn plan_workflow(
                     .and_then(|s| s.to_str())
                     .unwrap_or("flac");
 
-                if let Ok(target_path) =
-                    format_layout(Path::new(&row.root), &current_tags, template, ext)
-                {
+                match format_layout(Path::new(&row.root), &current_tags, template, ext) {
+                    Ok(target_path) => {
                     let target_str = target_path.display().to_string();
                     // APFS spelling differences alone do not require moving audio.
                     if target_str.nfc().collect::<String>().to_lowercase() != row.path.nfc().collect::<String>().to_lowercase() {
@@ -409,6 +432,8 @@ pub fn plan_workflow(
                         target = Some(target_str);
                         }
                     }
+                    }
+                    Err(error) => issues.push(format!("Cannot organise file: {error}")),
                 }
             }
             _ => {}
@@ -449,6 +474,75 @@ mod tests {
         assert!(plans.iter().all(|p| p.changes.get("tracktotal").is_none_or(|v| v == "01")));
         let plans = plan_workflow(&[sample(1,12), sample(2,14), sample(4,1)], "numbers", None);
         assert_ne!(plans.iter().find(|p| p.path.ends_with("4.flac")).unwrap().changes.get("tracktotal").map(String::as_str), Some("12"));
+    }
+
+    #[test]
+    fn disc_total_repair_uses_the_same_release_grouping_as_library_tables() {
+        let mut first = sample(1, 1);
+        first.path = "/root/Artist/Album/CD1/song.flac".into();
+        first.metadata.as_mut().unwrap()["disctotal"] = serde_json::json!("02");
+        let mut second = sample(1, 1);
+        second.path = "/root/Artist/Album/Disc_02/song.flac".into();
+        second.metadata.as_mut().unwrap()["discnumber"] = serde_json::json!("02");
+        let plans = plan_workflow(&[first, second.clone()], "numbers", None);
+        let plan = plans.iter().find(|plan| plan.path == second.path).unwrap();
+        assert_eq!(plan.changes["disctotal"], "02");
+        assert!(plan.issues.iter().any(|issue| issue.contains("sibling tags agree")));
+    }
+
+    #[tokio::test]
+    async fn number_corrections_roundtrip_once_for_flac_and_mp4_audio() {
+        let directory = std::env::temp_dir().join(format!("tibrary-number-roundtrip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = crate::db::TursoDb::open(directory.join("library.sqlite3")).await.unwrap();
+        for (extension, audio) in [
+            ("flac", crate::stream_download::MINIMAL_FLAC),
+            ("m4a", include_bytes!("../tests/fixtures/silence.m4a").as_slice()),
+        ] {
+            let root = directory.join(extension);
+            std::fs::create_dir(&root).unwrap();
+            for (position, count) in [(1, 12), (4, 1)] {
+                let path = root.join(format!("{position}.{extension}"));
+                std::fs::write(&path, audio).unwrap();
+                crate::tag_writer::write_tags(&path, &HashMap::from([
+                    ("title".into(), format!("Track {position}")),
+                    ("albumartist".into(), "Artist".into()), ("album".into(), "Release".into()),
+                    ("tracknumber".into(), position.to_string()), ("tracktotal".into(), count.to_string()),
+                    ("discnumber".into(), "1".into()), ("disctotal".into(), "1".into()),
+                ])).unwrap();
+            }
+            crate::scanner::scan_library(&db, &root, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| {}).await.unwrap();
+            let files = crate::actions::files(&db, root.to_str().unwrap()).await.unwrap();
+            let plans = plan_cached(&db, &files, "numbers", None).await.unwrap();
+            assert!(plans.iter().any(|plan| plan.changes.get("tracktotal").is_some_and(|value| value == "12")));
+            for plan in plans {
+                crate::maintenance::apply_file_item(&db, root.to_str().unwrap(), &crate::maintenance::FileApplyItem {
+                    path: plan.path, target: None, artwork: None, tags: plan.changes,
+                }).await.unwrap();
+            }
+            let files = crate::actions::files(&db, root.to_str().unwrap()).await.unwrap();
+            assert!(plan_cached(&db, &files, "numbers", None).await.unwrap().is_empty(), "{extension} correction must settle after one apply");
+            let track = files.iter().find(|file| file.path.ends_with(&format!("4.{extension}"))).unwrap();
+            let tags = extract_tags_map(&track.metadata);
+            assert_eq!(tags["tracknumber"], if extension == "flac" { "04" } else { "4" });
+            assert_eq!(tags["tracktotal"], "12");
+            // File naming is padded for both containers regardless of how tags
+            // are physically represented in the audio format.
+            assert!(format_layout(&root, &tags, None, extension).unwrap().file_name().unwrap().to_string_lossy().starts_with("04 -"));
+        }
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_folder_templates_remain_visible_as_review_evidence() {
+        for template in ["{albumartist}/{unknown}/{title}", "{albumartist}/{album}/{title"] {
+            let plans = plan_workflow(&[sample(1, 12)], "organise", Some(template));
+            assert_eq!(plans.len(), 1);
+            assert!(plans[0].target.is_none());
+            assert!(plans[0].changes.is_empty());
+            assert!(plans[0].issues[0].starts_with("Cannot organise file:"));
+        }
     }
     #[tokio::test]
     async fn unchanged_local_plans_are_reused_and_changed_tags_or_templates_invalidate() {

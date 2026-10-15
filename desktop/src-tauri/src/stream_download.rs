@@ -437,6 +437,18 @@ pub async fn load_saved_token(db: &TursoDb) -> Option<TidalToken> {
     None
 }
 
+/// Keep opt-in live checks isolated: never renew or rotate the user's credentials.
+#[cfg(test)]
+pub(crate) async fn use_read_only_saved_account(db: &TursoDb) {
+    let mut token = load_saved_token(db).await
+        .expect("Sign into Tibrary before running a live check without TIBRARY_TEST_MODE");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    assert!(token.expires_at > now + 600.0,
+        "Saved account needs at least ten minutes remaining; reconnect in Tibrary before running live checks");
+    token.refresh_token = None;
+    db.set_preference("tidal_token", &serde_json::to_value(token).unwrap()).await.unwrap();
+}
+
 /// Save the account in the OS credential store; retire legacy plaintext tokens.
 pub async fn save_token(db: &TursoDb, token: &TidalToken) -> Result<(), String> {
     let session = crate::account::AccountSession {
@@ -2136,7 +2148,6 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_audio_body_can_be_cancelled_and_removes_partial_files() {
-        use std::io::Read;
         for concurrency in [1, 2] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -2145,8 +2156,7 @@ mod tests {
                 for _ in 0..concurrency {
                     let (mut socket, _) = listener.accept().unwrap();
                     workers.push(std::thread::spawn(move || {
-                        let mut request = [0u8; 1024];
-                        socket.read(&mut request).unwrap();
+                        crate::network::read_test_request(&mut socket);
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").unwrap();
                         std::thread::sleep(Duration::from_secs(1));
                         let _ = socket.write_all(&[0u8; 100]);
@@ -2291,13 +2301,11 @@ mod tests {
 
     #[tokio::test]
     async fn downloaded_flac_survives_tagging_publication_and_idempotent_retry() {
-        use std::io::Read;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut request = [0u8; 1024];
-            socket.read(&mut request).unwrap();
+            crate::network::read_test_request(&mut socket);
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", MINIMAL_FLAC.len()).unwrap();
             socket.write_all(MINIMAL_FLAC).unwrap();
         });

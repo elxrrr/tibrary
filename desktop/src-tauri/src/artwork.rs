@@ -12,7 +12,7 @@ use std::{
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 // TIDAL currently supports 160px; 128px returns HTTP 403. Never probe it per row.
-const SIZES: [u16; 1] = [160];
+const THUMBNAIL_SIZE: u16 = 160;
 const FAILURE_COOLDOWN: i64 = 300;
 const MEMORY_LIMIT: usize = 96;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -173,13 +173,12 @@ impl ThumbnailService {
         if let Some(image) = self.image(&key) {
             return image;
         }
-        for size in SIZES {
-            let path = folder.join(format!("{cover}-{size}.jpg"));
-            if let Some(bytes) = read_image(&path, size).await {
-                let image = image_value(&cover, size, &bytes);
-                self.remember_image(key, image.clone());
-                return image;
-            }
+        let size = THUMBNAIL_SIZE;
+        let path = folder.join(format!("{cover}-{size}.jpg"));
+        if let Some(bytes) = read_image(&path, size).await {
+            let image = image_value(&cover, size, &bytes);
+            self.remember_image(key, image.clone());
+            return image;
         }
         let failure_path = folder.join(format!("{cover}.unavailable"));
         if self.is_unavailable(&key) || disk_cooldown(&failure_path).await {
@@ -206,20 +205,17 @@ impl ThumbnailService {
         {
             return Value::Null;
         }
-        for size in SIZES {
-            match self.fetch(&cover, size).await {
-                Fetch::Image(bytes) => {
-                    let image = image_value(&cover, size, &bytes);
-                    let _ = atomic_write(&folder.join(format!("{cover}-{size}.jpg")), &bytes).await;
-                    let _ = tokio::fs::remove_file(&failure_path).await;
-                    self.remember_image(key, image.clone());
-                    return image;
-                }
-                Fetch::Failed => break,
-                Fetch::Pause(duration) => {
-                    *self.network_paused.lock().unwrap() = Some(Instant::now() + duration);
-                    break;
-                }
+        match self.fetch(&cover, size).await {
+            Fetch::Image(bytes) => {
+                let image = image_value(&cover, size, &bytes);
+                let _ = atomic_write(&folder.join(format!("{cover}-{size}.jpg")), &bytes).await;
+                let _ = tokio::fs::remove_file(&failure_path).await;
+                self.remember_image(key, image.clone());
+                return image;
+            }
+            Fetch::Failed => {},
+            Fetch::Pause(duration) => {
+                *self.network_paused.lock().unwrap() = Some(Instant::now() + duration);
             }
         }
         self.remember_unavailable(key, Duration::from_secs(FAILURE_COOLDOWN as u64));
@@ -329,7 +325,7 @@ fn valid_cover(value: &str) -> Option<String> {
 }
 
 fn cover_url(cover: &str, size: u16) -> Option<String> {
-    if !SIZES.contains(&size) {
+    if size != THUMBNAIL_SIZE {
         return None;
     }
     Some(format!(

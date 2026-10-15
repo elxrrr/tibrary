@@ -306,10 +306,14 @@ fn grouped_link_facets(page: &Value, filters: &ColumnFilters, args: &Value, colu
     facets(&json!({"rows":rows,"revision":page["revision"]}), &ColumnFilters::new(), column, search, offset, limit)
 }
 
-/// Missing releases groups the already-scoped catalogue by the release's
+/// Catalogue tables group the already-scoped releases by each release's
 /// canonical album artist. Presentation parents never carry remote release IDs
 /// or change the saved release/track rows used by queue and metadata actions.
-fn missing_artist_groups(page: &Value, filters: &ColumnFilters, market: &str) -> Vec<Value> {
+fn catalogue_artist_groups(page: &Value, filters: &ColumnFilters, args: &Value) -> Vec<Value> {
+    let market = args["market"].as_str().unwrap_or("GB");
+    let route = args["route"].as_str().unwrap_or("missing");
+    let sort = args["sort"].as_str().unwrap_or("date");
+    let descending = args["direction"].as_str().map(|direction| direction == "desc").unwrap_or(sort == "date");
     let mut artists = BTreeMap::<String, Vec<Value>>::new();
     for release in page["rows"].as_array().into_iter().flatten()
         .filter(|release| matches(release, filters, None))
@@ -318,13 +322,19 @@ fn missing_artist_groups(page: &Value, filters: &ColumnFilters, market: &str) ->
             .or_default().push(release.clone());
     }
     artists.into_iter().map(|(key, mut children)| {
-        children.sort_by(|left, right| compare_table_cell(right, left, "date")
-            .then_with(|| compare_table_cell(left, right, "release"))
-            .then_with(|| compare_table_cell(left, right, "id")));
+        children.sort_by(|left, right| {
+            let order = if sort == "artist" { std::cmp::Ordering::Equal } else { compare_table_cell(left, right, sort) };
+            (if descending { order.reverse() } else { order })
+                .then_with(|| compare_table_cell(right, left, "date"))
+                .then_with(|| compare_table_cell(left, right, "release"))
+                .then_with(|| compare_table_cell(left, right, "id"))
+        });
         // Inspecting all confidence levels should not promote an artist only
         // because an unavailable or superseded entry has a more recent date.
-        let newest = children.iter().find(|release| release["available"] != false
-            && release["recommendation"] != "Superseded").unwrap_or(&children[0]);
+        let newest = children.iter().filter(|release| release["available"] != false
+            && release["recommendation"] != "Superseded")
+            .max_by(|left, right| compare_table_cell(left, right, "date"))
+            .or_else(|| children.iter().max_by(|left, right| compare_table_cell(left, right, "date"))).unwrap();
         let date = newest["date"].clone();
         let count = children.len();
         let tracks = children.iter().map(|release| release["tracks"].as_u64().unwrap_or(0)).sum::<u64>();
@@ -340,18 +350,18 @@ fn missing_artist_groups(page: &Value, filters: &ColumnFilters, market: &str) ->
             }
         }
         let evidence: Vec<_> = recommendations.iter().map(|(label, count)|format!("{count} {label}")).collect();
-        let id = format!("missing-artist:{:x}", Sha256::digest(serde_json::to_vec(
-            &(market.to_uppercase(), &key)).expect("missing artist key serializes")));
-        json!({"id":id,"artist":children[0]["artist"],"artist_group":true,"missing_artist_group":true,
+        let id = format!("{route}-artist:{:x}", Sha256::digest(serde_json::to_vec(
+            &(market.to_uppercase(), &key)).expect("catalogue artist key serializes")));
+        json!({"id":id,"artist":children[0]["artist"],"artist_group":true,"missing_artist_group":route == "missing",
             "release":format!("{count} {}",if count == 1 {"release"} else {"releases"}),
-            "releases":count,"tracks":tracks,"date":date,"status":shared("status"),
+            "releases":count,"tracks":tracks,"date":date,"type":shared("type"),"status":shared("status"),
             "recommendation":shared("recommendation"),"evidence":evidence,
             "expanded_available":true,"children":children})
     }).collect()
 }
 
-fn grouped_missing_page(mut page: Value, filters: &ColumnFilters, args: &Value, offset: usize, limit: usize) -> Value {
-    let mut rows = missing_artist_groups(&page, filters, args["market"].as_str().unwrap_or("GB"));
+fn grouped_catalogue_page(mut page: Value, filters: &ColumnFilters, args: &Value, offset: usize, limit: usize) -> Value {
+    let mut rows = catalogue_artist_groups(&page, filters, args);
     let key = args["sort"].as_str().unwrap_or("date");
     let key = if key == "release" { "releases" } else { key };
     let descending = args["direction"].as_str().map(|direction| direction == "desc")
@@ -476,7 +486,7 @@ fn local_file_release_groups(page: &Value, filters: &ColumnFilters, except: Opti
             }
             if let Some(operation) = child["folder_operation"].as_str().filter(|operation|!operation.is_empty() && *operation != "No change") {
                 *operations.entry(operation.into()).or_default() += 1;
-                movements += 1;
+                if operation != "Needs review" { movements += 1; }
             }
         }
         let evidence = std::iter::once(format!("{count} {}",if count == 1 {"file"} else {"files"}))
@@ -1033,7 +1043,7 @@ async fn get_table_page(state: &Arc<Backend>, db: &TursoDb, args: &Value) -> Res
                 let file = file_index.get(plan.path.as_str())?;
                 let description = if plan.target.is_some() { "Move or rename file to match its tags" } else { "Standardise local tags" };
                 Some(json!({"id":plan.path,"path":plan.path,"artist":plan.artist,"release":plan.album,"title":plan.title,
-                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"folder_operation":crate::organisation::folder_operation(&plan.path, plan.target.as_deref()),"evidence":if plan.issues.is_empty() { description.to_string() } else { plan.issues.join("; ") },
+                    "tags":plan.current_tags,"changes":plan.changes,"target":plan.target,"folder_operation":plan.folder_operation(),"folder_error":if action == "organise" {plan.folder_error()} else {None},"evidence":if plan.issues.is_empty() { description.to_string() } else { plan.issues.join("; ") },
                     "affected":!plan.changes.is_empty() || plan.target.is_some(),"status":if plan.changes.is_empty() && plan.target.is_none() { "Needs review" } else { "Needs update" },"size":file.size,"mtime":file.mtime,
                     "item":{"path":plan.path,"target":plan.target,"tags":plan.changes}}))
             }).collect();
@@ -1173,7 +1183,7 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
     }
     let filters = parse(args.get("column_filters"))?;
     let grouped_links = args["route"] == "links" && args["group_releases"] == true;
-    let grouped_missing = args["route"] == "missing" && args["group_artists"] == true;
+    let grouped_catalogue = matches!(args["route"].as_str(), Some("missing" | "queue" | "downloaded")) && args["group_artists"] == true;
     let grouped_files = local_file_route(args["route"].as_str().unwrap_or("")) && args["group_releases"] == true;
     let normalize = |mut page: Value| {
         if let Some(rows) = page["rows"].as_array_mut() {
@@ -1181,10 +1191,10 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
             // linked files, not proposed changes. Apply the scope consistently.
             if args["filter"] == "affected" { rows.retain(|row| row["affected"] == true); }
             for row in rows.iter_mut().filter(|row| row["ignored"] == true) { row["status"] = json!("Ignored"); }
-            // Missing artist parents are sorted after grouping. Keep their
+            // Catalogue artist parents are sorted after grouping. Keep their
             // shared flat snapshot in the source's default order so ungrouped
             // callers can reuse it without inheriting a presentation sort.
-            if let Some(key) = args["sort"].as_str().filter(|_| !grouped_missing) {
+            if let Some(key) = args["sort"].as_str().filter(|_| !grouped_catalogue) {
                 let descending = args["direction"] == "desc" ||
                     (args["direction"].is_null() && args["route"] == "missing" && key == "date");
                 rows.sort_by(|left,right| {
@@ -1206,9 +1216,14 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         for key in ["column_filters", "column", "facet_search", "group_releases", "group_artists"] { source.remove(key); }
         source.insert("offset".into(), json!(0));
         source.insert("limit".into(), json!(usize::MAX));
-        if grouped_files || grouped_missing {
+        if grouped_files || grouped_catalogue {
             // Sorting presentation parents must reuse the same flat snapshot.
             source.remove("sort"); source.remove("direction");
+        }
+        if grouped_catalogue && args["route"] != "missing" {
+            // Search cached track titles as well as artist/release names. Keep
+            // one flat source snapshot for repeated text and column filters.
+            source.remove("search");
         }
     }
     // Filtering/paging one column must not repeatedly reload a large catalogue.
@@ -1231,7 +1246,18 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         }
         page
     };
-    let page = scope_link_release_page(page, args);
+    let mut page = scope_link_release_page(page, args);
+    if grouped_catalogue && args["route"] != "missing" {
+        if let Some(query) = args["search"].as_str().map(str::trim).filter(|query| !query.is_empty()) {
+            let query = query.to_lowercase();
+            if let Some(rows) = page["rows"].as_array_mut() {
+                rows.retain(|row| ["artist", "release", "online_id"].iter().any(|field|
+                    row[field].as_str().unwrap_or("").to_lowercase().contains(&query))
+                    || row["children"].as_array().into_iter().flatten().any(|track|
+                        ["title", "isrc"].iter().any(|field| track[field].as_str().unwrap_or("").to_lowercase().contains(&query))));
+            }
+        }
+    }
     Ok(if grouped_links {
         if let Some(column) = column {
             grouped_link_facets(&page,&filters,args,column,args["facet_search"].as_str().unwrap_or(""),offset,limit.min(500))
@@ -1244,8 +1270,8 @@ pub async fn table_result(state: &Arc<Backend>, db: &TursoDb, args: &Value, is_f
         } else { grouped_file_page(page,&filters,args,offset,limit) }
     } else if let Some(column) = column {
         facets(&page,&filters,column,args["facet_search"].as_str().unwrap_or(""),offset,limit.min(500))
-    } else if grouped_missing {
-        grouped_missing_page(page,&filters,args,offset,limit)
+    } else if grouped_catalogue {
+        grouped_catalogue_page(page,&filters,args,offset,limit)
     } else {
         filter_page(page,&filters,offset,limit)
     })
@@ -1272,6 +1298,62 @@ mod tests {
         drop(db); std::fs::remove_dir_all(temp).unwrap();
     }
 
+    #[tokio::test]
+    async fn queue_and_downloaded_group_complete_artist_releases_and_search_cached_tracks() {
+        let temp = std::env::temp_dir().join(format!("catalogue-hierarchy-{}",uuid::Uuid::new_v4()));
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let state = Arc::new(Backend::default());
+        for (id, artist, title, date, kind) in [
+            ("101", "Album Artist", "Original", "2020-01-01", "ALBUM"),
+            ("102", "Album Artist", "Original deluxe", "2021-01-01", "ALBUM"),
+            ("103", "Album Artist", "Afterwards", "2022-01-01", "SINGLE"),
+            ("104", "Other Artist", "Elsewhere", "2023-01-01", "EP"),
+        ] {
+            let payload = json!({"id":id,"artist":artist,"title":title,"date":date,"type":kind,
+                "available":true,"track_count":2,"tracks_loaded":true,
+                "tracks":[{"id":format!("{id}1"),"title":if id == "102" {"Needle"} else {"Intro"},
+                    "artist":"Guest singer","disc_number":1,"track_number":1,"isrc":format!("GBTEST{id}1")},
+                    {"id":format!("{id}2"),"title":"Outro","disc_number":1,"track_number":2}],
+                "selected_tracks":[{"id":format!("{id}2")}]});
+            db.connect().unwrap().execute("INSERT INTO queue(id,payload,approved,decision) VALUES(?,?,1,'queued')",
+                (id,payload.to_string())).await.unwrap();
+        }
+        for route in ["queue","downloaded"] {
+            db.connect().unwrap().execute("UPDATE queue SET decision=?",(if route == "queue" {"queued"} else {"downloaded"},)).await.unwrap();
+            let args = json!({"route":route,"market":"GB","group_artists":true,"sort":"artist","direction":"asc","limit":1});
+            let first = table_result(&state,&db,&args,false).await.unwrap();
+            assert_eq!(first["total"],2);
+            assert_eq!(first["artist_total"],2);
+            assert_eq!(first["release_total"],4);
+            assert_eq!(first["track_total"],8);
+            let parent = &first["rows"][0];
+            assert_eq!(parent["artist"],"Album Artist","track guests cannot become album artist groups");
+            assert!(parent["id"].as_str().unwrap().starts_with(&format!("{route}-artist:")));
+            assert!(parent.get("online_id").is_none());
+            assert_eq!(parent["children"].as_array().unwrap().len(),3,"pagination must not split an artist's releases");
+            assert_eq!(parent["children"][0]["id"],"103");
+            assert_eq!(parent["children"][0]["selected"],json!(["1032"]));
+            assert_eq!(parent["children"][0]["children"].as_array().unwrap().len(),2);
+            let mut sorted=args.clone(); sorted["sort"]=json!("release"); sorted["direction"]=json!("desc");
+            let descending=table_result(&state,&db,&sorted,false).await.unwrap();
+            assert_eq!(descending["rows"][0]["id"],parent["id"]);
+            assert_eq!(descending["rows"][0]["children"][0]["id"],"102","requested order applies to releases within the artist");
+            let mut searched=args.clone(); searched["search"]=json!("needle");
+            let search=table_result(&state,&db,&searched,false).await.unwrap();
+            assert_eq!(search["total"],1);
+            assert_eq!(search["release_total"],1);
+            assert_eq!(search["rows"][0]["id"],parent["id"],"search preserves disclosure identity");
+            assert_eq!(search["rows"][0]["children"][0]["id"],"102");
+            assert_eq!(search["rows"][0]["children"][0]["children"].as_array().unwrap().len(),2,"search preserves whole-release approval context");
+            searched["column"]=json!("type");
+            let facet=table_result(&state,&db,&searched,true).await.unwrap();
+            assert_eq!(facet["options"],json!([{"value":"ALBUM","label":"ALBUM","count":1}]));
+            let mut page2=args.clone(); page2["offset"]=json!(1);
+            assert_eq!(table_result(&state,&db,&page2,false).await.unwrap()["rows"][0]["artist"],"Other Artist");
+        }
+        drop(db); std::fs::remove_dir_all(temp).unwrap();
+    }
+
     fn missing_release(id: &str, artist: &str, date: &str, recommendation: &str) -> Value {
         json!({"id":id,"online_id":id,"artist":artist,"release":format!("Release {id}"),
             "date":date,"type":"ALBUM","tracks":2,"status":"Missing release",
@@ -1281,13 +1363,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_artist_groups_preserve_release_tracks_and_page_whole_artists() {
+    fn catalogue_artist_groups_preserve_release_tracks_and_page_whole_artists() {
         let old = missing_release("1", "Album Artist", "2024-01-01", "Potential");
         let new = missing_release("2", "Album Artist", "2026-10-14", "Recommended");
         let other = missing_release("3", "Other Artist", "2025-01-01", "Recommended");
         let page = json!({"rows":[old.clone(),other.clone(),new.clone()],"revision":42,"missing_total":3});
         let args = json!({"route":"missing","market":"GB","group_artists":true});
-        let first = grouped_missing_page(page.clone(),&ColumnFilters::new(),&args,0,1);
+        let first = grouped_catalogue_page(page.clone(),&ColumnFilters::new(),&args,0,1);
         assert_eq!(first["total"],2);
         assert_eq!(first["artist_total"],2);
         assert_eq!(first["release_total"],3);
@@ -1303,7 +1385,7 @@ mod tests {
         assert_eq!(artist["children"],json!([new,old]));
         assert!(artist.get("online_id").is_none(), "artist parents are never remote releases");
         assert!(artist.get("selected").is_none(), "queue selection remains on actual release rows");
-        let second = grouped_missing_page(page.clone(),&ColumnFilters::new(),&args,1,1);
+        let second = grouped_catalogue_page(page.clone(),&ColumnFilters::new(),&args,1,1);
         assert_eq!(second["rows"][0]["children"],json!([other]));
         assert_eq!(second["offset"],1);
         assert_eq!(filter_page(page,&ColumnFilters::new(),0,10)["total"],3,
@@ -1316,18 +1398,18 @@ mod tests {
         let second = missing_release("2", "Second Artist", "2026-10-01", "Recommended");
         let page = json!({"rows":[first.clone(),second.clone()]});
         let args = json!({"market":"GB"});
-        let before = grouped_missing_page(page,&ColumnFilters::new(),&args,0,10);
+        let before = grouped_catalogue_page(page,&ColumnFilters::new(),&args,0,10);
         assert_eq!(before["rows"][0]["artist"],"Second Artist");
         let artist_id = before["rows"][1]["id"].clone();
         let new = missing_release("3", "First Artist", "2026-10-15", "Recommended");
         let mut superseded = missing_release("4", "Second Artist", "2026-12-01", "Superseded");
         superseded["available"] = json!(false);
         let page = json!({"rows":[first,second,new.clone(),superseded]});
-        let after = grouped_missing_page(page.clone(),&ColumnFilters::new(),&args,0,10);
+        let after = grouped_catalogue_page(page.clone(),&ColumnFilters::new(),&args,0,10);
         assert_eq!(after["rows"][0]["id"],artist_id);
         assert_eq!(after["rows"][0]["children"][0],new);
         assert_eq!(after["rows"][1]["date"],"2026-10-01", "hidden or unavailable entries do not promote the artist");
-        let ascending = grouped_missing_page(page,&ColumnFilters::new(),&json!({"sort":"date","direction":"asc"}),0,10);
+        let ascending = grouped_catalogue_page(page,&ColumnFilters::new(),&json!({"sort":"date","direction":"asc"}),0,10);
         assert_eq!(ascending["rows"][0]["artist"],"Second Artist");
     }
 
@@ -1339,20 +1421,20 @@ mod tests {
         let page = json!({"rows":[old.clone(),new.clone(),other]});
         let filters = parse(Some(&json!({"recommendation":{"include":["Potential"]}}))).unwrap();
         let args = json!({"sort":"date","direction":"desc","market":"GB"});
-        let filtered = grouped_missing_page(page.clone(),&filters,&args,0,1);
+        let filtered = grouped_catalogue_page(page.clone(),&filters,&args,0,1);
         assert_eq!(filtered["total"],2);
         assert_eq!(filtered["release_total"],2);
         assert_eq!(filtered["rows"][0]["artist"],"Other", "filtered-out newer entries cannot reorder groups");
-        let last = grouped_missing_page(page.clone(),&filters,&args,1,1);
+        let last = grouped_catalogue_page(page.clone(),&filters,&args,1,1);
         assert_eq!(last["rows"][0]["children"],json!([old]));
-        let unfiltered = grouped_missing_page(page.clone(),&ColumnFilters::new(),&args,0,10);
+        let unfiltered = grouped_catalogue_page(page.clone(),&ColumnFilters::new(),&args,0,10);
         let artist = unfiltered["rows"].as_array().unwrap().iter().find(|row|row["artist"] == "Artist").unwrap();
         assert_eq!(last["rows"][0]["id"],artist["id"], "filtering never changes expansion identity");
         let facet = facets(&page,&filters,"recommendation","",0,100);
         assert_eq!(facet["options"],json!([{"label":"Potential","value":"Potential","count":2},
             {"label":"Superseded","value":"Superseded","count":1}]));
         let only_superseded = parse(Some(&json!({"recommendation":{"include":["Superseded"]}}))).unwrap();
-        let inspected = grouped_missing_page(page,&only_superseded,&args,0,10);
+        let inspected = grouped_catalogue_page(page,&only_superseded,&args,0,10);
         assert_eq!(inspected["rows"][0]["children"],json!([new]), "superseded releases remain inspectable");
         assert_eq!(inspected["rows"][0]["date"],"2026-10-15");
     }

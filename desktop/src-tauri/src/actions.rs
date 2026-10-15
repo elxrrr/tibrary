@@ -105,11 +105,19 @@ async fn duplicate_review_clusters(db: &TursoDb, root: &str, indexed: &[LocalFil
 }
 
 async fn remove_reviewed_duplicate(db: &TursoDb, root: &str, path: &str) -> Result<(), String> {
+    remove_reviewed_duplicate_with_trash(db, root, path, || crate::duplicates::trash_file_or_directory(path)).await
+}
+
+async fn remove_reviewed_duplicate_with_trash<F, Fut>(db: &TursoDb, root: &str, path: &str, trash: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     crate::library_access::require_library(root)?;
     if !std::fs::symlink_metadata(path).map_err(|error| format!("Reviewed duplicate is unavailable; cached file retained: {error}"))?.is_file() {
         return Err("Reviewed duplicate is no longer a regular file; cached file retained".into());
     }
-    crate::duplicates::trash_file_or_directory(path).await?;
+    trash().await?;
     // Finder may report success or time out while the drive is disconnecting.
     crate::library_access::require_library(root)?;
     db.remove_local_file(path).await
@@ -2114,7 +2122,7 @@ pub async fn execute(
         let file_index:std::collections::HashMap<_,_>=indexed.iter().map(|f|(f.path.as_str(),f)).collect();
         let rows:Vec<Value>=plans.into_iter().filter(|p|ids.is_empty()||ids.contains(&p.path)).map(|p| {
             let f=file_index[p.path.as_str()];
-            json!({"id":p.path,"path":p.path,"artist":p.artist,"release":p.album,"title":p.title,"tags":p.current_tags,"changes":p.changes,"target":p.target,"folder_operation":crate::organisation::folder_operation(&p.path, p.target.as_deref()),"evidence":p.issues.join("; "),"affected":!p.changes.is_empty() || p.target.is_some(),"status":if !p.changes.is_empty() || p.target.is_some() {"Needs update"} else {"Needs review"},"size":f.size,"mtime":f.mtime,"item":{"path":p.path,"target":p.target,"tags":p.changes}})
+            json!({"id":p.path,"path":p.path,"artist":p.artist,"release":p.album,"title":p.title,"tags":p.current_tags,"changes":p.changes,"target":p.target,"folder_operation":p.folder_operation(),"folder_error":if action == "organise" {p.folder_error()} else {None},"evidence":p.issues.join("; "),"affected":!p.changes.is_empty() || p.target.is_some(),"status":if !p.changes.is_empty() || p.target.is_some() {"Needs update"} else {"Needs review"},"size":f.size,"mtime":f.mtime,"item":{"path":p.path,"target":p.target,"tags":p.changes}})
         }).collect();
         let id = uuid::Uuid::new_v4().to_string();
         state.previews.lock().unwrap().insert(id.clone(),json!({"id":id,"created":chrono::Utc::now().timestamp_millis(),"operation":action,"root":root,"rows":rows,"count":rows.len()}));
@@ -2222,6 +2230,47 @@ mod tests {
         let fresh = execute(&db, &backend, "local_duplicates", &json!({"root":root,"force":true}),
             Arc::new(AtomicBool::new(false))).await.unwrap();
         assert_eq!(fresh["opportunities"], 1);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reviewed_duplicate_trash_publishes_only_successful_file_removals() {
+        let temp = std::env::temp_dir().join(format!("reviewed-trash-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("Music");
+        let fixture_trash = temp.join("Test Trash");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&fixture_trash).unwrap();
+        let duplicate = root.join("duplicate.flac");
+        let keeper = root.join("keeper.flac");
+        let cover = root.join("cover.jpg");
+        std::fs::write(&cover, b"Keep companion artwork").unwrap();
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        for path in [&duplicate, &keeper] {
+            std::fs::write(path, crate::stream_download::MINIMAL_FLAC).unwrap();
+            let path = path.to_str().unwrap();
+            db.apply_file_update(path, path, root.to_str().unwrap(), &json!({"title":"Song"}), 1, 2).await.unwrap();
+            db.save_track_link(path, "GB", "[0,0,1,2]", r#"{"status":"linked"}"#).await.unwrap();
+        }
+        let failed = remove_reviewed_duplicate_with_trash(&db, root.to_str().unwrap(), duplicate.to_str().unwrap(), || async {
+            Err("Simulated Trash failure".into())
+        }).await.unwrap_err();
+        assert_eq!(failed, "Simulated Trash failure");
+        assert_eq!(files(&db, root.to_str().unwrap()).await.unwrap().len(), 2);
+        assert_eq!(std::fs::read(&duplicate).unwrap(), crate::stream_download::MINIMAL_FLAC);
+        remove_reviewed_duplicate_with_trash(&db, root.to_str().unwrap(), duplicate.to_str().unwrap(), || async {
+            std::fs::rename(&duplicate, fixture_trash.join("duplicate.flac")).map_err(|error| error.to_string())
+        }).await.unwrap();
+        assert!(!duplicate.exists());
+        assert!(keeper.exists());
+        assert_eq!(std::fs::read(&cover).unwrap(), b"Keep companion artwork");
+        assert_eq!(std::fs::read(fixture_trash.join("duplicate.flac")).unwrap(), crate::stream_download::MINIMAL_FLAC);
+        let remaining = files(&db, root.to_str().unwrap()).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].path, keeper.display().to_string());
+        let conn = db.connect().unwrap();
+        let mut links = conn.query("SELECT path FROM track_links", ()).await.unwrap();
+        assert_eq!(links.next().await.unwrap().unwrap().get::<String>(0).unwrap(), keeper.display().to_string());
+        assert!(links.next().await.unwrap().is_none());
         std::fs::remove_dir_all(temp).unwrap();
     }
 
@@ -3026,12 +3075,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Uses a copied real audio fixture; set TIBRARY_SAMPLE_FLAC and run this test with --ignored"]
     async fn real_flac_prepare_workflows_are_read_only_until_confirmed() {
-        let Ok(sample) = std::env::var("TIBRARY_SAMPLE_FLAC") else {
-            return;
-        };
+        let sample = std::env::var("TIBRARY_SAMPLE_FLAC").expect("Set TIBRARY_SAMPLE_FLAC to an existing FLAC fixture; only a disposable copy is modified");
         let source = std::path::Path::new(&sample);
         let before = std::fs::read(source).unwrap();
+        let samples = |path: &std::path::Path| claxon::FlacReader::open(path).unwrap().samples().collect::<Result<Vec<_>, _>>().unwrap();
+        let original_audio = samples(source);
         let temp = std::env::temp_dir().join(format!("tibrary-real-prep-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp).unwrap();
         let copied = temp.join("sample.flac");
@@ -3039,8 +3089,16 @@ mod tests {
         crate::tag_writer::write_tags(
             &copied,
             &std::collections::HashMap::from([
+                ("title".into(), "Test / Song".into()),
+                ("albumartist".into(), "Audit artist".into()),
+                ("album".into(), "Test release".into()),
+                ("date".into(), "2025/04/03".into()),
                 ("tracknumber".into(), "1".into()),
+                ("tracktotal".into(), "1".into()),
                 ("discnumber".into(), "1".into()),
+                ("disctotal".into(), "1".into()),
+                ("initialkey".into(), "G major".into()),
+                ("lyrics".into(), "Temporary audit lyrics".into()),
             ]),
         )
         .unwrap();
@@ -3051,7 +3109,8 @@ mod tests {
             .unwrap();
         let backend = Arc::new(Backend::new());
         for action in ["dates", "numbers", "keys", "lyrics", "organise"] {
-            execute(
+            let unchanged = std::fs::read(&copied).unwrap();
+            let preview = execute(
                 &db,
                 &backend,
                 "preview",
@@ -3060,25 +3119,26 @@ mod tests {
             )
             .await
             .unwrap();
+            assert_eq!(std::fs::read(&copied).unwrap(), unchanged, "{action} preview is read-only");
+            let applied = execute(&db, &backend, "apply", &json!({"root":temp,"preview_id":preview["preview_id"],"ids":[copied],"confirmed":true}), cancel.clone()).await.unwrap();
+            assert_eq!(applied["applied"], 1, "{action} applies its reviewed proposal");
         }
-        let preview = execute(
-            &db,
-            &backend,
-            "preview",
-            &json!({"root":temp,"action":"numbers"}),
-            cancel.clone(),
-        )
-        .await
-        .unwrap();
-        let applied = execute(&db, &backend, "apply", &json!({"root":temp,"preview_id":preview["preview_id"],"ids":[copied],"confirmed":true}), cancel.clone()).await.unwrap();
-        assert_eq!(applied["applied"], 1);
+        let indexed = files(&db, temp.to_str().unwrap()).await.unwrap();
+        assert_eq!(indexed.len(), 1);
+        let organised = std::path::Path::new(&indexed[0].path);
+        assert!(!copied.exists());
+        assert_eq!(organised, temp.join("Audit artist/Test release (2025)/01 - Test - Song.flac"));
         let copied_tags = workflows::extract_tags_map(&Some(
-            serde_json::to_value(crate::scanner::read_audio_metadata(&copied).unwrap()).unwrap(),
+            serde_json::to_value(crate::scanner::read_audio_metadata(organised).unwrap()).unwrap(),
         ));
-        assert_eq!(
-            copied_tags.get("tracknumber").map(String::as_str),
-            Some("01")
-        );
+        assert_eq!(copied_tags.get("tracknumber").map(String::as_str), Some("01"));
+        assert_eq!(copied_tags.get("date").map(String::as_str), Some("2025-04-03"));
+        assert_eq!(copied_tags.get("initialkey").map(String::as_str), Some("9B"));
+        assert!(!copied_tags.contains_key("lyrics"));
+        assert_eq!(workflows::extract_tags_map(&indexed[0].metadata), copied_tags);
+        assert_eq!(samples(organised), original_audio, "Tag edits and moves preserve decoded audio");
+        let rescanned = crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {}).await.unwrap();
+        assert_eq!((rescanned.read, rescanned.unchanged), (0, 1), "Completed edits already refresh the shared index");
         let audited = execute(&db, &backend, "mqa", &json!({"root":temp}), cancel.clone())
             .await
             .unwrap();
@@ -3087,6 +3147,51 @@ mod tests {
         drop(db);
         std::fs::remove_dir_all(temp).unwrap();
     }
+    #[tokio::test]
+    async fn invalid_folder_preview_survives_the_default_table_filter_without_proposing_a_move() {
+        let temp = std::env::temp_dir().join(format!("tibrary-invalid-layout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("track.flac");
+        std::fs::write(&path, crate::stream_download::MINIMAL_FLAC).unwrap();
+        crate::tag_writer::write_tags(&path, &std::collections::HashMap::from([
+            ("title".into(), "Example".into()),
+            ("albumartist".into(), "Artist".into()),
+            ("album".into(), "Release".into()),
+        ])).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let db = TursoDb::open(temp.join("db")).await.unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        crate::scanner::scan_library(&db, &temp, cancel.clone(), |_| {}).await.unwrap();
+        db.save_settings("organisation", &json!({"template":"{albumartist}/{unknown}/{title}"})).await.unwrap();
+        let backend = Arc::new(Backend::new());
+        let preview = execute(&db, &backend, "preview", &json!({"root":temp,"action":"organise"}), cancel).await.unwrap();
+        let saved = backend.previews.lock().unwrap()[preview["preview_id"].as_str().unwrap()].clone();
+        let assert_diagnostic = |row: &Value| {
+            assert_eq!(row["folder_operation"], "Needs review");
+            assert_eq!(row["status"], "Needs review");
+            assert_eq!(row["affected"], false);
+            assert!(row["target"].is_null());
+            assert!(row["changes"].as_object().unwrap().is_empty());
+            assert!(row["folder_error"].as_str().unwrap().starts_with("Cannot organise file:"));
+        };
+        assert_diagnostic(&saved["rows"][0]);
+        // This is the actual Organise files view's default filter. Invalid
+        // templates must remain discoverable without looking actionable.
+        let page = crate::table_filters::table_result(&backend, &db, &json!({
+            "route":"organise", "root":temp, "action":"organise", "group_releases":true,
+            "column_filters":{"folder_operation":{"exclude":["No change"]}}, "limit":100,
+        }), false).await.unwrap();
+        assert_eq!(page["total"], 1);
+        let release = &page["rows"][0];
+        assert_eq!(release["folder_operation"], "Needs review");
+        assert_eq!(release["affected"], false);
+        assert_eq!(release["children"].as_array().unwrap().len(), 1);
+        assert_diagnostic(&release["children"][0]);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        drop(db);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
     #[tokio::test]
     async fn preview_apply_roundtrip_preserves_audio_and_requires_review() {
         let temp = std::env::temp_dir().join(format!("tibrary-action-{}", uuid::Uuid::new_v4()));

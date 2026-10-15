@@ -158,6 +158,13 @@ test.beforeEach(async ({ page }) => {
       },
     },
   );
+  if (test.info().title.startsWith("queue and downloaded share album artist hierarchy")) {
+    execFileSync("python3", ["-c", `import json,sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); raw=c.execute("SELECT payload FROM queue WHERE id='910001'").fetchone()[0]
+r=json.loads(raw); r.update(id='920008',artist='South Circuit',title='Departure',date='2026-10-01',track_count=1)
+r['tracks']=[dict(id='92000800',title='Landing',duration=180,disc_number=1,track_number=1,isrc='GBTEST920008')]
+c.execute("INSERT INTO queue VALUES(?,?,0,'queued','2026-10-01')",('920008',json.dumps(r))); c.commit()`, join(folder,"db")]);
+  }
   if (test.info().title.startsWith("missing releases group album artists")) {
     execFileSync("python3", ["-c", `import json,sqlite3,sys
 c=sqlite3.connect(sys.argv[1])
@@ -420,6 +427,7 @@ test("tables publish usable results while catalogue revisions keep advancing", a
     await expect(page.locator("tbody")).toContainText("Night Maps",{timeout:1800});
     await expect(page.getByRole("button",{name:"Update missing releases",exact:true})).toBeDisabled();
     await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
+    await expandMissingArtist(page);
     await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeVisible({timeout:1500});
     await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeEnabled();
   } finally {await page.evaluate(()=>clearInterval((window as any).refreshTestTimer));}
@@ -470,7 +478,7 @@ test("queue approvals and lazy tracks stay usable during independent scans and r
     const response=await rpc(request.method,request.args);
     if(["state","job.status"].includes(request.method) && response.result) Object.assign(response.result,{job:local,online_job:online,download_job:null});
     if(request.method==="table" && request.args.route==="queue" && !tracksReady) {
-      const row=response.result.rows.find((row:any)=>row.release==="Blue Hours");
+      const row=response.result.rows.flatMap((row:any)=>row.artist_group ? row.children : [row]).find((row:any)=>row.release==="Blue Hours");
       if(row) {row.children=[];row.expanded_available=false;}
     }
     if(request.method==="release.ensure_tracks") {
@@ -482,6 +490,7 @@ test("queue approvals and lazy tracks stay usable during independent scans and r
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
+  await expandMissingArtist(page);
   await page.getByRole("checkbox",{name:"Select Blue Hours",exact:true}).check();
   await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeChecked();
   await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
@@ -506,7 +515,8 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   if (process.env.TIBRARY_SCREENSHOTS) {
     await page.emulateMedia({colorScheme:"dark"});
     await rpc("settings.save", {section:"downloads",values:{output:"/Users/demo/Music/Tibrary"}});
-    await rpc("queue.decision", {ids:["910002","910003","910004","910005","910006"],decision:"removed"});
+    await rpc("queue.decision", {ids:["910003","910004","910005","910006"],decision:"removed"});
+    await rpc("queue.decision", {ids:["910002"],decision:"downloaded"});
   }
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(e.message));
@@ -517,7 +527,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Working", exact: true }),
   ).toHaveCount(0);
-  const screenshots: Record<string, string> = {"Prepare library":"prepare_library", "Link artists":"link_artists", "Link releases":"link_releases", "Missing releases":"missing_releases", "Local duplicates":"local_duplicates", "MQA audit":"mqa_audit", "Favourite artists":"favourite_artists", "Activity":"activity_log", "General":"general_settings"};
+  const screenshots: Record<string, string> = {"Prepare library":"prepare_library", "Link artists":"link_artists", "Link releases":"link_releases", "Missing releases":"missing_releases", "Download queue":"download_queue", "Downloaded releases":"downloaded_releases", "Local duplicates":"local_duplicates", "MQA audit":"mqa_audit", "Favourite artists":"favourite_artists", "Activity":"activity_log", "General":"general_settings"};
   if (process.env.TIBRARY_SCREENSHOTS) {
     await expect(page.getByRole("region",{name:"Latest missing releases"}).locator(".library-row").first()).toBeVisible();
     await page.screenshot({path:"docs/imgs/overview.png"});
@@ -587,9 +597,19 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
         await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeVisible();
       }
       if (name === "Link releases") await columnAll(page,"Status");
-      if (["Link artists","Favourite artists","Link releases"].includes(name)) {
+      if (["Link artists","Favourite artists","Link releases","Missing releases","Download queue","Downloaded releases"].includes(name)) {
         const artist=page.getByRole("button",{name:"Expand North Assembly",exact:true});
         if (await artist.count()) await artist.click();
+      }
+      if (["Missing releases","Download queue","Downloaded releases"].includes(name)) {
+        const release = page.locator("tr.missing-release-row button.disclosure").first();
+        if (await release.count()) await release.click();
+      }
+      if (name === "Downloaded releases") {
+        await expect(page.locator("tr.missing-artist-row")).toHaveCount(1);
+        await expect(page.locator("tr.missing-release-row")).toHaveCount(1);
+        await expect(page.locator("tr.missing-release-row")).toContainText("Night Maps");
+        await expect(page.getByRole("checkbox",{name:"Select track Signal",exact:true})).toBeVisible();
       }
       if (name === "Link releases") {
         const remaining=page.locator("tbody").getByRole("button",{name:/^Expand /});
@@ -783,6 +803,7 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
     .locator("aside")
     .getByRole("button", { name: "Download queue", exact: true })
     .click();
+  await expandMissingArtist(page);
   const parent = page.getByRole("checkbox", {
     name: "Select Blue Hours",
     exact: true,
@@ -797,7 +818,7 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
     exact: true,
   });
   await expect(childBox).toBeChecked();
-  await expectTrackPositionInTracks(page, "First Light", "1 · 1");
+  await expectTrackPositionInTracks(page, "First Light", "1 · 1", 2);
   if (process.env.TIBRARY_SCREENSHOTS) await page.screenshot({path: "/tmp/tibrary-expanded-queue-0.9.17.png"});
   await childBox.uncheck();
   await expect(parent).toHaveJSProperty("indeterminate", true);
@@ -807,7 +828,7 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
   await expect(page.getByRole("textbox",{name:"Download links"})).toHaveValue("https://tidal.com/track/91000101\nhttps://tidal.com/track/91000102\n");
   await expect(page.getByRole("dialog")).not.toContainText("JSON");
   await page.getByRole("button",{name:"Close",exact:true}).click();
-  await page.getByRole("button", { name: "Coverage", exact: true }).click();
+  await page.getByRole("button", { name: "Status", exact: true }).click();
   await expect(childBox).toBeVisible();
   await expect(childBox).not.toBeChecked();
   await parent.check();
@@ -824,16 +845,18 @@ test("queue approvals cascade, persist and survive sorting and expansion", async
     .locator("aside")
     .getByRole("button", { name: "Download queue", exact: true })
     .click();
+  await expandMissingArtist(page);
   await expect(parent).not.toBeChecked();
   await expect(page.getByRole("alert")).toHaveCount(0);
   // Completed-release choices are transient; exporting them must not alter the
   // original queue approval or expand a single-track choice to the whole album.
   await rpc("queue.decision",{ids:["910001"],decision:"downloaded"});
   await page.locator("aside").getByRole("button",{name:"Downloaded releases",exact:true}).click();
+  await expandMissingArtist(page);
   const downloadedExpander = page.getByRole("button",{name:/^(Expand|Collapse) Blue Hours$/});
   await expect(downloadedExpander).toBeVisible();
   if (await downloadedExpander.getAttribute("aria-expanded") !== "true") await downloadedExpander.click();
-  await expectTrackPositionInTracks(page, "First Light", "1 · 1");
+  await expectTrackPositionInTracks(page, "First Light", "1 · 1", 2);
   await page.getByRole("checkbox",{name:"Select track First Light",exact:true}).check();
   await page.getByRole("button",{name:"Export",exact:true}).click();
   await expect(page.getByRole("textbox",{name:"Download links"})).toHaveValue("https://tidal.com/track/91000100\n");
@@ -1343,6 +1366,7 @@ test("missing releases queue only the selected audio tracks", async ({
     .locator("aside")
     .getByRole("button", { name: "Download queue", exact: true })
     .click();
+  await expandMissingArtist(page);
   await expect(
     page.getByRole("checkbox", { name: "Select Blue Hours", exact: true }),
   ).toHaveJSProperty("indeterminate", true);
@@ -1473,12 +1497,14 @@ test("downloaded release and track menus requeue the original record", async ({p
   await rpc("queue.decision", {ids:["910001"],decision:"downloaded"});
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"Downloaded releases",exact:true}).click();
+  await expandMissingArtist(page);
   await page.getByRole("button", {name:"Actions for Blue Hours"}).click();
   await page.getByRole("menuitem", {name:"Redownload release"}).click();
   await expect.poll(async () => (await rpc("table", {route:"queue"})).result.rows.some((row:any) => row.id === "910001")).toBe(true);
   await rpc("queue.decision", {ids:["910001"],decision:"downloaded"});
   await page.reload();
   await page.locator("aside").getByRole("button", {name:"Downloaded releases",exact:true}).click();
+  await expandMissingArtist(page);
   await page.getByRole("button", {name:"Expand Blue Hours"}).click();
   await page.getByRole("button", {name:"Actions for track Drift"}).click();
   await page.getByRole("menuitem", {name:"Redownload track"}).click();
@@ -1657,6 +1683,7 @@ test("libraries and local tables load while dashboard statistics are still pendi
 test("release details and download review show cached track names and exact approvals", async ({ page }) => {
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"Download queue",exact:true}).click();
+  await expandMissingArtist(page);
   await page.getByRole("checkbox", {name:"Select Blue Hours",exact:true}).check();
   await page.getByRole("button", {name:"Expand Blue Hours",exact:true}).dblclick();
   await expect(page.getByRole("dialog")).toHaveCount(0);
@@ -1680,7 +1707,7 @@ test("release details and download review show cached track names and exact appr
   await page.getByRole("dialog").getByRole("button", {name:"Done",exact:true}).click();
   await page.getByRole("button",{name:"Actions for track Drift",exact:true}).click();
   await expect(page.getByRole("menuitem",{name:"Open on web",exact:true})).toBeVisible();
-  await expect(page.getByRole("menuitem",{name:"Queue whole release",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("menuitem",{name:"Approve release",exact:true})).toHaveCount(0);
 });
 
 test("metadata and settings use readable views without implementation panels", async ({ page }) => {
@@ -2207,7 +2234,7 @@ test("release artwork loads only visible rows and is reused across missing, queu
     if(request.method==="table" && request.args.route==="missing")
       return route.fulfill({json:{result:{rows:[group],total:1,artist_total:1,release_total:80,revision:1}}});
     if(request.method==="table" && ["queue","downloaded"].includes(request.args.route))
-      return route.fulfill({json:{result:{rows:releases.map(row=>({...row,selected:[]})),total:releases.length,revision:1}}});
+      return route.fulfill({json:{result:{rows:[{...group,id:`${request.args.route}-artist:artwork-test`,children:releases.map(row=>({...row,selected:[]}))}],total:1,artist_total:1,release_total:releases.length,revision:1}}});
     if(request.method==="artwork.thumbnail") {
       const id=String(request.args.release_id);
       requests.push(id);maxInFlight=Math.max(maxInFlight,++inFlight);
@@ -2259,6 +2286,7 @@ test("release artwork loads only visible rows and is reused across missing, queu
   expect(requests).not.toContain("930040");
   for(const view of ["Download queue","Downloaded releases"]) {
     await page.locator("aside").getByRole("button",{name:view,exact:true}).click();
+    await expandMissingArtist(page);
     await expect(artwork("930000").locator("img")).toBeVisible();
     expect(requests.filter(id=>id==="930000")).toHaveLength(1);
     const releaseCell=artwork("930000").locator("..");
@@ -2267,7 +2295,7 @@ test("release artwork loads only visible rows and is reused across missing, queu
     expect(dimensions?.width).toBe(48);expect(dimensions?.height).toBe(48);
     const expand=page.getByRole("button",{name:/^(Expand|Collapse) Artwork release 00$/});
     if(await expand.getAttribute("aria-expanded")!=="true") await expand.click();
-    await expectTrackPositionInTracks(page,"Artwork track 0","1 · 1");
+    await expectTrackPositionInTracks(page,"Artwork track 0","1 · 1",2);
     await expect(page.locator("tr.track-row .release-artwork")).toHaveCount(0);
     if(process.env.TIBRARY_ARTWORK_SCREENSHOT) await page.screenshot({path:`/private/tmp/tibrary-${view==="Download queue" ? "queue" : "downloaded"}-artwork.png`});
     if(view==="Download queue") expect(requests).not.toContain("930040");
@@ -2485,8 +2513,9 @@ test("real table facets filter before paging and share checkbox rules across wor
   await page.goto("/");
   const sidebar=page.locator("aside");
   await sidebar.getByRole("button",{name:"Download queue",exact:true}).click();
+  await expandMissingArtist(page);
   await columnOnly(page,"Release",["Distant Rooms","Night Maps"]);
-  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tr.missing-release-row")).toHaveCount(2);
   await page.getByRole("checkbox",{name:"Select Night Maps",exact:true}).check();
   await page.getByRole("button",{name:"Expand Night Maps",exact:true}).click();
   await expect(page.getByRole("checkbox",{name:"Select track Signal",exact:true})).toBeChecked();
@@ -3064,6 +3093,7 @@ test("disconnected library can refresh missing releases and download only the ap
   await page.getByRole("checkbox", {name:"Select track Low Tide",exact:true}).check();
   await page.getByRole("button", {name:"Queue selected (1)",exact:true}).click();
   await sidebar.getByRole("button", {name:"Download queue",exact:true}).click();
+  await expandMissingArtist(page);
   await expect(page.getByRole("checkbox", {name:"Select Blue Hours",exact:true})).toHaveJSProperty("indeterminate", true);
   await page.getByRole("button", {name:"Download",exact:true}).click();
   const dialog = page.getByRole("dialog", {name:"Download approved music",exact:true});
@@ -3081,6 +3111,7 @@ test("download destination disconnection blocks an open review while queue expor
   const availability = await driveAvailability(page);
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"Download queue",exact:true}).click();
+  await expandMissingArtist(page);
   await page.getByRole("checkbox", {name:"Select Blue Hours",exact:true}).check();
   await page.getByRole("button", {name:"Download",exact:true}).click();
   const dialog = page.getByRole("dialog", {name:"Download approved music",exact:true});
@@ -3097,6 +3128,7 @@ test("download destination disconnection blocks an open review while queue expor
   await expect(page.getByLabel("Download folder",{exact:true})).toBeVisible();
   await availability.destination(true);
   await page.locator("aside").getByRole("button", {name:"Download queue",exact:true}).click();
+  await expandMissingArtist(page);
   await expect(page.getByRole("checkbox", {name:"Select Blue Hours",exact:true})).toBeChecked();
   await expect(page.getByRole("button", {name:"Download",exact:true})).toBeEnabled();
 });
@@ -3160,6 +3192,7 @@ test("AI policy uses saved labels to hide suggestions, block downloads and revie
   await detail.getByRole("button",{name:"Done",exact:true}).click();
 
   await page.locator("aside").getByRole("button",{name:"Download queue",exact:true}).click();
+  await expandMissingArtist(page);
   await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeDisabled();
   await page.getByRole("checkbox",{name:"Select visible rows",exact:true}).check();
   await expect(page.getByRole("checkbox",{name:"Select Distant Rooms",exact:true})).toBeChecked();
@@ -3168,11 +3201,12 @@ test("AI policy uses saved labels to hide suggestions, block downloads and revie
   await expect(page.getByRole("checkbox",{name:"Select track First Light",exact:true})).toBeDisabled();
   await expect(page.getByRole("checkbox",{name:"Select track Drift",exact:true})).toBeDisabled();
   await page.getByRole("button",{name:"Actions for Blue Hours",exact:true}).click();
-  await expect(page.getByRole("menuitem",{name:"Queue whole release",exact:true})).toBeDisabled();
+  await expect(page.getByRole("menuitem",{name:"Approve release",exact:true})).toBeDisabled();
   await page.getByRole("menu").press("Escape");
   await expect.poll(async () => (await rpc("queue.preview")).result?.map((row:any)=>row.id)).toEqual(["910005"]);
 
   await page.locator("aside").getByRole("button",{name:"Downloaded releases",exact:true}).click();
+  await expandMissingArtist(page);
   await page.getByRole("button",{name:"Actions for Glass",exact:true}).click();
   await expect(page.getByRole("menuitem",{name:"Redownload release",exact:true})).toBeDisabled();
   await page.getByRole("menu").press("Escape");
@@ -3197,4 +3231,107 @@ test("AI policy track-only labels flag the affected recording without labelling 
   await expect(first).toContainText("91000100");
   await expect(page.locator("tbody")).not.toContainText("Drift");
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+
+test("queue and downloaded share album artist hierarchy with exact approvals and keyboard track selection", async ({page}) => {
+  await rpc("settings.save",{section:"desktop",values:{page_size:1,theme:"dark"}});
+  const selectedPayloads:any[]=[];
+  await page.route("**/__test_rpc",async route=>{
+    const request=route.request().postDataJSON();
+    if(request.method==="queue.select") selectedPayloads.push(request.args.selection);
+    await route.fulfill({json:await rpc(request.method,request.args)});
+  });
+  await page.goto("/");
+  const sidebar=page.locator("aside");
+  await sidebar.getByRole("button",{name:"Download queue",exact:true}).click();
+  const pagination=page.getByRole("navigation",{name:"Table pagination",exact:true});
+  await expect(pagination).toContainText("1–1 of 2 artists · 7 releases");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByRole("columnheader").filter({hasText:"Recommendation"})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"Status",exact:true})).toBeVisible();
+  const north=page.getByRole("checkbox",{name:"Select releases by North Assembly",exact:true});
+  await north.check();
+  await expandMissingArtist(page);
+  await expect(page.getByRole("checkbox",{name:"Select Blue Hours",exact:true})).toBeChecked();
+  await page.getByRole("button",{name:"Expand Blue Hours",exact:true}).click();
+  const drift=page.getByRole("checkbox",{name:"Select track Drift",exact:true});
+  const driftRow=page.locator("tbody tr").filter({has:drift});
+  await driftRow.focus();
+  await driftRow.press("Space");
+  await expect(drift).not.toBeChecked();
+  await expect(north).toHaveJSProperty("indeterminate",true);
+  await expectTrackPositionInTracks(page,"Drift","1 · 2",2);
+  await expect(page.getByRole("button",{name:"Download",exact:true})).toBeEnabled();
+  await page.screenshot({path:"/private/tmp/tibrary-audit-queue-dark.png"});
+  await page.getByRole("button",{name:"Next",exact:true}).click();
+  await expect(pagination).toContainText("2–2 of 2 artists");
+  await page.getByRole("checkbox",{name:"Select releases by South Circuit",exact:true}).check();
+  await page.getByRole("button",{name:"Previous",exact:true}).click();
+  await expect(drift).not.toBeChecked();
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await page.getByRole("checkbox",{name:"Select visible rows",exact:true}).check();
+  await page.getByRole("checkbox",{name:"Select visible rows",exact:true}).uncheck();
+  await expect.poll(async()=> (await rpc("queue.preview")).result.map((row:any)=>row.id)).toEqual(["920008"]);
+
+  // Searching a cached track keeps its complete release and stable disclosures.
+  await page.getByRole("textbox",{name:"Filter table",exact:true}).fill("Drift");
+  await expect(pagination).toContainText("1–1 of 1 artist · 2 releases");
+  await expect(page.getByRole("button",{name:"Collapse Blue Hours",exact:true})).toBeVisible();
+  await drift.check();
+  await page.getByRole("button",{name:"Download",exact:true}).click();
+  const preview=page.getByRole("dialog",{name:"Download approved music",exact:true});
+  await expect(preview.getByRole("table",{name:"Tracks in Blue Hours",exact:true})).toContainText("Drift");
+  await expect(preview.getByRole("table",{name:"Tracks in Blue Hours",exact:true})).not.toContainText("First Light");
+  await expect(preview).toContainText("Departure");
+  await preview.getByRole("button",{name:"Cancel",exact:true}).click();
+  expect(selectedPayloads.length).toBeGreaterThan(3);
+  expect(selectedPayloads.every(selection=>Object.keys(selection).every(id=>/^\d+$/.test(id)))).toBe(true);
+
+  await rpc("queue.decision",{ids:["910001"],decision:"downloaded"});
+  await sidebar.getByRole("button",{name:"General",exact:true}).click();
+  const parallel=page.getByLabel("Parallel downloads",{exact:true});
+  const pause=page.getByLabel("Minimum pause between tracks (seconds)",{exact:true});
+  await expect(pause).toBeDisabled();
+  await parallel.fill("1"); await parallel.press("Tab");
+  await expect(pause).toBeEnabled();
+  await expect(pause.locator("..")).toHaveAttribute("title",/Parallel downloads is 1/);
+  await parallel.fill("2"); await parallel.press("Tab");
+  await expect(pause).toBeDisabled();
+  await page.getByLabel("Colour theme").selectOption("light");
+  await sidebar.getByRole("button",{name:"Downloaded releases",exact:true}).click();
+  await expect(pagination).toContainText("1–1 of 1 artist · 1 release");
+  await expandMissingArtist(page);
+  const expand=page.getByRole("button",{name:/^(Expand|Collapse) Blue Hours$/});
+  if(await expand.getAttribute("aria-expanded")!=="true") await expand.click();
+  await drift.check();
+  await page.getByRole("button",{name:"Export",exact:true}).click();
+  await expect(page.getByRole("textbox",{name:"Download links",exact:true})).toHaveValue("https://tidal.com/track/91000101\n");
+  await page.getByRole("dialog").getByRole("button",{name:"Close",exact:true}).click();
+  await page.screenshot({path:"/private/tmp/tibrary-audit-downloaded-light.png"});
+  await page.getByRole("button",{name:"Actions for track Drift",exact:true}).click();
+  await page.getByRole("menuitem",{name:"Redownload track",exact:true}).click();
+  await expect.poll(async()=> (await rpc("table",{route:"queue"})).result.rows.find((row:any)=>row.id==="910001")?.selected).toEqual(["91000101"]);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+
+test("invalid folder templates remain reviewable without implying a safe move", async ({page}) => {
+  const root=join(folder,"music"), path=join(root,"First Light.flac"), original=readFileSync(path);
+  const saved=await rpc("settings.save",{section:"organisation",values:{template:"{albumartist}/{unknown}/{title}"}});
+  expect(saved.error).toBeUndefined();
+  await page.goto("/");
+  await page.locator("aside").getByRole("button",{name:"Organise files",exact:true}).click();
+  const row=await localFileRow(page,"First Light");
+  await expect(row).toContainText("Needs review");
+  await row.dblclick();
+  const dialog=page.getByRole("dialog",{name:"Folder layout preview",exact:true});
+  await expect(dialog.getByRole("heading",{name:"Folder layout needs review",exact:true})).toBeVisible();
+  await expect(dialog).toContainText("Unknown folder template variable: unknown");
+  await expect(dialog).not.toContainText("already follows the saved folder template");
+  await expect(dialog.getByText("Proposed path",{exact:true})).toHaveCount(0);
+  await expect(dialog.getByText("Available placements",{exact:true})).toHaveCount(0);
+  await dialog.getByRole("button",{name:"Done",exact:true}).click();
+  await expect(page.getByRole("button",{name:/Review & apply/})).toBeDisabled();
+  expect(readFileSync(path).equals(original)).toBe(true);
 });

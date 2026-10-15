@@ -1627,7 +1627,7 @@ async fn handle_rpc_uncached(
     if method == "queue.select" {
         let sel_val = args.get("selection").cloned().unwrap_or(json!({}));
         let selection: HashMap<String, Option<Vec<String>>> =
-            serde_json::from_value(sel_val).unwrap_or_default();
+            serde_json::from_value(sel_val).map_err(|error| format!("Invalid queue selection: {error}"))?;
         db.queue_select(&selection).await?;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -1636,7 +1636,7 @@ async fn handle_rpc_uncached(
     }
     if method == "queue.decision" {
         let ids_val = args.get("ids").cloned().unwrap_or(json!([]));
-        let ids: Vec<String> = serde_json::from_value(ids_val).unwrap_or_default();
+        let ids: Vec<String> = serde_json::from_value(ids_val).map_err(|error| format!("Invalid release selection: {error}"))?;
         let decision = args
             .get("decision")
             .and_then(|v| v.as_str())
@@ -1659,7 +1659,7 @@ async fn handle_rpc_uncached(
     if method == "queue.add" {
         let sel_val = args.get("selection").cloned().unwrap_or(json!({}));
         let selection: HashMap<String, Option<Vec<String>>> =
-            serde_json::from_value(sel_val).unwrap_or_default();
+            serde_json::from_value(sel_val).map_err(|error| format!("Invalid queue selection: {error}"))?;
         db.queue_add(&selection).await?;
         if let Some(app) = app_handle {
             let _ = app.emit("backend-event", json!({ "event": "changed" }));
@@ -3162,6 +3162,23 @@ mod table_filter_tests {
 #[cfg(test)]
 mod activity_tests {
     #[tokio::test]
+    async fn malformed_queue_requests_fail_without_reporting_success() {
+        let dir=std::env::temp_dir().join(format!("queue-rpc-{}",uuid::Uuid::new_v4()));
+        let db=super::TursoDb::open(dir.join("db")).await.unwrap();
+        let backend=std::sync::Arc::new(super::Backend::new());
+        for method in ["queue.select","queue.add"] {
+            let error=super::handle_rpc_call(None,&backend,&db,method.into(),serde_json::json!({
+                "selection":{"123":{"tracks":["456"]}}
+            })).await.unwrap_err();
+            assert!(error.starts_with("Invalid queue selection:"));
+        }
+        let error=super::handle_rpc_call(None,&backend,&db,"queue.decision".into(),
+            serde_json::json!({"ids":{"release":"123"},"decision":"removed"})).await.unwrap_err();
+        assert!(error.starts_with("Invalid release selection:"));
+        drop(db); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn artist_refresh_has_one_durable_row_and_one_error_at_the_failed_stage() {
         let dir = std::env::temp_dir().join(format!("artist-log-{}",uuid::Uuid::new_v4()));
         let db = Arc::new(super::TursoDb::open(dir.join("db")).await.unwrap());
@@ -3362,6 +3379,7 @@ mod activity_tests {
     async fn live_catalogue_refresh_pipeline() {
         let dir = std::env::temp_dir().join(format!("catalogue-refresh-{}",uuid::Uuid::new_v4()));
         let db = TursoDb::open(dir.join("db")).await.unwrap();
+        crate::stream_download::use_read_only_saved_account(&db).await;
         let backend = Arc::new(Backend::new());
         async fn wait(backend: &Arc<Backend>) -> Value {
             tokio::time::timeout(std::time::Duration::from_secs(120),async {
@@ -3379,6 +3397,7 @@ mod activity_tests {
             ("warm recommendation metadata",vec!["3870503"],true),
         ] {
             let start=std::time::Instant::now();
+            let requests = crate::network::request_count();
             handle_rpc_call(None,&backend,&db,"job.start".into(),json!({"kind":"discography","args":{"ids":ids,"market":"GB","detailed":detailed}})).await.unwrap();
             let job=wait(&backend).await;
             assert_eq!(job["status"],"complete","{job}");
@@ -3389,7 +3408,7 @@ mod activity_tests {
             }
             let saved=db.get_preference("catalogue-refresh-checkpoint").await.unwrap().unwrap();
             assert_eq!(saved["completed"].as_array().unwrap().len(),ids.len());
-            println!("{label}: {} artists, {} ms",ids.len(),start.elapsed().as_millis());
+            println!("{label}: {} artists, {} ms, {} requests",ids.len(),start.elapsed().as_millis(),crate::network::request_count()-requests);
         }
         let args=json!({"kind":"discography","args":{"ids":["3870503","3924"],"market":"GB"}});
         handle_rpc_call(None,&backend,&db,"job.start".into(),args.clone()).await.unwrap();

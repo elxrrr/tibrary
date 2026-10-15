@@ -12,7 +12,7 @@
 
 - **Prepare your library:** preview tag corrections, organise folders, review local duplicates and flag AI-labelled files for removal.
 - **Link your collection:** match album artists, recordings and whole releases using cached catalogue evidence.
-- **Find missing music:** discover new releases and incomplete albums, filter recommendations, and queue selected tracks.
+- **Find missing music:** browse artists, releases and tracks with cached artwork; filter recommendations and queue exactly what you want.
 - **Update your files:** fill available tags—including BPM and Camelot keys—improve artwork, and audit MQA files.
 - **Follow the work:** one searchable activity log with action filters, saved details and separate cancellation controls for local tasks, online checks and downloads.
 
@@ -43,13 +43,17 @@ Captured from the current UI with a disposable sample library.
 | --- | --- |
 | ![Link releases](desktop/docs/imgs/link_releases.png) | ![Missing releases](desktop/docs/imgs/missing_releases.png) |
 
+| Download queue | Downloaded releases |
+| --- | --- |
+| ![Download queue](desktop/docs/imgs/download_queue.png) | ![Downloaded releases](desktop/docs/imgs/downloaded_releases.png) |
+
 | General settings | Activity |
 | --- | --- |
 | ![General settings](desktop/docs/imgs/general_settings.png) | ![Activity](desktop/docs/imgs/activity_log.png) |
 
 Cached libraries remain browsable when their removable drive is disconnected. Online work and downloads to a connected folder remain available; file-changing actions wait for the library drive.
 
-See the [guide](desktop/docs/DOCUMENTATION.md) for workflows, cache behaviour and the repeatable test suite.
+See the [guide](desktop/docs/DOCUMENTATION.md) for workflows and the [release audit](desktop/docs/RELEASE_AUDIT.md) for testing and known limits.
 
 ## Credits and licence
 

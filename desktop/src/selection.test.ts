@@ -65,3 +65,13 @@ describe("artist release selection", () => {
     expect(releaseSelectionState({blocked:null},rows[0].children[1])).toBe("empty");
     expect(selectedReleases(toggleReleaseRows(selection,rows,false))).toEqual({});
   });
+
+  it("keeps a wholly blocked artist unselectable while another artist retains its exact track choices", () => {
+    const blocked={id:"queue-artist:blocked",artist_group:true,children:[{id:"ai-album",ai_blocked:true}]};
+    const allowed={id:"queue-artist:allowed",artist_group:true,children:[{id:"safe-album",children:[{id:"one"},{id:"two"}]}]};
+    const before={"safe-album":["two"]};
+    expect(releaseSelectionState(before,allowed)).toBe("mixed");
+    expect(releaseSelectionState(toggleReleaseRows(before,[blocked],true),blocked)).toBe("empty");
+    expect(selectedReleases(toggleReleaseRows(before,[blocked],true))).toEqual(before);
+    expect(selectedReleases(toggleReleaseRows(before,[blocked,allowed],true))).toEqual({"safe-album":null});
+  });

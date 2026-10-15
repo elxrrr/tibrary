@@ -276,14 +276,17 @@ pub async fn scan_library_with_options(
         let mtime: i64 = row.get(2).map_err(|e| e.to_string())?;
         let error_opt: Option<String> = row.get::<Option<String>>(4).unwrap_or(None);
         let saved_metadata: Option<String> = row.get::<Option<String>>(3).unwrap_or(None);
+        let parsed_metadata = saved_metadata.as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .filter(serde_json::Value::is_object);
         let has_error = error_opt
             .as_deref()
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
-            || saved_metadata.as_deref().is_none_or(|value| value.trim().is_empty());
+            || parsed_metadata.is_none();
         let present: i64 = row.get(5).unwrap_or(1);
-        if let Some(metadata) = saved_metadata.as_deref().and_then(|raw|serde_json::from_str::<serde_json::Value>(raw).ok()) {
-            if metadata.is_object() && metadata["audio_properties_version"] != 1 {
+        if let Some(metadata) = parsed_metadata {
+            if metadata["audio_properties_version"] != 1 {
                 legacy_properties.insert(path.clone(), metadata);
             }
         }
@@ -670,6 +673,14 @@ mod tests {
         let recovered=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
         assert_eq!(recovered.read,1);
         assert!(store.get_local_files_page(None,10,0).await.unwrap().0[0].metadata.is_some());
+        // A nonempty but malformed/incorrectly typed legacy cache is also a
+        // cache miss, never a reason to keep skipping the file indefinitely.
+        for invalid_metadata in ["malformed JSON", "null", "[]", "\"legacy value\""] {
+            store.connect().unwrap().execute("UPDATE local_files SET metadata=? WHERE path=?", (invalid_metadata,song_path.to_str().unwrap())).await.unwrap();
+            let recovered=scan_library(&store,&music_dir,Arc::new(AtomicBool::new(false)),|_|{}).await.unwrap();
+            assert_eq!(recovered.read,1, "Must repair {invalid_metadata}");
+            assert!(store.get_local_files_page(None,10,0).await.unwrap().0[0].metadata.as_ref().unwrap().is_object());
+        }
         let _ = fs::remove_dir_all(temp_dir);
     }
 }

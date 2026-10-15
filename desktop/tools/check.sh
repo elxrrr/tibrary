@@ -17,6 +17,7 @@ esac
 
 export TIBRARY_TEST_MODE=1
 npm --prefix desktop test
+cargo clippy --locked --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -A clippy::all -D clippy::correctness
 cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
 cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml flac_container::tests -- --include-ignored
 npm --prefix desktop run build

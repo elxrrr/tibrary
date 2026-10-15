@@ -87,6 +87,7 @@ export function MetadataView({ value, title }: { value: any; title?: string }) {
   if (typeof value !== "object" || Array.isArray(value)) return <span>{readable(value)}</span>;
   return <div className="metadata-table"><table aria-label={title || "Metadata"}><tbody>
     {Object.entries(value).filter(([key, item]) => {
+      if (key === "audio_properties_version") return false;
       const canonical: Record<string,string> = {album_artist:"albumartist",track_artist:"artist",track_number:"tracknumber",disc_number:"discnumber",track_total:"tracktotal",disc_total:"disctotal"};
       const alias = canonical[key]; return !alias || value[alias] == null || readable(value[alias]) !== readable(item);
     }).map(([key, item]) => <tr key={key}><th scope="row">{metadataLabel(key)}</th><td>
