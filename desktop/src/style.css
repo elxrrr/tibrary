@@ -1212,29 +1212,6 @@ dialog p {
 .overview-dashboard > .card { margin-bottom: 0; padding: 16px; }
 .libraries-card { flex: none; }
 .libraries-card .overview-list { max-height: 128px; }
-.latest-missing-card { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.latest-missing-card .section-heading { flex: none; }
-.latest-missing-scroll {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-.latest-missing-scroll .overview-list {
-  height: auto;
-  max-height: none;
-  min-height: 0;
-  flex: 1;
-  padding: 4px 0 32px;
-}
-.latest-missing-scroll > .edge-gradient-top {
-  background: linear-gradient(to bottom, var(--card), transparent);
-}
-.latest-missing-scroll > .edge-gradient-bottom {
-  background: linear-gradient(to top, var(--card), transparent);
-}
 .overview-list > .library-row {
   height: 64px;
   box-sizing: border-box;

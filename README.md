@@ -12,7 +12,7 @@
 
 - **Prepare your library:** preview tag corrections, organise folders, review local duplicates and flag AI-labelled files for removal.
 - **Link your collection:** match album artists, recordings and whole releases using cached catalogue evidence.
-- **Browse online music:** explore new releases, search artists or tracks, paste a catalogue link, and queue full releases or selected songs.
+- **Browse online music:** explore artists, new releases and playlists, find related tracks, and queue full releases or selected songs.
 - **Find missing music:** browse artists, releases and tracks with cached artwork; filter recommendations and queue exactly what you want.
 - **Update your files:** fill available tags—including BPM and Camelot keys—improve artwork, and audit MQA files.
 - **Follow the work:** one searchable activity log with action filters, saved details and separate cancellation controls for local tasks, online checks and downloads.
@@ -43,6 +43,10 @@ Captured from the current UI with a disposable sample library.
 | Browse music | Release details |
 | --- | --- |
 | ![Browse music](desktop/docs/imgs/browse_music.png) | ![Release details](desktop/docs/imgs/browse_release.png) |
+
+| Artist pages | Playlists |
+| --- | --- |
+| ![Artist pages](desktop/docs/imgs/browse_artist.png) | ![Playlists](desktop/docs/imgs/browse_playlist.png) |
 
 | Link releases | Missing releases |
 | --- | --- |

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Disc3 } from "lucide-react";
+import { Disc3, ListMusic, UserRound } from "lucide-react";
 import { call } from "./api";
 
 type Thumbnail = { src: string; cover_id: string; size: number };
@@ -10,7 +10,8 @@ type Subscriber = {
 };
 type Request = {
   key: string;
-  releaseId: string;
+  releaseId?: string;
+  imageId?: string;
   market?: string;
   started: boolean;
   subscribers: Set<Subscriber>;
@@ -103,8 +104,8 @@ function scheduleRequests() {
       }
       request.started = true;
       activeRequests++;
-      void call<Thumbnail | null>("artwork.thumbnail", {
-        release_id: request.releaseId,
+      void call<Thumbnail | null>(request.imageId ? "artwork.image" : "artwork.thumbnail", {
+        ...(request.imageId ? {image_id: request.imageId} : {release_id: request.releaseId}),
         ...(request.market ? { market: request.market } : {}),
       }).catch(() => null).then(thumbnail => {
         if (thumbnail?.src?.startsWith("data:image/jpeg;base64,")) {
@@ -123,10 +124,10 @@ function scheduleRequests() {
   });
 }
 
-function requestThumbnail(key: string, releaseId: string, market: string | undefined, subscriber: Subscriber) {
+function requestThumbnail(key: string, releaseId: string | undefined, imageId: string | undefined, market: string | undefined, subscriber: Subscriber) {
   let request = requests.get(key);
   if (!request) {
-    request = { key, releaseId, market, started: false, subscribers: new Set() };
+    request = { key, releaseId, imageId, market, started: false, subscribers: new Set() };
     requests.set(key, request);
   }
   request.subscribers.add(subscriber);
@@ -137,18 +138,20 @@ function requestThumbnail(key: string, releaseId: string, market: string | undef
   };
 }
 
-export function ReleaseArtwork({ releaseId, market, metadata }: {
-  releaseId: string;
+function Artwork({ releaseId, imageId, kind = "release", market, metadata }: {
+  releaseId?: string;
+  imageId?: string | null;
+  kind?: "release" | "artist" | "playlist";
   market?: string;
   /** A replacement row means cached metadata may now include artwork. */
   metadata: object;
 }) {
   const ref = useRef<HTMLSpanElement>(null);
-  const key = JSON.stringify([market || "", releaseId]);
+  const key = JSON.stringify([market || "", kind === "release" ? "release" : "image", releaseId || imageId || ""]);
   const [image, setImage] = useState<{ key: string; src: string } | null>(null);
   useEffect(() => {
     const element = ref.current;
-    if (!element) return;
+    if (!element || (!releaseId && !imageId)) return;
     let visible = false;
     let attempted = false;
     let cancel: (() => void) | undefined;
@@ -170,7 +173,7 @@ export function ReleaseArtwork({ releaseId, market, metadata }: {
         return;
       }
       if (attempted || cancel) return;
-      cancel = requestThumbnail(key, releaseId, market, {
+      cancel = requestThumbnail(key, releaseId, imageId || undefined, market, {
         visible: () => visible && withinVisibleBounds(element),
         skipped: () => { cancel = undefined; },
         receive: thumbnail => {
@@ -183,13 +186,22 @@ export function ReleaseArtwork({ releaseId, market, metadata }: {
       });
     });
     return () => { visible = false; stopObserving(); cancel?.(); };
-  }, [key, releaseId, market, metadata]);
+  }, [key, releaseId, imageId, market, metadata]);
 
   const src = image?.key === key ? image.src : undefined;
-  return <span ref={ref} className="release-artwork" data-release-id={releaseId} aria-hidden="true">
+  return <span ref={ref} className={`release-artwork${kind === "release" ? "" : ` catalogue-artwork artwork-${kind}`}`} data-release-id={releaseId} data-image-id={imageId || undefined} aria-hidden="true">
     {src ? <img src={src} width={48} height={48} alt="" decoding="async" onError={() => {
       if (thumbnails.get(key)?.src === src) thumbnails.delete(key);
       setImage(null);
-    }} /> : <Disc3 size={20} strokeWidth={1.25} />}
+    }} /> : kind === "artist" ? <UserRound size={20} strokeWidth={1.25} /> : kind === "playlist" ? <ListMusic size={20} strokeWidth={1.25} /> : <Disc3 size={20} strokeWidth={1.25} />}
   </span>;
+}
+
+export function ReleaseArtwork(props: {releaseId: string; market?: string; metadata: object}) {
+  return <Artwork {...props} />;
+}
+
+/** Reuses the visible-only thumbnail lane for catalogue portraits and covers. */
+export function CatalogueArtwork(props: {imageId?: string | null; kind: "artist" | "playlist"; metadata: object}) {
+  return <Artwork {...props} />;
 }

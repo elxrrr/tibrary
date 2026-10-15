@@ -11,7 +11,11 @@ import { createInterface } from "node:readline";
 
 // Only catalogue responses are fixtures. Queue mutations go through the real
 // Rust RPC server and SQLite, with no account access or writes to user files.
-const artist = { id: "600001", name: "North Assembly", picture: null };
+const artist = {
+  id: "600001",
+  name: "North Assembly",
+  picture: "11111111-1111-4111-8111-111111111111",
+};
 const tracks = ["First Light", "Drift", "Low Tide"].map((title, index) => ({
   id: `6100010${index}`,
   title,
@@ -50,6 +54,47 @@ const secondRelease = {
   track_count: 1,
   tracks: [{ ...tracks[0], id: "61000200", title: "Signal" }],
 };
+const playlist = {
+  id: "22222222-2222-4222-8222-222222222222",
+  title: "After hours",
+  description: "A quiet collection for late evenings.",
+  creator: "North Assembly",
+  cover: "33333333-3333-4333-8333-333333333333",
+  track_count: 4,
+  duration: 780,
+};
+const playlistTracks = [
+  {
+    ...tracks[0],
+    release_id: release.id,
+    album_id: release.id,
+    album: release,
+    playlist_position: 1,
+  },
+  {
+    ...secondRelease.tracks[0],
+    release_id: secondRelease.id,
+    album_id: secondRelease.id,
+    album: secondRelease,
+    playlist_position: 2,
+  },
+  {
+    ...tracks[1],
+    release_id: release.id,
+    album_id: release.id,
+    album: release,
+    playlist_position: 3,
+    available: false,
+  },
+  {
+    ...tracks[2],
+    release_id: release.id,
+    album_id: release.id,
+    album: release,
+    playlist_position: 4,
+    ai: true,
+  },
+];
 const stamp = () => ({
   source: "cache",
   cached_at: Math.floor(Date.now() / 1000),
@@ -64,6 +109,19 @@ const home = () => ({
   sections: [
     { id: "new", title: "New releases", releases: [release, secondRelease] },
     { id: "artists", title: "Your artists", artists: [artist] },
+    { id: "playlists", title: "Made for your day", playlists: [playlist] },
+    {
+      id: "recommended",
+      title: "Recommended tracks",
+      tracks: [
+        {
+          ...tracks[0],
+          release_id: release.id,
+          album_id: release.id,
+          album: release,
+        },
+      ],
+    },
   ],
 });
 type Request = { method: string; args: Record<string, any> };
@@ -203,16 +261,18 @@ test.beforeEach(async ({ page }) => {
       const items =
         request.args.kind === "artists"
           ? [artist]
-          : request.args.kind === "tracks"
-            ? [
-                {
-                  ...tracks[0],
-                  release_id: release.id,
-                  album_id: release.id,
-                  album: release,
-                },
-              ]
-            : [release];
+          : request.args.kind === "playlists"
+            ? [playlist]
+            : request.args.kind === "tracks"
+              ? [
+                  {
+                    ...tracks[0],
+                    release_id: release.id,
+                    album_id: release.id,
+                    album: release,
+                  },
+                ]
+              : [release];
       return route.fulfill({
         json: {
           result: {
@@ -226,6 +286,59 @@ test.beforeEach(async ({ page }) => {
         },
       });
     }
+    if (request.method === "browse.playlists")
+      return route.fulfill({
+        json: {
+          result: {
+            ...stamp(),
+            items: [playlist],
+            offset: 0,
+            limit: 24,
+            total: 1,
+            has_more: false,
+          },
+        },
+      });
+    if (request.method === "browse.playlist") {
+      const offset = request.args.offset || 0;
+      return route.fulfill({
+        json: {
+          result: {
+            ...stamp(),
+            playlist,
+            items: playlistTracks.slice(offset, offset + 2),
+            offset,
+            limit: 2,
+            total: playlistTracks.length,
+            has_more: offset < 2,
+          },
+        },
+      });
+    }
+    if (request.method === "artwork.image")
+      return route.fulfill({
+        json: {
+          result: {
+            src: covers[2],
+            cover_id: request.args.image_id,
+            size: 160,
+          },
+        },
+      });
+    if (request.method === "browse.radio")
+      return route.fulfill({
+        json: {
+          result: {
+            ...stamp(),
+            seed: { ...tracks[0], release_id: release.id },
+            items: [playlistTracks[1]],
+            offset: 0,
+            limit: 24,
+            total: 1,
+            has_more: false,
+          },
+        },
+      });
     if (request.method === "browse.artist")
       return route.fulfill({
         json: {
@@ -255,7 +368,13 @@ test.beforeEach(async ({ page }) => {
         json: {
           result: {
             src: covers[
-              (((Number(request.args.release_id) - 610001) % 6) + 6) % 6
+              (
+                { "910003": 0, "910004": 5, "910006": 3 } as Record<
+                  string,
+                  number
+                >
+              )[String(request.args.release_id)] ??
+                (((Number(request.args.release_id) - 610001) % 6) + 6) % 6
             ],
             cover_id: String(request.args.release_id),
             size: 160,
@@ -792,9 +911,22 @@ test("browse documentation screenshots use disposable catalogue artwork", async 
               title: "Your artists",
               artists: [
                 artist,
-                { id: "600002", name: "South Circuit" },
-                { id: "600003", name: "Aster Vale" },
+                {
+                  id: "600002",
+                  name: "South Circuit",
+                  picture: "44444444-4444-4444-8444-444444444444",
+                },
+                {
+                  id: "600003",
+                  name: "Aster Vale",
+                  picture: "55555555-5555-4555-8555-555555555555",
+                },
               ],
+            },
+            {
+              id: "playlists",
+              title: "Playlists for your day",
+              playlists: [playlist],
             },
           ],
         },
@@ -803,8 +935,16 @@ test("browse documentation screenshots use disposable catalogue artwork", async 
       return { result: { ...stamp(), release: album } };
   };
   await browse(page);
-  await expect(page.locator(".browse-release-card img")).toHaveCount(6);
+  await expect(page.locator(".browse-release-card img").first()).toBeVisible();
+  await expect(page.locator(".artwork-artist img")).toHaveCount(3);
+  await expect(page.locator(".artwork-playlist img")).toBeVisible();
   await page.screenshot({ path: "docs/imgs/browse_music.png" });
+  await page
+    .getByRole("button", { name: `Browse artist ${artist.name}`, exact: true })
+    .click();
+  await expect(page.locator(".artwork-artist img")).toBeVisible();
+  await page.screenshot({ path: "docs/imgs/browse_artist.png" });
+  await page.getByRole("button", { name: "Back", exact: true }).click();
   await page
     .getByRole("button", {
       name: `Open release ${release.title} by ${artist.name}`,
@@ -813,6 +953,34 @@ test("browse documentation screenshots use disposable catalogue artwork", async 
     .click();
   await expect(page.locator(".browse-release-cover img")).toBeVisible();
   await page.screenshot({ path: "docs/imgs/browse_release.png" });
+  await page
+    .getByRole("tablist", { name: "Browse sections", exact: true })
+    .getByRole("tab", { name: "New releases", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "From your library", exact: true }),
+  ).toBeVisible();
+  await expect(page.locator(".browse-release-card").first()).toBeVisible();
+  await expect(page.locator(".browse-release-card img")).toHaveCount(12);
+  await page.screenshot({ path: "docs/imgs/browse_new_releases.png" });
+  await page
+    .getByRole("tablist", { name: "Browse sections", exact: true })
+    .getByRole("tab", { name: "Playlists", exact: true })
+    .click();
+  await page
+    .getByRole("button", {
+      name: `Open playlist ${playlist.title}`,
+      exact: true,
+    })
+    .click();
+  await page
+    .getByRole("button", { name: "Load all tracks", exact: true })
+    .click();
+  await expect(
+    page.getByRole("checkbox", { name: "Select Low Tide", exact: true }),
+  ).toBeDisabled();
+  await expect(page.locator(".artwork-playlist img")).toBeVisible();
+  await page.screenshot({ path: "docs/imgs/browse_playlist.png" });
   await page
     .locator("aside")
     .getByRole("button", { name: "General", exact: true })
@@ -830,9 +998,9 @@ test("browse documentation screenshots use disposable catalogue artwork", async 
     )
     .toBe(native.palettes.light.blue);
   await page.getByRole("button", { name: "Back", exact: true }).click();
-  await expect(page.locator(".browse-release-cover img")).toBeVisible();
+  await expect(page.locator(".artwork-playlist img")).toBeVisible();
   await page.screenshot({
-    path: "/private/tmp/tibrary-browse-release-light.png",
+    path: "/private/tmp/tibrary-browse-playlist-light.png",
   });
 });
 
@@ -893,4 +1061,310 @@ test("browse account changes invalidate the in-memory home cache", async ({
   expect(
     requests.filter((request) => request.method === "browse.home").length,
   ).toBeGreaterThan(calls);
+});
+
+test("artist and playlist images load only when visible and reuse their shared cache", async ({
+  page,
+}) => {
+  override = (request) =>
+    request.method === "browse.home"
+      ? {
+          result: {
+            ...home(),
+            sections: [
+              {
+                id: "new",
+                title: "New releases",
+                releases: Array.from({ length: 24 }, (_, index) => ({
+                  ...release,
+                  id: String(630000 + index),
+                  title: `Release ${index + 1}`,
+                })),
+              },
+              { id: "artists", title: "Your artists", artists: [artist] },
+              {
+                id: "playlists",
+                title: "Playlists for your day",
+                playlists: [playlist],
+              },
+            ],
+          },
+        }
+      : undefined;
+  await browse(page);
+  await expect(page.locator(".browse-release-card img").first()).toBeVisible();
+  expect(
+    requests.filter((request) => request.method === "artwork.image"),
+  ).toHaveLength(0);
+  const artistCard = page.getByRole("button", {
+    name: `Browse artist ${artist.name}`,
+    exact: true,
+  });
+  await artistCard.scrollIntoViewIfNeeded();
+  await expect(artistCard.locator(".artwork-artist img")).toBeVisible();
+  await expect
+    .poll(
+      () =>
+        requests.filter(
+          (request) =>
+            request.method === "artwork.image" &&
+            request.args.image_id === artist.picture,
+        ).length,
+    )
+    .toBe(1);
+  await artistCard.click();
+  await expect(
+    page.getByRole("heading", { name: artist.name, exact: true }),
+  ).toBeVisible();
+  await expect(page.locator(".artwork-artist img")).toBeVisible();
+  expect(
+    requests.filter(
+      (request) =>
+        request.method === "artwork.image" &&
+        request.args.image_id === artist.picture,
+    ),
+  ).toHaveLength(1);
+  await page.getByRole("button", { name: "Back", exact: true }).click();
+  await expect(artistCard.locator(".artwork-artist img")).toBeVisible();
+  expect(
+    requests.filter(
+      (request) =>
+        request.method === "artwork.image" &&
+        request.args.image_id === artist.picture,
+    ),
+  ).toHaveLength(1);
+  const playlistCard = page.getByRole("button", {
+    name: `Open playlist ${playlist.title}`,
+    exact: true,
+  });
+  await playlistCard.scrollIntoViewIfNeeded();
+  await expect(playlistCard.locator(".artwork-playlist img")).toBeVisible();
+  await playlistCard.click();
+  await expect(
+    page.getByRole("heading", { name: playlist.title, exact: true }),
+  ).toBeVisible();
+  await expect(page.locator(".artwork-playlist img")).toBeVisible();
+  expect(
+    requests.filter(
+      (request) =>
+        request.method === "artwork.image" &&
+        request.args.image_id === playlist.cover,
+    ),
+  ).toHaveLength(1);
+});
+
+test("playlist browsing preserves pagination and queues exact tracks into their original releases", async ({
+  page,
+}) => {
+  await browse(page);
+  await page.getByRole("tab", { name: "Playlists", exact: true }).click();
+  await page
+    .getByRole("button", {
+      name: `Open playlist ${playlist.title}`,
+      exact: true,
+    })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: playlist.title, exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: "Select First Light", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Show more", exact: true }).click();
+  await expect(
+    page.getByRole("checkbox", { name: "Select Drift", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("checkbox", { name: "Select Low Tide", exact: true }),
+  ).toBeDisabled();
+  const all = page.getByRole("checkbox", {
+    name: "Select all loaded available tracks",
+    exact: true,
+  });
+  await all.uncheck();
+  await page
+    .getByRole("checkbox", { name: "Select First Light", exact: true })
+    .check();
+  await page
+    .getByRole("checkbox", { name: "Select Signal", exact: true })
+    .check();
+  await page.getByRole("button", { name: "Back", exact: true }).click();
+  await page.getByRole("button", { name: "Forward", exact: true }).click();
+  await expect(
+    page.getByRole("checkbox", { name: "Select Signal", exact: true }),
+  ).toBeChecked();
+  await expect(
+    page.getByRole("checkbox", { name: "Select Low Tide", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByRole("button", { name: "Queue selected tracks (2)", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Open download queue", exact: true }),
+  ).toBeVisible();
+  expect((await savedQueue(release.id)).selected).toEqual([tracks[0].id]);
+  expect((await savedQueue(secondRelease.id)).selected).toEqual([
+    secondRelease.tracks[0].id,
+  ]);
+  const queued = requests.filter(
+    (request) => request.method === "browse.queue",
+  );
+  expect(queued).toHaveLength(1);
+  expect(queued[0].args.selection).toEqual({
+    [release.id]: [tracks[0].id],
+    [secondRelease.id]: [secondRelease.tracks[0].id],
+  });
+  expect(
+    requests
+      .filter((request) => request.method === "browse.playlist")
+      .map((request) => request.args.offset || 0),
+  ).toEqual([0, 2]);
+});
+
+test("playlist search and recommended tracks open the right detail and preserve navigation", async ({
+  page,
+}) => {
+  await browse(page);
+  const recommended = page.getByRole("heading", {
+    name: "Recommended tracks",
+    exact: true,
+  });
+  await recommended.scrollIntoViewIfNeeded();
+  await expect(recommended).toBeVisible();
+  await search(page, "After hours");
+  await page
+    .getByRole("tab", { name: "Playlists", exact: true })
+    .last()
+    .click();
+  await page
+    .getByRole("button", {
+      name: `Open playlist ${playlist.title}`,
+      exact: true,
+    })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: playlist.title, exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Back", exact: true }).click();
+  await expect(
+    page.getByRole("searchbox", { name: "Search online music" }),
+  ).toHaveValue("After hours");
+  expect(
+    requests.some(
+      (request) =>
+        request.method === "browse.search" && request.args.kind === "playlists",
+    ),
+  ).toBe(true);
+});
+
+test("loading a full playlist is explicit and cancellable without queuing music", async ({
+  page,
+}) => {
+  let finish: ((value: any) => void) | undefined;
+  let defer = true;
+  override = (request) => {
+    if (
+      request.method === "browse.playlist" &&
+      request.args.offset > 0 &&
+      defer
+    )
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+  };
+  await browse(page);
+  await page.getByRole("tab", { name: "Playlists", exact: true }).click();
+  await page
+    .getByRole("button", {
+      name: `Open playlist ${playlist.title}`,
+      exact: true,
+    })
+    .click();
+  await page
+    .getByRole("button", { name: "Load all tracks", exact: true })
+    .click();
+  await expect.poll(() => !!finish).toBe(true);
+  await expect(
+    page.getByRole("button", { name: "Load all tracks", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  finish!({
+    result: {
+      ...stamp(),
+      playlist,
+      items: playlistTracks.slice(2),
+      offset: 2,
+      limit: 2,
+      total: 4,
+      has_more: false,
+    },
+  });
+  await expect(
+    page.getByRole("button", { name: "Load all tracks", exact: true }),
+  ).toBeEnabled();
+  expect(
+    requests.filter((request) => request.method === "browse.queue"),
+  ).toHaveLength(0);
+  defer = false;
+  await page
+    .getByRole("button", { name: "Load all tracks", exact: true })
+    .click();
+  await expect(
+    page.getByRole("checkbox", { name: "Select Low Tide", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Load all tracks", exact: true }),
+  ).toHaveCount(0);
+  expect(
+    requests.filter((request) => request.method === "browse.queue"),
+  ).toHaveLength(0);
+});
+
+test("new releases can be opened without a local library and keeps provider discovery available", async ({
+  page,
+}) => {
+  noLibrary = true;
+  await browse(page);
+  await page.getByRole("tab", { name: "New releases", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "From your library", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", {
+      name: `Open release ${release.title} by ${artist.name}`,
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("recommended tracks use the selected song and queue its recommendation's original release", async ({
+  page,
+}) => {
+  await browse(page);
+  await page
+    .getByRole("button", { name: "More like First Light", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Tracks like First Light", exact: true }),
+  ).toBeVisible();
+  expect(
+    requests
+      .filter((request) => request.method === "browse.radio")
+      .map((request) => request.args.id),
+  ).toEqual([tracks[0].id]);
+  await page
+    .getByRole("button", { name: "Queue track Signal", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Open download queue", exact: true }),
+  ).toBeVisible();
+  expect((await savedQueue(secondRelease.id)).selected).toEqual([
+    secondRelease.tracks[0].id,
+  ]);
+  expect(await savedQueue(release.id)).toBeUndefined();
+  await page.getByRole("button", { name: "Back", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "New releases", exact: true }),
+  ).toBeVisible();
 });

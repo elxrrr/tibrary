@@ -15,7 +15,8 @@ use std::{
 
 const PAGE_TTL: i64 = 15 * 60;
 const ARTIST_TTL: i64 = 6 * 3600;
-const MAX_QUEUE_RELEASES: usize = 50;
+const MAX_QUEUE_RELEASES: usize = 500;
+const MAX_QUEUE_TRACKS: usize = 2000;
 
 async fn market(db: &TursoDb) -> Result<String, String> {
     crate::account::catalogue_market(db, None).await
@@ -23,6 +24,17 @@ async fn market(db: &TursoDb) -> Result<String, String> {
 
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn valid_playlist_id(id: &str) -> bool {
+    id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
+}
+
+fn requested_playlist_id(args: &Value) -> Result<&str, String> {
+    args["id"]
+        .as_str()
+        .filter(|id| valid_playlist_id(id))
+        .ok_or_else(|| "Choose a valid playlist".into())
 }
 
 fn requested_id(args: &Value) -> Result<&str, String> {
@@ -108,6 +120,85 @@ fn artist_card(raw: &Value) -> Option<Value> {
     let id = resource_id(&raw["id"]);
     let name = raw["name"].as_str()?;
     valid_id(&id).then(|| json!({"id":id,"name":name,"picture":raw["picture"]}))
+}
+
+fn plain_description(raw: &str) -> String {
+    let mut text = String::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find('<') {
+        text.push_str(&remaining[..start]);
+        let after = &remaining[start + 1..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!'))
+        {
+            if let Some(end) = after.find('>') {
+                let tag = after[..end]
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(tag.as_str(), "br" | "br/" | "p" | "div" | "li") {
+                    text.push(' ');
+                }
+                remaining = &after[end + 1..];
+                continue;
+            }
+        }
+        text.push('<');
+        remaining = after;
+    }
+    text.push_str(remaining);
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn playlist_card(raw: &Value) -> Option<Value> {
+    let raw = raw.get("playlist").unwrap_or(raw);
+    let id = raw["uuid"].as_str().or_else(|| raw["id"].as_str())?;
+    if !valid_playlist_id(id) || !raw["title"].is_string() {
+        return None;
+    }
+    let creator = raw["creator"]["name"]
+        .as_str()
+        .or_else(|| raw["creator"]["username"].as_str())
+        .or_else(|| (raw["type"] == "EDITORIAL").then_some("TIDAL"));
+    let cover = raw["squareImage"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .or_else(|| raw["image"].as_str());
+    Some(
+        json!({"id":id,"title":raw["title"],"description":plain_description(raw["description"].as_str().unwrap_or("")),
+        "creator":creator,"cover":cover,"track_count":raw["numberOfTracks"],
+        "duration":raw["duration"],"updated":raw["lastUpdated"],"type":raw["type"]}),
+    )
+}
+
+/// Private playlist lists and home recommendations must never cross accounts.
+async fn account_scope(db: &TursoDb) -> Result<(bool, String, String), String> {
+    let session = crate::stream_download::load_saved_token(db).await;
+    let saved = db
+        .get_preference("subscriber-account-market")
+        .await?
+        .unwrap_or(Value::Null);
+    let account = session
+        .as_ref()
+        .and_then(|v| v.user_id.as_deref())
+        .or_else(|| saved["user_id"].as_str())
+        .unwrap_or("anonymous")
+        .to_owned();
+    use sha2::{Digest, Sha256};
+    let key = format!("{:x}", Sha256::digest(account.as_bytes()));
+    Ok((session.is_some(), account, key))
 }
 
 fn release_card(raw: &Value) -> Option<Value> {
@@ -337,7 +428,7 @@ async fn filter_page(
     mut page: Value,
     kind: &str,
 ) -> Result<Value, String> {
-    if kind != "artists" {
+    if matches!(kind, "albums" | "tracks") {
         if let Some(items) = page["items"].as_array_mut() {
             filter_cards(db, market, items, kind).await?;
         }
@@ -355,8 +446,8 @@ pub(crate) async fn search(db: &TursoDb, args: &Value) -> Result<Value, String> 
         return Err("Enter a search between 1 and 200 characters".into());
     }
     let kind = args["kind"].as_str().unwrap_or("albums");
-    if !matches!(kind, "albums" | "artists" | "tracks") {
-        return Err("Choose releases, artists or tracks".into());
+    if !matches!(kind, "albums" | "artists" | "tracks" | "playlists") {
+        return Err("Choose releases, artists, tracks or playlists".into());
     }
     let (offset, limit) = pagination(args)?;
     let market = market(db).await?;
@@ -376,7 +467,7 @@ pub(crate) async fn search(db: &TursoDb, args: &Value) -> Result<Value, String> 
         let payload = client.request(&format!("search/{kind}"),&market,&[("query",query.into()),("offset",offset.to_string()),("limit",limit.to_string())]).await?;
         let raw = payload["items"].as_array().ok_or("Catalogue search returned no item list")?;
         let mut seen = HashSet::new();
-        let items: Vec<_> = raw.iter().filter_map(|v| match kind {"artists"=>artist_card(v),"tracks"=>track_card(v),_=>release_card(v)})
+        let items: Vec<_> = raw.iter().filter_map(|v| match kind {"artists"=>artist_card(v),"tracks"=>track_card(v),"playlists"=>playlist_card(v),_=>release_card(v)})
             .filter(|v|seen.insert(resource_id(&v["id"]))).collect();
         if kind == "albums" { cache_summaries(db,&client,raw,&market,"artist_list").await?; }
         if kind == "tracks" { cache_track_search(db,raw,&market).await?; }
@@ -392,6 +483,169 @@ pub(crate) async fn search(db: &TursoDb, args: &Value) -> Result<Value, String> 
                     &market,
                     saved_page(&saved, true, Some(&format!("Saved results · {error}"))),
                     kind,
+                )
+                .await
+            }
+            None => Err(error),
+        },
+    }
+}
+
+/// Saved and created playlists are separate provider lists. Keeping their
+/// pagination separate avoids skipping cards when the same playlist is in both.
+pub(crate) async fn playlists(db: &TursoDb, args: &Value) -> Result<Value, String> {
+    let (offset, limit) = pagination(args)?;
+    let source = args["source"].as_str().unwrap_or("created");
+    if !matches!(source, "created" | "saved") {
+        return Err("Choose your playlists or saved playlists".into());
+    }
+    let market = market(db).await?;
+    let (connected, account, scope) = account_scope(db).await?;
+    let key = format!("browse:v1:{market}:playlists:{scope}:{source}:{offset}:{limit}");
+    let gate = crate::actions::release_gate(format!("{}:{key}", db.path.display()));
+    let _guard = gate.lock().await;
+    let saved = db.get_preference(&key).await?;
+    if args["refresh"] != true {
+        if let Some(saved) = saved.as_ref().filter(|v| current(v, PAGE_TTL)) {
+            return Ok(saved_page(saved, false, None));
+        }
+    }
+    let fetched = async {
+        if !connected || !valid_id(&account) {return Err("Connect your account to see your playlists".to_owned());}
+        let mut client = TidalClient::from_db(db).await?;
+        let path = if source == "saved" {format!("users/{account}/favorites/playlists")} else {format!("users/{account}/playlists")};
+        let payload = client.request(&path,&market,&[("offset",offset.to_string()),("limit",limit.to_string())]).await?;
+        let raw = payload["items"].as_array().ok_or("The playlist list could not be read")?;
+        let mut seen = HashSet::new();
+        let items: Vec<_> = raw.iter().filter_map(playlist_card).filter(|v|seen.insert(resource_id(&v["id"]))).collect();
+        let total = payload["totalNumberOfItems"].as_u64().unwrap_or((offset+raw.len()) as u64);
+        save_page(db,&key,json!({"items":items,"total":total,"offset":offset,"limit":limit,"has_more":offset+raw.len()<total as usize,"playlist_source":source,"market":market})).await
+    }.await;
+    match fetched {
+        Ok(page) => Ok(page),
+        Err(error) => match saved {
+            Some(saved) => Ok(saved_page(
+                &saved,
+                true,
+                Some(&format!("Saved playlists · {error}")),
+            )),
+            None => Err(error),
+        },
+    }
+}
+
+fn playlist_tracks(raw: &[Value], offset: usize) -> Vec<Value> {
+    raw.iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            // Item lists may contain videos. Only audio tracks with a parent album
+            // can enter the download selection. Preserve repeated playlist positions;
+            // selection deduplicates recordings when they are queued.
+            if value.get("item").is_some() && value["type"] != "track" {
+                return None;
+            }
+            let mut track = track_card(value.get("item").unwrap_or(value))?;
+            track["playlist_position"] = json!(offset + index + 1);
+            Some(track)
+        })
+        .collect()
+}
+
+pub(crate) async fn playlist(db: &TursoDb, args: &Value) -> Result<Value, String> {
+    let id = requested_playlist_id(args)?;
+    let (offset, limit) = pagination(args)?;
+    let market = market(db).await?;
+    let (connected, _, scope) = account_scope(db).await?;
+    let key = format!("browse:v1:{market}:playlist:{scope}:{id}:{offset}:{limit}");
+    let gate = crate::actions::release_gate(format!("{}:{key}", db.path.display()));
+    let _guard = gate.lock().await;
+    let saved = db.get_preference(&key).await?;
+    if args["refresh"] != true {
+        if let Some(saved) = saved.as_ref().filter(|v| current(v, PAGE_TTL)) {
+            return filter_page(db, &market, saved_page(saved, false, None), "tracks").await;
+        }
+    }
+    let fetched = async {
+        if !connected {return Err("Connect your account to load this playlist".to_owned());}
+        let mut client = TidalClient::from_db(db).await?;
+        let profile = client.request(&format!("playlists/{id}"),&market,&[]).await?;
+        let card = playlist_card(&profile).ok_or("The playlist details could not be read")?;
+        if card["id"] != id {return Err("The catalogue returned a different playlist".into());}
+        let payload = client.request(&format!("playlists/{id}/items"),&market,&[("offset",offset.to_string()),("limit",limit.to_string())]).await?;
+        let raw = payload["items"].as_array().ok_or("The playlist tracks could not be read")?;
+        let items = playlist_tracks(raw,offset);
+        let tracks: Vec<_> = raw.iter().filter(|v|v["type"] == "track").map(|v|v["item"].clone()).collect();
+        cache_track_search(db,&tracks,&market).await?;
+        let total = payload["totalNumberOfItems"].as_u64().unwrap_or((offset+raw.len()) as u64);
+        save_page(db,&key,json!({"playlist":card,"items":items,"total":total,"offset":offset,"limit":limit,"has_more":offset+raw.len()<total as usize})).await
+    }.await;
+    match fetched {
+        Ok(page) => filter_page(db, &market, page, "tracks").await,
+        Err(error) => match saved {
+            Some(saved) => {
+                filter_page(
+                    db,
+                    &market,
+                    saved_page(&saved, true, Some(&format!("Saved playlist · {error}"))),
+                    "tracks",
+                )
+                .await
+            }
+            None => Err(error),
+        },
+    }
+}
+
+/// Related tracks are provider radio recommendations for this exact recording,
+/// not fabricated library recommendations or a replacement for release matching.
+pub(crate) async fn radio(db: &TursoDb, args: &Value) -> Result<Value, String> {
+    let id = requested_id(args)?;
+    let (offset, limit) = pagination(args)?;
+    let market = market(db).await?;
+    let (connected, _, scope) = account_scope(db).await?;
+    let key = format!("browse:v1:{market}:radio:{scope}:{id}:{offset}:{limit}");
+    let gate = crate::actions::release_gate(format!("{}:{key}", db.path.display()));
+    let _guard = gate.lock().await;
+    let saved = db.get_preference(&key).await?;
+    if args["refresh"] != true {
+        if let Some(saved) = saved.as_ref().filter(|v| current(v, PAGE_TTL)) {
+            return filter_page(db, &market, saved_page(saved, false, None), "tracks").await;
+        }
+    }
+    let fetched = async {
+        if !connected {return Err("Connect your account to find related tracks".to_owned());}
+        let mut client = TidalClient::from_db(db).await?;
+        let track_key = format!("browse-track:{market}:{id}");
+        let seed = match db.get_preference(&track_key).await?.filter(|v|args["refresh"] != true && current(v,PAGE_TTL)) {
+            Some(value)=>value,
+            None=>{
+                let value = client.request(&format!("tracks/{id}"),&market,&[]).await?;
+                cache_track_search(db,std::slice::from_ref(&value),&market).await?;
+                value
+            },
+        };
+        if resource_id(&seed["id"]) != id {return Err("The catalogue returned a different recording".into());}
+        let card = track_card(&seed).ok_or("The track details could not be read")?;
+        let payload = client.request(&format!("tracks/{id}/radio"),&market,&[("offset",offset.to_string()),("limit",limit.to_string())]).await?;
+        let raw = payload["items"].as_array().ok_or("The related tracks could not be read")?;
+        let items = playlist_tracks(raw,offset);
+        cache_track_search(db,raw,&market).await?;
+        let total = payload["totalNumberOfItems"].as_u64().unwrap_or((offset+raw.len()) as u64);
+        save_page(db,&key,json!({"seed":card,"items":items,"total":total,"offset":offset,"limit":limit,"has_more":offset+raw.len()<total as usize})).await
+    }.await;
+    match fetched {
+        Ok(page) => filter_page(db, &market, page, "tracks").await,
+        Err(error) => match saved {
+            Some(saved) => {
+                filter_page(
+                    db,
+                    &market,
+                    saved_page(
+                        &saved,
+                        true,
+                        Some(&format!("Saved related tracks · {error}")),
+                    ),
+                    "tracks",
                 )
                 .await
             }
@@ -480,6 +734,18 @@ fn home_sections(payload: &Value) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
                 }
                 albums.extend(raw.iter().take(24).cloned());
             }
+            Some("PLAYLIST_LIST") => {
+                let items: Vec<_> = raw.iter().take(24).filter_map(playlist_card).collect();
+                if !items.is_empty() {
+                    sections.push(json!({"id":format!("home-{}",sections.len()),"title":title,"playlists":items}));
+                }
+            }
+            Some("ARTIST_LIST") => {
+                let items: Vec<_> = raw.iter().take(24).filter_map(artist_card).collect();
+                if !items.is_empty() {
+                    sections.push(json!({"id":format!("home-{}",sections.len()),"title":title,"artists":items}));
+                }
+            }
             Some("TRACK_LIST") => {
                 let items: Vec<_> = raw.iter().take(12).filter_map(track_card).collect();
                 if !items.is_empty() {
@@ -489,16 +755,75 @@ fn home_sections(payload: &Value) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
             }
             _ => {}
         }
-        if sections.len() >= 6 {
+        if sections.len() >= 12 {
             break;
         }
+    }
+    for section in &mut sections {
+        let title = section["title"].as_str().unwrap_or("").to_ascii_lowercase();
+        section["category"] = json!(if title.starts_with("new ") {
+            "new"
+        } else if section["playlists"].is_array() {
+            "playlists"
+        } else {
+            "discover"
+        });
     }
     (sections, albums, tracks)
 }
 
-async fn home_local(db: &TursoDb, market: &str, account: &str) -> Result<Vec<Value>, String> {
+async fn refresh_favourite_portraits(
+    db: &TursoDb,
+    client: &mut TidalClient,
+    market: &str,
+    account: &str,
+    scope: &str,
+    refresh: bool,
+) -> Result<(), String> {
+    if !valid_id(account) {
+        return Ok(());
+    }
+    let key = format!("browse:v1:{market}:favourite-artists:{scope}");
+    if !refresh
+        && db
+            .get_preference(&key)
+            .await?
+            .as_ref()
+            .is_some_and(|v| current(v, ARTIST_TTL))
+    {
+        return Ok(());
+    }
+    // One account list supplies portraits for the visible favourites, rather
+    // than a request per artist. Failure leaves previous saved portraits intact.
+    let payload = client
+        .request(
+            &format!("users/{account}/favorites/artists"),
+            market,
+            &[("limit", "24".into()), ("offset", "0".into())],
+        )
+        .await?;
+    let raw = payload["items"]
+        .as_array()
+        .ok_or("Favourite artists could not be read")?;
+    let items: Vec<_> = raw
+        .iter()
+        .filter_map(|v| artist_card(v.get("artist").unwrap_or(v)))
+        .collect();
+    save_page(db, &key, json!({"items":items})).await?;
+    Ok(())
+}
+
+async fn home_local(
+    db: &TursoDb,
+    market: &str,
+    account: &str,
+    scope: &str,
+) -> Result<Vec<Value>, String> {
     let conn = db.connect()?;
     let mut sections = Vec::new();
+    let portraits = db
+        .get_preference(&format!("browse:v1:{market}:favourite-artists:{scope}"))
+        .await?;
     let mut rows = conn
         .query(
             "SELECT payload FROM favourite_artists WHERE cache_id=? LIMIT 1",
@@ -523,6 +848,16 @@ async fn home_local(db: &TursoDb, market: &str, account: &str) -> Result<Vec<Val
         }
     }
     drop(rows);
+    if let Some(items) = portraits
+        .as_ref()
+        .and_then(|v| v["value"]["items"].as_array())
+    {
+        sections.retain(|section| section["id"] != "favourites");
+        if !items.is_empty() {
+            sections
+                .push(json!({"id":"favourites","title":"Your favourite artists","artists":items}));
+        }
+    }
     let mut rows = conn.query("SELECT payload FROM app_preferences WHERE key LIKE ? ORDER BY CAST(json_extract(payload,'$.checked_at') AS INTEGER) DESC LIMIT 12",(format!("browse:v1:{market}:release:%"),)).await.map_err(|e|e.to_string())?;
     let mut releases = Vec::new();
     while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
@@ -543,22 +878,8 @@ async fn home_local(db: &TursoDb, market: &str, account: &str) -> Result<Vec<Val
 
 pub(crate) async fn home(db: &TursoDb, args: &Value) -> Result<Value, String> {
     let market = market(db).await?;
-    let session = crate::stream_download::load_saved_token(db).await;
-    let connected = session.is_some();
-    let saved_account = db
-        .get_preference("subscriber-account-market")
-        .await?
-        .unwrap_or(Value::Null);
-    let account = session
-        .as_ref()
-        .and_then(|session| session.user_id.as_deref())
-        .or_else(|| saved_account["user_id"].as_str())
-        .unwrap_or("anonymous");
-    // Home may be personalised. Public catalogue pages share a country cache,
-    // but changing accounts must not reuse another subscriber's home/favourites.
-    use sha2::{Digest, Sha256};
-    let account_key = format!("{:x}", Sha256::digest(account.as_bytes()));
-    let key = format!("browse:v1:{market}:home:{account_key}");
+    let (connected, account, account_key) = account_scope(db).await?;
+    let key = format!("browse:v1:{market}:home:v2:{account_key}");
     let gate = crate::actions::release_gate(format!("{}:{key}", db.path.display()));
     let _guard = gate.lock().await;
     let saved = db.get_preference(&key).await?;
@@ -571,6 +892,7 @@ pub(crate) async fn home(db: &TursoDb, args: &Value) -> Result<Value, String> {
             let locale = format!("en_{market}");
             let payload = client.request("pages/home",&market,&[("deviceType","BROWSER".into()),("locale",locale)]).await?;
             let (sections,albums,tracks) = home_sections(&payload);
+            let _ = refresh_favourite_portraits(db,&mut client,&market,&account,&account_key,args["refresh"] == true).await;
             if sections.is_empty() { return Err("The catalogue home page has no supported music sections. Search for an artist, release or track.".to_owned()); }
             cache_summaries(db,&client,&albums,&market,"artist_list").await?;
             cache_track_search(db,&tracks,&market).await?;
@@ -586,7 +908,7 @@ pub(crate) async fn home(db: &TursoDb, args: &Value) -> Result<Value, String> {
             None => envelope(json!({"sections":[]}), 0, "cache", true, Some(&error)),
         },
     };
-    let mut sections = home_local(db, &market, account).await?;
+    let mut sections = home_local(db, &market, &account, &account_key).await?;
     sections.extend(value["sections"].as_array().into_iter().flatten().cloned());
     for section in &mut sections {
         if let Some(releases) = section["releases"].as_array_mut() {
@@ -597,7 +919,7 @@ pub(crate) async fn home(db: &TursoDb, args: &Value) -> Result<Value, String> {
         }
     }
     sections.retain(|section| {
-        ["releases", "artists", "tracks"]
+        ["releases", "artists", "tracks", "playlists"]
             .iter()
             .any(|key| section[*key].as_array().is_some_and(|v| !v.is_empty()))
     });
@@ -846,7 +1168,7 @@ pub(crate) async fn release(db: &TursoDb, args: &Value) -> Result<Value, String>
 pub(crate) async fn resolve(db: &TursoDb, args: &Value) -> Result<Value, String> {
     let (kind, id) = parse_url(args["url"].as_str().unwrap_or(""))?;
     if kind != "track" {
-        return Ok(json!({"kind":if kind == "album" {"release"} else {"artist"},"id":id}));
+        return Ok(json!({"kind":if kind == "album" {"release"} else {kind.as_str()},"id":id}));
     }
     let market = market(db).await?;
     let key = format!("browse-track:{market}:{id}");
@@ -896,9 +1218,15 @@ fn parse_url(raw: &str) -> Result<(String, String), String> {
     } else {
         segments.as_slice()
     };
-    if parts.len() != 2 || !matches!(parts[0], "album" | "artist" | "track") || !valid_id(parts[1])
+    if parts.len() != 2
+        || !matches!(parts[0], "album" | "artist" | "track" | "playlist")
+        || !(if parts[0] == "playlist" {
+            valid_playlist_id(parts[1])
+        } else {
+            valid_id(parts[1])
+        })
     {
-        return Err("Open an artist, release or track link".into());
+        return Err("Open an artist, release, track or playlist link".into());
     }
     Ok((parts[0].into(), parts[1].into()))
 }
@@ -908,7 +1236,7 @@ pub(crate) async fn queue(db: &TursoDb, args: &Value) -> Result<Value, String> {
         serde_json::from_value(args["selection"].clone())
             .map_err(|_| "Choose releases or audio tracks to queue".to_owned())?;
     if selection.is_empty() || selection.len() > MAX_QUEUE_RELEASES {
-        return Err("Select between 1 and 50 releases".into());
+        return Err("Select between 1 and 500 releases".into());
     }
     if selection.iter().any(|(id, tracks)| {
         !valid_id(id)
@@ -918,21 +1246,48 @@ pub(crate) async fn queue(db: &TursoDb, args: &Value) -> Result<Value, String> {
     }) {
         return Err("Select valid audio tracks or a complete release".into());
     }
+    if selection
+        .values()
+        .filter_map(Option::as_ref)
+        .map(Vec::len)
+        .sum::<usize>()
+        > MAX_QUEUE_TRACKS
+    {
+        return Err("Select up to 2,000 tracks at a time".into());
+    }
+    if selection.values().filter(|tracks| tracks.is_none()).count() > 50 {
+        return Err("Select up to 50 complete releases at a time".into());
+    }
     let market = market(db).await?;
-    let mut prepared = Vec::new();
+    // Playlist selections commonly span many releases. Fetch at most three
+    // releases concurrently; the shared request limiter still handles backoff.
+    // Prepare everything before the transaction so a failed lookup queues none.
+    let permits = Arc::new(tokio::sync::Semaphore::new(3));
+    let mut tasks = tokio::task::JoinSet::new();
     for (id, ids) in &selection {
-        let detail = release(db, &json!({"id":id})).await?;
-        if detail["stale"] == true {
-            return Err("Reconnect and refresh this release before adding it to the queue".into());
-        }
-        let payload = detail["release"].clone();
-        if resource_id(&payload["id"]) != *id {
-            return Err(
-                "The saved release does not match this selection; refresh its details".into(),
-            );
-        }
-        validate_queue_release(&payload, ids.as_deref())?;
-        prepared.push((id.clone(), payload, ids.clone()));
+        let (db, id, ids, permits) = (db.clone(), id.clone(), ids.clone(), permits.clone());
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await.map_err(|e| e.to_string())?;
+            let detail = release(&db, &json!({"id":id})).await?;
+            if detail["stale"] == true {
+                return Err(
+                    "Reconnect and refresh this release before adding it to the queue".to_owned(),
+                );
+            }
+            let payload = detail["release"].clone();
+            if resource_id(&payload["id"]) != id {
+                return Err(
+                    "The saved release does not match this selection; refresh its details"
+                        .to_owned(),
+                );
+            }
+            validate_queue_release(&payload, ids.as_deref())?;
+            Ok((id, payload, ids))
+        });
+    }
+    let mut prepared = Vec::with_capacity(selection.len());
+    while let Some(result) = tasks.join_next().await {
+        prepared.push(result.map_err(|e| format!("Could not prepare selected releases: {e}"))??);
     }
     // Safety labels can be published by another worker during release loading.
     let flags = crate::ai_policy::flags(db, &market).await?;
@@ -1155,13 +1510,14 @@ mod tests {
         let raw = json!({"rows":[{"modules":[
             {"type":"ALBUM_LIST","title":"New albums","pagedList":{"items":[{"id":10,"title":"Release","artists":[{"id":2,"name":"Primary"}]}]}},
             {"type":"TRACK_LIST","title":"New tracks","pagedList":{"items":[{"id":11,"title":"Song","album":{"id":10,"title":"Release"}}]}},
-            {"type":"PLAYLIST_LIST","title":"Not albums","pagedList":{"items":[{"id":12,"title":"List"}]}}
+            {"type":"PLAYLIST_LIST","title":"Editorial","pagedList":{"items":[{"uuid":"36fd9903-251c-4d25-bee2-ae267f645632","title":"List"}]}}
         ]}]});
         let (sections, albums, tracks) = home_sections(&raw);
-        assert_eq!(sections.len(), 2);
+        assert_eq!(sections.len(), 3);
         assert_eq!(albums.len(), 1);
         assert_eq!(tracks.len(), 1);
         assert_eq!(sections[1]["tracks"][0]["album_id"], "10");
+        assert_eq!(sections[2]["playlists"][0]["title"], "List");
     }
     #[test]
     fn opening_release_keeps_saved_extended_metadata_without_copying_old_identity() {
@@ -1399,7 +1755,7 @@ mod tests {
         .unwrap();
         use sha2::{Digest, Sha256};
         let other = format!("{:x}", Sha256::digest(b"other"));
-        db.set_preference(&format!("browse:v1:GB:home:{other}"),&json!({"checked_at":Utc::now().timestamp(),"value":{"sections":[{"id":"other","title":"Other account","releases":[sample("10")]}]}})).await.unwrap();
+        db.set_preference(&format!("browse:v1:GB:home:v2:{other}"),&json!({"checked_at":Utc::now().timestamp(),"value":{"sections":[{"id":"other","title":"Other account","releases":[sample("10")]}]}})).await.unwrap();
         let result = home(&db, &json!({})).await.unwrap();
         assert!(result["sections"].as_array().unwrap().is_empty());
     }
@@ -1608,5 +1964,171 @@ mod tests {
             0
         );
         println!("Browser home, 3 search types, bounded artist page, 12 audio tracks with credits, exact queue selection and one decoded FLAC download passed in {country}; cached browsing works disconnected; catalogue scope unchanged");
+    }
+    #[test]
+    fn playlist_cards_and_items_keep_identity_and_skip_videos() {
+        let id = "36fd9903-251c-4d25-bee2-ae267f645632";
+        assert_eq!(
+            parse_url(&format!("https://tidal.com/browse/playlist/{id}")).unwrap(),
+            ("playlist".into(), id.into())
+        );
+        assert!(parse_url("https://tidal.com/playlist/123").is_err());
+        let card=playlist_card(&json!({"playlist":{"uuid":id,"title":"Mix","type":"EDITORIAL","description":"Try <a href='https://tidal.com'>these &amp; more</a>.","image":"wide","squareImage":"square"}})).unwrap();
+        assert_eq!(card["cover"], "square");
+        assert_eq!(card["creator"], "TIDAL");
+        assert_eq!(card["description"], "Try these & more.");
+        let audio = json!({"type":"track","item":{"id":101,"title":"First","album":{"id":10,"title":"Release"},"trackNumber":1,"volumeNumber":1}});
+        let video = json!({"type":"video","item":{"id":102,"title":"Video","album":{"id":10}}});
+        let items = playlist_tracks(&[audio.clone(), video, audio], 50);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["playlist_position"], 51);
+        assert_eq!(items[1]["playlist_position"], 53);
+        assert_eq!(items[0]["album_id"], "10");
+    }
+
+    #[tokio::test]
+    async fn cached_playlist_and_radio_safety_are_account_scoped() {
+        let (_temp, db) = database().await;
+        let (_, _, scope) = account_scope(&db).await.unwrap();
+        let id = "36fd9903-251c-4d25-bee2-ae267f645632";
+        let items = json!([
+            {"id":"101","album_id":"10","title":"Allowed","available":true},
+            {"id":"102","album_id":"10","title":"AI","ai":true},
+            {"id":"201","album_id":"20","title":"Withdrawn","available":true}
+        ]);
+        db.set_preference("release-live:GB:20", &json!({"available":false}))
+            .await
+            .unwrap();
+        for key in [
+            format!("browse:v1:GB:playlist:{scope}:{id}:0:24"),
+            format!("browse:v1:GB:radio:{scope}:101:0:24"),
+        ] {
+            db.set_preference(&key,&json!({"checked_at":Utc::now().timestamp(),"value":{"items":items,"has_more":false}})).await.unwrap();
+        }
+        let page = playlist(&db, &json!({"id":id})).await.unwrap();
+        assert_eq!(page["source"], "cache");
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            radio(&db, &json!({"id":"101"})).await.unwrap()["items"][0]["id"],
+            "101"
+        );
+        db.set_preference(
+            "subscriber-account-market",
+            &json!({"country_code":"GB","user_id":"other"}),
+        )
+        .await
+        .unwrap();
+        assert!(playlist(&db, &json!({"id":id}))
+            .await
+            .unwrap_err()
+            .contains("Connect"));
+        assert!(radio(&db, &json!({"id":"101"}))
+            .await
+            .unwrap_err()
+            .contains("Connect"));
+    }
+
+    #[tokio::test]
+    async fn playlist_selection_across_many_releases_queues_only_chosen_tracks() {
+        let (_temp, db) = database().await;
+        let mut selection = serde_json::Map::new();
+        for id in 100..151 {
+            let id = id.to_string();
+            let value = sample(&id);
+            seed(&db, &value).await;
+            selection.insert(id, json!([value["tracks"][0]["id"]]));
+        }
+        let result = queue(&db, &json!({"selection":selection})).await.unwrap();
+        assert_eq!(result["queued_releases"], 51);
+        assert_eq!(result["queued_tracks"], 51);
+        for id in ["100", "125", "150"] {
+            let payload = queued(&db, id).await.unwrap();
+            assert_eq!(payload["selected_tracks"].as_array().unwrap().len(), 1);
+            assert_eq!(payload["selected_tracks"][0]["id"], format!("{id}1"));
+        }
+        assert!(queue(&db, &json!({"selection":{"10":vec!["101";2001]}}))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Read-only subscriber discovery, playlists, related tracks, portraits, and disposable queue"]
+    async fn live_discovery_playlists_recommendations_and_artwork() {
+        let temp = Temp(
+            std::env::temp_dir().join(format!("tibrary-discovery-live-{}", uuid::Uuid::new_v4())),
+        );
+        let db = TursoDb::open(temp.0.join("cache.sqlite3")).await.unwrap();
+        crate::stream_download::use_read_only_saved_account(&db).await;
+        crate::account::ensure_account_market(&db, &crate::network::client(20).unwrap(), None)
+            .await
+            .unwrap();
+        let front = home(&db, &json!({})).await.unwrap();
+        assert!(front["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["playlists"].as_array().is_some_and(|v| !v.is_empty())));
+        let lists = search(
+            &db,
+            &json!({"kind":"playlists","query":"electronic","limit":2}),
+        )
+        .await
+        .unwrap();
+        let id = lists["items"][0]["id"].as_str().unwrap();
+        let page = playlist(&db, &json!({"id":id,"limit":2})).await.unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 2);
+        assert_eq!(page["has_more"], true);
+        let next = playlist(&db, &json!({"id":id,"limit":2,"offset":2}))
+            .await
+            .unwrap();
+        assert_ne!(page["items"][0]["id"], next["items"][0]["id"]);
+        for source in ["created", "saved"] {
+            assert!(playlists(&db, &json!({"source":source,"limit":2}))
+                .await
+                .unwrap()["items"]
+                .is_array());
+        }
+        let related = radio(&db, &json!({"id":"140303441","limit":5}))
+            .await
+            .unwrap();
+        assert!(!related["items"].as_array().unwrap().is_empty());
+        assert_eq!(related["seed"]["id"], "140303441");
+        let artists = search(&db, &json!({"query":"Cassie","kind":"artists","limit":2}))
+            .await
+            .unwrap();
+        let picture = artists["items"][0]["picture"].as_str().unwrap();
+        let service = crate::artwork::ThumbnailService::default();
+        for image in [picture, page["playlist"]["cover"].as_str().unwrap()] {
+            let image = service.catalogue_image(&db, image).await;
+            assert!(image["src"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("data:image/jpeg;base64,")));
+            assert_eq!(image["size"], 160);
+        }
+        let mut selection = serde_json::Map::new();
+        for track in page["items"].as_array().unwrap() {
+            selection
+                .entry(track["album_id"].as_str().unwrap())
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .unwrap()
+                .push(track["id"].clone());
+        }
+        let queued = queue(&db, &json!({"selection":selection})).await.unwrap();
+        assert_eq!(queued["queued_tracks"], 2);
+        db.set_preference("account-disconnected", &json!(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            playlist(&db, &json!({"id":id,"limit":2})).await.unwrap()["source"],
+            "cache"
+        );
+        assert_eq!(
+            radio(&db, &json!({"id":"140303441","limit":5}))
+                .await
+                .unwrap()["source"],
+            "cache"
+        );
+        println!("Live editorial home, playlist search/detail/pagination, created and saved playlists, track radio, 160px artist and playlist artwork, exact cross-release queue and disconnected cache passed");
     }
 }

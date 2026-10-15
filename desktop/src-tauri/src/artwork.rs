@@ -96,6 +96,12 @@ impl ThumbnailService {
         self.cover_thumbnail(&db.path, &cover).await
     }
 
+    /// The same fixed CDN and cache serve artist portraits and playlist covers.
+    /// Only a validated image UUID is accepted, never a remote URL or API path.
+    pub(crate) async fn catalogue_image(&self, db: &TursoDb, image_id: &str) -> Value {
+        self.cover_thumbnail(&db.path, image_id).await
+    }
+
     fn gate(&self, key: &str) -> Arc<AsyncMutex<()>> {
         let mut gates = self.gates.lock().unwrap();
         if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
@@ -673,7 +679,10 @@ mod tests {
         let before = db.revision.load(Ordering::SeqCst);
         let server = Server::new(|_| Reply::jpeg());
         let service = server.service();
-        let first = service.thumbnail(&db, "12", Some("GB")).await;
+        let first = service.catalogue_image(&db, COVER).await;
+        assert!(service.catalogue_image(&db, "https://example.com/private.jpg").await.is_null());
+        assert!(service.catalogue_image(&db, "../../outside").await.is_null());
+        assert_eq!(service.thumbnail(&db, "12", Some("GB")).await, first);
         assert_eq!(first["size"], 160);
         assert_eq!(first["cover_id"], COVER);
         assert!(first["src"]

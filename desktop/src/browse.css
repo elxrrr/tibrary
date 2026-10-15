@@ -5,7 +5,7 @@
   min-height: 0;
   min-width: 0;
   overflow: hidden;
-  gap: 20px;
+  gap: 16px;
 }
 .browse-toolbar {
   display: flex;
@@ -210,27 +210,13 @@
   color: var(--muted);
   flex-shrink: 0;
 }
-.browse-artist-avatar {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  color: var(--accent-ink);
-  background: var(--accent-soft);
-  border: 1px solid var(--line);
-  font-size: 22px;
-  font-weight: 500;
-}
 .browse-artist-heading {
   display: flex;
   align-items: center;
   gap: 22px;
   padding: 8px 0 28px;
 }
-.browse-artist-heading > .browse-artist-avatar {
+.browse-artist-heading > .artwork-artist {
   width: 104px;
   height: 104px;
   font-size: 45px;
@@ -508,4 +494,45 @@
   .browse-release-open > .release-artwork {
     transition: none;
   }
+}
+
+.browse-navigation {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+.browse-navigation .browse-tabs {
+  background: transparent;
+}
+.browse-artist-card > .artwork-artist {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.browse-artist-heading > .artwork-artist {
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.browse-artist-heading > .artwork-artist img,
+.browse-artist-card > .artwork-artist img {
+  width: 100%;
+  height: 100%;
+}
+.browse-artist-heading > .artwork-artist svg {
+  width: 42px;
+  height: 42px;
+}
+.browse-section-heading h2 {
+  font-size: 18px;
+}
+.browse-section-heading p {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.browse-playlist-description {
+  max-width: 72ch;
+  line-height: 1.5;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }

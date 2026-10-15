@@ -8,24 +8,32 @@ import {
   Disc3,
   Home,
   LoaderCircle,
+  ListMusic,
+  Sparkles,
   Music2,
   RefreshCw,
+  Radio,
   Search,
   UserRound,
 } from "lucide-react";
 import { call, external } from "./api";
-import { ReleaseArtwork } from "./ReleaseArtwork";
+import { CatalogueArtwork, ReleaseArtwork } from "./ReleaseArtwork";
 import "./browse.css";
 
-export type BrowseCategory = "albums" | "artists" | "tracks";
+export type BrowseCategory = "albums" | "artists" | "tracks" | "playlists";
 export type BrowseLocation =
   | { kind: "home" }
+  | { kind: "new" }
+  | { kind: "radio"; id: string }
+  | { kind: "playlists"; source?: "created" | "saved" }
+  | { kind: "playlist"; id: string }
   | { kind: "search"; query: string; category?: BrowseCategory }
   | { kind: "artist"; id: string; filter?: "ALBUMS" | "EPSANDSINGLES" }
   | { kind: "release"; id: string; trackId?: string };
 type Artist = {
   id: string;
   name: string;
+  picture?: string | null;
   releases?: number;
   local_tracks?: number;
 };
@@ -46,6 +54,16 @@ type Track = {
   release_title?: string;
   album?: string | Release;
   isrc?: string;
+  playlist_position?: number;
+};
+type Playlist = {
+  id: string;
+  title: string;
+  description?: string;
+  creator?: string;
+  cover?: string | null;
+  track_count?: number;
+  duration?: number;
 };
 type Release = {
   id: string;
@@ -69,15 +87,20 @@ type Release = {
 type Section = {
   id: string;
   title: string;
+  category?: "new" | "playlists" | "discover";
   artists?: Artist[];
   releases?: Release[];
   tracks?: Track[];
+  playlists?: Playlist[];
 };
 type BrowseResult = {
   sections?: Section[];
   artists?: Artist[];
   releases?: Release[];
-  items?: (Release | Artist | Track)[];
+  items?: (Release | Artist | Track | Playlist)[];
+  playlists?: Playlist[];
+  playlist?: Playlist;
+  seed?: Track;
   artist?: Artist;
   release?: Release;
   total?: number;
@@ -115,6 +138,18 @@ function remember<T>(cache: Map<string, T>, key: string, value: T) {
 }
 function request(location: BrowseLocation, refresh = false, offset = 0) {
   const common = { refresh, offset, limit: 24 };
+  if (location.kind === "radio")
+    return { method: "browse.radio", args: { ...common, id: location.id } };
+  if (location.kind === "playlist")
+    return {
+      method: "browse.playlist",
+      args: { ...common, limit: 50, id: location.id },
+    };
+  if (location.kind === "playlists")
+    return {
+      method: "browse.playlists",
+      args: { ...common, source: location.source || "created" },
+    };
   if (location.kind === "search")
     return {
       method: "browse.search",
@@ -152,7 +187,7 @@ function fetchResult(
 }
 export function browseLink(
   input: string,
-): { kind: "artist" | "release" | "track"; id: string } | null {
+): { kind: "artist" | "release" | "track" | "playlist"; id: string } | null {
   try {
     const url = new URL(input.trim());
     if (
@@ -165,6 +200,10 @@ export function browseLink(
       )
     )
       return null;
+    const playlist = url.pathname.match(
+      /^\/(?:browse\/)?playlist\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i,
+    );
+    if (playlist) return { kind: "playlist", id: playlist[1].toLowerCase() };
     const match = url.pathname.match(
       /^\/(?:browse\/)?(album|artist|track)\/(\d+)\/?$/,
     );
@@ -189,6 +228,29 @@ export function availableTracks(release: Release): Track[] {
     : (release.tracks || []).filter(
         (track) => track.available !== false && !track.ai,
       );
+}
+export function playlistTracks(items: Track[]): Track[] {
+  return [
+    ...new Map(
+      items
+        .filter(
+          (track) =>
+            track.available !== false && !track.ai && trackRelease(track),
+        )
+        .map((track) => [String(track.id), track]),
+    ).values(),
+  ];
+}
+export function groupTrackSelection(
+  tracks: Track[],
+  selection?: Set<string>,
+): Record<string, string[]> {
+  const grouped: Record<string, string[]> = Object.create(null);
+  for (const track of playlistTracks(tracks)) {
+    if (selection && !selection.has(String(track.id))) continue;
+    (grouped[trackRelease(track)] ||= []).push(String(track.id));
+  }
+  return grouped;
 }
 function duration(seconds?: number) {
   if (!seconds || !Number.isFinite(seconds)) return "—";
@@ -233,23 +295,29 @@ function trackReleaseTitle(track: Track): string {
     "View release"
   );
 }
-function mergePage(
+export function mergeBrowsePage(
   current: BrowseResult | null,
   next: BrowseResult,
 ): BrowseResult {
   const unique = <T extends { id: string }>(
     old: T[] = [],
     incoming: T[] = [],
+    itemKey: (item: T) => string = (item) => String(item.id),
   ) =>
     Array.from(
       new Map(
-        [...old, ...incoming].map((item) => [String(item.id), item]),
+        [...old, ...incoming].map((item) => [itemKey(item), item]),
       ).values(),
     );
   return {
     ...next,
-    items: unique(current?.items, next.items),
+    items: unique(current?.items, next.items, (item) =>
+      "playlist_position" in item && item.playlist_position
+        ? `${item.id}:${item.playlist_position}`
+        : String(item.id),
+    ),
     releases: unique(current?.releases, next.releases),
+    playlists: unique(current?.playlists, next.playlists),
   };
 }
 
@@ -260,6 +328,9 @@ export function BrowseView({
   onOpenQueue,
   onOpenSettings,
   onQueued,
+  libraryReleases,
+  libraryName,
+  onOpenMissing,
 }: {
   location: BrowseLocation;
   /** Account identity and market, independent of frequent job revisions. */
@@ -268,6 +339,9 @@ export function BrowseView({
   onOpenQueue: () => void;
   onOpenSettings: () => void;
   onQueued?: () => void | Promise<void>;
+  libraryReleases?: Release[] | null;
+  libraryName?: string;
+  onOpenMissing?: () => void;
 }) {
   if (currentCacheScope !== cacheScope) {
     clearBrowseCache();
@@ -288,9 +362,13 @@ export function BrowseView({
   );
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [queueBusy, setQueueBusy] = useState(false);
+  const [queueReleaseCount, setQueueReleaseCount] = useState(0);
   const [queueMessage, setQueueMessage] = useState("");
   const [queueError, setQueueError] = useState("");
   const [resolving, setResolving] = useState(false);
+  const [playlistLoading, setPlaylistLoading] = useState(false);
+  const [playlistProgress, setPlaylistProgress] = useState("");
+  const playlistCancel = useRef(false);
   const scroller = useRef<HTMLDivElement>(null);
   const generation = useRef(0);
   const resolveGeneration = useRef(0);
@@ -310,7 +388,7 @@ export function BrowseView({
       const value = await fetchResult(location, cacheScope, refresh, offset);
       if (token !== generation.current || liveKey.current !== requestKey)
         return;
-      const next = more ? mergePage(result, value) : value;
+      const next = more ? mergeBrowsePage(result, value) : value;
       remember(resultCache, requestKey, {
         value: next,
         expires: Date.now() + 60_000,
@@ -341,6 +419,7 @@ export function BrowseView({
     return () => {
       generation.current++;
       resolveGeneration.current++;
+      playlistCancel.current = true;
     };
   }, [key]);
   useLayoutEffect(() => {
@@ -352,27 +431,32 @@ export function BrowseView({
       restoredKey.current = key;
     }
   }, [key, result]);
+  const selectionKey =
+    location.kind === "playlist"
+      ? `playlist:${location.id}`
+      : location.kind === "release"
+        ? `release:${location.id}:${location.trackId || ""}`
+        : "";
+  const selectable = result?.release
+    ? availableTracks(result.release)
+    : result?.playlist && !result.stale
+      ? playlistTracks((result.items || []) as Track[])
+      : [];
   useEffect(() => {
-    if (!result?.release) return;
-    const release = result.release;
-    const available = availableTracks(release).map((track) => String(track.id));
+    if (!selectionKey || !result) return;
+    const available = selectable.map((track) => String(track.id));
+    const saved = trackSelections.get(selectionKey);
     const target = location.kind === "release" ? location.trackId : undefined;
-    const saved = trackSelections.get(
-      JSON.stringify([String(release.id), target || ""]),
+    setSelection(
+      new Set(
+        saved
+          ? available.filter((id) => saved.has(id))
+          : target
+            ? available.filter((id) => id === target)
+            : available,
+      ),
     );
-    const chosen = new Set(
-      saved
-        ? available.filter((id) => saved.has(id))
-        : target
-          ? available.filter((id) => id === target)
-          : available,
-    );
-    setSelection(chosen);
-  }, [
-    result?.release,
-    location.kind === "release" ? location.trackId : undefined,
-  ]);
-  const selectable = result?.release ? availableTracks(result.release) : [];
+  }, [result?.release, result?.items, result?.stale, selectionKey]);
   const selectedCount = selectable.filter((track) =>
     selection.has(String(track.id)),
   ).length;
@@ -388,7 +472,11 @@ export function BrowseView({
     const value = query.trim();
     if (!value) return;
     const link = browseLink(value);
-    if (link?.kind === "release" || link?.kind === "artist") {
+    if (
+      link?.kind === "release" ||
+      link?.kind === "artist" ||
+      link?.kind === "playlist"
+    ) {
       onNavigate({ kind: link.kind, id: link.id });
       return;
     }
@@ -438,30 +526,54 @@ export function BrowseView({
       kind: "search",
       query: value,
       category:
-        location.kind === "search" ? location.category || "albums" : "albums",
+        location.kind === "search"
+          ? location.category || "albums"
+          : location.kind === "playlists"
+            ? "playlists"
+            : "albums",
     });
   }
 
-  async function queue(releaseId: string, tracks: string[] | null) {
-    if (queueBusy || (tracks && !tracks.length)) return;
+  async function queueSelection(selectionMap: Record<string, string[] | null>) {
+    const entries = Object.entries(selectionMap).filter(
+      ([, tracks]) => tracks === null || tracks.length,
+    );
+    if (queueBusy || !entries.length) return;
     const requestKey = key;
     setQueueBusy(true);
+    setQueueReleaseCount(entries.length);
     setQueueError("");
     setQueueMessage("");
     try {
+      // Validate every selected release before committing the exact track set.
       const added = await call<{
         queued_releases: number;
         queued_tracks: number;
-      }>("browse.queue", { selection: { [releaseId]: tracks } });
+      }>("browse.queue", {
+        selection: Object.fromEntries(entries),
+      });
+      const queued = added.queued_tracks;
       resultCache.clear();
       if (liveKey.current === requestKey) {
-        const count = added.queued_tracks;
         setQueueMessage(
-          typeof count === "number"
-            ? `${count} ${count === 1 ? "track" : "tracks"} queued.`
-            : "Added to the download queue.",
+          `${queued} ${queued === 1 ? "track" : "tracks"} queued.`,
         );
-        void load();
+        if (location.kind === "playlist" && result) {
+          const next = {
+            ...result,
+            items: ((result.items || []) as Track[]).map((track) => {
+              const picked = selectionMap[trackRelease(track)];
+              return picked === null || picked?.includes(String(track.id))
+                ? { ...track, queued: true }
+                : track;
+            }),
+          };
+          remember(resultCache, requestKey, {
+            value: next,
+            expires: Date.now() + 60_000,
+          });
+          setResult(next);
+        } else void load();
       }
       await onQueued?.();
     } catch (failure) {
@@ -473,17 +585,59 @@ export function BrowseView({
       setQueueBusy(false);
     }
   }
+  function queue(releaseId: string, tracks: string[] | null) {
+    return queueSelection({ [releaseId]: tracks });
+  }
+  async function loadFullPlaylist() {
+    if (
+      location.kind !== "playlist" ||
+      !result?.playlist ||
+      playlistLoading ||
+      queueBusy ||
+      result.stale
+    )
+      return;
+    const requestKey = key;
+    playlistCancel.current = false;
+    setPlaylistLoading(true);
+    setQueueError("");
+    let combined = result;
+    try {
+      while (combined.has_more) {
+        setPlaylistProgress(
+          `Loading playlist tracks · ${combined.items?.length || 0} of ${combined.total || "…"}`,
+        );
+        const offset = (combined.offset || 0) + (combined.limit || 50);
+        const page = await fetchResult(location, cacheScope, false, offset);
+        if (playlistCancel.current || liveKey.current !== requestKey) return;
+        if (page.stale)
+          throw new Error("Refresh the playlist before queueing all tracks.");
+        if ((page.offset || 0) < offset)
+          throw new Error(
+            "The next playlist page could not be loaded. Please refresh and try again.",
+          );
+        combined = mergeBrowsePage(combined, page);
+        remember(resultCache, requestKey, {
+          value: combined,
+          expires: Date.now() + 60_000,
+        });
+        setResult(combined);
+      }
+      if (playlistCancel.current || liveKey.current !== requestKey) return;
+      setQueueMessage("");
+    } catch (failure) {
+      if (liveKey.current === requestKey)
+        setQueueError(
+          String(failure instanceof Error ? failure.message : failure),
+        );
+    } finally {
+      setPlaylistLoading(false);
+      setPlaylistProgress("");
+    }
+  }
   function choose(next: Set<string>) {
     setSelection(next);
-    if (result?.release)
-      remember(
-        trackSelections,
-        JSON.stringify([
-          String(result.release.id),
-          location.kind === "release" ? location.trackId || "" : "",
-        ]),
-        next,
-      );
+    if (selectionKey) remember(trackSelections, selectionKey, next);
   }
   function navigateRelease(release: Release) {
     onNavigate({ kind: "release", id: String(release.id) });
@@ -496,11 +650,11 @@ export function BrowseView({
         aria-label={`Browse artist ${artist.name}`}
         onClick={() => onNavigate({ kind: "artist", id: String(artist.id) })}
       >
-        <span className="browse-artist-avatar" aria-hidden="true">
-          {artist.name?.trim().slice(0, 1).toLocaleUpperCase() || (
-            <UserRound size={24} />
-          )}
-        </span>
+        <CatalogueArtwork
+          imageId={artist.picture}
+          kind="artist"
+          metadata={artist}
+        />
         <span>
           <strong>{artist.name}</strong>
           <small>
@@ -558,18 +712,53 @@ export function BrowseView({
       </article>
     );
   }
-  function renderTracks(tracks: Track[], release?: Release) {
+  function renderPlaylist(playlist: Playlist) {
+    return (
+      <article className="browse-release-card" key={playlist.id}>
+        <button
+          className="browse-release-open"
+          aria-label={`Open playlist ${playlist.title}`}
+          onClick={() =>
+            onNavigate({ kind: "playlist", id: String(playlist.id) })
+          }
+        >
+          <CatalogueArtwork
+            imageId={playlist.cover}
+            kind="playlist"
+            metadata={playlist}
+          />
+          <strong title={playlist.title}>{playlist.title}</strong>
+          <span className="browse-release-artist">
+            {playlist.creator || "Playlist"}
+          </span>
+        </button>
+        <div className="browse-card-foot">
+          <small>
+            {typeof playlist.track_count === "number"
+              ? `${playlist.track_count} tracks`
+              : "Explore playlist"}
+          </small>
+        </div>
+      </article>
+    );
+  }
+  function renderTracks(tracks: Track[], release?: Release, playlist = false) {
+    const selectableTable = Boolean(release) || playlist;
     return (
       <div className="browse-track-table">
         <table>
           <thead>
             <tr>
-              {release && (
+              {selectableTable && (
                 <th className="browse-check">
                   <input
                     ref={allCheck}
                     type="checkbox"
-                    aria-label="Select all available tracks"
+                    aria-label={
+                      playlist
+                        ? "Select all loaded available tracks"
+                        : "Select all available tracks"
+                    }
                     disabled={!selectable.length}
                     checked={
                       selectable.length > 0 &&
@@ -596,22 +785,23 @@ export function BrowseView({
             </tr>
           </thead>
           <tbody>
-            {tracks.map((track) => {
+            {tracks.map((track, index) => {
               const available =
                 track.available !== false &&
                 !track.ai &&
                 !release?.ai &&
                 release?.available !== false &&
-                release?.downloadable !== false;
+                release?.downloadable !== false &&
+                (!playlist || (!result?.stale && Boolean(trackRelease(track))));
               const releaseId = release
                 ? String(release.id)
                 : trackRelease(track);
               return (
                 <tr
-                  key={track.id}
+                  key={`${track.id}:${track.playlist_position || index}`}
                   className={!available ? "browse-track-unavailable" : ""}
                 >
-                  {release && (
+                  {selectableTable && (
                     <td className="browse-check">
                       <input
                         type="checkbox"
@@ -628,11 +818,15 @@ export function BrowseView({
                     </td>
                   )}
                   <td className="browse-position">
-                    {track.disc_number && track.disc_number > 1
+                    {!playlist && track.disc_number && track.disc_number > 1
                       ? `${track.disc_number} · `
                       : ""}
-                    {track.track_number
-                      ? String(track.track_number).padStart(2, "0")
+                    {(playlist ? track.playlist_position : track.track_number)
+                      ? String(
+                          playlist
+                            ? track.playlist_position
+                            : track.track_number,
+                        ).padStart(2, "0")
                       : "—"}
                   </td>
                   <td>
@@ -665,7 +859,8 @@ export function BrowseView({
                     ) : track.available === false ||
                       release?.available === false ? (
                       <span className="badge unavailable">Unavailable</span>
-                    ) : release?.downloadable === false ? (
+                    ) : release?.downloadable === false ||
+                      (playlist && result?.stale) ? (
                       <span className="badge needs-review">Refresh needed</span>
                     ) : track.owned ? (
                       <span className="badge in-library">In library</span>
@@ -680,7 +875,13 @@ export function BrowseView({
                       {!release && (
                         <button
                           className="browse-icon-button"
-                          disabled={!available || !releaseId || queueBusy}
+                          disabled={
+                            !available ||
+                            !releaseId ||
+                            queueBusy ||
+                            playlistLoading ||
+                            (playlist && loadingMore)
+                          }
                           title="Add this track to the download queue"
                           aria-label={`Queue track ${track.title}`}
                           onClick={() =>
@@ -690,6 +891,16 @@ export function BrowseView({
                           <ArrowDownToLine size={16} />
                         </button>
                       )}
+                      <button
+                        className="browse-icon-button"
+                        title="Find recommended tracks like this"
+                        aria-label={`More like ${track.title}`}
+                        onClick={() =>
+                          onNavigate({ kind: "radio", id: String(track.id) })
+                        }
+                      >
+                        <Radio size={16} />
+                      </button>
                       <button
                         className="browse-icon-button"
                         title="Open on web"
@@ -715,10 +926,18 @@ export function BrowseView({
 
   const release = result?.release;
   const artist = result?.artist;
+  const playlist = result?.playlist;
+  const playlistSelection = playlist
+    ? groupTrackSelection((result?.items || []) as Track[], selection)
+    : {};
+  const oversizedPlaylistSelection =
+    Boolean(playlist) &&
+    (selectedCount > 2000 || Object.keys(playlistSelection).length > 500);
   const categories: [BrowseCategory, string][] = [
     ["albums", "Releases"],
     ["artists", "Artists"],
     ["tracks", "Tracks"],
+    ["playlists", "Playlists"],
   ];
   const sectionList: Section[] = result?.sections || [
     { id: "artists", title: "Your artists", artists: result?.artists || [] },
@@ -732,7 +951,8 @@ export function BrowseView({
     (section) =>
       section.artists?.length ||
       section.releases?.length ||
-      section.tracks?.length,
+      section.tracks?.length ||
+      section.playlists?.length,
   );
   return (
     <section className="browse-view" aria-label="Browse music">
@@ -757,7 +977,7 @@ export function BrowseView({
           <input
             type="search"
             aria-label="Search online music"
-            placeholder="Search artists, releases or tracks, or paste a link…"
+            placeholder="Search music and playlists, or paste a link…"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -775,7 +995,9 @@ export function BrowseView({
           className="browse-icon-button"
           aria-label="Refresh browse results"
           title="Refresh this page from the online catalogue"
-          disabled={loading || loadingMore || resolving}
+          disabled={
+            loading || loadingMore || resolving || playlistLoading || queueBusy
+          }
           onClick={() => void load(true)}
         >
           <RefreshCw size={17} className={loading && result ? "spin" : ""} />
@@ -785,6 +1007,31 @@ export function BrowseView({
           <span className="browse-queue-label">Download queue</span>
         </button>
       </form>
+      <nav className="browse-navigation" aria-label="Browse sections">
+        <div
+          className="browse-tabs"
+          role="tablist"
+          aria-label="Browse sections"
+        >
+          {(
+            [
+              ["home", "Discover", Sparkles],
+              ["new", "New releases", Disc3],
+              ["playlists", "Playlists", ListMusic],
+            ] as const
+          ).map(([kind, label, Icon]) => (
+            <button
+              key={kind}
+              role="tab"
+              aria-selected={location.kind === kind}
+              onClick={() => onNavigate({ kind })}
+            >
+              <Icon size={16} />
+              {label}
+            </button>
+          ))}
+        </div>
+      </nav>
       <div
         className="browse-scroll"
         ref={scroller}
@@ -795,10 +1042,27 @@ export function BrowseView({
             remember(scrollPositions, key, event.currentTarget.scrollTop);
         }}
       >
+        {playlistLoading && !queueBusy && (
+          <div className="browse-notice" role="status">
+            <LoaderCircle size={18} className="spin" />
+            <span>{playlistProgress || "Preparing playlist tracks…"}</span>
+            <button
+              onClick={() => {
+                playlistCancel.current = true;
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
         {queueBusy && (
           <div className="browse-notice" role="status">
             <LoaderCircle size={18} className="spin" />
-            <span>Checking availability and preparing the download queue…</span>
+            <span>
+              Checking {queueReleaseCount}{" "}
+              {queueReleaseCount === 1 ? "release" : "releases"} for the
+              download queue…
+            </span>
           </div>
         )}
         {queueMessage && (
@@ -867,13 +1131,17 @@ export function BrowseView({
             <LoaderCircle size={24} className="spin" />
             <span>
               Loading{" "}
-              {location.kind === "release"
-                ? "release and tracks"
-                : location.kind === "artist"
-                  ? "artist releases"
-                  : location.kind === "search"
-                    ? "search results"
-                    : "your music"}
+              {location.kind === "playlist"
+                ? "playlist tracks"
+                : location.kind === "playlists"
+                  ? "playlists"
+                  : location.kind === "release"
+                    ? "release and tracks"
+                    : location.kind === "artist"
+                      ? "artist releases"
+                      : location.kind === "search"
+                        ? "search results"
+                        : "your music"}
               …
             </span>
           </div>
@@ -884,14 +1152,15 @@ export function BrowseView({
                 <header className="browse-page-heading">
                   <div>
                     <span className="browse-eyebrow">Online catalogue</span>
-                    <h1>Find your next release</h1>
-                    <p>Explore your artists or search for something new.</p>
+                    <h1>Discover music</h1>
+                    <p>Explore artists, playlists and recommendations.</p>
                   </div>
                 </header>
                 {sectionList.map((section) =>
                   section.artists?.length ||
                   section.releases?.length ||
-                  section.tracks?.length ? (
+                  section.tracks?.length ||
+                  section.playlists?.length ? (
                     <section className="browse-section" key={section.id}>
                       <h2>{section.title}</h2>
                       {section.artists?.length ? (
@@ -907,6 +1176,11 @@ export function BrowseView({
                       {section.tracks?.length
                         ? renderTracks(section.tracks)
                         : null}
+                      {section.playlists?.length ? (
+                        <div className="browse-release-grid">
+                          {section.playlists.map(renderPlaylist)}
+                        </div>
+                      ) : null}
                     </section>
                   ) : null,
                 )}
@@ -918,6 +1192,295 @@ export function BrowseView({
                       Search for an artist, release or track above. You can
                       browse and queue music without adding a local library.
                     </p>
+                  </div>
+                )}
+              </>
+            )}
+            {location.kind === "new" && (
+              <>
+                <header className="browse-page-heading">
+                  <div>
+                    <span className="browse-eyebrow">New releases</span>
+                    <h1>Fresh music to explore</h1>
+                  </div>
+                </header>
+                {libraryName && (
+                  <section className="browse-section">
+                    <div className="browse-section-heading">
+                      <div>
+                        <h2>From your library</h2>
+                        <p>Latest missing releases for {libraryName}.</p>
+                      </div>
+                      {onOpenMissing && (
+                        <button onClick={onOpenMissing}>
+                          View all missing releases <ChevronRight size={16} />
+                        </button>
+                      )}
+                    </div>
+                    {libraryReleases == null ? (
+                      <p role="status">Loading saved releases…</p>
+                    ) : libraryReleases.length ? (
+                      <div className="browse-release-grid">
+                        {libraryReleases.map(renderRelease)}
+                      </div>
+                    ) : (
+                      <p>
+                        No recommended or potential releases in the saved
+                        catalogue.
+                      </p>
+                    )}
+                  </section>
+                )}
+                {sectionList
+                  .filter(
+                    (section) =>
+                      (section.category === "new" ||
+                        (!section.category &&
+                          /^new(?:[\s:]|$)/i.test(section.title))) &&
+                      (section.releases?.length || section.tracks?.length),
+                  )
+                  .map((section) => (
+                    <section className="browse-section" key={section.id}>
+                      <div className="browse-section-heading">
+                        <div>
+                          <h2>{section.title}</h2>
+                          <p>From the online catalogue.</p>
+                        </div>
+                      </div>
+                      {section.releases?.length ? (
+                        <div className="browse-release-grid">
+                          {section.releases.map(renderRelease)}
+                        </div>
+                      ) : null}
+                      {section.tracks?.length
+                        ? renderTracks(section.tracks)
+                        : null}
+                    </section>
+                  ))}
+                {!sectionList.some(
+                  (section) =>
+                    (section.category === "new" ||
+                      (!section.category &&
+                        /^new(?:[\s:]|$)/i.test(section.title))) &&
+                    (section.releases?.length || section.tracks?.length),
+                ) && (
+                  <div className="browse-empty">
+                    <Disc3 size={36} />
+                    <h2>No new catalogue picks available</h2>
+                    <p>
+                      Discover music or search for an artist to explore their
+                      releases.
+                    </p>
+                  </div>
+                )}
+              </>
+            )}
+            {location.kind === "playlists" && result && (
+              <>
+                <header className="browse-page-heading">
+                  <div>
+                    <span className="browse-eyebrow">Playlists</span>
+                    <h1>Music for every mood</h1>
+                  </div>
+                </header>
+                <div className="browse-section-heading">
+                  <div
+                    className="browse-tabs"
+                    role="tablist"
+                    aria-label="Playlist source"
+                  >
+                    {(
+                      [
+                        ["created", "Your playlists"],
+                        ["saved", "Saved playlists"],
+                      ] as const
+                    ).map(([source, label]) => (
+                      <button
+                        key={source}
+                        role="tab"
+                        aria-selected={
+                          (location.source || "created") === source
+                        }
+                        onClick={() => onNavigate({ ...location, source })}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  {typeof result.total === "number" && (
+                    <small>{result.total.toLocaleString()} playlists</small>
+                  )}
+                </div>
+                {(result.playlists || result.items)?.length ? (
+                  <div className="browse-release-grid">
+                    {((result.playlists || result.items) as Playlist[]).map(
+                      renderPlaylist,
+                    )}
+                  </div>
+                ) : (
+                  <div className="browse-empty">
+                    <ListMusic size={40} />
+                    <h2>No playlists here yet</h2>
+                    <p>Search by name or paste a playlist link to open one.</p>
+                    <button
+                      onClick={() => {
+                        if (query.trim())
+                          onNavigate({
+                            kind: "search",
+                            query: query.trim(),
+                            category: "playlists",
+                          });
+                        else
+                          scroller.current?.parentElement
+                            ?.querySelector<HTMLInputElement>(
+                              'input[type="search"]',
+                            )
+                            ?.focus();
+                      }}
+                    >
+                      Search playlists
+                    </button>
+                  </div>
+                )}
+                {result.sections?.map((section) =>
+                  section.playlists?.length ? (
+                    <section className="browse-section" key={section.id}>
+                      <h2>{section.title}</h2>
+                      <div className="browse-release-grid">
+                        {section.playlists.map(renderPlaylist)}
+                      </div>
+                    </section>
+                  ) : null,
+                )}
+              </>
+            )}
+            {location.kind === "playlist" && playlist && (
+              <>
+                <header className="browse-release-heading">
+                  <div className="browse-release-cover">
+                    <CatalogueArtwork
+                      imageId={playlist.cover}
+                      kind="playlist"
+                      metadata={playlist}
+                    />
+                  </div>
+                  <div className="browse-release-summary">
+                    <span className="browse-eyebrow">Playlist</span>
+                    <h1>{playlist.title}</h1>
+                    <p>
+                      {[
+                        playlist.creator,
+                        `${playlist.track_count ?? result?.total ?? 0} tracks`,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </p>
+                    {playlist.description && (
+                      <p className="browse-playlist-description">
+                        {playlist.description}
+                      </p>
+                    )}
+                    <div className="browse-release-actions">
+                      <button
+                        className="primary"
+                        disabled={
+                          !selectedCount ||
+                          oversizedPlaylistSelection ||
+                          queueBusy ||
+                          playlistLoading ||
+                          loadingMore ||
+                          result?.stale
+                        }
+                        onClick={() => void queueSelection(playlistSelection)}
+                      >
+                        {queueBusy ? (
+                          <LoaderCircle size={16} className="spin" />
+                        ) : (
+                          <ArrowDownToLine size={16} />
+                        )}
+                        Queue selected tracks ({selectedCount})
+                      </button>
+                      {result?.has_more && (
+                        <button
+                          disabled={
+                            loading ||
+                            loadingMore ||
+                            playlistLoading ||
+                            queueBusy ||
+                            result.stale
+                          }
+                          onClick={() => void loadFullPlaylist()}
+                        >
+                          Load all tracks
+                        </button>
+                      )}
+                      <button
+                        aria-label="Open playlist on web"
+                        title="Open on web"
+                        onClick={() =>
+                          void external(
+                            `https://tidal.com/browse/playlist/${playlist.id}`,
+                          ).catch((failure) => setQueueError(String(failure)))
+                        }
+                      >
+                        <ArrowUpRight size={16} />
+                      </button>
+                    </div>
+                    <small>
+                      {result?.has_more
+                        ? `${result.items?.length || 0} of ${result.total ?? playlist.track_count ?? "…"} tracks loaded · select from the loaded tracks`
+                        : `${result?.items?.length || 0} audio tracks loaded`}
+                    </small>
+                  </div>
+                </header>
+                {result?.stale && (
+                  <div className="browse-notice">
+                    <CircleAlert size={18} />
+                    <span>
+                      Refresh this playlist before selecting tracks to queue.
+                    </span>
+                  </div>
+                )}
+                {oversizedPlaylistSelection && (
+                  <div className="browse-notice">
+                    <CircleAlert size={18} />
+                    <span>
+                      Select up to 2,000 tracks from 500 releases at a time.
+                    </span>
+                  </div>
+                )}
+                {result?.items?.length ? (
+                  renderTracks(result.items as Track[], undefined, true)
+                ) : (
+                  <div className="browse-empty">
+                    <Music2 size={36} />
+                    <h2>No audio tracks available</h2>
+                    <p>Videos and unavailable items cannot be queued.</p>
+                  </div>
+                )}
+              </>
+            )}
+            {location.kind === "radio" && result && (
+              <>
+                <header className="browse-page-heading">
+                  <div>
+                    <span className="browse-eyebrow">Recommended tracks</span>
+                    <h1>Tracks like {result.seed?.title || "this"}</h1>
+                    {result.seed?.artist && (
+                      <p>
+                        {result.seed.artist} · Related tracks from the online
+                        catalogue.
+                      </p>
+                    )}
+                  </div>
+                </header>
+                {result.items?.length ? (
+                  renderTracks(result.items as Track[])
+                ) : (
+                  <div className="browse-empty">
+                    <Radio size={36} />
+                    <h2>No related tracks available</h2>
+                    <p>Try a different track.</p>
                   </div>
                 )}
               </>
@@ -950,6 +1513,10 @@ export function BrowseView({
                   <div className="browse-artists-grid">
                     {(result.items as Artist[]).map(renderArtist)}
                   </div>
+                ) : location.category === "playlists" ? (
+                  <div className="browse-release-grid">
+                    {(result.items as Playlist[]).map(renderPlaylist)}
+                  </div>
                 ) : (
                   renderTracks(result.items as Track[])
                 )}
@@ -958,9 +1525,11 @@ export function BrowseView({
             {location.kind === "artist" && artist && (
               <>
                 <header className="browse-artist-heading">
-                  <span className="browse-artist-avatar" aria-hidden="true">
-                    {artist.name.slice(0, 1).toLocaleUpperCase()}
-                  </span>
+                  <CatalogueArtwork
+                    imageId={artist.picture}
+                    kind="artist"
+                    metadata={artist}
+                  />
                   <div>
                     <span className="browse-eyebrow">Artist</span>
                     <h1>{artist.name}</h1>
@@ -1152,7 +1721,9 @@ export function BrowseView({
             {result?.has_more && (
               <div className="browse-more">
                 <button
-                  disabled={loadingMore || loading}
+                  disabled={
+                    loadingMore || loading || playlistLoading || queueBusy
+                  }
                   onClick={() => void load(false, true)}
                 >
                   {loadingMore && <LoaderCircle size={16} className="spin" />}

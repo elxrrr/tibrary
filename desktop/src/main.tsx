@@ -1,6 +1,6 @@
 import { MetadataView, DownloadReview, TagChanges, ReleaseMetadata } from "./MetadataView";
 import { availableColumnSelections, columnFilterAvailable } from "./columnFilters";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -277,7 +277,10 @@ function App() {
     document.querySelector<HTMLInputElement>('.table-view-options input:checked')?.focus({preventScroll:true});
     return () => { if (viewOptionsButton.current?.isConnected) viewOptionsButton.current.focus({preventScroll:true}); };
   }, [viewOptionsOpen]);
-  const [latestMissing, setLatestMissing] = useState<Row[] | null>(null);
+  const [latestMissing, setLatestMissing] = useState<{root: string; rows: Row[]} | null>(null);
+  const libraryReleaseCards = useMemo(() => latestMissing?.root === root ? latestMissing.rows.map(row => ({
+    ...row, id:String(row.id), title:row.release || row.title, artist:row.artist,
+  })) : null, [latestMissing, root]);
   const [missingReleaseCount, setMissingReleaseCount] = useState<number | null>(null);
   const [downloadMonitor, setDownloadMonitor] = useState<Record<string, Row>>({});
   const [tableReader] = useState(() => new CoalescedQuery<any>(setLoading, e => setError(String(e))));
@@ -301,12 +304,16 @@ function App() {
     return () => window.clearInterval(timer);
   }, [state?.job?.status, state?.online_job?.status, state?.download_job?.status]);
   useEffect(() => {
-    if (route !== "overview" || !state) { overviewReader.clear(); return; }
-    const args = {route: "missing", ...overviewMissingFilters,
-      sort: "date", direction: "desc", limit: 20};
+    const newReleases = route === "browse" && currentPage.browse?.kind === "new";
+    if ((!newReleases && route !== "overview") || !state) { overviewReader.clear(); return; }
+    const args = {route: "missing", root: root || undefined, ...overviewMissingFilters,
+      sort: "date", direction: "desc", limit: newReleases ? 20 : 1};
     overviewReader.request({key:JSON.stringify(args), revision:state.revision,
-      read:()=>call("table",args), publish:result=>{setLatestMissing(result.rows); setMissingReleaseCount(result.total);}});
-  }, [route, state?.revision]);
+      read:()=>call("table",args), publish:result=>{
+        if (newReleases) setLatestMissing({root, rows:result.rows});
+        setMissingReleaseCount(result.total);
+      }});
+  }, [route, currentPage.browse?.kind, root, state?.revision]);
   const [detail, setDetail] = useState<any>(null),
     [review, setReview] = useState<any>(null),
     [exportPreview, setExportPreview] = useState<{
@@ -1103,50 +1110,7 @@ function App() {
           )}
           </div>
         </section>
-        <section className="card latest-missing-card">
-            <div className="section-heading">
-              <h2>Latest missing releases</h2>
-              <button onClick={() => { openMissingReleases(); setSort("date"); setDirection("desc"); }}>
-                View missing releases
-              </button>
-            </div>
-            <div className="latest-missing-scroll">
-            <div className="overview-list" role="region" aria-label="Latest missing releases" tabIndex={0}>
-            {latestMissing?.length ? (
-              latestMissing.map((r) => (
-                <div className="library-row" key={r.id}>
-                  <Music2 size={18} />
-                  <strong>
-                    {r.artist} — {r.release}
-                  </strong>
-                  <span>
-                    {[
-                      r.date,
-                      r.type ? r.type.toUpperCase() : "",
-                      r.recommendation,
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </span>
-                  <button
-                    onClick={() =>
-                      external(`https://tidal.com/album/${r.id}`).catch(
-                        notifyError,
-                      )
-                    }
-                  >
-                    Open on web
-                  </button>
-                </div>
-              ))
-            ) : (
-              <p>{latestMissing === null ? "Loading cached missing releases…" : "No missing releases with verified album artists. Check release artists or view all recommendations in Missing releases."}</p>
-            )}
-            </div>
-            <div className="edge-gradient-top" aria-hidden="true" />
-            <div className="edge-gradient-bottom" aria-hidden="true" />
-            </div>
-        </section>
+
       </div>
     );
   }
@@ -2128,6 +2092,9 @@ function App() {
             <BrowseView location={currentPage.browse || browseHome} onNavigate={navigateBrowse}
               cacheScope={JSON.stringify([Boolean(state?.connections.account), state?.connections.tidal?.user_id || "", state?.settings.market || ""])}
               onOpenQueue={() => setRoute("queue")} onOpenSettings={() => setRoute("general")}
+              libraryName={root ? root.split("/").pop() : state?.roots.length ? "Your libraries" : undefined}
+              libraryReleases={libraryReleaseCards}
+              onOpenMissing={() => { openMissingReleases(); setSort("date"); setDirection("desc"); }}
               onQueued={async () => { await refresh(); }} />
           ) : ["general", "connections", "downloads"].includes(route) ? (
             settingsPage()

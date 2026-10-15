@@ -529,7 +529,7 @@ test("all workflow routes render with no runtime errors", async ({ page }) => {
   ).toHaveCount(0);
   const screenshots: Record<string, string> = {"Prepare library":"prepare_library", "Link artists":"link_artists", "Link releases":"link_releases", "Missing releases":"missing_releases", "Download queue":"download_queue", "Downloaded releases":"downloaded_releases", "Local duplicates":"local_duplicates", "MQA audit":"mqa_audit", "Favourite artists":"favourite_artists", "Activity":"activity_log", "General":"general_settings"};
   if (process.env.TIBRARY_SCREENSHOTS) {
-    await expect(page.getByRole("region",{name:"Latest missing releases"}).locator(".library-row").first()).toBeVisible();
+    await expect(page.getByRole("region", {name:"Your libraries",exact:true}).locator(".library-row").first()).toBeVisible();
     await page.screenshot({path:"docs/imgs/overview.png"});
   }
   const categoryPages: Record<string,string> = {"Prepare library":"Correct tags", "Link catalogue":"Link artists", "Complete library":"Missing releases", "Update library":"MQA audit", "Settings":"General"};
@@ -710,45 +710,21 @@ test("window navigation remains available with the sidebar hidden and overview l
   expect(toolbar.y).toBeLessThan(95);
   await page.locator("aside").getByRole("button", {name:"Overview",exact:true}).click();
   await expect(page.getByRole("button", {name:"Forward",exact:true})).toBeDisabled();
-  const list = page.getByRole("region", {name:"Latest missing releases"});
-  await expect(list.locator(".library-row").first()).toBeVisible();
-  const listBox=(await list.boundingBox())!, mainBox=(await page.locator("main").boundingBox())!;
-  expect(listBox.height).toBeGreaterThan(320);
-  expect(listBox.y+listBox.height).toBeLessThanOrEqual(mainBox.y+mainBox.height);
-  expect(await list.evaluate(element => getComputedStyle(element).overflowY)).toBe("auto");
+  await expect(page.getByRole("heading", {name:"Latest missing releases",exact:true})).toHaveCount(0);
   expect(await page.locator("main").evaluate(element=>element.scrollHeight <= element.clientHeight+1)).toBe(true);
   expect(await page.evaluate(()=>window.scrollY)).toBe(0);
-  const fades=page.locator(".latest-missing-scroll > .edge-gradient-top, .latest-missing-scroll > .edge-gradient-bottom");
-  await expect(fades).toHaveCount(2);
-  for(const theme of ["light","dark"]) {
-    await page.evaluate(theme=>{document.documentElement.dataset.theme=theme;},theme);
-    const styles=await fades.evaluateAll(elements=>elements.map(element=>{
-      const style=getComputedStyle(element),card=getComputedStyle(element.closest(".card")!);
-      return {hidden:element.getAttribute("aria-hidden"),position:style.position,pointerEvents:style.pointerEvents,background:style.backgroundImage,card:card.backgroundColor};
-    }));
-    for(const style of styles) {
-      expect(style.hidden).toBe("true");
-      expect(style.position).toBe("absolute");
-      expect(style.pointerEvents).toBe("none");
-      expect(style.background).toContain("linear-gradient");
-      expect(style.background).toContain(style.card);
-    }
-  }
-  // A shorter window makes the real cached catalogue overflow this region.
-  await page.setViewportSize({width:1600,height:680});
-  expect(await list.evaluate(element=>element.scrollHeight>element.clientHeight)).toBe(true);
+  await page.locator("aside").getByRole("button", {name:"Browse music",exact:true}).click();
+  await page.getByRole("tab", {name:"New releases",exact:true}).click();
+  await expect(page.getByRole("heading", {name:"From your library",exact:true})).toBeVisible();
+  await expect(page.locator(".browse-release-card").first()).toBeVisible();
+  const list=page.locator(".browse-scroll");
+  expect(await list.evaluate(element=>getComputedStyle(element).overflowY)).toBe("auto");
+  const listBox=(await list.boundingBox())!, mainBox=(await page.locator("main").boundingBox())!;
+  expect(listBox.y+listBox.height).toBeLessThanOrEqual(mainBox.y+mainBox.height+1);
+  await page.setViewportSize({width:1000,height:680});
   await list.evaluate(element=>{element.scrollTop=element.scrollHeight;});
-  await expect.poll(()=>list.evaluate(element=>element.scrollTop)).toBeGreaterThan(0);
   expect(await page.locator("main").evaluate(element=>element.scrollTop)).toBe(0);
   expect(await page.evaluate(()=>window.scrollY)).toBe(0);
-  const last=list.locator(".library-row").last(),web=last.getByRole("button",{name:"Open on web",exact:true});
-  await expect(web).toBeInViewport();
-  const [buttonBox,fadeBox]=await Promise.all([web.boundingBox(),page.locator(".latest-missing-scroll > .edge-gradient-bottom").boundingBox()]);
-  expect(buttonBox!.y+buttonBox!.height).toBeLessThanOrEqual(fadeBox!.y+1);
-  await page.evaluate(()=>{(window as any).openedURLs=[];(window as any).__TAURI_INTERNALS__={invoke:async(command:string,args:any)=>{if(command==="open_external") (window as any).openedURLs.push(args.url);}};});
-  await web.click();
-  await expect.poll(()=>page.evaluate(()=>(window as any).openedURLs)).toHaveLength(1);
-  expect((await page.evaluate(()=>(window as any).openedURLs))[0]).toMatch(/^https:\/\/tidal\.com\/album\/\d+$/);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 test("local table sorting and filters are usable", async ({ page }) => {
@@ -1420,13 +1396,16 @@ test("window panes stay isolated and theme labels are readable", async ({
   ).toBeLessThanOrEqual(680);
 });
 
-test("overview restores the library and shows cached missing releases", async ({ page }) => {
+test("overview restores the library and Browse holds cached new releases", async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem("tibrary.root", "/old-library"));
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Latest missing releases" })).toBeVisible();
   await expect(page.getByLabel("Active library")).not.toHaveValue("/old-library");
   await expect(page.getByText("Choose a registered library first")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "View missing releases" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Latest missing releases" })).toHaveCount(0);
+  await page.locator("aside").getByRole("button", {name:"Browse music",exact:true}).click();
+  await page.getByRole("tab", {name:"New releases",exact:true}).click();
+  await expect(page.getByRole("heading", {name:"From your library",exact:true})).toBeVisible();
+  await expect(page.getByRole("button", { name: "View all missing releases",exact:true })).toBeVisible();
 });
 
 test("reviewed number corrections run through the UI and survive navigation", async ({ page }) => {
@@ -2390,12 +2369,7 @@ test("missing release defaults keep low matches inspectable without inflating ov
     await route.fulfill({json:await rpc(request.method,request.args)});
   });
   await page.goto("/");
-  const latest=page.getByRole("region",{name:"Latest missing releases",exact:true});
-  await expect(latest).toContainText("Verified catalogue");
-  await expect(latest).toContainText("Incomplete evidence");
-  await expect(latest).not.toContainText("Unrelated catalogue");
-  await expect(latest).not.toContainText("Other artist catalogue");
-  await expect(latest).not.toContainText("Unchecked artist catalogue");
+  await expect(page.getByRole("heading",{name:"Latest missing releases",exact:true})).toHaveCount(0);
   const metric=page.locator(".metric").filter({hasText:"Missing releases"});
   await expect(metric.locator("strong")).toHaveText("2");
   await expect(metric).toContainText("My album artists · Recommended and Potential");
@@ -2427,6 +2401,15 @@ test("missing release defaults keep low matches inspectable without inflating ov
   expect(queries.every(args=>!("copyright" in args))).toBe(true);
   await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
   await expect(metric.locator("strong")).toHaveText("2");
+  await page.locator("aside").getByRole("button",{name:"Browse music",exact:true}).click();
+  await page.getByRole("tablist",{name:"Browse sections",exact:true}).getByRole("tab",{name:"New releases",exact:true}).click();
+  const libraryReleases=page.locator(".browse-section").filter({has:page.getByRole("heading",{name:"From your library",exact:true})});
+  await expect(libraryReleases).toContainText("Verified catalogue");
+  await expect(libraryReleases).toContainText("Incomplete evidence");
+  await expect(libraryReleases).not.toContainText("Unrelated catalogue");
+  await expect(libraryReleases).not.toContainText("Unmatched catalogue");
+  await expect(libraryReleases).not.toContainText("Other artist catalogue");
+  await expect(libraryReleases).not.toContainText("Unchecked artist catalogue");
 });
 
 test("column menus filter, sort and preserve table interaction state", async ({page}) => {
@@ -2784,15 +2767,18 @@ test("activity shows measured progress across navigation and disables repeated c
 });
 
 test("a failed table request can be retried without freezing navigation", async ({page})=>{
-  let failed=false;
+  let unavailable=true;
   await page.route("**/__test_rpc",async route=>{
     const request=route.request().postDataJSON();
-    if(!failed && request.method==="table" && request.args.route==="missing") {failed=true;await route.fulfill({json:{error:"Temporary catalogue failure"}});return;}
+    // Keep the actual table unavailable through startup's scope/sort changes;
+    // the Overview count is independent, and superseded reads may be discarded.
+    if(unavailable && request.method==="table" && request.args.route==="missing" && request.args.group_artists === true) {await route.fulfill({json:{error:"Temporary catalogue failure"}});return;}
     await route.fulfill({json:await rpc(request.method,request.args)});
   });
   await page.goto("/");
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
   await expect(page.getByRole("alert")).toContainText("Temporary catalogue failure");
+  unavailable=false;
   await page.locator("aside").getByRole("button",{name:"Overview",exact:true}).click();
   await page.locator("aside").getByRole("button",{name:"Missing releases",exact:true}).click();
   await expect(page.locator(".table-scroll")).toHaveAttribute("aria-busy","false");
@@ -3072,15 +3058,34 @@ test("disconnected cached library keeps browsing and online work while file acti
   await expect(page.getByRole("button", {name:"Find cached replacements",exact:true})).toBeEnabled();
   await sidebar.getByRole("button", {name:"Missing releases",exact:true}).click();
   await expect(page.getByRole("button", {name:"Update missing releases",exact:true})).toBeEnabled();
+  await sidebar.getByRole("button", {name:"Browse music",exact:true}).click();
+  await page.getByRole("tab", {name:"New releases",exact:true}).click();
+  await expect(page.getByRole("heading", {name:"From your library",exact:true})).toBeVisible();
+  await expect(page.locator(".browse-release-card").first()).toBeVisible();
+  await expect(page.getByRole("button", {name:"View all missing releases",exact:true})).toBeEnabled();
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("disconnecting during a tag review blocks confirmation and reconnecting preserves the review", async ({page}) => {
   const availability = await driveAvailability(page);
   const original = readFileSync(join(folder, "music", "First Light.flac"));
+  let releaseTable!: () => void, requestedNumbers = false, holdNumbers = true;
+  const tableReady = new Promise<void>(resolve => { releaseTable = resolve; });
+  await page.route("**/__test_rpc", async route => {
+    const request = route.request().postDataJSON();
+    if (request.method === "table" && request.args.route === "correct" && request.args.action === "numbers" && holdNumbers) {
+      requestedNumbers = true;
+      await tableReady;
+    }
+    await route.fallback();
+  });
   await page.goto("/");
   await page.locator("aside").getByRole("button", {name:"Correct tags",exact:true}).click();
   await actionOption(page, "Choose correction", "Track & disc numbers", "menuitemradio");
+  await expect.poll(() => requestedNumbers).toBe(true);
+  await expect(page.getByRole("checkbox", {name:"Select visible rows",exact:true})).toBeDisabled();
+  holdNumbers = false;
+  releaseTable();
   await page.getByRole("checkbox", {name:"Select visible rows",exact:true}).check();
   await page.getByRole("button", {name:/Review & apply/}).click();
   const dialog = page.getByRole("dialog", {name:"Review changes",exact:true});

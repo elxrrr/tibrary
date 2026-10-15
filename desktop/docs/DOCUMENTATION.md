@@ -1,13 +1,13 @@
 # Tibrary guide
 
-Version **0.9.36** · [Setup and screenshots](../../README.md) · [Release audit](RELEASE_AUDIT.md)
+Version **0.9.37** · [Setup and screenshots](../../README.md) · [Release audit](RELEASE_AUDIT.md)
 
 ## Everyday use
 
 | Area | Purpose |
 | --- | --- |
-| Overview | Indexed and linked counts, your libraries and recent missing releases. |
-| Browse music | Explore the online catalogue and choose releases or tracks for the queue. |
+| Overview | Indexed and linked counts, missing-release count and your libraries. |
+| Browse music | Explore artists, new releases, playlists and related tracks; choose music for the queue. |
 | Prepare library | Correct tags, organise folders, review duplicates and flag AI-labelled files. |
 | Link catalogue | Match album artists and recordings; review ambiguous release placements. |
 | Complete library | Browse missing music, approve releases or tracks, and manage downloads. |
@@ -15,15 +15,22 @@ Version **0.9.36** · [Setup and screenshots](../../README.md) · [Release audit
 | Settings → General | Account, libraries, appearance, download folders, audio and matching options. |
 | Settings → Activity | Search saved activity and cancel individual local, online or download jobs. |
 
-Choose the library at the bottom of the sidebar. Category headings open their first workflow. Overview is the dashboard; its recent-release list scrolls independently.
+Choose the library at the bottom of the sidebar. Category headings open their first workflow. Overview is the dashboard; recent missing releases are now in Browse music → New releases.
 
 ### Browse music
 
-Open **Browse music** in the sidebar. Explore the new-release feed, search Releases / Artists / Tracks, or paste a TIDAL artist, album or track link. Artist pages separate albums from EPs and singles. Back and Forward return to your previous results.
+Open **Browse music** in the sidebar. Search Releases / Artists / Tracks / Playlists, or paste a TIDAL artist, album, track or playlist link. Artist pages show portraits and separate albums from EPs and singles. Back and Forward return to your previous results.
+
+- **Discover:** favourite artists, recently viewed releases and the account's available editorial sections.
+- **New releases:** the latest 20 missing releases for your library, followed by the catalogue's new albums and tracks. **View all missing releases** opens the full library-based list.
+- **Playlists:** browse your created or saved playlists, or open editorial playlists from Discover. Select individual songs across releases. **Load all tracks** fetches longer lists with progress and cancellation; queueing uses exactly the checked songs.
+- **More like this:** the radio icon beside a track opens the provider's related-track suggestions. These are separate from Tibrary's library-based recommendations.
 
 Open a release to inspect its audio tracks. Choose **Queue full release**, or check individual tracks and choose **Queue selected tracks**. Then open Download queue to review and start the download. Adding more tracks preserves existing approvals; browsing does not add artists to Missing releases or change local links.
 
-No local library is required. Cached pages remain available offline. New searches and uncached release checks need a working account; stale release details must be refreshed before queueing. Page refreshes are independent of library jobs. Artwork loads only as it comes into view and uses the shared disk cache. AI-labelled and known-unavailable items are excluded from discovery and cannot be queued.
+No local library is required. Cached pages remain available offline. New searches and uncached release checks need a working account; stale release details must be refreshed before queueing. Page refreshes are independent of library jobs. Artist photos, playlist artwork and covers load only as they come into view and use the shared disk cache. AI-labelled and known-unavailable items are excluded from discovery and cannot be queued. Private playlist lists and account feeds have separate account caches.
+
+Playlist queueing checks up to three releases concurrently, then saves the complete selection in one transaction. If a check fails, nothing from that selection is queued. Each operation supports up to 2,000 selected tracks across 500 releases; whole-release selection is limited to 50 releases.
 
 ### Tables and selection
 
@@ -138,6 +145,10 @@ sh desktop/tools/check.sh --live
 # Browse, queue one selected track, download and verify temporary audio
 env -u TIBRARY_TEST_MODE cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml \
   live_browser_search_to_download_roundtrip -- --ignored --nocapture
+
+# Artist images, playlists, pagination, radio and exact cross-release queueing
+env -u TIBRARY_TEST_MODE cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml \
+  live_discovery_playlists_recommendations_and_artwork -- --ignored --nocapture
 ```
 
 Live checks refuse credentials close to expiry rather than refreshing the account. Other ignored tests and benchmarks are opt-in; do not run them indiscriminately. See the [release audit](RELEASE_AUDIT.md) for what was actually tested and the remaining manual checks.

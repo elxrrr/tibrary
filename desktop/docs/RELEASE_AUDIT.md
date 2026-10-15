@@ -1,6 +1,21 @@
-# Release audit — 0.9.36
+# Release audit — 0.9.37
 
 Audit date: 15 October 2026. Changes were developed in an isolated copy and promoted after verification. Personal music and the live application database were not modified by tests.
+
+## Discovery, playlists and artist images — 0.9.37
+
+- Added artist portraits and playlist artwork to the shared visible-only thumbnail cache. Requests are bounded and successful images persist on disk.
+- Added Discover, New releases and Playlists tabs. New releases now contains the latest missing music from the selected library alongside separate catalogue picks; Overview keeps its counts and library controls.
+- Added editorial, created and saved playlists, playlist search/link opening, paginated audio tracks and cancellable loading of longer lists. The track radio action offers provider recommendations without presenting editorial lists as personal recommendations.
+- Playlist selections retain their original album IDs. Up to three release checks run concurrently before one atomic queue transaction; failures leave the selected batch unqueued. Repeated playlist positions remain visible but queue each recording once.
+- Account-scoped page caches, market checks, unavailable-release handling and AI exclusions remain in place. Browsing does not add artists to library discovery.
+- Fixed the shared Select-all checkbox accepting clicks while its table was empty or loading. Updated documentation and screenshots in both themes.
+
+Validation passed **36 frontend unit tests, 306 Rust tests and three FFmpeg checks**, plus the correctness lint and production frontend build. All **87 functional WebKit workflows** and the documentation capture passed across the full run and focused repair checks. The full run exposed the Select-all loading race and an overly broad network-error fixture; after repair, both cases passed three consecutive runs. The repeated-playlist-position regression also passed. Twenty-two Rust tests remain opt-in.
+
+The bounded live discovery check passed in **6.03 seconds**: editorial home, playlist search/details/pagination, created/saved lists, related tracks, actual artist/playlist images, exact cross-release queueing and disconnected cache reuse. The separate browser-to-download test passed in **4.55 seconds**, verifying a real decoded FLAC, tags and queue persistence. Both used copied credentials with refresh disabled and disposable databases/output.
+
+The final 0.9.37 macOS bundle passed strict signature verification, native startup, reopening its disposable database and all four native appearance palettes. The final playlist browser checks and the moved library-recommendation filtering assertions passed against the rebuilt backend. Existing links, account settings and catalogue caches are preserved; no reset is required.
 
 ## Browse music — 0.9.36
 

@@ -472,7 +472,7 @@ export function DataTable({
                       ? "mixed"
                       : "empty"
                 }
-                disabled={!!tree && (busy || !selectableRows.length)}
+                disabled={loading || !selectableRows.length || (!!tree && busy)}
                 onChange={(yes) => {
                   if (tree && onTreeSelect) {
                     onTreeSelect(toggleReleaseRows(treeSelection || {}, rows, yes));

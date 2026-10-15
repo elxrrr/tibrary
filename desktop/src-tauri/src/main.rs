@@ -1067,6 +1067,9 @@ async fn handle_rpc_uncached(
     if method == "artwork.thumbnail" {
         return Ok(state.thumbnails.thumbnail(db, args["release_id"].as_str().unwrap_or(""), args["market"].as_str()).await);
     }
+    if method == "artwork.image" {
+        return Ok(state.thumbnails.catalogue_image(db, args["image_id"].as_str().unwrap_or("")).await);
+    }
     if method == "appearance.accent" {
         return serde_json::to_value(appearance::system_accent(app_handle).await).map_err(|error| error.to_string());
     }
@@ -1078,6 +1081,9 @@ async fn handle_rpc_uncached(
             "browse.search" => browse::search(db, &args).await,
             "browse.artist" => browse::artist(db, &args).await,
             "browse.release" => browse::release(db, &args).await,
+            "browse.playlists" => browse::playlists(db, &args).await,
+            "browse.playlist" => browse::playlist(db, &args).await,
+            "browse.radio" => browse::radio(db, &args).await,
             "browse.resolve" => browse::resolve(db, &args).await,
             "browse.queue" => browse::queue(db, &args).await,
             _ => Err("Unknown browse action".into()),
